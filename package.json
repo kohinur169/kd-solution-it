@@ -1,6 +1,7 @@
 {
   "name": "kd-solution-it",
   "version": "0.1.0",
+  "type": "module",
   "private": true,
   "description": "KD Solution IT - enterprise multi-tenant SaaS payment facilitator platform",
   "license": "UNLICENSED",
@@ -15,12 +16,15 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "check:structure": "node scripts/verify-structure.mjs",
-    "verify": "npm run check:structure && npm run typecheck && npm run lint && npm run build"
+    "verify": "npm run check:structure && npm run check:env && npm run typecheck && npm run lint && npm run build",
+    "env:example": "node lib/env/generate-example.ts",
+    "check:env": "node lib/env/generate-example.ts --check"
   },
   "dependencies": {
     "next": "16.4.3",
     "react": "19.3.1",
-    "react-dom": "19.3.1"
+    "react-dom": "19.3.1",
+    "zod": "4.6.7"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "4.3.3",

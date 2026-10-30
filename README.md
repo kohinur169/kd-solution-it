@@ -26,6 +26,31 @@ numeric(18,4) with a decimal library.
 Both are enforced: .npmrc sets engine-strict, so installing on another runtime fails
 immediately instead of failing later in production.
 
+## Environment configuration
+
+Every environment variable is declared once in `lib/env/manifest.ts`: name, scope, format,
+requirement, secret flag, description and a safe placeholder. From that single file come the
+zod validation, the typed accessors and the committed `.env.example`.
+
+```bash
+cp .env.example .env.local   # then replace the placeholders
+npm run env:example         # regenerate .env.example after a manifest change
+npm run check:env           # fails when the example file and the manifest disagree
+```
+
+- The server validates the contract at boot through `instrumentation.ts` and refuses to
+  start when a required variable is missing or malformed. A production build does not need
+  runtime secrets.
+- Application code never reads `process.env` directly: server code uses `serverEnv()` from
+  `lib/env/server.ts`, browser code uses `clientEnv` from `lib/env/client.ts`.
+- Only `NEXT_PUBLIC_*` names may reach the browser. The schema rejects a client scoped
+  variable without that prefix, and the client module imports types only, so the server
+  schema can never leak into a client bundle.
+- Validation errors name variables and rules, never values, so a boot failure is safe to
+  read in a log.
+- Real values live only in `.env.local` for development and in the hosting platform's
+  environment settings for staging and production.
+
 ## Commands
 
 | Command | What it does |

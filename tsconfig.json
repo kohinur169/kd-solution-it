@@ -8,6 +8,7 @@
     "moduleResolution": "bundler",
     "moduleDetection": "force",
     "allowJs": true,
+    "allowImportingTsExtensions": true,
     "checkJs": false,
     "noEmit": true,
     "strict": true,

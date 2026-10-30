@@ -87,11 +87,13 @@
   ],
   "rootFiles": [
     ".editorconfig",
+    ".env.example",
     ".gitignore",
     ".npmrc",
     ".nvmrc",
     "README.md",
     "eslint.config.mjs",
+    "instrumentation.ts",
     "next.config.mjs",
     "package-lock.json",
     "package.json",
