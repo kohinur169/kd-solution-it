@@ -303,6 +303,14 @@ handoff file.
   is history rather than an overwrite; the constraint `(role = 'owner') = (company_id is not null)`
   keeps an owner scoped to a company and a platform role out of one. A client is a tokenized link
   and never a user row.
+- STEP 014 adds the office control surfaces. `public.office_permissions` delegates one dotted
+  permission key (`payout.release`) to one office user, with an optional expiry and a revoke
+  instant, so a temporary grant is a row rather than a role change. `public.delegations` records
+  one office user handing one approval scope to another between two instants, and the delegate is
+  never the delegator. `public.announcements` is a platform popup that stays a draft until
+  `published_at` is set, and `public.announcement_dismissals` holds one row per person per
+  announcement, which is how "a dismissed announcement does not appear again for that user" is
+  enforced.
 - `public.uuid_generate_v7()` is defined in `0001`, because PostgreSQL before 18 has no native
   UUID v7. Ids sort by creation time, carry version nibble 7 and the RFC 4122 variant bits, and
   take their random tail from `gen_random_uuid()`.
