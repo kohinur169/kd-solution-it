@@ -62,7 +62,11 @@ npm run check:env           # fails when the example file and the manifest disag
 | npm run typecheck | Runs the TypeScript compiler with strict mode and no emit |
 | npm run lint | Runs ESLint over the repository |
 | npm run check:structure | Verifies the canonical folder tree, path comments and forbidden markers |
-| npm run verify | Runs the structure gate, typecheck, lint and build in that order |
+| npm run check:env | Verifies that .env.example matches the environment manifest |
+| npm run check:config | Verifies the typed configuration and refuses credential shaped keys |
+| npm run check:i18n | Verifies the English string catalog |
+| npm run check:logger | Exercises the structured logger, its redaction and its request context |
+| npm run verify | Runs every gate, then typecheck, lint and build in that order |
 
 ## TypeScript configuration
 
@@ -143,6 +147,49 @@ formatMessage("home.structureGate", { directories: 16, rootFiles: 13 });
   the catalog only decides how a value is worded.
 - `npm run check:i18n` fails on an empty or padded message, a malformed placeholder, a locale
   code that disagrees with the shipped locales, or a character outside English copy.
+
+## Structured logging
+
+Every server line comes from `lib/logger/logger.ts`. Writing to a stream directly is a defect.
+
+```ts
+import { logger } from "@/lib/logger/logger";
+
+logger.info("invoice created", { invoiceId, tenantId, amount });
+logger.error("provider call failed", { provider: "stripe", error });
+```
+
+- One call is one newline terminated JSON object with `level`, `time`, `message`, `service`,
+  `environment`, the request context and the fields of the call. A log aggregator can parse it
+  and an engineer can search it.
+- `error` goes to `stderr`; `debug`, `info` and `warn` go to `stdout`. `LOG_LEVEL` filters the
+  four levels before any serialization work happens.
+- Redaction is the logger's job. A field named `password`, `token`, `authorization`, `cookie`,
+  `apiKey`, `cardNumber` and similar is replaced by `[REDACTED]`, and every string is scanned
+  for bearer tokens, JWTs, provider keys, AWS key ids, private key blocks and passwords inside
+  URLs or `key=value` text. `npm run check:logger` proves a seed secret never survives.
+- A request is wrapped once, and everything it calls shares one id:
+
+  ```ts
+  const requestId = request.headers.get("x-request-id");
+
+  return runWithRequestContext(
+    requestId === null ? { route } : { requestId, route },
+    () => {
+      logger.info("handled");
+      return respond();
+    },
+  );
+  ```
+
+  The context lives in `AsyncLocalStorage`, so it survives `await` and timers without being
+  threaded through every function. An inbound id that fails the safe alphabet is replaced by a
+  generated UUID rather than rejected.
+- Output is bounded: depth, collection size, string length and the whole record (16 KiB) are
+  capped, a circular reference becomes `[circular]`, and a record that hits a limit carries
+  `truncated: true`. A failing sink never throws into the request.
+- `logger.child({ tenantId })` adds fields to every later line without losing the parent's,
+  the request context, or the level.
 
 ## Repository structure
 
