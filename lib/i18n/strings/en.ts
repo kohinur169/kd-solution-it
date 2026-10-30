@@ -45,6 +45,25 @@ const catalog = {
       "The structure gate enforces {directories} canonical directories and {rootFiles} root files on every verification run.",
     healthLink: "Service health",
   },
+  errors: {
+    /** Every message states what the client can do next. None describes what the server saw. */
+    validationFailed:
+      "Some of the information sent could not be accepted. Check the highlighted fields and try again.",
+    authenticationRequired: "Sign in to continue.",
+    permissionDenied: "This account does not have permission to perform that action.",
+    resourceNotFound: "The requested item could not be found.",
+    methodNotAllowed: "This endpoint does not accept that request method.",
+    conflict: "The item was changed by another request. Reload it and try again.",
+    idempotencyConflict:
+      "A request with this idempotency key was already processed with different details.",
+    payloadTooLarge: "The request is larger than this endpoint accepts.",
+    unsupportedMediaType: "This endpoint accepts JSON request bodies only.",
+    rateLimited: "Too many requests. Wait a moment and try again.",
+    dependencyFailed: "A connected service did not answer correctly. Try again shortly.",
+    serviceUnavailable: "The service is temporarily unavailable. Try again shortly.",
+    timeout: "The request took too long to complete. Try again.",
+    internal: "Something went wrong on our side. Quote the request id when you contact support.",
+  },
 } as const;
 
 export const en = deepFreeze(catalog);

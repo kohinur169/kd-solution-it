@@ -66,6 +66,7 @@ npm run check:env           # fails when the example file and the manifest disag
 | npm run check:config | Verifies the typed configuration and refuses credential shaped keys |
 | npm run check:i18n | Verifies the English string catalog |
 | npm run check:logger | Exercises the structured logger, its redaction and its request context |
+| npm run check:errors | Verifies the error code catalog and the error response format |
 | npm run verify | Runs every gate, then typecheck, lint and build in that order |
 
 ## TypeScript configuration
@@ -190,6 +191,39 @@ logger.error("provider call failed", { provider: "stripe", error });
   `truncated: true`. A failing sink never throws into the request.
 - `logger.child({ tenantId })` adds fields to every later line without losing the parent's,
   the request context, or the level.
+
+## Error responses
+
+Every failed API call answers with one JSON envelope, built in `lib/errors/respond.ts`.
+
+```json
+{
+  "error": {
+    "code": "VALIDATION_FAILED",
+    "message": "Some of the information sent could not be accepted. Check the highlighted fields and try again.",
+    "requestId": "req_6e94639a-5564-4585-9a6a-91fbea9b6e38",
+    "retryable": false,
+    "details": [{ "field": "items[0].price", "rule": "invalid_type" }]
+  }
+}
+```
+
+- A route is wrapped once: `export const GET = withErrorResponse(handler)`. The wrapper opens the
+  request context, catches a synchronous throw and an asynchronous rejection, writes one log
+  line and returns the envelope. On success the handler's own response passes through untouched.
+- `lib/errors/codes.ts` is the catalog: each code maps to an HTTP status, a message key in the
+  string catalog and a retry flag. Codes are stable public identifiers and are never renamed.
+- Throw `new AppError("RESOURCE_NOT_FOUND")` for a failure you understand, a `ZodError` or
+  `validationError(details)` for input, and anything else becomes `INTERNAL_ERROR`.
+- The raw error never leaves the server: an internal failure returns catalog copy, and the stack,
+  the driver message and the cause go to the structured log only, where they are redacted.
+- A validation detail carries a field path and a rule name. The rejected value is never echoed,
+  because it can be a password or a card number.
+- `retryable` and `retryAfterSeconds` say whether and when a retry can succeed; a delay also sets
+  the `retry-after` header. Headers are always JSON, `no-store` and `nosniff`, plus
+  `x-request-id` so a merchant can quote the id and an engineer can find the exact log line.
+- `AUTHENTICATION_REQUIRED` is identical for an unknown account and a wrong password, so an error
+  never reveals whether an account exists.
 
 ## Repository structure
 
