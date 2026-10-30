@@ -105,6 +105,23 @@ match the shadcn/ui vocabulary (background, surface, muted, primary, secondary, 
 destructive, border, input, ring) so the component library added in a later STEP needs no
 translation layer.
 
+## Application configuration
+
+Code level configuration lives in `config/` and is split by who may read it:
+
+- `config/app.ts` - pure typed constants (money scale and minimum amounts, pagination bounds,
+  login lock, payout cooling period, reconciliation deadline, dispute windows, subscription
+  warning, cache lifetimes). Frozen, invariant checked at import, safe in a client bundle.
+- `config/server.ts` - `getServerConfig()`: the safe subset derived from the validated
+  environment (environment name and flags, application URL, storage provider, log level,
+  monitoring). Server only, built lazily so a production build needs no runtime secrets.
+- `config/verify.ts` - the configuration gate: re-runs the invariants and refuses a
+  credential shaped key.
+
+There is no barrel file, so every import names its side of the boundary (`@/config/app` or
+`@/config/server`). Money is always a string with the numeric(18,4) scale; configuration never
+introduces a JavaScript number for an amount.
+
 ## Repository structure
 
 The canonical tree is machine readable in config/structure.json and is enforced by
