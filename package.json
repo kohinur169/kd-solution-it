@@ -16,10 +16,11 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "check:structure": "node scripts/verify-structure.mjs",
-    "verify": "npm run check:structure && npm run check:env && npm run check:config && npm run typecheck && npm run lint && npm run build",
+    "verify": "npm run check:structure && npm run check:env && npm run check:config && npm run check:i18n && npm run typecheck && npm run lint && npm run build",
     "env:example": "node lib/env/generate-example.ts",
     "check:env": "node lib/env/generate-example.ts --check",
-    "check:config": "node config/verify.ts"
+    "check:config": "node config/verify.ts",
+    "check:i18n": "node lib/i18n/verify.ts"
   },
   "dependencies": {
     "next": "16.4.3",

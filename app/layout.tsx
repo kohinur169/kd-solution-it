@@ -1,12 +1,12 @@
 // path: app/layout.tsx
 import type { Metadata, Viewport } from "next";
 import type { ReactNode } from "react";
+import { en } from "@/lib/i18n/strings/en";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "KD Solution IT",
-  description:
-    "Enterprise multi-tenant payment facilitator platform for Asian merchants with worldwide merchant country control.",
+  title: en.brand.name,
+  description: en.brand.description,
 };
 
 export const viewport: Viewport = {
@@ -19,7 +19,7 @@ export default function RootLayout({
   children,
 }: Readonly<{ children: ReactNode }>): ReactNode {
   return (
-    <html lang="en">
+    <html lang={en.locale.code} dir={en.locale.direction}>
       <body>{children}</body>
     </html>
   );

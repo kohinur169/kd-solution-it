@@ -122,6 +122,28 @@ There is no barrel file, so every import names its side of the boundary (`@/conf
 `@/config/server`). Money is always a string with the numeric(18,4) scale; configuration never
 introduces a JavaScript number for an amount.
 
+## Strings and language
+
+Every user facing string lives in `lib/i18n/strings/en.ts`. Nothing is written into a
+component, a layout or a JSON file.
+
+```ts
+import { formatMessage, getMessage } from "@/lib/i18n/messages";
+
+getMessage("home.eyebrow");                                   // no parameters
+formatMessage("home.structureGate", { directories: 16, rootFiles: 13 });
+```
+
+- English is the schema: `TranslationCatalog` is derived from the catalog object, so a future
+  locale must satisfy the same shape.
+- Message paths are typed. A misspelled key is a compile error, not a blank label.
+- Parameters are strict. A missing parameter throws and so does an unused one, which means a
+  half substituted sentence can never reach a screen.
+- Wording lives here, numbers do not. Amounts, limits and timeouts come from `config/app.ts`;
+  the catalog only decides how a value is worded.
+- `npm run check:i18n` fails on an empty or padded message, a malformed placeholder, a locale
+  code that disagrees with the shipped locales, or a character outside English copy.
+
 ## Repository structure
 
 The canonical tree is machine readable in config/structure.json and is enforced by
