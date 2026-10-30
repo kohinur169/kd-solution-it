@@ -61,6 +61,25 @@ import structure from "@/config/structure.json";
 import { PLATFORM_SERVICE_SLUG } from "@/lib/constants/platform";
 ```
 
+## Design system
+
+Every visual decision lives in one file, styles/tokens.css, and reaches the interface
+through Tailwind CSS 4 utilities. Three layers:
+
+1. **Primitives** - raw palette steps (`--palette-ink-700`). Private to the token file.
+2. **Semantics** - theme aware names (`--kd-background`, `--kd-surface`,
+   `--kd-muted-foreground`, `--kd-border`, `--kd-primary`, `--kd-ring`, `--kd-destructive`,
+   `--kd-success`, `--kd-warning`) defined once with the CSS `light-dark()` function.
+3. **Tailwind** - `@theme inline` exposes the semantic layer, so a component writes
+   `bg-surface`, `text-muted-foreground`, `border-border`, `rounded-card` or `shadow-card`
+   and never a palette step or a colour literal.
+
+The theme follows `color-scheme`: the operating system preference applies with no
+JavaScript, and a `.light` or `.dark` class on any ancestor forces a theme. The token names
+match the shadcn/ui vocabulary (background, surface, muted, primary, secondary, accent,
+destructive, border, input, ring) so the component library added in a later STEP needs no
+translation layer.
+
 ## Repository structure
 
 The canonical tree is machine readable in config/structure.json and is enforced by
@@ -76,6 +95,7 @@ command instead of being discovered late.
 | migrations/ | Append-only numbered migrations with their rollback files |
 | scripts/ | Repository verification and maintenance scripts |
 | services/ | Domain services: clients, invoices, payments, refunds, billing, support |
+| styles/ | Central design tokens: colour, radius, elevation, typography, easing |
 | docs/ | Product documents, planning notes and step handoffs |
 
 ## Build discipline

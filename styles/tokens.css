@@ -1,0 +1,191 @@
+/* path: styles/tokens.css */
+
+/*
+ * KD Solution IT central design tokens.
+ *
+ * This file is the single owner of every visual decision in the product: colour, radius,
+ * elevation, typography and easing. A component asks for a semantic name (bg-surface,
+ * text-muted-foreground, rounded-card). It never names a palette step and never carries a
+ * colour literal, so a brand change is one file and a dark theme cannot drift.
+ *
+ * Three layers, in order:
+ *   1. Primitives  - raw palette steps. Private to this file, never used by a component.
+ *   2. Semantics   - theme aware names in CSS custom properties, defined once with the CSS
+ *                    light-dark() function. The active theme comes from color-scheme, so
+ *                    there is no duplicated dark block waiting to fall out of sync.
+ *   3. Tailwind    - @theme inline exposes the semantic layer to utilities and to
+ *                    shadcn/ui, whose fixed vocabulary (background, card, muted, primary,
+ *                    secondary, accent, destructive, border, input, ring) is matched here.
+ *
+ * Theme switching: `:root` declares color-scheme: light dark, so the operating system
+ * preference applies with no JavaScript. Adding `.light` or `.dark` to any ancestor forces
+ * a theme, which is the hook the application shell uses (STEP 010 owns the switcher).
+ */
+
+:root {
+  /* 1. Primitives: neutral ink and brand blue, plus status colours. */
+  --palette-ink-50: #f7f8fa;
+  --palette-ink-100: #eef1f6;
+  --palette-ink-200: #dfe3ea;
+  --palette-ink-300: #c2cad6;
+  --palette-ink-400: #98a1b2;
+  --palette-ink-500: #6b7484;
+  --palette-ink-600: #4b5364;
+  --palette-ink-700: #2c3444;
+  --palette-ink-750: #1d2637;
+  --palette-ink-775: #263041;
+  --palette-ink-800: #182031;
+  --palette-ink-900: #10151f;
+  --palette-ink-925: #0b0e14;
+  --palette-ink-950: #06080d;
+
+  --palette-brand-50: #eef4ff;
+  --palette-brand-100: #dbe7ff;
+  --palette-brand-200: #bcd3ff;
+  --palette-brand-300: #93b6ff;
+  --palette-brand-400: #7aa2ff;
+  --palette-brand-500: #3f73f5;
+  --palette-brand-600: #1d4ed8;
+  --palette-brand-700: #1a3fb0;
+  --palette-brand-800: #193788;
+  --palette-brand-900: #1a3168;
+  --palette-brand-950: #17203a;
+
+  --palette-danger-500: #dc2626;
+  --palette-danger-600: #b91c1c;
+  --palette-danger-400: #f87171;
+  --palette-success-500: #16a34a;
+  --palette-success-600: #15803d;
+  --palette-success-400: #4ade80;
+  --palette-warning-500: #d97706;
+  --palette-warning-600: #b45309;
+  --palette-warning-400: #fbbf24;
+
+  --palette-white: #ffffff;
+  --palette-black: #06080d;
+
+  /*
+   * 2. Semantics. Each token declares a plain light value first so an engine without
+   * light-dark() still renders a readable page, then the theme aware value.
+   */
+  color-scheme: light dark;
+
+  --kd-background: var(--palette-ink-50);
+  --kd-background: light-dark(var(--palette-ink-50), var(--palette-ink-950));
+
+  --kd-foreground: var(--palette-ink-925);
+  --kd-foreground: light-dark(var(--palette-ink-925), var(--palette-ink-100));
+
+  --kd-surface: var(--palette-white);
+  --kd-surface: light-dark(var(--palette-white), var(--palette-ink-900));
+
+  --kd-surface-foreground: var(--palette-ink-925);
+  --kd-surface-foreground: light-dark(var(--palette-ink-925), var(--palette-ink-100));
+
+  --kd-muted: var(--palette-ink-100);
+  --kd-muted: light-dark(var(--palette-ink-100), var(--palette-ink-800));
+
+  --kd-muted-foreground: var(--palette-ink-600);
+  --kd-muted-foreground: light-dark(var(--palette-ink-600), var(--palette-ink-300));
+
+  --kd-border: var(--palette-ink-200);
+  --kd-border: light-dark(var(--palette-ink-200), var(--palette-ink-775));
+
+  --kd-input: var(--palette-ink-200);
+  --kd-input: light-dark(var(--palette-ink-200), var(--palette-ink-775));
+
+  --kd-ring: var(--palette-brand-600);
+  --kd-ring: light-dark(var(--palette-brand-600), var(--palette-brand-300));
+
+  --kd-primary: var(--palette-brand-600);
+  --kd-primary: light-dark(var(--palette-brand-600), var(--palette-brand-300));
+
+  --kd-primary-foreground: var(--palette-white);
+  --kd-primary-foreground: light-dark(var(--palette-white), var(--palette-ink-950));
+
+  --kd-secondary: var(--palette-brand-50);
+  --kd-secondary: light-dark(var(--palette-brand-50), var(--palette-brand-950));
+
+  --kd-secondary-foreground: var(--palette-brand-700);
+  --kd-secondary-foreground: light-dark(var(--palette-brand-700), var(--palette-brand-200));
+
+  --kd-accent: var(--palette-ink-100);
+  --kd-accent: light-dark(var(--palette-ink-100), var(--palette-ink-750));
+
+  --kd-accent-foreground: var(--palette-ink-925);
+  --kd-accent-foreground: light-dark(var(--palette-ink-925), var(--palette-ink-100));
+
+  --kd-destructive: var(--palette-danger-600);
+  --kd-destructive: light-dark(var(--palette-danger-600), var(--palette-danger-400));
+
+  --kd-destructive-foreground: var(--palette-white);
+  --kd-destructive-foreground: light-dark(var(--palette-white), var(--palette-ink-950));
+
+  --kd-success: var(--palette-success-600);
+  --kd-success: light-dark(var(--palette-success-600), var(--palette-success-400));
+
+  --kd-success-foreground: var(--palette-white);
+  --kd-success-foreground: light-dark(var(--palette-white), var(--palette-ink-950));
+
+  --kd-warning: var(--palette-warning-600);
+  --kd-warning: light-dark(var(--palette-warning-600), var(--palette-warning-400));
+
+  --kd-warning-foreground: var(--palette-white);
+  --kd-warning-foreground: light-dark(var(--palette-white), var(--palette-ink-950));
+}
+
+/* Forced themes. color-scheme drives every light-dark() token above. */
+.light {
+  color-scheme: light;
+}
+
+.dark {
+  color-scheme: dark;
+}
+
+/* 3. Tailwind surface. Static scales: radius, elevation, typography, motion. */
+@theme {
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, "Noto Sans", sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+    "Liberation Mono", monospace;
+
+  --radius-xs: 0.25rem;
+  --radius-sm: 0.375rem;
+  --radius-md: 0.5rem;
+  --radius-lg: 0.75rem;
+  --radius-xl: 1rem;
+  --radius-card: 1rem;
+  --radius-pill: 9999px;
+
+  --shadow-card: 0 1px 2px 0 rgb(6 8 13 / 0.06), 0 10px 28px -14px rgb(6 8 13 / 0.2);
+  --shadow-raised: 0 2px 4px 0 rgb(6 8 13 / 0.08), 0 18px 44px -18px rgb(6 8 13 / 0.28);
+
+  --ease-standard: cubic-bezier(0.2, 0, 0, 1);
+}
+
+/* 3. Tailwind surface. Theme aware colours, exposed inline so utilities read the
+   semantic variable directly and a theme switch needs no rebuild. */
+@theme inline {
+  --color-background: var(--kd-background);
+  --color-foreground: var(--kd-foreground);
+  --color-surface: var(--kd-surface);
+  --color-surface-foreground: var(--kd-surface-foreground);
+  --color-muted: var(--kd-muted);
+  --color-muted-foreground: var(--kd-muted-foreground);
+  --color-border: var(--kd-border);
+  --color-input: var(--kd-input);
+  --color-ring: var(--kd-ring);
+  --color-primary: var(--kd-primary);
+  --color-primary-foreground: var(--kd-primary-foreground);
+  --color-secondary: var(--kd-secondary);
+  --color-secondary-foreground: var(--kd-secondary-foreground);
+  --color-accent: var(--kd-accent);
+  --color-accent-foreground: var(--kd-accent-foreground);
+  --color-destructive: var(--kd-destructive);
+  --color-destructive-foreground: var(--kd-destructive-foreground);
+  --color-success: var(--kd-success);
+  --color-success-foreground: var(--kd-success-foreground);
+  --color-warning: var(--kd-warning);
+  --color-warning-foreground: var(--kd-warning-foreground);
+}

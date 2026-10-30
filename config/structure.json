@@ -75,6 +75,11 @@
       "purpose": "Dependency free repository verification and maintenance scripts run through npm scripts."
     },
     {
+      "path": "styles",
+      "owner": "STEP 003",
+      "purpose": "Central design tokens. The single owner of colour, radius, elevation, typography and easing."
+    },
+    {
       "path": "services",
       "owner": "STEP 001 (root), later STEPs own their services",
       "purpose": "Domain services that hold business rules: clients, products, invoices, payments, ledger, refunds, disputes, billing, support and company accounting."
@@ -88,11 +93,34 @@
     "README.md",
     "eslint.config.mjs",
     "next.config.mjs",
-    "package.json",
     "package-lock.json",
+    "package.json",
+    "postcss.config.mjs",
     "tsconfig.json"
   ],
-  "sourceRoots": ["app", "components", "config", "lib", "scripts", "services"],
-  "sourceExtensions": [".ts", ".tsx", ".mjs", ".cjs", ".md", ".css"],
-  "forbiddenMarkers": ["TODO", "FIXME", "XXX", "lorem ipsum", "coming soon", "console.log"]
+  "sourceRoots": [
+    "app",
+    "styles",
+    "components",
+    "config",
+    "lib",
+    "scripts",
+    "services"
+  ],
+  "sourceExtensions": [
+    ".ts",
+    ".tsx",
+    ".mjs",
+    ".cjs",
+    ".md",
+    ".css"
+  ],
+  "forbiddenMarkers": [
+    "TODO",
+    "FIXME",
+    "XXX",
+    "lorem ipsum",
+    "coming soon",
+    "console.log"
+  ]
 }
