@@ -1,6 +1,7 @@
 // path: app/page.tsx
 import Link from "next/link";
 import type { ReactNode } from "react";
+import structure from "@/config/structure.json";
 
 const platformSummary =
   "Enterprise multi-tenant payment facilitator platform for Asian merchants with worldwide merchant country control.";
@@ -12,6 +13,9 @@ const foundationFacts: ReadonlyArray<string> = [
 ];
 
 export default function HomePage(): ReactNode {
+  const canonicalDirectoryCount = structure.directories.length;
+  const rootFileCount = structure.rootFiles.length;
+
   return (
     <main className="page">
       <div className="shell">
@@ -25,6 +29,10 @@ export default function HomePage(): ReactNode {
             </li>
           ))}
         </ul>
+        <p className="meta">
+          The structure gate enforces {canonicalDirectoryCount} canonical directories and{" "}
+          {rootFileCount} root files on every verification run.
+        </p>
         <p className="meta">
           <Link className="link" href="/api/health">
             Service health

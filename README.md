@@ -20,8 +20,11 @@ numeric(18,4) with a decimal library.
 
 ## Requirements
 
-- Node.js 22 (see .nvmrc)
-- npm 10 or newer
+- Node.js 26.13.0 LTS (pinned in .nvmrc, enforced by the engines field in package.json)
+- npm 10.9.0 or newer
+
+Both are enforced: .npmrc sets engine-strict, so installing on another runtime fails
+immediately instead of failing later in production.
 
 ## Commands
 
@@ -35,6 +38,28 @@ numeric(18,4) with a decimal library.
 | npm run lint | Runs ESLint over the repository |
 | npm run check:structure | Verifies the canonical folder tree, path comments and forbidden markers |
 | npm run verify | Runs the structure gate, typecheck, lint and build in that order |
+
+## TypeScript configuration
+
+The compiler runs in strict mode with the full safety matrix switched on, so an unsafe
+pattern fails at typecheck time instead of at runtime in production:
+
+- `strict` plus `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`,
+  `noImplicitOverride`, `noImplicitReturns`, `noFallthroughCasesInSwitch`,
+  `noPropertyAccessFromIndexSignature`, `useUnknownInCatchVariables`
+- `noUnusedLocals`, `noUnusedParameters`, `allowUnreachableCode: false`,
+  `allowUnusedLabels: false`, `forceConsistentCasingInFileNames`
+- `verbatimModuleSyntax` and `moduleDetection: force`, so a type import can never leak into
+  the runtime bundle by accident
+- target and lib are `ES2024`, below what Node.js 26.13.0 provides
+
+Imports inside the repository always use the `@/` alias, which maps to the repository root
+in the compiler, in ESLint and in the bundler:
+
+```ts
+import structure from "@/config/structure.json";
+import { PLATFORM_SERVICE_SLUG } from "@/lib/constants/platform";
+```
 
 ## Repository structure
 

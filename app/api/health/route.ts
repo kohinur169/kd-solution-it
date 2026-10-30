@@ -1,5 +1,6 @@
 // path: app/api/health/route.ts
 import { NextResponse } from "next/server";
+import { PLATFORM_SERVICE_SLUG } from "@/lib/constants/platform";
 
 export const dynamic = "force-dynamic";
 
@@ -10,13 +11,12 @@ interface HealthPayload {
   readonly checkedAt: string;
 }
 
-const serviceName = "kd-solution-it";
 const bootedAtEpochMs = Date.now();
 
 function buildHealthPayload(checkedAtEpochMs: number): HealthPayload {
   return {
     status: "ok",
-    service: serviceName,
+    service: PLATFORM_SERVICE_SLUG,
     uptimeSeconds: Math.max(
       0,
       Math.floor((checkedAtEpochMs - bootedAtEpochMs) / 1000),
