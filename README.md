@@ -295,16 +295,24 @@ handoff file.
   audit columns `created_at`, `updated_at`, `deleted_at`, `version`. `public.job_queue` is the
   durable form of the `JobRecord` contract from `lib/jobs/queue.ts`, with a nullable `company_id`
   so platform wide work needs no fake tenant.
+- STEP 013 adds the accounts. `public.users` is a person who can sign in, with a nullable
+  `company_id` because office staff belong to no merchant company, a lowercase email that is
+  unique for ever ("one person, one account"), the credential columns, and the encrypted TOTP
+  secret and backup code hashes that section 22 makes mandatory. `public.role_assignments` records
+  each grant of one of the seven roles with `granted_by` and `revoked_at`, so a permission change
+  is history rather than an overwrite; the constraint `(role = 'owner') = (company_id is not null)`
+  keeps an owner scoped to a company and a platform role out of one. A client is a tokenized link
+  and never a user row.
 - `public.uuid_generate_v7()` is defined in `0001`, because PostgreSQL before 18 has no native
   UUID v7. Ids sort by creation time, carry version nibble 7 and the RFC 4122 variant bits, and
   take their random tail from `gen_random_uuid()`.
 - `public.set_row_metadata()` is a before-update trigger installed per table. It sets
   `updated_at = now()` and increments `version`, so optimistic locking cannot drift even for a
   hand written update; the application still writes `where id = $1 and version = $2`.
-- Both tables enable row level security and carry an explicit `<table>_default_deny` policy. A
-  STEP that grants access adds a permissive policy beside it, never in place of it. The migration
-  does not force RLS, because the table owner and the service role must still be able to migrate
-  and to enqueue.
+- Every table enables row level security and carries an explicit `<table>_default_deny` policy. A
+  STEP that grants access adds a permissive policy beside it, never in place of it. The migrations
+  do not force RLS, because the table owner and the service role must still be able to migrate and
+  to enqueue.
 - The queue's two hot queries have partial indexes: `(available_at, created_at)` for
   `pending`/`retrying` rows and `(lease_expires_at)` for `running` rows, so the store STEP's
   `for update skip locked` claim reads an index instead of the table. Idempotency is unique per

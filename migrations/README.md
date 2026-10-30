@@ -4,13 +4,15 @@
 Owner: STEP 012-036 and every later STEP that adds a table.
 
 Append-only numbered SQL migrations applied with the Supabase CLI against the project of the
-current environment. STEP 012 created the first two files; `npm run check:migrations` keeps them
-honest.
+current environment. STEP 012 and STEP 013 created the first four files; `npm run
+check:migrations` keeps them honest.
 
 | File | What it creates |
 | --- | --- |
 | 0001_companies.sql | `public.uuid_generate_v7()`, `public.set_row_metadata()`, the `companies` tenant table, its slug index, row level security and the default-deny policy |
 | 0002_job_queue.sql | The `job_queue` background work table, its seven indexes, its trigger, row level security and the default-deny policy |
+| 0003_users.sql | The `users` sign-in accounts table, its email and company indexes, the TOTP and backup code columns, its trigger, row level security and the default-deny policy |
+| 0004_role_assignments.sql | The `role_assignments` grant history table for the seven roles, its two live indexes, its trigger, row level security and the default-deny policy |
 
 Every file is paired with `<name>.down.sql`, which undoes exactly what its forward file created and
 nothing else.
@@ -46,7 +48,11 @@ nothing else.
 10. The queue table's shape is fixed by the `JobQueue` port in `lib/jobs/queue.ts`, not the other
     way round. Changing a column to suit a store implementation is a design change that starts in
     that port and in a new migration.
-11. Numbering is contiguous from 0001. A migration is never renumbered after it has been applied
+11. A role is a row in `role_assignments`, never a column on `users`. A grant is recorded with
+    `granted_by`, `granted_at` and `revoked_at`; revoking sets `revoked_at`, it does not delete the
+    row, and a later grant of the same role is a new row. The role vocabulary is the seven names in
+    FEATURE_LIST.md section 2, and `client` is never one of them because a client cannot sign in.
+12. Numbering is contiguous from 0001. A migration is never renumbered after it has been applied
     anywhere.
 
 ## Commands
