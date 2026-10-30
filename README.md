@@ -67,6 +67,7 @@ npm run check:env           # fails when the example file and the manifest disag
 | npm run check:i18n | Verifies the English string catalog |
 | npm run check:logger | Exercises the structured logger, its redaction and its request context |
 | npm run check:errors | Verifies the error code catalog and the error response format |
+| npm run check:lint | Verifies the lint matrix: required rules, severities and exemptions |
 | npm run verify | Runs every gate, then typecheck, lint and build in that order |
 
 ## TypeScript configuration
@@ -224,6 +225,33 @@ Every failed API call answers with one JSON envelope, built in `lib/errors/respo
   `x-request-id` so a merchant can quote the id and an engineer can find the exact log line.
 - `AUTHENTICATION_REQUIRED` is identical for an unknown account and a wrong password, so an error
   never reveals whether an account exists.
+
+## Lint and typing rules
+
+`npm run lint` runs ESLint over every source file, with type information from `tsconfig.json`.
+The matrix lives in `eslint.config.mjs` and is grouped by intent:
+
+| Layer | What it enforces |
+| --- | --- |
+| Framework | Next.js and React rules from `eslint-config-next` |
+| Platform safety | No stream output outside the logger, no `eval` family, no loose equality, no `var` |
+| Strict typing | No `any`, no `!` assertion, no `@ts-ignore`, type-only imports, no `require`, closed escape hatches |
+| Promises | No floating promise, no promise in a condition, no `await` on a non thenable |
+| Boundaries | English only source, and the environment read only through `lib/env/` |
+
+- Every entry is an error. A warning in a gate is a rule that is already being ignored.
+- `projectService` is on, so the promise rules see the same types the compiler sees. A forgotten
+  `await` in a payment path is a lint failure, not a review comment.
+- `local/english-only-source` scans code, comments and strings and allows only printable ASCII
+  plus en dash, em dash, curly quotes, ellipsis, bullet and middle dot. A translated comment
+  cannot enter the repository.
+- `local/no-process-env` refuses a direct `process.env` read. The exemption list is one visible
+  block in `eslint.config.mjs`: `lib/env/**`, `instrumentation.ts`, `scripts/**` and the tool
+  configuration files.
+- `npm run check:lint` proves the matrix itself: every required rule is present as an error, the
+  local rules are registered, each failure probe fires, a clean probe stays clean, and ESLint's
+  resolved configuration shows the exemptions exactly where they belong. It needs no file on
+  disk, so it leaves no artefact behind.
 
 ## Repository structure
 
