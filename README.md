@@ -69,6 +69,7 @@ npm run check:env           # fails when the example file and the manifest disag
 | npm run check:errors | Verifies the error code catalog and the error response format |
 | npm run check:lint | Verifies the lint matrix: required rules, severities and exemptions |
 | npm run check:shell | Verifies the shell contract and refuses colour outside the token file |
+| npm run check:jobs | Exercises the job foundation: registration, validation, leases, retries, timeouts, scheduling and health |
 | npm run verify | Runs every gate, then typecheck, lint and build in that order |
 
 ## TypeScript configuration
@@ -281,6 +282,36 @@ The document, the theme and the header are built once in `app/layout.tsx`.
 - Colour and palette steps live only in `styles/tokens.css`. `npm run check:shell` refuses a
   colour literal or a palette step utility under `app/` and `components/`, and refuses a layout
   that lost the script, the skip link, the catalog driven attributes or the provider boundary.
+
+## Background jobs
+
+`lib/jobs/` is the contract every later job is written against; STEP 011 builds the foundation and
+STEP 012 adds the table behind the same port.
+
+- A job is a name, a `zod` payload schema and a handler, registered once on a `JobRegistry`. The
+  payload is validated at enqueue and again before the handler runs, so a schema change after a
+  deploy produces a clear `VALIDATION_FAILED` rather than a crash on a missing field.
+- `enqueueJob` is the only call feature code makes. An idempotency key returns the first job with
+  `deduplicated: true`, so a retried request cannot enqueue the same invoice twice, and the
+  attempt ceiling comes from the definition rather than from the caller.
+- `InMemoryJobQueue` is the development and gate store, and its snapshot says `memory` so nobody
+  mistakes it for durable. `JobQueue` is the port; the SQL store arrives with the queue table in
+  STEP 012 without a change to the worker, the scheduler or the route.
+- A claim is a lease with an expiry. `releaseExpiredLeases` returns a stalled job to the queue with
+  its attempt counter intact and `LEASE_EXPIRED` recorded, which is what keeps a job that kills its
+  worker from looping forever.
+- `JobWorker` runs one attempt at a time: a scoped log line, the job's trace id as the request id,
+  an `AbortSignal` with the definition's timeout, and a retry decision taken from the error
+  catalog. Retryable codes back off as `min(ceiling, base * 2^(attempt-1))` from configuration;
+  `PERMISSION_DENIED` or `VALIDATION_FAILED` dies on the first attempt.
+- `JobScheduler` is an interval clock, not a cron parser. Wall time is divided into slots and the
+  slot index is part of the idempotency key, so two ticks in one slot enqueue one job. A schedule
+  naming an unregistered job is rejected at registration.
+- `app/api/jobs/health/route.ts` answers `200` while work is moving and `503` with the reasons when
+  it is not: a stalled lease, a waiting job older than `stalledAfterSeconds`, or a job that died.
+  `/api/health` stays the liveness endpoint.
+- `npm run check:jobs` drives all of it on a controlled clock, and `getJobRuntime()` builds one
+  queue, registry, scheduler and worker per process without starting a loop by itself.
 
 ## Repository structure
 

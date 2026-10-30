@@ -6,7 +6,7 @@ configuration modules.
 
 | File | Purpose |
 | --- | --- |
-| app.ts | Pure typed application configuration: money rules, pagination, login lock, payouts, reconciliation, disputes, billing and caching. Frozen and invariant checked at import. Safe in a client bundle |
+| app.ts | Pure typed application configuration: money rules, pagination, login lock, payouts, reconciliation, disputes, billing, caching and the job limits (attempts, backoff, timeout, worker slots, stall window). Frozen and invariant checked at import. Safe in a client bundle |
 | server.ts | `getServerConfig()`: the safe, environment derived subset (environment name and flags, application URL, storage provider, log level, monitoring). Server only |
 | verify.ts | The configuration gate behind `npm run check:config`, also part of `npm run verify` |
 | structure.json | The canonical repository tree read by the structure gate |
@@ -27,3 +27,6 @@ configuration modules.
    holds code level defaults and hard limits.
 7. `getServerConfig()` is called inside a request, a server component body or a job, never at
    module scope, so a production build never needs runtime secrets.
+8. The `jobs` section is a hard limit, not a suggestion: a worker reads `workerConcurrency` and a
+   retry reads `retryBaseDelaySeconds` and `retryMaxDelaySeconds` from here, so an operator cannot
+   tune a deployment into a retry storm by editing a handler.

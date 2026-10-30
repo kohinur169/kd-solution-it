@@ -16,7 +16,7 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "check:structure": "node scripts/verify-structure.mjs",
-    "verify": "npm run check:structure && npm run check:env && npm run check:config && npm run check:i18n && npm run check:logger && npm run check:errors && npm run check:lint && npm run check:shell && npm run typecheck && npm run lint && npm run build",
+    "verify": "npm run check:structure && npm run check:env && npm run check:config && npm run check:i18n && npm run check:logger && npm run check:errors && npm run check:lint && npm run check:shell && npm run check:jobs && npm run typecheck && npm run lint && npm run build",
     "env:example": "node lib/env/generate-example.ts",
     "check:env": "node lib/env/generate-example.ts --check",
     "check:config": "node config/verify.ts",
@@ -24,7 +24,8 @@
     "check:logger": "node lib/logger/verify.ts",
     "check:errors": "node lib/errors/verify.ts",
     "check:lint": "node scripts/verify-lint-rules.mjs",
-    "check:shell": "node scripts/verify-shell.mjs"
+    "check:shell": "node scripts/verify-shell.mjs",
+    "check:jobs": "node lib/jobs/verify.ts"
   },
   "dependencies": {
     "next": "16.4.3",

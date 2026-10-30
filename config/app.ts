@@ -64,6 +64,14 @@ export interface AppConfig {
     readonly publicPageRevalidateSeconds: number;
     readonly dashboardSummarySeconds: number;
   };
+  readonly jobs: {
+    readonly defaultMaxAttempts: number;
+    readonly retryBaseDelaySeconds: number;
+    readonly retryMaxDelaySeconds: number;
+    readonly jobTimeoutSeconds: number;
+    readonly workerConcurrency: number;
+    readonly stalledAfterSeconds: number;
+  };
 }
 
 const configuredAppConfig = {
@@ -122,6 +130,17 @@ const configuredAppConfig = {
     // summaries. Lifetimes are platform defaults.
     publicPageRevalidateSeconds: 300,
     dashboardSummarySeconds: 30,
+  },
+  jobs: {
+    // FEATURE_LIST section 27 and 32: background work is retried with a limit, and a stalled job
+    // must be visible to monitoring. These are platform defaults; the queue table that stores the
+    // work arrives in STEP 012.
+    defaultMaxAttempts: 5,
+    retryBaseDelaySeconds: 15,
+    retryMaxDelaySeconds: 900,
+    jobTimeoutSeconds: 120,
+    workerConcurrency: 4,
+    stalledAfterSeconds: 300,
   },
 } as const satisfies AppConfig;
 
@@ -226,6 +245,24 @@ function collectInvariantViolations(config: AppConfig): readonly string[] {
   ) {
     violations.push("caching.dashboardSummarySeconds must be an integer of at least 0");
   }
+
+  requirePositive("jobs.defaultMaxAttempts", config.jobs.defaultMaxAttempts, 1);
+  if (config.jobs.defaultMaxAttempts > 20) {
+    violations.push("jobs.defaultMaxAttempts must not exceed 20, so a bad job cannot loop for a day");
+  }
+  requirePositive("jobs.retryBaseDelaySeconds", config.jobs.retryBaseDelaySeconds, 1);
+  requirePositive("jobs.retryMaxDelaySeconds", config.jobs.retryMaxDelaySeconds, 1);
+  if (config.jobs.retryMaxDelaySeconds < config.jobs.retryBaseDelaySeconds) {
+    violations.push(
+      "jobs.retryMaxDelaySeconds must not be shorter than jobs.retryBaseDelaySeconds",
+    );
+  }
+  requirePositive("jobs.jobTimeoutSeconds", config.jobs.jobTimeoutSeconds, 1);
+  requirePositive("jobs.workerConcurrency", config.jobs.workerConcurrency, 1);
+  if (config.jobs.workerConcurrency > 64) {
+    violations.push("jobs.workerConcurrency must not exceed 64");
+  }
+  requirePositive("jobs.stalledAfterSeconds", config.jobs.stalledAfterSeconds, 1);
 
   return violations;
 }
