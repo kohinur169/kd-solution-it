@@ -68,6 +68,7 @@ npm run check:env           # fails when the example file and the manifest disag
 | npm run check:logger | Exercises the structured logger, its redaction and its request context |
 | npm run check:errors | Verifies the error code catalog and the error response format |
 | npm run check:lint | Verifies the lint matrix: required rules, severities and exemptions |
+| npm run check:shell | Verifies the shell contract and refuses colour outside the token file |
 | npm run verify | Runs every gate, then typecheck, lint and build in that order |
 
 ## TypeScript configuration
@@ -252,6 +253,34 @@ The matrix lives in `eslint.config.mjs` and is grouped by intent:
   local rules are registered, each failure probe fires, a clean probe stays clean, and ESLint's
   resolved configuration shows the exemptions exactly where they belong. It needs no file on
   disk, so it leaves no artefact behind.
+
+## Application shell and theming
+
+The document, the theme and the header are built once in `app/layout.tsx`.
+
+- `<html>` takes its `lang` and `dir` from the string catalog and carries
+  `suppressHydrationWarning`, because the theme class is applied before React hydrates.
+- A small inline script in `<head>` reads the stored preference and sets `.light` or `.dark` on
+  `<html>` before the first paint, so a dark preference never flashes a light page. STEP 059 adds
+  the CSP nonce to that script element.
+- `components/providers/` holds the client boundary (`AppProviders`) and the theme store. The
+  provider uses `useSyncExternalStore`, so the stored preference and the operating system theme
+  are external state rather than effects, and hydration stays deterministic. A change applies
+  immediately, survives a reload, and follows a change made in another tab.
+- `System` is the default and follows `prefers-color-scheme`. `Light` and `Dark` force a theme.
+  The class lives on `<html>`, because `.light` and `.dark` set `color-scheme`, which is what every
+  `light-dark()` token in `styles/tokens.css` reads.
+- The switcher in `components/ui/` is three buttons in a labelled group with `aria-pressed`, so it
+  is keyboard operable and does not rely on colour alone. Its labels come from the catalog.
+- The shell is a skip link, a slim header with the brand and the switcher, and a focusable content
+  wrapper. `app/page.tsx` renders the one `<main>`; navigation and footer arrive with the public
+  site in STEP 231-238.
+- `app/error.tsx` and `app/global-error.tsx` render the shared error panel with catalog copy and
+  the framework's reference, never the raw error message. The root boundary supplies its own
+  document and stylesheet because it replaces the root layout.
+- Colour and palette steps live only in `styles/tokens.css`. `npm run check:shell` refuses a
+  colour literal or a palette step utility under `app/` and `components/`, and refuses a layout
+  that lost the script, the skip link, the catalog driven attributes or the provider boundary.
 
 ## Repository structure
 

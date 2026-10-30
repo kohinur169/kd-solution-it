@@ -45,6 +45,17 @@ const catalog = {
       "The structure gate enforces {directories} canonical directories and {rootFiles} root files on every verification run.",
     healthLink: "Service health",
   },
+  shell: {
+    /** Skip link, announced to a screen reader before the header. */
+    skipToContent: "Skip to content",
+    /** Accessible name of the brand link in the header. */
+    homeLink: "Go to the home page",
+    /** Accessible name of the theme switcher group. */
+    themeLabel: "Theme",
+    themeSystem: "System",
+    themeLight: "Light",
+    themeDark: "Dark",
+  },
   errors: {
     /** Every message states what the client can do next. None describes what the server saw. */
     validationFailed:
@@ -63,6 +74,14 @@ const catalog = {
     serviceUnavailable: "The service is temporarily unavailable. Try again shortly.",
     timeout: "The request took too long to complete. Try again.",
     internal: "Something went wrong on our side. Quote the request id when you contact support.",
+  },
+  errorScreen: {
+    title: "Something went wrong",
+    description:
+      "This page could not be shown. Try again, and quote the reference below if the problem continues.",
+    retry: "Try again",
+    home: "Back to the home page",
+    referenceLabel: "Reference",
   },
 } as const;
 
