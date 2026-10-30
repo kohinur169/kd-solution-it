@@ -70,6 +70,7 @@ npm run check:env           # fails when the example file and the manifest disag
 | npm run check:lint | Verifies the lint matrix: required rules, severities and exemptions |
 | npm run check:shell | Verifies the shell contract and refuses colour outside the token file |
 | npm run check:jobs | Exercises the job foundation: registration, validation, leases, retries, timeouts, scheduling and health |
+| npm run check:migrations | Verifies numbering, rollback pairing, tenancy columns and the default-deny policy of every migration |
 | npm run verify | Runs every gate, then typecheck, lint and build in that order |
 
 ## TypeScript configuration
@@ -282,6 +283,36 @@ The document, the theme and the header are built once in `app/layout.tsx`.
 - Colour and palette steps live only in `styles/tokens.css`. `npm run check:shell` refuses a
   colour literal or a palette step utility under `app/` and `components/`, and refuses a layout
   that lost the script, the skip link, the catalog driven attributes or the provider boundary.
+
+## Database schema and migrations
+
+`migrations/` holds the append-only SQL that builds the database; `npm run check:migrations` is
+the gate over it, and the STEP that adds a migration records its forward apply and rollback in its
+handoff file.
+
+- STEP 012 creates the first two tables. `public.companies` is the tenant root: `id` (UUID v7),
+  `company_id` generated from `id` because the row is its own tenant, `name`, `slug`, and the
+  audit columns `created_at`, `updated_at`, `deleted_at`, `version`. `public.job_queue` is the
+  durable form of the `JobRecord` contract from `lib/jobs/queue.ts`, with a nullable `company_id`
+  so platform wide work needs no fake tenant.
+- `public.uuid_generate_v7()` is defined in `0001`, because PostgreSQL before 18 has no native
+  UUID v7. Ids sort by creation time, carry version nibble 7 and the RFC 4122 variant bits, and
+  take their random tail from `gen_random_uuid()`.
+- `public.set_row_metadata()` is a before-update trigger installed per table. It sets
+  `updated_at = now()` and increments `version`, so optimistic locking cannot drift even for a
+  hand written update; the application still writes `where id = $1 and version = $2`.
+- Both tables enable row level security and carry an explicit `<table>_default_deny` policy. A
+  STEP that grants access adds a permissive policy beside it, never in place of it. The migration
+  does not force RLS, because the table owner and the service role must still be able to migrate
+  and to enqueue.
+- The queue's two hot queries have partial indexes: `(available_at, created_at)` for
+  `pending`/`retrying` rows and `(lease_expires_at)` for `running` rows, so the store STEP's
+  `for update skip locked` claim reads an index instead of the table. Idempotency is unique per
+  tenant and separately unique for platform rows, with no sentinel company.
+- Every migration file is one transaction, has a `.down.sql` beside it, and is validated by
+  `migrations/verify.ts`: contiguous numbering, the six required columns on every table, an `id`
+  default from the shared function, RLS plus a default-deny policy, and no forward file that
+  drops or deletes.
 
 ## Background jobs
 
