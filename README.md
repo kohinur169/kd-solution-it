@@ -472,6 +472,15 @@ handoff file.
   enabled provider, verification is the only state that may take money, and the row walks forward
   to a restricted or rejected history. `last_synced_at` names a processed webhook event of the same
   provider, so "synced by verified webhooks" is a shape rather than a habit.
+- STEP 030 adds the card security of section 18. `public.card_blacklist` blocks a card by the
+  SHA-256 of its provider token or provider fingerprint and records which of the two it was, with a
+  closed reason, the payment that led to the block and an optional expiry; the block belongs to the
+  platform, an active fingerprint can be held once, and a release records the person, the instant
+  and the note and then freezes the row. `public.velocity_counters` counts one card or one address
+  in one window, stores the address as a real `inet`, keeps the configured limit that applied and
+  the instant it was first breached, and refuses a count that falls, a breach that is cleared and a
+  soft delete of either row; an old window leaves by the physical delete of the sweep, because a
+  hidden counter would free its window for a fresh count.
 - `public.uuid_generate_v7()` is defined in `0001`, because PostgreSQL before 18 has no native
   UUID v7. Ids sort by creation time, carry version nibble 7 and the RFC 4122 variant bits, and
   take their random tail from `gen_random_uuid()`.

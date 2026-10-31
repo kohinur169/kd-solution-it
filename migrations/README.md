@@ -4,7 +4,7 @@
 Owner: STEP 012-036 and every later STEP that adds a table.
 
 Append-only numbered SQL migrations applied with the Supabase CLI against the project of the
-current environment. STEP 012 to STEP 029 created the first fifty four files; `npm run
+current environment. STEP 012 to STEP 030 created the first fifty six files; `npm run
 check:migrations` keeps them honest.
 
 | File | What it creates |
@@ -63,6 +63,8 @@ check:migrations` keeps them honest.
 | 0052_policy_acceptances.sql | The `policy_acceptances` evidence row with its twelve policy keys, its dotted version, its text hash and its person, one acceptance per merchant, policy and version, the identity guard, three indexes and the policy |
 | 0053_review_decisions.sql | The `review_decisions` audit row with its four subject kinds, its six decisions, its reason, its appeal through the tenant key, one appeal per decision, the append only guard that moves the appeal state forward only, five indexes and the policy |
 | 0054_submerchant_provisions.sql | The `submerchant_provisions` row that carries the KYC approval, the provider and its key, the mode, the master account, the provider sub-merchant id, the five statuses with their instants, the two flags that wait for verification, the attempt and queue columns, the webhook evidence, four guards that freeze the identity, check the provider and the approval, walk the status forward and verify the sync, five indexes and the policy |
+| 0055_card_blacklist.sql | The `card_blacklist` row that blocks a card by the SHA-256 of its token or provider fingerprint, never by a card number, with its source, its provider, its six reasons and the note an other reason needs, its active and released life with the person and the note of a release, the optional payment behind it and the optional expiry, the one active block per fingerprint, the state guard that freezes the block and refuses a soft delete, three indexes and the policy |
+| 0056_velocity_counters.sql | The `velocity_counters` row that counts one card or one address in one window, with the address as a real `inet`, exactly one subject, the window start and length with a unique key per subject, the count, the configured limit it applied and the instant it was first breached, the guard that counts up only, never clears a breach and refuses a soft delete, three indexes and the policy |
 
 Every file is paired with `<name>.down.sql`, which undoes exactly what its forward file created and
 nothing else.
@@ -281,7 +283,18 @@ nothing else.
     5; the reference may be filled once and never changed, charges and payouts are legal only on a
     verified row, the five statuses walk forward to a closed row, and a sync must name a processed
     webhook event with a good signature of its own provider.
-43. Numbering is contiguous from 0001. A migration is never renumbered after it has been applied
+43. A card is blocked by a hash and counted in a window. `card_blacklist` keeps the SHA-256 of
+    the token or the provider fingerprint with the source that says which, never a card number,
+    expiry, CVV or clear token; the block is the platform's, it carries a closed reason, it is
+    released once with its person, its instant and its note, a released row is history, and no
+    row is soft deleted, because a delete would drop a block off the list without a release and
+    would free a counter's window for a fresh count of zero.
+    `velocity_counters` counts one card or one address in one window, the subject is exactly one
+    of the two columns and the address is a real `inet`, the window is unique per subject, the
+    configured limit that applied is stored beside the count and the breach, and the guard counts
+    up only, never clears a breach and refuses a soft delete. Old windows leave by the physical
+    delete of STEP 067's sweep. The defaults live in `config/`, not in a migration.
+44. Numbering is contiguous from 0001. A migration is never renumbered after it has been applied
     anywhere.
 
 ## Commands
