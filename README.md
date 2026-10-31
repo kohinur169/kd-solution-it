@@ -327,7 +327,14 @@ handoff file.
   an office unlock that requires the owner contact to be confirmed first, or an expiry that cannot
   be recorded before it happens. Nothing in `users` can clear a lock, which is how a password
   change fails to end one.
-- `public.uuid_generate_v7()` is defined in `0001`, because PostgreSQL before 18 has no native
+- STEP 017 adds the audit log of section 1. `public.audit_logs` is append-only in the strongest sense
+  the database offers: a guard trigger refuses every update and every removal, whatever role asks.
+  Rows are hash chained per tenant, with a generated `chain_id`, a gapless `sequence` and a
+  `prev_hash` that a second guard checks against the current head before the row is written, and
+  every row carries an Ed25519 signature and the id of the key that produced it. The canonical
+  string the hash covers is defined once, in the migration, because a second definition would make
+  every later verification meaningless. Merkle roots are computed from the chain by the export job,
+  so the table stores the leaves and no roots of its own.- `public.uuid_generate_v7()` is defined in `0001`, because PostgreSQL before 18 has no native
   UUID v7. Ids sort by creation time, carry version nibble 7 and the RFC 4122 variant bits, and
   take their random tail from `gen_random_uuid()`.
 - `public.set_row_metadata()` is a before-update trigger installed per table. It sets

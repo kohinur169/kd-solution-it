@@ -4,7 +4,7 @@
 Owner: STEP 012-036 and every later STEP that adds a table.
 
 Append-only numbered SQL migrations applied with the Supabase CLI against the project of the
-current environment. STEP 012 to STEP 016 created the first twelve files; `npm run
+current environment. STEP 012 to STEP 017 created the first thirteen files; `npm run
 check:migrations` keeps them honest.
 
 | File | What it creates |
@@ -21,6 +21,7 @@ check:migrations` keeps them honest.
 | 0010_sessions.sql | The `sessions` table with its token hash, family, rotation parent, step-up instants and closed revocation vocabulary, seven indexes, its trigger, row level security and the default-deny policy |
 | 0011_login_attempts.sql | The `login_attempts` event record with its factor and outcome vocabularies, the rate limit and counter indexes, its trigger, row level security and the default-deny policy |
 | 0012_account_locks.sql | The `account_locks` table with its two hour window, the owner alert and contact instants, the two mutually exclusive closures, the open lock unique index, its trigger, row level security and the default-deny policy |
+| 0013_audit_logs.sql | The `audit_logs` append-only hash chain with its per tenant chain, its Ed25519 signature and signing key columns, the seven query indexes, both guard functions and triggers, row level security and the default-deny policy |
 
 Every file is paired with `<name>.down.sql`, which undoes exactly what its forward file created and
 nothing else.
@@ -84,7 +85,16 @@ nothing else.
     requires the owner contact to be confirmed first; expiry sets `expired_at` and never before
     `expires_at`. The two are mutually exclusive, the window may not exceed two hours from
     `locked_at`, and one account has at most one open lock.
-18. Numbering is contiguous from 0001. A migration is never renumbered after it has been applied
+18. The audit log is append-only and hash chained. A row names its chain through a generated
+    `chain_id`, its position through a gapless `sequence` and its predecessor through `prev_hash`;
+    the insert guard refuses anything that does not extend the current head, and the second guard
+    refuses every update and every removal whatever role asks. The canonical hash string is defined
+    once, in `0013_audit_logs.sql`, and a second definition would invalidate every later check.
+19. Every audit row is signed. `signature` is the base64url Ed25519 signature over the 32 byte
+    hash and `signing_key_id` names the key, so rotating the signing key leaves history verifiable.
+    Merkle roots are derived from `chain_id`, `sequence` and `hash` by the export job; no roots are
+    stored in the migrations.
+20. Numbering is contiguous from 0001. A migration is never renumbered after it has been applied
     anywhere.
 
 ## Commands
