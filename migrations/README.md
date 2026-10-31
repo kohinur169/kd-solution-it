@@ -4,7 +4,7 @@
 Owner: STEP 012-036 and every later STEP that adds a table.
 
 Append-only numbered SQL migrations applied with the Supabase CLI against the project of the
-current environment. STEP 012 to STEP 025 created the first forty one files; `npm run
+current environment. STEP 012 to STEP 026 created the first forty five files; `npm run
 check:migrations` keeps them honest.
 
 | File | What it creates |
@@ -50,6 +50,10 @@ check:migrations` keeps them honest.
 | 0039_disputes.sql | The `disputes` chargeback with its 24 or 48 hour deadline, the evidence flag, the response and its submission, the resolved outcome, the deadline guard, four indexes and the policy |
 | 0040_ledger_accounts.sql | The `ledger_accounts` chart with its eight closed codes, the kind and side pairing, the platform and merchant scopes of two partial unique keys, the close instant, the identity guard, three indexes and the policy |
 | 0041_ledger_entries.sql | The `ledger_entries` double-entry rows with their balanced group, the deferred balance trigger, the append only guard, the reversal mirror and its one-reversal key, the three source pairs, the invoice sync, six indexes and the policy |
+| 0042_settlements.sql | The `settlements` processor batch with its window, its six money parts, the generated net that may be negative, the hold days copied onto the row, the release instant, the four statuses and their instants, the identity guard, five indexes and the policy |
+| 0043_holds.sql | The `holds` money the platform keeps back, with its five reasons, its payment and batch links, the cap guard against its payment, the owner guard, the released and collected pairs, the closed hold guard, four indexes and the policy |
+| 0044_reserves.sql | The `reserves` rolling reserve with its basis point percent, its release days, the held and released totals bounded by one check, one active reserve per merchant, the release instant, the terms guard, three indexes and the policy |
+| 0045_payouts.sql | The `payouts` request with its requester and approver, the generated net, the 100 USD minimum with its remainder exception, the destination snapshot, the failure pair, the unique provider identifier, the closed payout guard, four indexes and the policy |
 
 Every file is paired with `<name>.down.sql`, which undoes exactly what its forward file created and
 nothing else.
@@ -216,7 +220,23 @@ nothing else.
     reversal per entry. The payment, refund and dispute links are pairs of a source type and a
     foreign key, and the payment post writes the invoice paid total and state that STEP 024 left to
     this STEP.
-36. Numbering is contiguous from 0001. A migration is never renumbered after it has been applied
+36. A settlement is a batch and a hold is money kept back. `settlements` carries the window, the
+    gross and the five deductions, and its net is generated so the batch cannot disagree with its
+    parts; the net may be negative because section 10 covers a negative balance from the reserve
+    first. The hold days are copied onto the row with the release instant, so a setting changed
+    tomorrow cannot move a batch already in flight, one processor batch is booked once per merchant,
+    and a settled or failed batch is history. `holds` names its payment and its batch, takes a
+    reason from the five causes the statement groups by, never takes more than its payment through a
+    guard that sums the live holds, and closes one way: released with its instant and its person, or
+    collected with its instant, its person and the note section 10 needs.
+37. A reserve is one account and a payout is a request with a decision. `reserves` stores the
+    percent in basis points beside the release days, keeps one active row per merchant, bounds the
+    released total by the held total, and freezes its terms for the life of the row. `payouts` names
+    who asked and who approved with their instants, refuses processing or payment without an
+    approval, refuses an amount under the 100 USD minimum unless it is the accumulated remainder,
+    requires the destination snapshot on a paid payout, requires a code and a detail on a failed
+    one, and freezes the row once it is paid, failed or cancelled.
+38. Numbering is contiguous from 0001. A migration is never renumbered after it has been applied
     anywhere.
 
 ## Commands

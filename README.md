@@ -431,6 +431,17 @@ handoff file.
   and the unique index allows one reversal per entry. The payment, refund and chargeback links are
   source pairs of a type and a foreign key, and a posted payment writes its invoice's paid total and
   `partially_paid` or `paid` state, which is the tie STEP 024 left to this STEP.
+- STEP 026 adds the settlement and the money that leaves. `public.settlements` is one processor
+  batch per merchant: the window, the gross and the five deductions, with a generated net that may
+  be negative because section 10 covers a negative balance from the reserve first, the hold days
+  copied onto the row with the release instant so a changed setting cannot move a batch already in
+  flight, and one booked batch per processor identifier. `public.holds` is money the platform keeps
+  back, with five reasons, a cap guard that sums the live holds of its payment, and a close that is
+  either released or collected with its instant and its person. `public.reserves` is the rolling
+  reserve in basis points with its release days, one active row per merchant and a released total
+  that never passes what was held. `public.payouts` is a request with its requester, its approver, a
+  generated net, the 100 USD minimum with the remainder exception of section 10, the destination
+  snapshot and a failure pair for the email the merchant receives.
 - `public.uuid_generate_v7()` is defined in `0001`, because PostgreSQL before 18 has no native
   UUID v7. Ids sort by creation time, carry version nibble 7 and the RFC 4122 variant bits, and
   take their random tail from `gen_random_uuid()`.
