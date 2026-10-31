@@ -342,6 +342,21 @@ handoff file.
   row: the five fees the public pricing page names, each with its own payer, versioned by `revision`
   inside a scope derived from `company_id`, with a check that a price announced for a later date
   cannot take effect sooner than thirty days after its announcement.
+- STEP 019 adds the subscription of sections 12 and 13. `public.subscriptions` is the agreement,
+  not the money: it carries the plan it follows, the current cycle as explicit start, end and
+  next due instants, and five status instants for pending, active, past due, stopped and
+  cancelled, while every amount stays on the charge row that took it. One merchant has one live
+  agreement, enforced by a partial unique index rather than by application code, and cancelling
+  sets `cancelled_at` so a closed agreement stays as history and the merchant is free again.
+  Saving a card is an explicit consent, so the text, its version, the instant and the address are
+  recorded together or not at all, and a warning cannot be recorded earlier than seven days
+  before the due date. `public.subscription_charges` is one attempt per row, keyed by
+  subscription, period and attempt number so a retry is a new row and never an edit. Because
+  section 12 takes the merchant balance first and the saved card second, each charge keeps that
+  split: a succeeded attempt adds up to the amount, a failed or pending one took nothing, and a
+  failure names its cause from a closed vocabulary with a detail short enough that no card number
+  can be written there. Two failures on the due date stop the services, and the instant is on the
+  row, so login and the billing page can stay open while everything else is closed.
 - `public.uuid_generate_v7()` is defined in `0001`, because PostgreSQL before 18 has no native
   UUID v7. Ids sort by creation time, carry version nibble 7 and the RFC 4122 variant bits, and
   take their random tail from `gen_random_uuid()`.

@@ -4,7 +4,7 @@
 Owner: STEP 012-036 and every later STEP that adds a table.
 
 Append-only numbered SQL migrations applied with the Supabase CLI against the project of the
-current environment. STEP 012 to STEP 018 created the first sixteen files; `npm run
+current environment. STEP 012 to STEP 019 created the first eighteen files; `npm run
 check:migrations` keeps them honest.
 
 | File | What it creates |
@@ -25,6 +25,8 @@ check:migrations` keeps them honest.
 | 0014_plans.sql | The `plans` catalogue with its code, price, period and status, its three indexes, its trigger, row level security and the default-deny policy |
 | 0015_plan_entitlements.sql | The `plan_entitlements` table, one row per service a plan includes, with its live pair index, its service index, its trigger, row level security and the default-deny policy |
 | 0016_pricing_versions.sql | The `pricing_versions` price list with the five fees of section 14 and their payers, its scope, its thirty day announcement check, three indexes, its trigger, row level security and the default-deny policy |
+| 0017_subscriptions.sql | The `subscriptions` agreement with its cycle, its five status instants, the seven day warning window, the card mandate consent quartet with its text, version, time and address, four indexes including the one live agreement per merchant, its trigger, row level security and the default-deny policy |
+| 0018_subscription_charges.sql | The `subscription_charges` attempt record with its balance and card split, its closed failure vocabulary, the retry key of subscription, period and attempt, four indexes, its trigger, row level security and the default-deny policy |
 
 Every file is paired with `<name>.down.sql`, which undoes exactly what its forward file created and
 nothing else.
@@ -105,7 +107,19 @@ nothing else.
     generated from `company_id` so the platform list and a merchant override are separate lines. A
     price list announced for a later date must be effective at least thirty days after the
     announcement, every fee names its payer, and percentages are basis points.
-22. Numbering is contiguous from 0001. A migration is never renumbered after it has been applied
+22. A subscription is the agreement, not the money. The plan price is never copied onto it: the
+    cycle is `current_period_start`, `current_period_end` and `next_due_at`, and every amount lives
+    on the charge row that took it. One merchant has one live agreement; the partial unique index
+    on `company_id` is what makes a second one impossible, and cancelling sets `cancelled_at` so
+    the old agreement stays as history. Saving a card is an explicit consent: the text, its
+    version, the instant and the address are recorded together or not at all, and warnings are
+    refused earlier than seven days before the due date.
+23. A charge attempt is a row, so a retry is a new row keyed by subscription, period and attempt
+    number rather than an edit. Section 12 charges the merchant balance first and the saved card
+    second, and the split column keeps that visible: a succeeded charge adds up to the amount, a
+    failed or pending one took nothing. A failure names its cause from a closed vocabulary and its
+    detail is at most 280 characters, so no card number can be written there.
+24. Numbering is contiguous from 0001. A migration is never renumbered after it has been applied
     anywhere.
 
 ## Commands
