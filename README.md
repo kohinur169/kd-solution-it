@@ -442,6 +442,15 @@ handoff file.
   that never passes what was held. `public.payouts` is a request with its requester, its approver, a
   generated net, the 100 USD minimum with the remainder exception of section 10, the destination
   snapshot and a failure pair for the email the merchant receives.
+- STEP 027 adds the payout bank account and the change that moves it. `public.payout_bank_accounts`
+  stores the account number as AES-256-GCM ciphertext with its vector, tag and key version, four
+  visible characters and a SHA-256 fingerprint, and the row walks pending, verified, active and then
+  rejected or retired, with one active account per merchant and the same account never live twice.
+  `public.payouts` gains `bank_account_id` through a composite key, so a payout cannot name another
+  merchant's account while the snapshot columns keep what the audit needs.
+  `public.bank_change_requests` is section 10's change: who asked, who verified, the refusal and its
+  reason, and a cooling instant that must equal the verification instant plus 96 hours, so a
+  rejected request never starts a cooling and an activation comes after it ends.
 - `public.uuid_generate_v7()` is defined in `0001`, because PostgreSQL before 18 has no native
   UUID v7. Ids sort by creation time, carry version nibble 7 and the RFC 4122 variant bits, and
   take their random tail from `gen_random_uuid()`.

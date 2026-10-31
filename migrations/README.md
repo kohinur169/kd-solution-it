@@ -4,7 +4,7 @@
 Owner: STEP 012-036 and every later STEP that adds a table.
 
 Append-only numbered SQL migrations applied with the Supabase CLI against the project of the
-current environment. STEP 012 to STEP 026 created the first forty five files; `npm run
+current environment. STEP 012 to STEP 027 created the first forty seven files; `npm run
 check:migrations` keeps them honest.
 
 | File | What it creates |
@@ -54,6 +54,8 @@ check:migrations` keeps them honest.
 | 0043_holds.sql | The `holds` money the platform keeps back, with its five reasons, its payment and batch links, the cap guard against its payment, the owner guard, the released and collected pairs, the closed hold guard, four indexes and the policy |
 | 0044_reserves.sql | The `reserves` rolling reserve with its basis point percent, its release days, the held and released totals bounded by one check, one active reserve per merchant, the release instant, the terms guard, three indexes and the policy |
 | 0045_payouts.sql | The `payouts` request with its requester and approver, the generated net, the 100 USD minimum with its remainder exception, the destination snapshot, the failure pair, the unique provider identifier, the closed payout guard, four indexes and the policy |
+| 0046_payout_bank_accounts.sql | The `payout_bank_accounts` row with its number as AES-256-GCM ciphertext, its four visible characters and its fingerprint, its five statuses and their instants, one active account per merchant, the identity guard, five indexes, the policy and the `payouts.bank_account_id` column with its composite foreign key |
+| 0047_bank_change_requests.sql | The `bank_change_requests` row with its current and requested accounts, its six statuses, the 96 hour cooling check, one open request per merchant, the identity guard, four indexes and the policy |
 
 Every file is paired with `<name>.down.sql`, which undoes exactly what its forward file created and
 nothing else.
@@ -236,7 +238,19 @@ nothing else.
     approval, refuses an amount under the 100 USD minimum unless it is the accumulated remainder,
     requires the destination snapshot on a paid payout, requires a code and a detail on a failed
     one, and freezes the row once it is paid, failed or cancelled.
-38. Numbering is contiguous from 0001. A migration is never renumbered after it has been applied
+38. A bank account is ciphertext and a life. `payout_bank_accounts` stores the account number as
+    AES-256-GCM ciphertext with its vector, its tag and its key version, four visible characters and
+    a SHA-256 fingerprint, and never a plain number in any column. The row walks pending, verified,
+    active and then rejected or retired, one account is active per merchant through a partial unique
+    index, the same fingerprint cannot be live twice, and a guard freezes its identity. The payouts
+    table gains `bank_account_id` through the composite key, so a payout cannot name another
+    merchant's account.
+39. A bank change is 96 hours or it is not a change. `bank_change_requests` names the account in use
+    and the account asked for, who asked and who verified, and it refuses a cooling instant that is
+    not exactly the verification instant plus 96 hours. A rejected request carries no cooling
+    instant at all, an activation cannot precede the end of the cooling, one request is open per
+    merchant, and the closed row is history.
+40. Numbering is contiguous from 0001. A migration is never renumbered after it has been applied
     anywhere.
 
 ## Commands
