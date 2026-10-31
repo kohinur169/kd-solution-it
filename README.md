@@ -357,6 +357,18 @@ handoff file.
   failure names its cause from a closed vocabulary with a detail short enough that no card number
   can be written there. Two failures on the due date stop the services, and the instant is on the
   row, so login and the billing page can stay open while everything else is closed.
+- STEP 020 adds the three tables a merchant works with every day. `public.clients` is the person or
+  business an invoice is addressed to, tenant scoped and soft deleted, with an address that is
+  all-or-nothing from the street line downwards and an email that is unique per merchant under
+  `lower(email)` while the row is live, so a mistyped client can be removed and the same address
+  used again. `public.products` and `public.services` are two catalogues with one money rule:
+  `unit_price_minor` in minor units beside an explicit currency, never negative and never a float,
+  an optional SKU or service code that is unique per merchant for the rows that are not deleted, and
+  a `unit` drawn from the closed list of `item`, `unit`, `hour`, `day`, `week`, `month` and
+  `project` because the invoice prints the quantity and the word together. They stay two tables
+  because a product is a good and a service is work billed by time, and STEP 021's line item stores
+  its own snapshot of the name and the price, so retiring a product never rewrites an invoice that
+  was already sent.
 - `public.uuid_generate_v7()` is defined in `0001`, because PostgreSQL before 18 has no native
   UUID v7. Ids sort by creation time, carry version nibble 7 and the RFC 4122 variant bits, and
   take their random tail from `gen_random_uuid()`.

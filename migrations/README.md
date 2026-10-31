@@ -4,7 +4,7 @@
 Owner: STEP 012-036 and every later STEP that adds a table.
 
 Append-only numbered SQL migrations applied with the Supabase CLI against the project of the
-current environment. STEP 012 to STEP 019 created the first eighteen files; `npm run
+current environment. STEP 012 to STEP 020 created the first twenty one files; `npm run
 check:migrations` keeps them honest.
 
 | File | What it creates |
@@ -27,6 +27,9 @@ check:migrations` keeps them honest.
 | 0016_pricing_versions.sql | The `pricing_versions` price list with the five fees of section 14 and their payers, its scope, its thirty day announcement check, three indexes, its trigger, row level security and the default-deny policy |
 | 0017_subscriptions.sql | The `subscriptions` agreement with its cycle, its five status instants, the seven day warning window, the card mandate consent quartet with its text, version, time and address, four indexes including the one live agreement per merchant, its trigger, row level security and the default-deny policy |
 | 0018_subscription_charges.sql | The `subscription_charges` attempt record with its balance and card split, its closed failure vocabulary, the retry key of subscription, period and attempt, four indexes, its trigger, row level security and the default-deny policy |
+| 0019_clients.sql | The `clients` table a merchant invoices, with its checked address, its optional tax identifier, three indexes including the email unique per merchant, its trigger, row level security and the default-deny policy |
+| 0020_products.sql | The `products` catalogue of goods with its optional SKU, its price in minor units, its currency and unit, three indexes, its trigger, row level security and the default-deny policy |
+| 0021_services.sql | The `services` catalogue of work with its optional code, the same money rules as products, the `hour` default unit, three indexes, its trigger, row level security and the default-deny policy |
 
 Every file is paired with `<name>.down.sql`, which undoes exactly what its forward file created and
 nothing else.
@@ -119,7 +122,17 @@ nothing else.
     second, and the split column keeps that visible: a succeeded charge adds up to the amount, a
     failed or pending one took nothing. A failure names its cause from a closed vocabulary and its
     detail is at most 280 characters, so no card number can be written there.
-24. Numbering is contiguous from 0001. A migration is never renumbered after it has been applied
+24. A catalogue row is soft deleted, never removed. Clients, products and services all point at
+    history: an invoice written last year must still explain the client it was sent to and the item
+    it sold, so `deleted_at` marks the row and the partial unique index stops counting it, which is
+    what lets a mistyped address, SKU or service code be entered again. Uniqueness is per merchant
+    and on `lower(...)`, never platform wide and never case sensitive.
+25. A product and a service are separate tables with one money rule. Both store `unit_price_minor`
+    in minor units beside a three letter currency, both refuse a negative price and accept zero, and
+    both draw `unit` from the same closed list because the invoice prints the quantity and the word
+    together. A product identifies itself by a SKU and defaults to `item`; a service identifies
+    itself by a code and defaults to `hour`.
+26. Numbering is contiguous from 0001. A migration is never renumbered after it has been applied
     anywhere.
 
 ## Commands
