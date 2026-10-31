@@ -46,6 +46,8 @@ const appendOnlyBreaches: readonly RegExp[] = [
 const nonAsciiPattern = /[^\u0009\u000a\u000d\u0020-\u007e]/u;
 const defaultDenyPattern =
   /create policy \w+_default_deny\b[^;]*using \(false\)[^;]*with check \(false\);/u;
+const columnPattern =
+  /^([a-z_][a-z0-9_]*)\s+(uuid|text|boolean|integer|bigint|smallint|numeric|jsonb|json|timestamptz|date|interval|bytea|character|varchar|double precision)\b/u;
 
 interface TableDefinition {
   readonly name: string;
@@ -90,7 +92,11 @@ function parseTables(content: string): readonly TableDefinition[] {
       .split("\n")
       .map((line) => line.trim())
       .filter((line) => line.length > 0 && !line.startsWith("constraint"));
-    const columns = lines.map((line) => line.split(/\s+/u)[0] ?? "");
+    // A column line starts with its name and a type; the body of a long constraint does not, so
+    // this keeps the words of a wrapped check from being read as columns of the table.
+    const columns = lines
+      .map((line) => columnPattern.exec(line)?.[1])
+      .filter((column): column is string => column !== undefined);
     const idLine = lines.find((line) => line.startsWith("id ")) ?? "";
 
     tables.push({ name, columns, idClause: idLine });

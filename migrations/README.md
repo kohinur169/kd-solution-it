@@ -4,7 +4,7 @@
 Owner: STEP 012-036 and every later STEP that adds a table.
 
 Append-only numbered SQL migrations applied with the Supabase CLI against the project of the
-current environment. STEP 012 to STEP 028 created the first fifty three files; `npm run
+current environment. STEP 012 to STEP 029 created the first fifty four files; `npm run
 check:migrations` keeps them honest.
 
 | File | What it creates |
@@ -62,6 +62,7 @@ check:migrations` keeps them honest.
 | 0051_sanctions_screenings.sql | The `sanctions_screenings` row with its three subject kinds, the four lists, the three results, the case note of a confirmed match, the SAR flag that is never cleared, the identity guard, six indexes and the policy |
 | 0052_policy_acceptances.sql | The `policy_acceptances` evidence row with its twelve policy keys, its dotted version, its text hash and its person, one acceptance per merchant, policy and version, the identity guard, three indexes and the policy |
 | 0053_review_decisions.sql | The `review_decisions` audit row with its four subject kinds, its six decisions, its reason, its appeal through the tenant key, one appeal per decision, the append only guard that moves the appeal state forward only, five indexes and the policy |
+| 0054_submerchant_provisions.sql | The `submerchant_provisions` row that carries the KYC approval, the provider and its key, the mode, the master account, the provider sub-merchant id, the five statuses with their instants, the two flags that wait for verification, the attempt and queue columns, the webhook evidence, four guards that freeze the identity, check the provider and the approval, walk the status forward and verify the sync, five indexes and the policy |
 
 Every file is paired with `<name>.down.sql`, which undoes exactly what its forward file created and
 nothing else.
@@ -273,7 +274,14 @@ nothing else.
     decision it appeals through the tenant key; an overturn or an uphold is legal only on an appeal,
     one appeal per decision, and the appeal state moves none, open, upheld or overturned and no
     further.
-42. Numbering is contiguous from 0001. A migration is never renumbered after it has been applied
+42. A sub-merchant is provisioned once per merchant and provider, and its row is a life. The KYC
+    approval is a composite foreign key, so only an approved submission of the same merchant can
+    provision, and the provider is checked as platform level, able to create sub-merchants and
+    enabled before an attempt. A pending row with no master account is the queued case of section
+    5; the reference may be filled once and never changed, charges and payouts are legal only on a
+    verified row, the five statuses walk forward to a closed row, and a sync must name a processed
+    webhook event with a good signature of its own provider.
+43. Numbering is contiguous from 0001. A migration is never renumbered after it has been applied
     anywhere.
 
 ## Commands
@@ -295,7 +303,9 @@ path comment, a body without the `begin;`/`commit;` pair, non ASCII text, a forw
 drops or deletes, a created table that misses one of the six required columns, an `id` default
 that is not the shared UUID v7 function, a table without `enable row level security` and its
 `<table>_default_deny` policy, a default-deny policy that does not refuse reads and writes alike,
-and a rollback that does not drop the tables its forward creates.
+a required column that is missing (the parser reads a column only where a name is followed by a
+type, so the wrapped body of a constraint is never mistaken for one), and a rollback that does not
+drop the tables its forward creates.
 
 It is static, so it needs no database. Whether the SQL actually applies is proven by running it:
 STEP 012 recorded a forward apply, a data level proof of every constraint and both rollbacks on

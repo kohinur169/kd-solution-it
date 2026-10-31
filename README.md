@@ -464,6 +464,14 @@ handoff file.
   per merchant, policy and version with the hash of the accepted text. `public.review_decisions` is
   the audit record, append only, with the reason the merchant reads and the appeal that points at the
   decision it appeals through the tenant key.
+- STEP 029 adds the sub-merchant account section 5 provisions. `public.submerchant_provisions`
+  carries the approved `kyc_submissions` row through its composite key, the provider and a copy of
+  its key, the mode, the master platform account and the identifier the provider returns, the five
+  statuses with their instants, and the two flags that section 5 keeps off until verification. A
+  pending row with no master account is the queued case, an attempt needs the account and an
+  enabled provider, verification is the only state that may take money, and the row walks forward
+  to a restricted or rejected history. `last_synced_at` names a processed webhook event of the same
+  provider, so "synced by verified webhooks" is a shape rather than a habit.
 - `public.uuid_generate_v7()` is defined in `0001`, because PostgreSQL before 18 has no native
   UUID v7. Ids sort by creation time, carry version nibble 7 and the RFC 4122 variant bits, and
   take their random tail from `gen_random_uuid()`.
