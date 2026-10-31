@@ -4,7 +4,7 @@
 Owner: STEP 012-036 and every later STEP that adds a table.
 
 Append-only numbered SQL migrations applied with the Supabase CLI against the project of the
-current environment. STEP 012 to STEP 015 created the first ten files; `npm run
+current environment. STEP 012 to STEP 016 created the first twelve files; `npm run
 check:migrations` keeps them honest.
 
 | File | What it creates |
@@ -19,6 +19,8 @@ check:migrations` keeps them honest.
 | 0008_announcement_dismissals.sql | The `announcement_dismissals` table, its unique pair index, its trigger, row level security and the default-deny policy |
 | 0009_device_proof_keys.sql | The `device_proof_keys` enrolled device table with its trust and revoke instants, four indexes including the `(user_id, id)` target of the session key, its trigger, row level security and the default-deny policy |
 | 0010_sessions.sql | The `sessions` table with its token hash, family, rotation parent, step-up instants and closed revocation vocabulary, seven indexes, its trigger, row level security and the default-deny policy |
+| 0011_login_attempts.sql | The `login_attempts` event record with its factor and outcome vocabularies, the rate limit and counter indexes, its trigger, row level security and the default-deny policy |
+| 0012_account_locks.sql | The `account_locks` table with its two hour window, the owner alert and contact instants, the two mutually exclusive closures, the open lock unique index, its trigger, row level security and the default-deny policy |
 
 Every file is paired with `<name>.down.sql`, which undoes exactly what its forward file created and
 nothing else.
@@ -73,7 +75,16 @@ nothing else.
     `(user_id, device_proof_key_id)` against `(user_id, id)` on `device_proof_keys` is what makes
     "a cookie works only inside its own session" true in the database and not only in the code that
     writes it.
-16. Numbering is contiguous from 0001. A migration is never renumbered after it has been applied
+16. A failed attempt counter is a query, not a column: `login_attempts` records every attempt with
+    its factor and outcome, and "two consecutive failures" is counted since the last success. A
+    stored counter is a second truth that drifts. An attempt against an address with no account
+    stores a hash of the address and never the address, and the two identity columns are mutually
+    exclusive.
+17. A lock closes one way: an office unlock sets `unlocked_at`, `unlocked_by` and `unlock_note` and
+    requires the owner contact to be confirmed first; expiry sets `expired_at` and never before
+    `expires_at`. The two are mutually exclusive, the window may not exceed two hours from
+    `locked_at`, and one account has at most one open lock.
+18. Numbering is contiguous from 0001. A migration is never renumbered after it has been applied
     anywhere.
 
 ## Commands

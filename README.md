@@ -319,6 +319,14 @@ handoff file.
   `(user_id, device_proof_key_id)` means a session can only name a device of its own account, and
   `sessions_rotation_key` means a parent is rotated once: a replayed cookie ends the family, it does
   not open a second one.
+- STEP 016 adds the lock of section 22. `public.login_attempts` records every attempt with its
+  factor (`password`, `totp`), its outcome (`failed`, `succeeded`, `blocked`, `challenged`) and its
+  origin address, which is what makes the failed attempt counters a query instead of a number in
+  memory. `public.account_locks` is the resulting state: a two hour window the database refuses to
+  extend, one open lock per account, an owner alert instant, and two mutually exclusive closures,
+  an office unlock that requires the owner contact to be confirmed first, or an expiry that cannot
+  be recorded before it happens. Nothing in `users` can clear a lock, which is how a password
+  change fails to end one.
 - `public.uuid_generate_v7()` is defined in `0001`, because PostgreSQL before 18 has no native
   UUID v7. Ids sort by creation time, carry version nibble 7 and the RFC 4122 variant bits, and
   take their random tail from `gen_random_uuid()`.
