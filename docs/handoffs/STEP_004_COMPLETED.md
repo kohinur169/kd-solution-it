@@ -46,6 +46,11 @@
   or storage client, any provider adapter, the lint rule matrix (STEP 009) and every
   migration (STEP 012+).
 
+## Database
+- Migrations added (file names): none. STEP 004 is a configuration STEP, so it adds no migration
+  and no table; the first migration arrives with STEP 012.
+- Rollback verified on clean database (yes/no, how): not applicable, because nothing was applied.
+
 ## Environment
 - Environment variables added to .env.example: 16, all generated from the manifest.
   | Variable | Scope | Requirement | Secret | Why it exists |
