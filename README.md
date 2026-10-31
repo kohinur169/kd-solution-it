@@ -369,6 +369,18 @@ handoff file.
   because a product is a good and a service is work billed by time, and STEP 021's line item stores
   its own snapshot of the name and the price, so retiring a product never rewrites an invoice that
   was already sent.
+- STEP 021 adds the invoice and its history. `public.invoices` is a document, not a view: it
+  snapshots the client name, email and address at issue time, carries the seven statuses of section
+  16 with their own instants, keeps `subtotal`, `discount`, `tax`, `total` and `amount_paid` in
+  minor units, and derives the total by trigger so the four can never disagree. A number is assigned
+  at issue and unique per merchant, a partially paid invoice cannot sit below the 20 USD floor, and
+  a paid invoice is held shut by a trigger against every change. `public.invoice_items` is a printed
+  line: a snapshot of the description, unit and price, a decimal quantity, and a generated
+  `line_total_minor` so the arithmetic has one rounding rule; an item trigger keeps the parent
+  subtotal equal to the sum of the live lines and refuses any line change once the invoice has left
+  `draft`. `public.invoice_events` is the append only timeline that a support call and a chargeback
+  evidence pack read months later, and both child tables reach their invoice through `(invoice_id,
+  company_id)`, so no row can join another merchant's document.
 - `public.uuid_generate_v7()` is defined in `0001`, because PostgreSQL before 18 has no native
   UUID v7. Ids sort by creation time, carry version nibble 7 and the RFC 4122 variant bits, and
   take their random tail from `gen_random_uuid()`.
