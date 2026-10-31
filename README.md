@@ -409,6 +409,17 @@ handoff file.
   secret, while `public.store_connections` and `public.taxcloud_connections` encrypt the Shopify,
   WooCommerce and TaxCloud tokens the same way and refuse new ciphertext under an unchanged key
   version.
+- STEP 024 adds the money movements themselves. `public.payments` is one processor transaction: it
+  names the provider, the key, the routing rule and the idempotency key, and the key is unique, so a
+  replayed request cannot charge twice. Its `net_minor` is generated from the amount and the fee,
+  the only card columns are the brand and four digits, and section 18's rules are checks: a capture
+  without 3D Secure needs both the billing postal code and the payer IP country to match, and a
+  provider fraud signal can only sit on a failed payment. `public.refunds` is the section 19
+  document with a requester, an approver and a processor answer, capped against its payment by a
+  guard and synced back so the payment's refunded total and its `partially_refunded` or `refunded`
+  status are written by the database and never by hand. `public.disputes` is the chargeback with its
+  opening instant, its 24 or 48 hour window, its evidence flag and its resolved outcome, and a
+  resolved dispute cannot reopen.
 - `public.uuid_generate_v7()` is defined in `0001`, because PostgreSQL before 18 has no native
   UUID v7. Ids sort by creation time, carry version nibble 7 and the RFC 4122 variant bits, and
   take their random tail from `gen_random_uuid()`.

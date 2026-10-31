@@ -4,7 +4,7 @@
 Owner: STEP 012-036 and every later STEP that adds a table.
 
 Append-only numbered SQL migrations applied with the Supabase CLI against the project of the
-current environment. STEP 012 to STEP 023 created the first thirty six files; `npm run
+current environment. STEP 012 to STEP 024 created the first thirty nine files; `npm run
 check:migrations` keeps them honest.
 
 | File | What it creates |
@@ -45,6 +45,9 @@ check:migrations` keeps them honest.
 | 0034_merchant_api_credentials.sql | The `merchant_api_credentials` key as a hash plus prefix and tail, the encrypted signing secret beside its own tail, the rotation link, the revocation, the identity guard, five indexes and the policy |
 | 0035_store_connections.sql | The `store_connections` Shopify and WooCommerce row with its bare lower case domain, its encrypted access token, its install states, the identity guard, three indexes and the policy |
 | 0036_taxcloud_connections.sql | The `taxcloud_connections` merchant account with both credentials encrypted, one usable connection per merchant, the on and off collection switch, the credential guard, two indexes and the policy |
+| 0037_payments.sql | The `payments` processor transaction with its provider, key, routing rule and unique idempotency key, its amount, fee and generated net, the four card characters, the 3DS capture rule, the risk rule, the status instants, the refund state guard, seven indexes and the policy |
+| 0038_refunds.sql | The `refunds` document with its request, approval and processing states, the cap guard against its payment, the sync that writes the payment refunded total and status, four indexes and the policy |
+| 0039_disputes.sql | The `disputes` chargeback with its 24 or 48 hour deadline, the evidence flag, the response and its submission, the resolved outcome, the deadline guard, four indexes and the policy |
 
 Every file is paired with `<name>.down.sql`, which undoes exactly what its forward file created and
 nothing else.
@@ -186,7 +189,18 @@ nothing else.
     and scope, with the answer a retry replays and a guard that never reopens a decided key.
     `webhook_events` is keyed by the provider own identifier, keeps only the payload hash, and lets
     an unverified delivery live as `rejected` but never as `processed`.
-33. Numbering is contiguous from 0001. A migration is never renumbered after it has been applied
+34. A payment is one processor transaction with a route. It names the provider, the key, the routing
+    rule and the idempotency key, and the key is unique, so the second delivery of a request cannot
+    write a second payment. `net_minor` is generated from the amount and the fee, the only card
+    columns are the brand and four digits, and section 18's two operational rules are checks: a
+    capture without 3DS needs the postal code and the IP country to match, and a fraud rejection can
+    only sit on a failed payment.
+35. A refund is capped by its payment and a dispute is a deadline. The refund guard sums the live
+    refunds and refuses one that would take the total above what was charged, its sync writes the
+    payment refunded total and status so nobody types them, and a refund is cancelled or failed
+    rather than removed. A dispute states its opening instant, its 24 or 48 hour window and its due
+    date, cannot be submitted without its evidence pack, and cannot reopen once resolved.
+36. Numbering is contiguous from 0001. A migration is never renumbered after it has been applied
     anywhere.
 
 ## Commands

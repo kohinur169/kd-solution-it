@@ -7,9 +7,10 @@
 - Depends on (earlier STEPs in this category and their handoff files): STEP 020 (`clients`,
   `products` and `services`, which this STEP references and snapshots) and STEP 018 (the price list
   the lines are priced from). STEP 022 adds estimates and recurring schedules that convert into an
-  invoice, STEP 024 adds the payments that move `amount_paid_minor`, and STEP 025 writes the ledger
-  entries a payment produces. The owner asked for five sub-steps with one approval between each, and
-  the plan is `docs/planning/STEP_021_SUBSTEP_BREAKDOWN.md`.
+  invoice, STEP 024 adds the payments a converted invoice collects, and STEP 025 writes the ledger
+  entries a payment produces, which is also what moves `amount_paid_minor`. The owner asked for five
+  sub-steps with one approval between each, and the plan is
+  `docs/planning/STEP_021_SUBSTEP_BREAKDOWN.md`.
 
 ## Files
 - Created:
@@ -182,8 +183,10 @@ ended with `PROOF COMPLETE`.
 - The invoice stores no token. The tokenized link of section 16 is the portal STEP's data
   (181-190), and rule 14 of the migrations folder still applies: a token is stored as a hash, never
   as the token.
-- `amount_paid_minor` is a running total written by the payment STEP (024). This STEP proves the
-  states it can be in and the 20 USD floor they imply; it does not write a payment row.
+- `amount_paid_minor` is a running total. STEP 024 stores the payments but deliberately leaves this
+  column to the double-entry ledger of STEP 025, which is the single owner of money aggregation;
+  writing it from both a payment trigger and a ledger posting would be two truths. This STEP proves
+  the states it can be in and the 20 USD floor they imply; it does not write a payment row.
 - The invoice level `tax_minor` is the section 7 tax line. The TaxCloud STEP writes it; nothing here
   computes tax.
 - Transition legality beyond what a check can see (for example sent then viewed then overdue) is the
