@@ -481,6 +481,16 @@ handoff file.
   the instant it was first breached, and refuses a count that falls, a breach that is cleared and a
   soft delete of either row; an old window leaves by the physical delete of the sweep, because a
   hidden counter would free its window for a fresh count.
+- STEP 031 adds the file records of section 21. `public.files` keeps the provider, the bucket and
+  the storage key rather than a URL, because a signed URL expires; the key must start with the
+  merchant's own id, so tenant separation is a check and not a habit, and it may not climb out of
+  that prefix with a parent segment. The row carries the plaintext SHA-256, the size bounded at
+  50 MB, the type, the AES-256-GCM quartet the key tables already use, the magic byte verdict
+  with its instant, and a status that walks `pending` to `ready`, quarantine or archive; a
+  quarantined file keeps its reason when it is archived, and the guard freezes the bytes and
+  refuses a verdict taken back. One storage key is one row for ever, so a re-upload cannot fork
+  the record, and a removed file is a soft delete marker, because section 13 keeps records for
+  seven years.
 - `public.uuid_generate_v7()` is defined in `0001`, because PostgreSQL before 18 has no native
   UUID v7. Ids sort by creation time, carry version nibble 7 and the RFC 4122 variant bits, and
   take their random tail from `gen_random_uuid()`.

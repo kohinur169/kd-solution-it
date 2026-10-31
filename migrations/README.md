@@ -68,6 +68,7 @@ table has once the file has run, the primary key included, so it is what `\d` pr
 | 0054_submerchant_provisions.sql | The `submerchant_provisions` row that carries the KYC approval, the provider and its key, the mode, the master account, the provider sub-merchant id, the five statuses with their instants, the two flags that wait for verification, the attempt and queue columns, the webhook evidence, four guards that freeze the identity, check the provider and the approval, walk the status forward and verify the sync, five indexes and the policy |
 | 0055_card_blacklist.sql | The `card_blacklist` row that blocks a card by the SHA-256 of its token or provider fingerprint, never by a card number, with its source, its provider, its six reasons and the note an other reason needs, its active and released life with the person and the note of a release, the optional payment behind it and the optional expiry, the one active block per fingerprint, the state guard that freezes the block and refuses a soft delete, four indexes and the policy |
 | 0056_velocity_counters.sql | The `velocity_counters` row that counts one card or one address in one window, with the address as a real `inet`, exactly one subject, the window start and length with a unique key per subject, the count, the configured limit it applied and the instant it was first breached, the guard that counts up only, never clears a breach and refuses a soft delete, four indexes and the policy |
+| 0057_files.sql | The `files` row that records one stored object: the provider, the bucket and the tenant prefixed key, the plaintext hash, the size and the type, the AES-256-GCM quartet, the magic byte verdict with its instant and the four states that follow it, one key per object, the guard that freezes the bytes and walks the status forward, four indexes and the policy |
 
 Every file is paired with `<name>.down.sql`, which undoes exactly what its forward file created and
 nothing else.
@@ -298,7 +299,15 @@ nothing else.
     configured limit that applied is stored beside the count and the breach, and the guard counts
     up only, never clears a breach and refuses a soft delete. Old windows leave by the physical
     delete of STEP 067's sweep. The defaults live in `config/`, not in a migration.
-44. Numbering is contiguous from 0001. A migration is never renumbered after it has been applied
+44. A file is a key and a hash, never a URL. `files` keeps the provider, the bucket and the
+    storage key under the merchant's own prefix - a check, so one merchant's row cannot point at
+    another merchant's bytes and a key cannot climb out with a parent segment - beside the
+    plaintext SHA-256, the size bounded at the same 50 MB the KYC documents allow, the type and
+    the AES-256-GCM quartet the key tables use. The magic byte verdict and its instant are the
+    evidence `ready` and `archived` require, a `quarantined` row carries the reason that survives
+    its archive, the guard freezes the bytes and walks the status forward only, and the soft
+    delete marker is set once, because section 13 keeps records for seven years.
+45. Numbering is contiguous from 0001. A migration is never renumbered after it has been applied
     anywhere.
 
 ## Commands
