@@ -491,6 +491,18 @@ handoff file.
   refuses a verdict taken back. One storage key is one row for ever, so a re-upload cannot fork
   the record, and a removed file is a soft delete marker, because section 13 keeps records for
   seven years.
+- STEP 032 adds the email, support, CMS, accounting and compliance records of sections 23, 24, 25,
+  26 and 3. `email_settings` keeps one SMTP or API sender with its encrypted credential and a
+  successful test, and a partial unique index allows one active method at a time;
+  `email_templates` closes the twenty activity keys and retires a template instead of deleting
+  it; `email_send_logs` walks a send from queued to sent, failed or dropped, records the provider
+  message id once and refuses a delete. `support_tickets` stores the service level as two
+  deadlines and a stored on-time answer, refuses a stuck payment deadline past 72 hours and is
+  closed, never deleted; its messages are append only with one attachment each. `cms_pages` keeps
+  one live slug and one live page per policy key, `blog_posts` walks draft to published to
+  archived, `company_transactions` is corrected by a reversing entry rather than deleted,
+  `processor_bills` stores a generated variance over the matched amount, and `compliance_items`
+  moves its expiry and its last alert forward only.
 - `public.uuid_generate_v7()` is defined in `0001`, because PostgreSQL before 18 has no native
   UUID v7. Ids sort by creation time, carry version nibble 7 and the RFC 4122 variant bits, and
   take their random tail from `gen_random_uuid()`.

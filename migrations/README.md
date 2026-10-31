@@ -4,7 +4,7 @@
 Owner: STEP 012-036 and every later STEP that adds a table.
 
 Append-only numbered SQL migrations applied with the Supabase CLI against the project of the
-current environment. STEP 012 to STEP 030 created the first fifty six files; `npm run
+current environment. STEP 012 to STEP 032 created the first sixty eight files; `npm run
 check:migrations` keeps them honest.
 
 Each row names the objects its file creates. The index count is the number of indexes the
@@ -69,6 +69,17 @@ table has once the file has run, the primary key included, so it is what `\d` pr
 | 0055_card_blacklist.sql | The `card_blacklist` row that blocks a card by the SHA-256 of its token or provider fingerprint, never by a card number, with its source, its provider, its six reasons and the note an other reason needs, its active and released life with the person and the note of a release, the optional payment behind it and the optional expiry, the one active block per fingerprint, the state guard that freezes the block and refuses a soft delete, four indexes and the policy |
 | 0056_velocity_counters.sql | The `velocity_counters` row that counts one card or one address in one window, with the address as a real `inet`, exactly one subject, the window start and length with a unique key per subject, the count, the configured limit it applied and the instant it was first breached, the guard that counts up only, never clears a breach and refuses a soft delete, four indexes and the policy |
 | 0057_files.sql | The `files` row that records one stored object: the provider, the bucket and the tenant prefixed key, the plaintext hash, the size and the type, the AES-256-GCM quartet, the magic byte verdict with its instant and the four states that follow it, one key per object, the guard that freezes the bytes and walks the status forward, four indexes and the policy |
+| 0058_files_purposes.sql | `cms_image` and `compliance_document` added to the purpose check of 0057, in a file that creates no table; its rollback restores the five names |
+| 0059_email_settings.sql | The `email_settings` row of the SMTP or API sender of section 23, with one active method at a time, the method's own fields, the encrypted credential quartet, the sender identity, the successful test that activation requires, its guard, its three indexes and the policy |
+| 0060_email_templates.sql | The `email_templates` row for one of the twenty activity emails in one locale, editable by super_admin and retired with `is_active` rather than deleted, with its guard, its three indexes and the policy |
+| 0061_email_send_logs.sql | The `email_send_logs` row per attempted send with its template, recipient, status, provider message id, attempt count and retry instant, the guard that freezes the queue and walks the send forward, its four indexes and the policy |
+| 0062_support_tickets.sql | The `support_tickets` row with its category, priority, assignment, the first response deadline the 72 hour promise is checked against, the stored on-time answer, the status walk, its four indexes and the policy |
+| 0063_support_ticket_messages.sql | The `support_ticket_messages` row per reply, portal or email, with its optional attachment and the guard that refuses every update and every delete, its two indexes and the policy |
+| 0064_cms_pages.sql | The `cms_pages` row for one public page, its slug and its policy key unique among live rows, the draft and published states with their person, the SEO pair, its four indexes and the policy |
+| 0065_blog_posts.sql | The `blog_posts` row for one article with its author, its cover image and the draft to published to archived walk, the SEO pair, its four indexes and the policy |
+| 0066_company_transactions.sql | The `company_transactions` row for one income or expense of the platform company, the category tied to its direction, the tax bounded by the amount, the guard that refuses a delete, its three indexes and the policy |
+| 0067_processor_bills.sql | The `processor_bills` row per provider and period with the billed and matched amounts, the generated variance, the matching status walk, its three indexes and the policy |
+| 0068_compliance_items.sql | The `compliance_items` row per certificate or filing with its issue and expiry dates, its alert window, the renewal instant an archive keeps, the guard that moves both forward, its three indexes and the policy |
 
 Every file is paired with `<name>.down.sql`, which undoes exactly what its forward file created and
 nothing else.
@@ -307,7 +318,31 @@ nothing else.
     evidence `ready` and `archived` require, a `quarantined` row carries the reason that survives
     its archive, the guard freezes the bytes and walks the status forward only, and the soft
     delete marker is set once, because section 13 keeps records for seven years.
-45. Numbering is contiguous from 0001. A migration is never renumbered after it has been applied
+45. Email has one active sender and a log of everything it sent. `email_settings` keeps one
+    configuration of section 23, `smtp` with its host, port and user name or `api` with its
+    provider and endpoint, the credential as the ciphertext quartet of the key tables and never
+    in the clear, and a partial unique index over the value `active` so a second sender cannot
+    exist; an active row needs its successful test, and its connection changes only while it is
+    disabled. `email_templates` closes the twenty activity keys and retires a template with
+    `is_active`. `email_send_logs` freezes the template, the recipient and the queue instant,
+    walks `queued` to `sent`, `failed` or `dropped`, raises the attempt count only, writes the
+    provider message id once and refuses a delete; a failed row under its limit carries the next
+    retry instant, and one delivery cannot be logged twice.
+46. A service level and a public page are records, not claims. `support_tickets` stores the first
+    response deadline and writes the answer, the resolution and the close instants once, keeps
+    `first_response_on_time` as a stored generated column, refuses a `payment_stuck` deadline
+    later than 72 hours, and is closed rather than deleted. `support_ticket_messages` is append
+    only and carries one attachment. `cms_pages` keeps its slug and its policy key unique among
+    live rows and requires the person and the instant of a publication; `blog_posts` walks
+    `draft` to `published` to `archived` and never back.
+47. The platform book is corrected, never deleted. `company_transactions` ties the category to
+    the direction, bounds the tax by the amount, and refuses every change to the direction, the
+    amounts, the currency, the date and the source as well as any delete, because a mistake is a
+    reversing entry. `processor_bills` is one per provider and period, its variance is a stored
+    generated column, the matched amount only rises and the bill is never deleted.
+    `compliance_items` moves its expiry and its last alert forward only, keeps the renewal
+    instant when the item is archived, and is archived rather than deleted.
+48. Numbering is contiguous from 0001. A migration is never renumbered after it has been applied
     anywhere.
 
 ## Commands
