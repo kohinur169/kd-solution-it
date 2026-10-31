@@ -451,6 +451,19 @@ handoff file.
   `public.bank_change_requests` is section 10's change: who asked, who verified, the refusal and its
   reason, and a cooling instant that must equal the verification instant plus 96 hours, so a
   rejected request never starts a cooling and an activation comes after it ends.
+- STEP 028 adds the KYC file section 5 describes and the audit around it. `public.kyc_submissions`
+  is the cycle: the method that ran with the provider reference of a provider method, one open cycle
+  per merchant through a partial unique index, and a four-eye decision that needs two different
+  reviewers. `public.kyc_documents` keeps the storage key, the SHA-256 of the bytes, the mime type
+  and the size instead of the file, requires the issue instant the three month rule of a utility bill
+  needs, and freezes the key and the bytes after upload. `public.ubo_records` keeps each owner's
+  share in basis points, ties the 25 percent flag to the number, and a trigger refuses owners that
+  add up to more than 10000 basis points. `public.sanctions_screenings` records which of the OFAC,
+  United Nations, European Union and United States lists ran, requires the case note of a confirmed
+  match and never clears the SAR flag. `public.policy_acceptances` is evidence of a consent: one row
+  per merchant, policy and version with the hash of the accepted text. `public.review_decisions` is
+  the audit record, append only, with the reason the merchant reads and the appeal that points at the
+  decision it appeals through the tenant key.
 - `public.uuid_generate_v7()` is defined in `0001`, because PostgreSQL before 18 has no native
   UUID v7. Ids sort by creation time, carry version nibble 7 and the RFC 4122 variant bits, and
   take their random tail from `gen_random_uuid()`.

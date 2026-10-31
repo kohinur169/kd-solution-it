@@ -18,7 +18,7 @@ import { fileURLToPath } from "node:url";
  *   5. tenancy: every created table has id, company_id, created_at, updated_at, deleted_at and
  *      version, and the id default is the shared UUID v7 function;
  *   6. security: every created table enables row level security and carries its default-deny
- *      policy in the same file;
+ *      policy in the same file, refusing reads and writes alike;
  *   7. rollback: a down file drops exactly the tables its forward file creates.
  *
  * The gate is static, so it runs anywhere a Node.js process runs. Whether the SQL actually
@@ -44,6 +44,8 @@ const appendOnlyBreaches: readonly RegExp[] = [
   /\bdelete\s+from\b/iu,
 ];
 const nonAsciiPattern = /[^\u0009\u000a\u000d\u0020-\u007e]/u;
+const defaultDenyPattern =
+  /create policy \w+_default_deny\b[^;]*using \(false\)[^;]*with check \(false\);/u;
 
 interface TableDefinition {
   readonly name: string;
@@ -186,6 +188,11 @@ function checkForwardFile(file: MigrationFile): void {
     expect(
       file.content.includes(`create policy ${table.name}_default_deny`),
       `${file.name}: table ${table.name} must carry its default-deny policy in this file`,
+    );
+
+    expect(
+      defaultDenyPattern.test(file.content),
+      `${file.name}: the default-deny policy of ${table.name} must refuse reads and writes`,
     );
   }
 }

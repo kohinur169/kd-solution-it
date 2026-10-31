@@ -4,7 +4,7 @@
 Owner: STEP 012-036 and every later STEP that adds a table.
 
 Append-only numbered SQL migrations applied with the Supabase CLI against the project of the
-current environment. STEP 012 to STEP 027 created the first forty seven files; `npm run
+current environment. STEP 012 to STEP 028 created the first fifty three files; `npm run
 check:migrations` keeps them honest.
 
 | File | What it creates |
@@ -56,6 +56,12 @@ check:migrations` keeps them honest.
 | 0045_payouts.sql | The `payouts` request with its requester and approver, the generated net, the 100 USD minimum with its remainder exception, the destination snapshot, the failure pair, the unique provider identifier, the closed payout guard, four indexes and the policy |
 | 0046_payout_bank_accounts.sql | The `payout_bank_accounts` row with its number as AES-256-GCM ciphertext, its four visible characters and its fingerprint, its five statuses and their instants, one active account per merchant, the identity guard, five indexes, the policy and the `payouts.bank_account_id` column with its composite foreign key |
 | 0047_bank_change_requests.sql | The `bank_change_requests` row with its current and requested accounts, its six statuses, the 96 hour cooling check, one open request per merchant, the identity guard, four indexes and the policy |
+| 0048_kyc_submissions.sql | The `kyc_submissions` cycle with its method and provider reference, its five statuses, the one open cycle per merchant, the four-eye reviewer pair with its two-people check, the decision instants and reason, the identity guard, five indexes and the policy |
+| 0049_kyc_documents.sql | The `kyc_documents` evidence row with its storage key, byte hash, mime type and size, its six document types, the issue instant of the three month rule, the review pair and its rejection reason, the evidence guard, four indexes and the policy |
+| 0050_ubo_records.sql | The `ubo_records` owner with its share in basis points, the 25 percent flag tied to the number, the identity document hash, the PEP flag, the sum guard, the identity guard, three indexes and the policy |
+| 0051_sanctions_screenings.sql | The `sanctions_screenings` row with its three subject kinds, the four lists, the three results, the case note of a confirmed match, the SAR flag that is never cleared, the identity guard, six indexes and the policy |
+| 0052_policy_acceptances.sql | The `policy_acceptances` evidence row with its twelve policy keys, its dotted version, its text hash and its person, one acceptance per merchant, policy and version, the identity guard, three indexes and the policy |
+| 0053_review_decisions.sql | The `review_decisions` audit row with its four subject kinds, its six decisions, its reason, its appeal through the tenant key, one appeal per decision, the append only guard that moves the appeal state forward only, five indexes and the policy |
 
 Every file is paired with `<name>.down.sql`, which undoes exactly what its forward file created and
 nothing else.
@@ -250,7 +256,24 @@ nothing else.
     not exactly the verification instant plus 96 hours. A rejected request carries no cooling
     instant at all, an activation cannot precede the end of the cooling, one request is open per
     merchant, and the closed row is history.
-40. Numbering is contiguous from 0001. A migration is never renumbered after it has been applied
+40. A KYC submission is a cycle and its evidence is a row. `kyc_submissions` keeps one open cycle
+    per merchant through a partial unique index, records the method that ran with the provider
+    reference of that method, and refuses a decision without its instant, a rejection without its
+    reason and a four-eye decision without a second, different reviewer. `kyc_documents` keeps the
+    storage key, the SHA-256 of the bytes, the mime type and the size rather than a file, requires
+    the issue instant the three month rule of a utility bill needs, and freezes the key and the
+    bytes after upload. `ubo_records` keeps the share in basis points, ties the 25 percent flag to
+    the number, and a trigger refuses owners that add up to more than 10000 basis points.
+41. A screening is four lists and a result, and a decision is history. `sanctions_screenings` records
+    which of the OFAC, United Nations, European Union and United States lists ran, requires at least
+    one of them, requires the case note of a confirmed match and never clears the SAR flag once it
+    is raised. `policy_acceptances` keeps one row per merchant, policy and version with the hash of
+    the accepted text, so a consent is provable and a new version is a new row. `review_decisions`
+    is append only, names its subject, its person, its instant and its reason, and points at the
+    decision it appeals through the tenant key; an overturn or an uphold is legal only on an appeal,
+    one appeal per decision, and the appeal state moves none, open, upheld or overturned and no
+    further.
+42. Numbering is contiguous from 0001. A migration is never renumbered after it has been applied
     anywhere.
 
 ## Commands
@@ -271,7 +294,8 @@ or a duplicate in the numbering, a forward file without its rollback (and the re
 path comment, a body without the `begin;`/`commit;` pair, non ASCII text, a forward file that
 drops or deletes, a created table that misses one of the six required columns, an `id` default
 that is not the shared UUID v7 function, a table without `enable row level security` and its
-`<table>_default_deny` policy, and a rollback that does not drop the tables its forward creates.
+`<table>_default_deny` policy, a default-deny policy that does not refuse reads and writes alike,
+and a rollback that does not drop the tables its forward creates.
 
 It is static, so it needs no database. Whether the SQL actually applies is proven by running it:
 STEP 012 recorded a forward apply, a data level proof of every constraint and both rollbacks on
