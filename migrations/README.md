@@ -4,7 +4,7 @@
 Owner: STEP 012-036 and every later STEP that adds a table.
 
 Append-only numbered SQL migrations applied with the Supabase CLI against the project of the
-current environment. STEP 012 to STEP 021 created the first twenty four files; `npm run
+current environment. STEP 012 to STEP 022 created the first twenty eight files; `npm run
 check:migrations` keeps them honest.
 
 | File | What it creates |
@@ -33,6 +33,10 @@ check:migrations` keeps them honest.
 | 0022_invoices.sql | The `invoices` document with its client snapshot, its seven status values and their instants, its five money columns, the unique number per merchant, the derived total trigger and the paid lock, six indexes, row level security and the default-deny policy |
 | 0023_invoice_items.sql | The `invoice_items` lines with their generated line total, their position uniqueness, their optional catalogue references, the tenant pair foreign key, the catalogue guard and the totals sync trigger, four indexes, RLS and the policy |
 | 0024_invoice_events.sql | The `invoice_events` append only timeline with its closed event and actor vocabularies, the guard trigger that refuses every update and removal, three indexes, RLS and the default-deny policy |
+| 0025_estimates.sql | The `estimates` quote with its client snapshot, its five statuses and the void reason, its derived total, its expiry, the unique number per merchant, the terminal lock, the one conversion link, seven indexes, RLS and the default-deny policy |
+| 0026_estimate_items.sql | The `estimate_items` quote lines with their generated line total, their position uniqueness, their catalogue guard and their totals sync trigger, four indexes, RLS and the policy |
+| 0027_estimate_signatures.sql | The `estimate_signatures` evidence row with its consent pair, the IP, geo, fingerprint and SHA-256 document hash, one signature per quote, the append only guard and the open-quote guard, three indexes, RLS and the policy |
+| 0028_recurring_schedules.sql | The `recurring_schedules` repeating invoice with its draft template, its interval, run dates, terms and reminder policy, the template guard, four indexes, RLS and the default-deny policy |
 
 Every file is paired with `<name>.down.sql`, which undoes exactly what its forward file created and
 nothing else.
@@ -147,7 +151,18 @@ nothing else.
     every removal, so what a dispute pack reads months later is what happened. Both child tables
     point at their invoice through `(invoice_id, company_id)`, so no row can join another merchant's
     document.
-29. Numbering is contiguous from 0001. A migration is never renumbered after it has been applied
+30. A quote is a document that ends in a decision. It snapshots its client and its lines like an
+    invoice, derives its total the same way, and states its own expiry; `accepted` and `void` are
+    terminal and a guard trigger holds them shut. Section 16 folds a decline and an expiry into
+    `void`, so `void_reason` carries which one happened, and acceptance is written once together
+    with the invoice it becomes, because the same statement that decides a quote freezes it.
+31. A signature is evidence and a schedule is a promise. Every element section 16 names sits on the
+    signature row, the consent pair cannot be false, the document hash is 64 lower case hex
+    characters, one quote takes one signature, and nothing may update or remove the row. A recurring
+    schedule points at a draft invoice as its template rather than a second catalogue of lines,
+    states its interval and run dates in columns, and has no retry or attempt column at all, because
+    section 16 says a failed recurring payment is not retried automatically.
+32. Numbering is contiguous from 0001. A migration is never renumbered after it has been applied
     anywhere.
 
 ## Commands

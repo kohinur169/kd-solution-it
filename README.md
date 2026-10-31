@@ -381,6 +381,18 @@ handoff file.
   `draft`. `public.invoice_events` is the append only timeline that a support call and a chargeback
   evidence pack read months later, and both child tables reach their invoice through `(invoice_id,
   company_id)`, so no row can join another merchant's document.
+- STEP 022 adds the quote, its signature and the repeating invoice. `public.estimates` is a document
+  that ends in a decision: it snapshots its client and its lines, derives its total the same way an
+  invoice does, carries its own `expires_at`, and separates the two ways section 16 ends a quote
+  with `void_reason` (`declined`, `expired`, `withdrawn`). `accepted` and `void` are terminal and
+  held shut by a trigger, and the invoice a quote becomes is linked once through
+  `converted_invoice_id`, so a quote cannot produce two invoices. `public.estimate_signatures` is
+  the evidence section 16 asks for: signer, address, the consent wording and a flag the check forces
+  to true, the instant, the IP, the geo location, the device fingerprint and the SHA-256 of the
+  signed document, one row per quote, append only. `public.recurring_schedules` points at a draft
+  invoice as its template rather than a second catalogue of lines, states its interval, run dates,
+  due offset and reminder policy as columns, and has no retry column at all, because a failed
+  recurring payment is never retried automatically.
 - `public.uuid_generate_v7()` is defined in `0001`, because PostgreSQL before 18 has no native
   UUID v7. Ids sort by creation time, carry version nibble 7 and the RFC 4122 variant bits, and
   take their random tail from `gen_random_uuid()`.
