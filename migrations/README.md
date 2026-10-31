@@ -4,7 +4,7 @@
 Owner: STEP 012-036 and every later STEP that adds a table.
 
 Append-only numbered SQL migrations applied with the Supabase CLI against the project of the
-current environment. STEP 012 to STEP 014 created the first eight files; `npm run
+current environment. STEP 012 to STEP 015 created the first ten files; `npm run
 check:migrations` keeps them honest.
 
 | File | What it creates |
@@ -17,6 +17,8 @@ check:migrations` keeps them honest.
 | 0006_delegations.sql | The `delegations` approval handover table with its window and scope, two live indexes, its trigger, row level security and the default-deny policy |
 | 0007_announcements.sql | The `announcements` table with its draft and publish instants, the published index, its trigger, row level security and the default-deny policy |
 | 0008_announcement_dismissals.sql | The `announcement_dismissals` table, its unique pair index, its trigger, row level security and the default-deny policy |
+| 0009_device_proof_keys.sql | The `device_proof_keys` enrolled device table with its trust and revoke instants, four indexes including the `(user_id, id)` target of the session key, its trigger, row level security and the default-deny policy |
+| 0010_sessions.sql | The `sessions` table with its token hash, family, rotation parent, step-up instants and closed revocation vocabulary, seven indexes, its trigger, row level security and the default-deny policy |
 
 Every file is paired with `<name>.down.sql`, which undoes exactly what its forward file created and
 nothing else.
@@ -62,7 +64,16 @@ nothing else.
 13. An announcement is a draft until `published_at` is set, and a dismissal is one row per person
     per announcement. The unique index is the rule "a dismissed announcement does not appear again
     for that user", not a cleaner in application code.
-14. Numbering is contiguous from 0001. A migration is never renumbered after it has been applied
+14. A session token is stored as a hash, never as the token itself, and one row is one rotation.
+    Every rotation of one login shares `family_id`, so ending a family is one statement on that
+    column, and a parent may be rotated once: a fork is refused by `sessions_rotation_key` rather
+    than by convention. A replay is a revocation with `replay_detected_at` set, never a quiet
+    expiry, and the check constraint keeps the two together.
+15. A session names a device of its own account. The composite key
+    `(user_id, device_proof_key_id)` against `(user_id, id)` on `device_proof_keys` is what makes
+    "a cookie works only inside its own session" true in the database and not only in the code that
+    writes it.
+16. Numbering is contiguous from 0001. A migration is never renumbered after it has been applied
     anywhere.
 
 ## Commands

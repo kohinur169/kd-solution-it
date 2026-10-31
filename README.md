@@ -311,6 +311,14 @@ handoff file.
   `published_at` is set, and `public.announcement_dismissals` holds one row per person per
   announcement, which is how "a dismissed announcement does not appear again for that user" is
   enforced.
+- STEP 015 adds the session layer of section 22. `public.device_proof_keys` is one enrolled device:
+  the public half of a proof key, its fingerprint, and the instants that matter, first seen, trusted
+  after the new-device confirmation, and revoked when the device is lost. `public.sessions` stores
+  the *hash* of the rotating token, the `family_id` shared by every rotation, the parent each
+  rotation replaced, the step-up instants, and a closed revocation vocabulary. The composite key
+  `(user_id, device_proof_key_id)` means a session can only name a device of its own account, and
+  `sessions_rotation_key` means a parent is rotated once: a replayed cookie ends the family, it does
+  not open a second one.
 - `public.uuid_generate_v7()` is defined in `0001`, because PostgreSQL before 18 has no native
   UUID v7. Ids sort by creation time, carry version nibble 7 and the RFC 4122 variant bits, and
   take their random tail from `gen_random_uuid()`.
