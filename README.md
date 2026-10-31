@@ -334,7 +334,15 @@ handoff file.
   every row carries an Ed25519 signature and the id of the key that produced it. The canonical
   string the hash covers is defined once, in the migration, because a second definition would make
   every later verification meaningless. Merkle roots are computed from the chain by the export job,
-  so the table stores the leaves and no roots of its own.- `public.uuid_generate_v7()` is defined in `0001`, because PostgreSQL before 18 has no native
+  so the table stores the leaves and no roots of its own.
+- STEP 018 adds the plan and price catalogue of sections 9 and 14. `public.plans` holds the plan
+  code, name, price in minor units, currency, billing period and status, and `public.plan_entitlements`
+  holds one row per service a plan includes, so a service is data rather than a column and "which
+  plans include invoicing" is an indexed query. `public.pricing_versions` is a whole price list per
+  row: the five fees the public pricing page names, each with its own payer, versioned by `revision`
+  inside a scope derived from `company_id`, with a check that a price announced for a later date
+  cannot take effect sooner than thirty days after its announcement.
+- `public.uuid_generate_v7()` is defined in `0001`, because PostgreSQL before 18 has no native
   UUID v7. Ids sort by creation time, carry version nibble 7 and the RFC 4122 variant bits, and
   take their random tail from `gen_random_uuid()`.
 - `public.set_row_metadata()` is a before-update trigger installed per table. It sets

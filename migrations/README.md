@@ -4,7 +4,7 @@
 Owner: STEP 012-036 and every later STEP that adds a table.
 
 Append-only numbered SQL migrations applied with the Supabase CLI against the project of the
-current environment. STEP 012 to STEP 017 created the first thirteen files; `npm run
+current environment. STEP 012 to STEP 018 created the first sixteen files; `npm run
 check:migrations` keeps them honest.
 
 | File | What it creates |
@@ -22,6 +22,9 @@ check:migrations` keeps them honest.
 | 0011_login_attempts.sql | The `login_attempts` event record with its factor and outcome vocabularies, the rate limit and counter indexes, its trigger, row level security and the default-deny policy |
 | 0012_account_locks.sql | The `account_locks` table with its two hour window, the owner alert and contact instants, the two mutually exclusive closures, the open lock unique index, its trigger, row level security and the default-deny policy |
 | 0013_audit_logs.sql | The `audit_logs` append-only hash chain with its per tenant chain, its Ed25519 signature and signing key columns, the seven query indexes, both guard functions and triggers, row level security and the default-deny policy |
+| 0014_plans.sql | The `plans` catalogue with its code, price, period and status, its three indexes, its trigger, row level security and the default-deny policy |
+| 0015_plan_entitlements.sql | The `plan_entitlements` table, one row per service a plan includes, with its live pair index, its service index, its trigger, row level security and the default-deny policy |
+| 0016_pricing_versions.sql | The `pricing_versions` price list with the five fees of section 14 and their payers, its scope, its thirty day announcement check, three indexes, its trigger, row level security and the default-deny policy |
 
 Every file is paired with `<name>.down.sql`, which undoes exactly what its forward file created and
 nothing else.
@@ -94,7 +97,15 @@ nothing else.
     hash and `signing_key_id` names the key, so rotating the signing key leaves history verifiable.
     Merkle roots are derived from `chain_id`, `sequence` and `hash` by the export job; no roots are
     stored in the migrations.
-20. Numbering is contiguous from 0001. A migration is never renumbered after it has been applied
+20. A plan is the platform catalogue entry: a unique code, a price in minor units with a currency,
+    a billing period, and a status that moves from draft to active to retired. The services a plan
+    includes are rows in `plan_entitlements`, not columns, so adding a service to a plan is data; the
+    catalogue of service keys lives in code and the table only checks their shape.
+21. A price list is versioned, not edited. `revision` counts up inside a scope, and `scope_id` is
+    generated from `company_id` so the platform list and a merchant override are separate lines. A
+    price list announced for a later date must be effective at least thirty days after the
+    announcement, every fee names its payer, and percentages are basis points.
+22. Numbering is contiguous from 0001. A migration is never renumbered after it has been applied
     anywhere.
 
 ## Commands
