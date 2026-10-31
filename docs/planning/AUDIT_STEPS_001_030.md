@@ -86,6 +86,25 @@ The proof scripts that still exist were re-run against the current schema:
   Their claims were checked against the catalog instead, which is what section 1.1 to 1.3
   records.
 
+### 1.5 The second pass, line by line
+
+The first pass compared the documentation with the catalog. The second pass read the source
+again, rule by rule, and checked the history against the plan:
+
+- every file a STEP commit touches is named in that STEP's handoff, compared by basename so a
+  Python list of paths does not read as one path: no unnamed file in thirty STEPs, and no
+  handoff naming a file that the commit does not hold;
+- every STEP commit stays inside its own scope (`migrations/`, `docs/`, plus the root
+  `README.md` and `package.json` of STEP 012), with no `lib/`, `app/` or `services/` file
+  arriving before the STEP that owns it;
+- every commit subject was compared with the `commit with message "STEP NNN: ..."` line of
+  `docs/final/STEP_PLAN_250.md`, read from the quoted line and not from the heading, because
+  the heading carries prose after the subject: one subject differed, was corrected by a message
+  rewrite (observation 8 of section 3), and all thirty now match character for character;
+- the check blocks of `0018` to `0054` were read one constraint at a time, in four groups, and
+  the two rules that no check can express were probed on a database of all fifty six
+  migrations: the hold cap of `0043` and the refund cap of `0038`.
+
 ## 2. What Was Wrong And What Changed
 
 1. **Nine inventory rows counted indexes by a different rule.** The `migrations/README.md` table
@@ -103,6 +122,24 @@ The proof scripts that still exist were re-run against the current schema:
 
 3. **Nothing in the migrations was changed.** Every shape, rule, guard, index, policy and proof
    above was found correct, so the audit produced no new migration and no repair.
+
+4. **One handoff label claimed more than the schema enforces.** Test 14 of
+   `STEP_024_COMPLETED.md` was headed "A refund is never a rewrite", while the three facts under
+   it prove the processor identifier, the failure detail and the unique refund key. The heading
+   now reads "A refund keeps its processor record".
+
+5. **One limit was missing from that handoff.** A probe on the full schema lowered a succeeded
+   refund from 10000 to 1 minor unit and the payment followed to 1 and `partially_refunded`, so
+   a settled refund and a captured payment are not frozen. The limit is now a bullet under
+   Decisions of STEP 024 and observation 5 of section 3.
+
+6. **One README sentence described the hold cap inaccurately.** Rule 36 said the guard sums the
+   live holds; the guard sums every hold of the payment that is not deleted, so a released or a
+   collected hold keeps taking its share of the payment. The probe and the sentence now agree.
+
+7. **One commit message was rewritten.** STEP 011's subject is the plan line now, which is the
+   rule this project holds every STEP to. No file moved: every commit tree was compared with its
+   old counterpart and only these sentences are new, and every gate passes on this branch.
 
 ## 3. Observations Left For Later STEPs
 
@@ -126,6 +163,39 @@ decide:
    this repository states a width for Markdown, so nothing was rewrapped; a later documentation
    STEP may standardise it.
 
+4. **The hold cap is a lifetime sum, not a live balance.** `holds_guard_amount` sums every hold
+   of the payment that is not deleted, whatever its status, so a hold of 10000 that is released
+   still blocks a second hold of 10000, and a hold of 3000 that is released leaves 7000 for the
+   life of that payment. The refund guard does the opposite: it counts only the approved,
+   processing and succeeded rows, so a cancelled refund frees its share. If the hold cap was
+   meant to be a concurrent balance, the filter is a one line change in a new migration; the
+   README now states the behaviour that exists.
+
+5. **A settled refund and a captured payment are not frozen.** `refunds` and `payments` carry no
+   state guard. The amount of a succeeded refund can be lowered and the payment's refunded total
+   follows through `refunds_sync_payment`; a captured payment's amount and method can be
+   rewritten. The caps still bound the totals, so no money is created, but a history can be
+   restated. Holds, payouts, settlements, paid invoices and ledger entries are frozen and these
+   two are not; a guard for both is a new migration.
+
+6. **One closed vocabulary leaves a small latitude.** `review_decisions.appeal_state` may jump
+   from `none` to `upheld` without passing through `open`, although the states are documented in
+   that order. Nothing breaks: a final state still cannot move again.
+
+7. **Another leaves a detail without its code.** `subscription_charges` accepts a failure detail
+   with no failure code, while `payments` and `payouts` refuse that shape. Neither contradicts a
+   written rule; both are recorded so the STEP that reads them knows.
+
+8. **STEP 011's commit subject did not match the plan, and was rewritten.** The plan quotes
+   "Background job queue, worker and scheduler foundation with health check route"; the subject
+   was "Add background job queue, worker and scheduler foundation with health route", gaining an
+   "Add", losing the word "check" and carrying a lower case first letter. The message now reads
+   the plan line and the branch was force pushed. A rewrite moves every later commit, so all
+   thirty three commits were compared with their old counterparts: every tree is identical
+   except this audit commit, whose only differences are the sentences that record the rewrite.
+   The twenty one commits after STEP 011 changed identity and nothing else, and the co-author
+   trailer the platform adds survived the rewrite.
+
 ## 4. How To Repeat This Audit
 
 The scripts are throwaway and live outside the repository, as every proof script in this project
@@ -133,3 +203,8 @@ does. The steps are: apply the forward files in order on an empty database; read
 the shapes, the policies and the comments; run the proof scripts of the STEPs in question; and
 compare the numbers in the handoffs, the breakdowns and the two README files with what the
 catalog reports.
+
+The two probes of the second pass are three statements each on a database that holds all fifty
+six migrations: one inserts a payment of 10000 minor units, holds all of it, releases it and
+tries to hold it again; the other takes a refund of that payment through `approved` and
+`succeeded`, lowers its amount and reads the payment back.

@@ -241,8 +241,9 @@ nothing else.
     tomorrow cannot move a batch already in flight, one processor batch is booked once per merchant,
     and a settled or failed batch is history. `holds` names its payment and its batch, takes a
     reason from the five causes the statement groups by, never takes more than its payment through a
-    guard that sums the live holds, and closes one way: released with its instant and its person, or
-    collected with its instant, its person and the note section 10 needs.
+    guard that sums every hold of that payment that is not deleted, a released or a collected one
+    included, and closes one way: released with its instant and its person, or collected with its
+    instant, its person and the note section 10 needs.
 37. A reserve is one account and a payout is a request with a decision. `reserves` stores the
     percent in basis points beside the release days, keeps one active row per merchant, bounds the
     released total by the held total, and freezes its terms for the life of the row. `payouts` names

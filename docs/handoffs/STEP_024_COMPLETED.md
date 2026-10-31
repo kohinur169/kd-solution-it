@@ -121,9 +121,9 @@ with `PROOF COMPLETE`.
 13. **The payment follows its refunds.** The first succeeded refund left 4000 and
    `partially_refunded`, the second left 9000 and the same status, and the last left 10000,
    `refunded` and its refund instant, with no writer computing any of it.
-14. **A refund is never a rewrite.** A succeeded refund with no provider identifier was refused, a
-   failed refund with no detail was refused, and the same processor refund identifier twice was
-   refused by `refunds_provider_refund_key`.
+14. **A refund keeps its processor record.** A succeeded refund with no provider identifier was
+   refused, a failed refund with no detail was refused, and the same processor refund identifier
+   twice was refused by `refunds_provider_refund_key`.
 15. **The refund queue index is used.** With sequential scans disabled the planner used
    `refunds_queue_idx` for what still needs a person.
 16. **A dispute is a deadline.** It opened with 24 hours and no resolution; a window of 12 hours, a
@@ -211,6 +211,10 @@ with `PROOF COMPLETE`.
   belongs to the adapter STEPs of section 6.
 - **A refund is capped but not sequenced.** The guard refuses a total above the payment; it does not
   decide which staff role may approve a refund, which is the permission STEP.
+- **A refund row and a payment row are not frozen.** The cap and the sync keep the money and the
+  refunded total right, but the amount and the status of a succeeded refund and of a captured
+  payment are still writable, and rewriting the refund moves the payment total with it. Freezing
+  those two lives is a later migration; the audit of STEP 001-030 records the probe.
 - **A chargeback fee is a column, not a posting.** Section 18 sets it and the merchant balance
   carries it; here the row records the amount, and STEP 025 posts it.
 - **The evidence pack is a flag.** The invoice, the delivery proof, the client communication and the
