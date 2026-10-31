@@ -393,6 +393,22 @@ handoff file.
   invoice as its template rather than a second catalogue of lines, states its interval, run dates,
   due offset and reminder policy as columns, and has no retry column at all, because a failed
   recurring payment is never retried automatically.
+- STEP 023 adds the provider plumbing that has no screen of its own yet. `public.payment_providers`
+  is the platform catalogue of the five section 6 adapters: a closed `provider_key` vocabulary, a
+  capability matrix of three booleans, and an `enabled` state that only a passing connection test
+  allows. `public.provider_keys` stores each key as AES-256-GCM ciphertext with its vector, tag and
+  key version, and shows nothing but four characters, so one active key per provider and mode is
+  what makes rotation the section 29 procedure of add, test, activate, disable.
+  `public.routing_rules` names exactly one provider per rule with a priority that is unique per
+  mode, and has no fallback column at all, because a payment no rule matches is rejected, never sent
+  somewhere else. `public.webhook_events` is keyed by the provider's own event identifier and keeps
+  only the payload hash, so a delivery is processed once and a provider body that carries card data
+  never reaches the database. `public.idempotency_keys` stores the caller key as a hash, unique per
+  tenant and scope, with the answer a retry must replay. `public.merchant_api_credentials` keeps the
+  API key only as a SHA-256 with its visible prefix and tail and encrypts the webhook signing
+  secret, while `public.store_connections` and `public.taxcloud_connections` encrypt the Shopify,
+  WooCommerce and TaxCloud tokens the same way and refuse new ciphertext under an unchanged key
+  version.
 - `public.uuid_generate_v7()` is defined in `0001`, because PostgreSQL before 18 has no native
   UUID v7. Ids sort by creation time, carry version nibble 7 and the RFC 4122 variant bits, and
   take their random tail from `gen_random_uuid()`.

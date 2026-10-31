@@ -25,7 +25,7 @@
 - Modified:
   - migrations/README.md - three inventory rows and two new rules: an invoice is a document that
     snapshots and derives rather than copies, and a line is arithmetic defined once while a timeline
-    is evidence. The numbering rule moved from 26 to 29.
+    is evidence. The numbering rule moved from 26 to 28.
   - README.md - the database section describes the invoice, its lines and its timeline, directly
     above the `uuid_generate_v7()` bullet.
 - Owned paths touched (must match the File Ownership Rules in STEP_PLAN_250.md): numbered migration

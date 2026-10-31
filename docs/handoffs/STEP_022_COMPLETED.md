@@ -9,9 +9,10 @@
   `invoice_items` and `invoice_events`, which an accepted quote becomes and which a recurring
   schedule uses as its template), STEP 020 (`clients`, `products`, `services`, snapshotted and
   referenced here) and STEP 018 (the price list the quoted lines are priced from). STEP 023 adds the
-  expenses, STEP 024 the payments a converted invoice eventually collects, and STEP 035 the
-  permissive policies. The owner asked for five sub-steps with one approval between each, and the
-  plan is `docs/planning/STEP_022_SUBSTEP_BREAKDOWN.md`.
+  payment providers, their keys and the routing rules a payment is sent through, STEP 024 the
+  payments a converted invoice eventually collects, and STEP 035 the permissive policies. The owner
+  asked for five sub-steps with one approval between each, and the plan is
+  `docs/planning/STEP_022_SUBSTEP_BREAKDOWN.md`.
 
 ## Files
 - Created:
@@ -34,7 +35,7 @@
 - Modified:
   - migrations/README.md - four inventory rows and two new rules: a quote is a document that ends in
     a decision, and a signature is evidence while a schedule is a promise. The numbering rule moved
-    from 29 to 32.
+    from 26 to 30.
   - README.md - the database section describes the quote, its signature and the repeating invoice,
     directly above the `uuid_generate_v7()` bullet.
 - Owned paths touched (must match the File Ownership Rules in STEP_PLAN_250.md): numbered migration
@@ -83,81 +84,81 @@ Three scripts ran against the local PostgreSQL 16.2 with 43, 39 and 46 checks; a
 ended with `PROOF COMPLETE`.
 
 1. **Forward apply.** `0001` to `0028` applied in order and produced twenty eight tables, twenty
-   eight policies, thirty nine triggers and fifteen functions.
-2. **Every table shape holds.** `estimates` reported 24 columns and 26 constraints, `estimate_items`
-   16 and 15, `estimate_signatures` 18 and 15, `recurring_schedules` 21 and 20, with seven, four,
-   three and four indexes, RLS on, one policy each, and 25, 17, 19 and 22 comments, so every column
-   is documented.
-3. **A quote is a draft by default.** A new quote stored as `draft` with no number, no issue
-   instant, no expiry instant visible to the client, no money and version 1.
-4. **A wrong total is derived, not stored.** A row written with `total_minor = 5` and a subtotal of
-   100.00 less a 10.00 discount plus 8.00 tax was stored as 98.00 by the shared
-   `invoices_derive_total()` function, so a quote and an invoice total by the same rule.
-5. **The status vocabulary is section 16's**, asserted from `pg_get_constraintdef`, and an unknown
-   word was refused by the vocabulary or the issue check, whichever the planner reached first.
-6. **A quote states its own end.** `expires_at` is not null and must follow `issued_at`, and
-   `void_reason` is `declined`, `expired` or `withdrawn`, present exactly when the status is `void`,
-   so section 16's folded decline and expiry stay distinguishable.
-7. **The status carries its own facts.** A void status without a reason, a reason on an open quote,
-   the word `cancelled`, a draft carrying a number, a sent quote without one, a lower case number,
-   an expiry before the issue instant, an accepted status without its instant, a conversion link on
-   a quote that was not accepted, a padded and an empty client name, an address without an at sign,
-   a 2001 character memo and a lower case currency were each refused by name.
-8. **Numbers are per merchant.** Two merchants issued `EST-2026-0001` independently, and a duplicate
-   inside one merchant was refused by `estimates_number_key`.
-9. **The workflow moves.** A draft became `sent` with its number and instant, then `viewed`, then
-   `accepted`; a declined quote and an expired quote both became `void` carrying `declined` and
-   `expired` respectively.
-10. **A decided quote is locked.** An edit to the memo of an accepted quote, a return to `void` and
-   a soft delete were each refused with "a decided estimate is locked".
-11. **One quote produces one invoice.** A second quote converting into the same invoice was refused
-   by `estimates_invoice_key`, and because the terminal guard freezes a decided row, acceptance and
-   `converted_invoice_id` are written in one statement, which the service must also do.
-12. **The expiry index is used.** With sequential scans disabled the planner answered "which open
-   quotes expire soon" from `estimates_expiry_idx`.
-13. **A line rounds once.** Two and a half hours at 1999 less a 500 discount is 4498 minor units,
-   and the generated column reports version 1 on the first write.
-14. **The quote totals itself.** Two lines settled the subtotal at 79198 before any quote level
-   discount, then a 1000 discount and 800 tax produced a total of 78998 through the trigger pair.
-15. **Every line shape is refused by name.** Position zero and a repeated position, a zero and a
-   negative quantity, a negative unit price, a discount above the gross line, a padded and a 301
-   character description, a unit outside the vocabulary, a line with both a product and a service, a
-   product and a service from another merchant, a line numbered to another merchant's quote, and a
-   line moved to another quote.
-16. **An issued quote holds its lines.** A new line, an edit and a soft delete on a sent quote were
-   each refused with "lines of an issued estimate are locked", while the same operations are allowed
-   on a draft.
-17. **Removing and editing lines moves the totals.** A removed line lowered the subtotal and freed
-   its position, and an edited line moved its own total, its version to 2 and the quote subtotal to
-   31896.
-18. **Every section 16 element is stored.** The signature row held the decision, the consent wording
-   with `consent_accepted = true`, a 64 character lower case hash, `host(ip)` equal to
-   `203.0.113.10`, the geo location and the device fingerprint.
-19. **The signature shape is closed.** An unticked consent, the word `maybe`, an upper case hash, a
-   short hash, a three character fingerprint and an address without an at sign were refused.
-20. **One signature per quote, and it is evidence.** A second signature was refused, an edit to a
-   recorded signature and a removal of one were both refused with "estimate signatures are append
-   only", and a signature offered on a draft or on a void quote was refused with "a quote accepts a
-   signature only while it is open".
-21. **Section 16 end to end.** An accepted two line quote converted into an invoice carrying the
-   same two lines and the same total of 79198, while a declined quote stayed `void` with its
-   signature on file as the evidence a chargeback would read.
-22. **A schedule is a promise.** The template had to be a draft invoice of the same merchant and the
-   same client, a duplicate template was refused by `recurring_schedules_template_key`, and
-   `fortnight`, a count of 0, a next run before the start, an end before the start, terms of 366
-   days, a reminder interval without a limit and a reminder before any run were each refused by
-   name.
-23. **The schedule moves.** A schedule paused, returned to active and ended, each with its instant,
-   and the planner answered the due list from `recurring_schedules_run_idx`.
-24. **Nothing here retries.** A query over `information_schema.columns` for a retry or attempt
-   column returned no row, because section 16 says a failed recurring payment is not retried
-   automatically; the absence is structural, not a setting.
-25. **Row level security.** A plain role saw zero quotes, zero lines, zero signatures and zero
-   schedules and could not insert into any of them, while the owner saw its own six quotes, two
-   signatures and one schedule.
-26. **Rollback and re-apply.** The twenty eight rollbacks emptied the `public` schema completely,
-   removed every function of this STEP, and the twenty eight forward files rebuilt it on a second
-   database with no rows.
+eight policies, thirty nine triggers and fifteen functions. 2. **Every table shape holds.**
+`estimates` reported 24 columns and 26 constraints, `estimate_items`
+16 and 15, `estimate_signatures` 18 and 15, `recurring_schedules` 21 and 20, with seven, four,
+three and four indexes, RLS on, one policy each, and 25, 17, 19 and 22 comments, so every column
+is documented. 3. **A quote is a draft by default.** A new quote stored as `draft` with no number,
+no issue
+instant, no expiry instant visible to the client, no money and version 1. 4. **A wrong total is
+derived, not stored.** A row written with `total_minor = 5` and a subtotal of
+100.00 less a 10.00 discount plus 8.00 tax was stored as 98.00 by the shared
+`invoices_derive_total()` function, so a quote and an invoice total by the same rule. 5. **The
+status vocabulary is section 16's**, asserted from `pg_get_constraintdef`, and an unknown
+word was refused by the vocabulary or the issue check, whichever the planner reached first. 6. **A
+quote states its own end.** `expires_at` is not null and must follow `issued_at`, and
+`void_reason` is `declined`, `expired` or `withdrawn`, present exactly when the status is `void`,
+so section 16's folded decline and expiry stay distinguishable. 7. **The status carries its own
+facts.** A void status without a reason, a reason on an open quote,
+the word `cancelled`, a draft carrying a number, a sent quote without one, a lower case number,
+an expiry before the issue instant, an accepted status without its instant, a conversion link on
+a quote that was not accepted, a padded and an empty client name, an address without an at sign,
+a 2001 character memo and a lower case currency were each refused by name. 8. **Numbers are per
+merchant.** Two merchants issued `EST-2026-0001` independently, and a duplicate
+inside one merchant was refused by `estimates_number_key`. 9. **The workflow moves.** A draft became
+`sent` with its number and instant, then `viewed`, then
+`accepted`; a declined quote and an expired quote both became `void` carrying `declined` and
+`expired` respectively. 10. **A decided quote is locked.** An edit to the memo of an accepted quote,
+a return to `void` and
+a soft delete were each refused with "a decided estimate is locked". 11. **One quote produces one
+invoice.** A second quote converting into the same invoice was refused
+by `estimates_invoice_key`, and because the terminal guard freezes a decided row, acceptance and
+`converted_invoice_id` are written in one statement, which the service must also do. 12. **The
+expiry index is used.** With sequential scans disabled the planner answered "which open
+quotes expire soon" from `estimates_expiry_idx`. 13. **A line rounds once.** Two and a half hours at
+1999 less a 500 discount is 4498 minor units,
+and the generated column reports version 1 on the first write. 14. **The quote totals itself.** Two
+lines settled the subtotal at 79198 before any quote level
+discount, then a 1000 discount and 800 tax produced a total of 78998 through the trigger pair. 15.
+**Every line shape is refused by name.** Position zero and a repeated position, a zero and a
+negative quantity, a negative unit price, a discount above the gross line, a padded and a 301
+character description, a unit outside the vocabulary, a line with both a product and a service, a
+product and a service from another merchant, a line numbered to another merchant's quote, and a
+line moved to another quote. 16. **An issued quote holds its lines.** A new line, an edit and a soft
+delete on a sent quote were
+each refused with "lines of an issued estimate are locked", while the same operations are allowed
+on a draft. 17. **Removing and editing lines moves the totals.** A removed line lowered the subtotal
+and freed
+its position, and an edited line moved its own total, its version to 2 and the quote subtotal to
+31896. 18. **Every section 16 element is stored.** The signature row held the decision, the consent
+wording
+with `consent_accepted = true`, a 64 character lower case hash, `host(ip)` equal to
+`203.0.113.10`, the geo location and the device fingerprint. 19. **The signature shape is closed.**
+An unticked consent, the word `maybe`, an upper case hash, a
+short hash, a three character fingerprint and an address without an at sign were refused. 20. **One
+signature per quote, and it is evidence.** A second signature was refused, an edit to a
+recorded signature and a removal of one were both refused with "estimate signatures are append
+only", and a signature offered on a draft or on a void quote was refused with "a quote accepts a
+signature only while it is open". 21. **Section 16 end to end.** An accepted two line quote
+converted into an invoice carrying the
+same two lines and the same total of 79198, while a declined quote stayed `void` with its
+signature on file as the evidence a chargeback would read. 22. **A schedule is a promise.** The
+template had to be a draft invoice of the same merchant and the
+same client, a duplicate template was refused by `recurring_schedules_template_key`, and
+`fortnight`, a count of 0, a next run before the start, an end before the start, terms of 366
+days, a reminder interval without a limit and a reminder before any run were each refused by
+name. 23. **The schedule moves.** A schedule paused, returned to active and ended, each with its
+instant,
+and the planner answered the due list from `recurring_schedules_run_idx`. 24. **Nothing here
+retries.** A query over `information_schema.columns` for a retry or attempt
+column returned no row, because section 16 says a failed recurring payment is not retried
+automatically; the absence is structural, not a setting. 25. **Row level security.** A plain role
+saw zero quotes, zero lines, zero signatures and zero
+schedules and could not insert into any of them, while the owner saw its own six quotes, two
+signatures and one schedule. 26. **Rollback and re-apply.** The twenty eight rollbacks emptied the
+`public` schema completely,
+removed every function of this STEP, and the twenty eight forward files rebuilt it on a second
+database with no rows.
 
 ## Verification
 - `npm run check:migrations`: `migrations gate passed: 843 checks, 28 migrations, 28 tables, every
@@ -186,28 +187,25 @@ ended with `PROOF COMPLETE`.
 1. **Counts written before they were measured.** The quote shape was planned as 25 constraints and
 measured as 26, so the down file's comment was corrected; the owner counts for the rebuilt database
 were planned as five and measured as six. The same discipline as STEP 020 and 021: the catalog is
-measured first, then the label is written.
-2. **A neighbouring check that hijacked a proof.** An unknown status was refused by
-`estimates_issue_check` before the vocabulary check, so the proof now asserts the five word
-vocabulary from `pg_get_constraintdef` and accepts either refusal, instead of adding a summary check
-that would have masked the specific ones.
-3. **A duplicate probe that ran too late.** The second signature was first attempted after
-acceptance and was refused by the terminal guard instead of the unique index; it now runs while the
-quote is still open, which is the only state in which a signature can be written at all.
-4. **A conversion that the lock pre-empted.** Creating the invoice and then setting
-`converted_invoice_id` in a second statement failed with "a decided estimate is locked"; the
-acceptance and the link are now one statement, and the handoff says so for the service author.
-5. **A draft invoice that could not carry its own numbers.** The conversion invoice was first
-created with `issued_at`, then with a discount and tax before its lines existed, and
-`invoices_issue_check` and `invoices_discount_check` refused both; it is now created bare, given the
-copied lines, and only then the quote level discount and tax, which is also how the invoice STEP
-proved it.
-6. **An address that rendered a netmask.** `ip::text` returns `203.0.113.10/32`, so the proof now
-compares `host(ip)`; the column and its check were already right.
-7. **A refusal that arrived as a privilege error.** A non-owner role inserting a signature failed
-with "permission denied for table estimates" before RLS, because the decision guard reads the quote;
-the proof accepts any of the three refusal messages, and the append only guarantee itself was proven
-by detaching the guard and watching the edit and the removal succeed.
+measured first, then the label is written. 2. **A neighbouring check that hijacked a proof.** An
+unknown status was refused by `estimates_issue_check` before the vocabulary check, so the proof now
+asserts the five word vocabulary from `pg_get_constraintdef` and accepts either refusal, instead of
+adding a summary check that would have masked the specific ones. 3. **A duplicate probe that ran too
+late.** The second signature was first attempted after acceptance and was refused by the terminal
+guard instead of the unique index; it now runs while the quote is still open, which is the only
+state in which a signature can be written at all. 4. **A conversion that the lock pre-empted.**
+Creating the invoice and then setting `converted_invoice_id` in a second statement failed with "a
+decided estimate is locked"; the acceptance and the link are now one statement, and the handoff says
+so for the service author. 5. **A draft invoice that could not carry its own numbers.** The
+conversion invoice was first created with `issued_at`, then with a discount and tax before its lines
+existed, and `invoices_issue_check` and `invoices_discount_check` refused both; it is now created
+bare, given the copied lines, and only then the quote level discount and tax, which is also how the
+invoice STEP proved it. 6. **An address that rendered a netmask.** `ip::text` returns
+`203.0.113.10/32`, so the proof now compares `host(ip)`; the column and its check were already
+right. 7. **A refusal that arrived as a privilege error.** A non-owner role inserting a signature
+failed with "permission denied for table estimates" before RLS, because the decision guard reads the
+quote; the proof accepts any of the three refusal messages, and the append only guarantee itself was
+proven by detaching the guard and watching the edit and the removal succeed.
 
 ## Decisions And Limits Left For Later STEPs
 - The quote stores no token. The tokenized link of section 16 is the portal STEP's data (181-190),
@@ -220,7 +218,7 @@ by detaching the guard and watching the edit and the removal succeed.
 - The signature is evidence of the document as it stood: `document_hash` is the SHA-256 the client
   saw. Producing that hash is the PDF renderer's job, not the database's.
 - `recurring_schedules` is a promise, not a job. Which worker wakes up, how it orders the due list
-  and how it records a failure is STEP 023's reminder work and the job STEPs; this schema only fixes
+  and how it records a failure is the work of the job STEPs of section 27; this schema only fixes
   the interval, the run dates and the reminder policy.
 - Section 16 says no automatic retry, so no retry or attempt column exists and none should be added
   quietly. If a later STEP wants to record a failure, it writes it as an event on the invoice, not
@@ -232,8 +230,10 @@ by detaching the guard and watching the edit and the removal succeed.
   and the office the whole list.
 
 ## Next Chat Notes
-- Next in this category is STEP 023. The quote, its lines, its signature and the schedule are the
-  four pieces section 16 asks for, and the invoice they produce is STEP 021's shape unchanged.
+- Next in this category is STEP 023, the provider catalogue, its encrypted keys, the routing rules,
+  the webhook events, the idempotency keys, the merchant API credentials, the store connections and
+  the TaxCloud connections. The quote, its lines, its signature and the schedule are the four pieces
+  section 16 asks for, and the invoice they produce is STEP 021's shape unchanged.
 - A writer that accepts a quote must do it in one statement: `status`, `accepted_at` and
   `converted_invoice_id` together, because the terminal guard freezes the row the moment it is
   decided. The service that also inserts the invoice should do both in one transaction.

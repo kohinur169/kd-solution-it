@@ -4,7 +4,7 @@
 Owner: STEP 012-036 and every later STEP that adds a table.
 
 Append-only numbered SQL migrations applied with the Supabase CLI against the project of the
-current environment. STEP 012 to STEP 022 created the first twenty eight files; `npm run
+current environment. STEP 012 to STEP 023 created the first thirty six files; `npm run
 check:migrations` keeps them honest.
 
 | File | What it creates |
@@ -37,6 +37,14 @@ check:migrations` keeps them honest.
 | 0026_estimate_items.sql | The `estimate_items` quote lines with their generated line total, their position uniqueness, their catalogue guard and their totals sync trigger, four indexes, RLS and the policy |
 | 0027_estimate_signatures.sql | The `estimate_signatures` evidence row with its consent pair, the IP, geo, fingerprint and SHA-256 document hash, one signature per quote, the append only guard and the open-quote guard, three indexes, RLS and the policy |
 | 0028_recurring_schedules.sql | The `recurring_schedules` repeating invoice with its draft template, its interval, run dates, terms and reminder policy, the template guard, four indexes, RLS and the default-deny policy |
+| 0029_payment_providers.sql | The `payment_providers` platform catalogue: a closed adapter vocabulary, a capability matrix of three booleans, the display order, the connection test and the enable condition, two indexes, RLS and the default-deny policy |
+| 0030_provider_keys.sql | The `provider_keys` AES-256-GCM ciphertext with its initialisation vector, tag and key version, the four visible characters, the fingerprint, one active key per provider and mode, the rotation link, the identity guard, five indexes and the policy |
+| 0031_routing_rules.sql | The `routing_rules` decision with one provider per rule, a unique priority per mode, the country, method and amount criteria, no fallback column, the enabled provider guard, four indexes, RLS and the default-deny policy |
+| 0032_webhook_events.sql | The `webhook_events` delivery keyed by the provider identifier, with the payload hash, the signature result, the forward only status, the evidence guard, four indexes, RLS and the policy |
+| 0033_idempotency_keys.sql | The `idempotency_keys` caller key as a hash, unique per tenant and scope, with the request hash, the three states, the replayed answer, the expiry window, the state guard, four indexes and the policy |
+| 0034_merchant_api_credentials.sql | The `merchant_api_credentials` key as a hash plus prefix and tail, the encrypted signing secret beside its own tail, the rotation link, the revocation, the identity guard, five indexes and the policy |
+| 0035_store_connections.sql | The `store_connections` Shopify and WooCommerce row with its bare lower case domain, its encrypted access token, its install states, the identity guard, three indexes and the policy |
+| 0036_taxcloud_connections.sql | The `taxcloud_connections` merchant account with both credentials encrypted, one usable connection per merchant, the on and off collection switch, the credential guard, two indexes and the policy |
 
 Every file is paired with `<name>.down.sql`, which undoes exactly what its forward file created and
 nothing else.
@@ -139,30 +147,46 @@ nothing else.
     both draw `unit` from the same closed list because the invoice prints the quantity and the word
     together. A product identifies itself by a SKU and defaults to `item`; a service identifies
     itself by a code and defaults to `hour`.
-27. An invoice is a document, not a view of other tables. It snapshots the client name, email and
+26. An invoice is a document, not a view of other tables. It snapshots the client name, email and
     address when it is issued, its lines snapshot the description, unit and price, and its number is
     assigned at issue rather than at creation, so a draft never burns one. `total = subtotal -
     discount + tax` is derived by a trigger and stated again by a check, and the status carries its
     own facts: paid exactly when the paid instant is set, void exactly when the voided instant is
     set, and a paid invoice that the guard trigger holds shut against every change.
-28. A line is arithmetic defined once and a timeline is evidence. `line_total_minor` is a generated
+27. A line is arithmetic defined once and a timeline is evidence. `line_total_minor` is a generated
     column, an item trigger keeps the parent subtotal equal to the sum of the live lines and refuses
     any line change on an invoice that has left draft, and `invoice_events` refuses every update and
     every removal, so what a dispute pack reads months later is what happened. Both child tables
     point at their invoice through `(invoice_id, company_id)`, so no row can join another merchant's
     document.
-30. A quote is a document that ends in a decision. It snapshots its client and its lines like an
+28. A quote is a document that ends in a decision. It snapshots its client and its lines like an
     invoice, derives its total the same way, and states its own expiry; `accepted` and `void` are
     terminal and a guard trigger holds them shut. Section 16 folds a decline and an expiry into
     `void`, so `void_reason` carries which one happened, and acceptance is written once together
     with the invoice it becomes, because the same statement that decides a quote freezes it.
-31. A signature is evidence and a schedule is a promise. Every element section 16 names sits on the
+29. A signature is evidence and a schedule is a promise. Every element section 16 names sits on the
     signature row, the consent pair cannot be false, the document hash is 64 lower case hex
     characters, one quote takes one signature, and nothing may update or remove the row. A recurring
     schedule points at a draft invoice as its template rather than a second catalogue of lines,
     states its interval and run dates in columns, and has no retry or attempt column at all, because
     section 16 says a failed recurring payment is not retried automatically.
-32. Numbering is contiguous from 0001. A migration is never renumbered after it has been applied
+31. A provider is a catalogue row and a key is ciphertext. `payment_providers` holds the closed
+    vocabulary of the five section 6 adapters, a capability matrix of three booleans, and an
+    `enabled` state that a passing connection test alone permits. `provider_keys` holds the
+    AES-256-GCM ciphertext of a key with its vector, its tag and its key version, and nothing but
+    four visible characters, so one active key per provider and mode is what makes rotation the
+    section 29 procedure of add, test, activate, disable. A routing rule names exactly one provider,
+    its priority is unique per mode, and there is no fallback column anywhere, because section 6
+    rejects a payment no rule matches instead of sending it somewhere else.
+32. A credential is a hash and a secret is ciphertext. `merchant_api_credentials` keeps the API key
+    only as a SHA-256 with its visible prefix and tail, and encrypts the webhook signing secret
+    because it must be read back; `store_connections` and `taxcloud_connections` encrypt their
+    tokens the same way, all three refuse new ciphertext under an unchanged key version, and a
+    revoked row stays revoked. `idempotency_keys` keeps the caller key as a hash, unique per tenant
+    and scope, with the answer a retry replays and a guard that never reopens a decided key.
+    `webhook_events` is keyed by the provider own identifier, keeps only the payload hash, and lets
+    an unverified delivery live as `rejected` but never as `processed`.
+33. Numbering is contiguous from 0001. A migration is never renumbered after it has been applied
     anywhere.
 
 ## Commands
