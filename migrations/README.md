@@ -4,7 +4,7 @@
 Owner: STEP 012-036 and every later STEP that adds a table.
 
 Append-only numbered SQL migrations applied with the Supabase CLI against the project of the
-current environment. STEP 012 to STEP 024 created the first thirty nine files; `npm run
+current environment. STEP 012 to STEP 025 created the first forty one files; `npm run
 check:migrations` keeps them honest.
 
 | File | What it creates |
@@ -48,6 +48,8 @@ check:migrations` keeps them honest.
 | 0037_payments.sql | The `payments` processor transaction with its provider, key, routing rule and unique idempotency key, its amount, fee and generated net, the four card characters, the 3DS capture rule, the risk rule, the status instants, the refund state guard, seven indexes and the policy |
 | 0038_refunds.sql | The `refunds` document with its request, approval and processing states, the cap guard against its payment, the sync that writes the payment refunded total and status, four indexes and the policy |
 | 0039_disputes.sql | The `disputes` chargeback with its 24 or 48 hour deadline, the evidence flag, the response and its submission, the resolved outcome, the deadline guard, four indexes and the policy |
+| 0040_ledger_accounts.sql | The `ledger_accounts` chart with its eight closed codes, the kind and side pairing, the platform and merchant scopes of two partial unique keys, the close instant, the identity guard, three indexes and the policy |
+| 0041_ledger_entries.sql | The `ledger_entries` double-entry rows with their balanced group, the deferred balance trigger, the append only guard, the reversal mirror and its one-reversal key, the three source pairs, the invoice sync, six indexes and the policy |
 
 Every file is paired with `<name>.down.sql`, which undoes exactly what its forward file created and
 nothing else.
@@ -173,7 +175,7 @@ nothing else.
     schedule points at a draft invoice as its template rather than a second catalogue of lines,
     states its interval and run dates in columns, and has no retry or attempt column at all, because
     section 16 says a failed recurring payment is not retried automatically.
-31. A provider is a catalogue row and a key is ciphertext. `payment_providers` holds the closed
+30. A provider is a catalogue row and a key is ciphertext. `payment_providers` holds the closed
     vocabulary of the five section 6 adapters, a capability matrix of three booleans, and an
     `enabled` state that a passing connection test alone permits. `provider_keys` holds the
     AES-256-GCM ciphertext of a key with its vector, its tag and its key version, and nothing but
@@ -181,7 +183,7 @@ nothing else.
     section 29 procedure of add, test, activate, disable. A routing rule names exactly one provider,
     its priority is unique per mode, and there is no fallback column anywhere, because section 6
     rejects a payment no rule matches instead of sending it somewhere else.
-32. A credential is a hash and a secret is ciphertext. `merchant_api_credentials` keeps the API key
+31. A credential is a hash and a secret is ciphertext. `merchant_api_credentials` keeps the API key
     only as a SHA-256 with its visible prefix and tail, and encrypts the webhook signing secret
     because it must be read back; `store_connections` and `taxcloud_connections` encrypt their
     tokens the same way, all three refuse new ciphertext under an unchanged key version, and a
@@ -189,17 +191,31 @@ nothing else.
     and scope, with the answer a retry replays and a guard that never reopens a decided key.
     `webhook_events` is keyed by the provider own identifier, keeps only the payload hash, and lets
     an unverified delivery live as `rejected` but never as `processed`.
-34. A payment is one processor transaction with a route. It names the provider, the key, the routing
+32. A payment is one processor transaction with a route. It names the provider, the key, the routing
     rule and the idempotency key, and the key is unique, so the second delivery of a request cannot
     write a second payment. `net_minor` is generated from the amount and the fee, the only card
     columns are the brand and four digits, and section 18's two operational rules are checks: a
     capture without 3DS needs the postal code and the IP country to match, and a fraud rejection can
     only sit on a failed payment.
-35. A refund is capped by its payment and a dispute is a deadline. The refund guard sums the live
+33. A refund is capped by its payment and a dispute is a deadline. The refund guard sums the live
     refunds and refuses one that would take the total above what was charged, its sync writes the
     payment refunded total and status so nobody types them, and a refund is cancelled or failed
     rather than removed. A dispute states its opening instant, its 24 or 48 hour window and its due
     date, cannot be submitted without its evidence pack, and cannot reopen once resolved.
+34. A chart of accounts is eight closed codes, not free text. `ledger_accounts` accepts only the
+    codes section 11 names, pairs each kind with its normal side, and scopes them with two partial
+    unique keys so the platform chart holds one row per code while a merchant may repeat a code
+    inside its own chart. A closed account carries its instant and cannot reopen, its code, kind,
+    side and owner never change, and a soft deleted row frees its code for a fresh one.
+35. A money movement is a balanced group and a posted entry never changes. `ledger_entries` names
+    its movement through `entry_group_id`, and a deferred constraint trigger sums that group at
+    commit and refuses anything but equal debits and credits in one currency for one merchant, so a
+    half posted movement cannot commit. Every update and every removal is refused by the append only
+    guard, so a correction is a reversal: the mirror guard requires the opposite side, the same
+    amount, the same currency and merchant, in a group of its own, and the unique index allows one
+    reversal per entry. The payment, refund and dispute links are pairs of a source type and a
+    foreign key, and the payment post writes the invoice paid total and state that STEP 024 left to
+    this STEP.
 36. Numbering is contiguous from 0001. A migration is never renumbered after it has been applied
     anywhere.
 

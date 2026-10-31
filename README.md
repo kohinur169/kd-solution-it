@@ -420,6 +420,17 @@ handoff file.
   status are written by the database and never by hand. `public.disputes` is the chargeback with its
   opening instant, its 24 or 48 hour window, its evidence flag and its resolved outcome, and a
   resolved dispute cannot reopen.
+- STEP 025 adds the ledger section 11 describes. `public.ledger_accounts` is the chart: eight closed
+  codes, each kind paired with its normal side, scoped by two partial unique keys so the platform
+  holds one row per code while a merchant repeats a code inside its own chart, with a close instant,
+  a frozen identity and a soft delete that frees the code. `public.ledger_entries` is the movement:
+  every entry names its `entry_group_id`, and a deferred constraint trigger balances that group at
+  commit, refusing anything but equal debits and credits in one currency for one merchant, so a half
+  posted movement cannot commit. The append-only guard refuses every update and removal, so a
+  correction is a reversal whose guard demands the opposite side, the same amount and its own group,
+  and the unique index allows one reversal per entry. The payment, refund and chargeback links are
+  source pairs of a type and a foreign key, and a posted payment writes its invoice's paid total and
+  `partially_paid` or `paid` state, which is the tie STEP 024 left to this STEP.
 - `public.uuid_generate_v7()` is defined in `0001`, because PostgreSQL before 18 has no native
   UUID v7. Ids sort by creation time, carry version nibble 7 and the RFC 4122 variant bits, and
   take their random tail from `gen_random_uuid()`.
