@@ -7,6 +7,7 @@ import { PLATFORM_ROLES, isPlatformRole, type PlatformRole, type RequestActor } 
 import { getMessage, type MessagePath } from "../../lib/i18n/messages.ts";
 import { APPROVAL_QUEUE_ROLES } from "../../lib/approvals/registry.ts";
 import { GATEWAY_MANAGEMENT_ROLES, OFFICE_DASHBOARD_ROLES } from "../../lib/gateways/registry.ts";
+import { PERMISSION_DELEGATION_ROLES } from "../../lib/permissions/registry.ts";
 import {
   decideOfficeAccess,
   hasOfficeRole,
@@ -140,13 +141,13 @@ function checkRoles(): void {
   expectEqual(isOfficeRole(42), false, "nor a number");
 }
 
-/** ---- The section catalog: six screens, each with the roles its service enforces. */
+/** ---- The section catalog: seven screens, each with the roles its service enforces. */
 function checkCatalog(): void {
-  expectEqual(OFFICE_NAVIGATION.length, 6, "six office screens exist");
+  expectEqual(OFFICE_NAVIGATION.length, 7, "seven office screens exist");
   expect(Object.isFrozen(OFFICE_NAVIGATION), "the catalog is frozen");
   expectEqual(
     OFFICE_NAVIGATION.map((section) => section.key).join(","),
-    "workspace,dashboard,ceo,gateways,sessions,twoFactorResets",
+    "workspace,dashboard,ceo,gateways,delegations,sessions,twoFactorResets",
     "in the order the sidebar shows them",
   );
   expectEqual(
@@ -210,7 +211,17 @@ function checkCatalog(): void {
   expectEqual(
     officeSectionByKey("gateways")?.roles.join(","),
     GATEWAY_MANAGEMENT_ROLES.join(","),
-    "and the gateway entry carries the role list of the gateway service",
+    "the gateway entry carries the role list of the gateway service",
+  );
+  expectEqual(
+    officeSectionByKey("delegations")?.roles.join(","),
+    PERMISSION_DELEGATION_ROLES.join(","),
+    "and the delegation entry carries the role list of the permission service",
+  );
+  expectEqual(
+    PERMISSION_DELEGATION_ROLES.join(","),
+    "super_admin",
+    "section 2 keeps the delegation lever to the super administrator",
   );
   expectEqual(
     GATEWAY_MANAGEMENT_ROLES.join(","),
@@ -232,7 +243,7 @@ function checkCatalog(): void {
 /** ---- Which roles see which screen. */
 function checkRoleFiltering(): void {
   const expected: Readonly<Record<PlatformRole, string>> = {
-    super_admin: "workspace,dashboard,ceo,gateways,sessions,twoFactorResets",
+    super_admin: "workspace,dashboard,ceo,gateways,delegations,sessions,twoFactorResets",
     ceo: "workspace,ceo,sessions,twoFactorResets",
     compliance_kyc: "workspace,sessions,twoFactorResets",
     finance_ops: "workspace",
@@ -255,7 +266,7 @@ function checkRoleFiltering(): void {
   );
   expectEqual(
     sectionsOf(["support", "super_admin"]),
-    "workspace,dashboard,ceo,gateways,sessions,twoFactorResets",
+    "workspace,dashboard,ceo,gateways,delegations,sessions,twoFactorResets",
     "and the union is not counted twice",
   );
   expectEqual(sectionKeysOf(officeSectionsFor(["ceo"]).map((section) => section.key)), "workspace,ceo,sessions,twoFactorResets", "the catalog order is stable");

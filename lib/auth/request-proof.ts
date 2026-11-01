@@ -128,6 +128,11 @@ export const SENSITIVE_ENDPOINTS: readonly SensitiveEndpoint[] = [
   },
   {
     method: "POST",
+    path: "/api/office/delegations",
+    note: "Section 2's delegation lever (STEP 071): handing a permission to a colleague grants an authority, so the browser that hands it out is the one that signs.",
+  },
+  {
+    method: "POST",
     path: "/api/office/gateways",
     note: "Section 6's gateway page (STEP 069): storing a provider key or changing a provider's state is the request that decides where money is routed, so it is signed by the browser holding the key.",
   },
