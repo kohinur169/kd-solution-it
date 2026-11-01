@@ -57,16 +57,17 @@ export function getAuthRuntime(): AuthRuntime {
   const config = getAuthConfig();
   const http = createAuthHttpForConfig(config);
   const server = getServerConfig();
+  const settings = createRestSettings(config, http, () => serverEnv().ENCRYPTION_MASTER_KEY);
 
   runtime = {
     config,
     http,
     rest: createRestClient(config, http),
-    settings: createRestSettings(config, http, () => serverEnv().ENCRYPTION_MASTER_KEY),
+    settings,
     client: createAuthClient(config, http),
     admin: createAuthAdminClient(config, http),
     turnstile: createTurnstileGuard({
-      settings: createRestSettings(config, http, () => serverEnv().ENCRYPTION_MASTER_KEY),
+      settings,
       http,
       isProduction: server.isProduction,
     }),

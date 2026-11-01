@@ -156,6 +156,11 @@
      - **Mail template**: point the Supabase confirmation template at
        `/api/auth/verify?token_hash={{ .TokenHash }}&type={{ .Type }}` on `APP_URL`; with the default
        template the link never reaches this route and no account is ever verified.
+     - **Policy pages**: the twelve pages of `0078` are seeded as drafts and
+       `public.bootstrap_super_admin()` of `0079` publishes them in the transaction that creates the
+       first account. Signup on a database where the bootstrap has not run answers
+       `SERVICE_UNAVAILABLE`, which is the designed answer and not a defect: consent is recorded
+       against published text, so the bootstrap is a prerequisite of the first real signup.
   4. The audit chain is per company, with `PLATFORM_CHAIN_ID` (all zero UUID) for platform events.
      Never write an audit row with a hand made sequence: the insert guard refuses it and the caller
      has no way to recover the link.
