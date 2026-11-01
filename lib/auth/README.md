@@ -401,6 +401,35 @@ the authority. A permission check uses the record, never a claim.
     `openSession` and `rotateSession` compute each expiry as the earlier of the rotation window and
     the ceiling, so a browser that keeps a stolen cookie rotating cannot extend a login for ever.
     A rotation past the ceiling is refused as `expired`, not silently renewed.
+75. A new device is detected where a session starts, and nowhere else. `device_proof_keys.trusted_at`
+    is the flag: STEP 049 writes every enrolment with it null, STEP 051 binds a session to that row
+    and reports the flag without enforcing it, and `lib/auth/device-trust.ts` - the sibling of the
+    lock alert, one table over - is the module that turns the flag over. The detection runs in
+    `POST /api/auth/session/rotate` only when the answer is `bound` - the request that starts a
+    session - so rotating an existing session is the same machine asking again and never becomes a
+    second email.
+76. The alert is a queue row, not a mail client. `challengeDeviceTrust` writes one
+    `email_send_logs` row with `template_key = 'new_device_alert'`, `reference_kind = 'account'` and
+    the account's own address, in the shape `lock-alert.ts` already uses, and the section 23 worker
+    of STEP 227 does the rest. `0090`'s unique index on the alert and its partial unique index on one
+    live challenge per device are what make "one alert per new device" true even when two requests
+    read the same empty table: the loser's row is marked `dropped` with a reason.
+77. The step that trusts a device is the second factor, not another email. `email_send_logs` has no
+    field for a per-send secret and `0060`/`0061` are closed, so the platform does not pretend to
+    mail a code it could not mail: `POST /api/auth/devices/confirm` takes the authenticator code,
+    verifies it against the sealed secret (`twoFactorContext`), and only then stamps `trusted_at`
+    and consumes the challenge. A wrong code spends an attempt of the five `0090` allows; an
+    expired challenge, an exhausted budget and an account that never finished its enrolment are
+    three different `422` rules because each asks the person for something different.
+78. The session must be bound to the device it is confirming. `sessions.device_proof_key_id` is
+    compared with the device in the body before the code is read, so a session on a trusted machine
+    cannot be used to trust a machine somebody else holds; the refusal is `403`, which a screen can
+    act on, and a `401` would read as "sign in again" and change nothing.
+79. An unconfirmed device gets no dangerous action. `verifySensitiveRequest` still reports
+    `trusted` rather than refusing - every key the platform creates starts unconfirmed, and the
+    enrolment has to be reachable from the device that has to be confirmed - and
+    `requireTrustedDevice` turns the report into the refusal at the three endpoints that hand out a
+    way in: ten fresh backup codes, an approved reset and an unlock.
 
 ## Adding an operation
 

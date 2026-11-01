@@ -55,9 +55,18 @@ import {
 import { readBoundSession, readRequestActor } from "./request-actor.ts";
 import {
   isSensitivePath,
+  requireTrustedDevice,
   SENSITIVE_ENDPOINTS,
   verifySensitiveRequest,
 } from "./request-proof.ts";
+import {
+  challengeDeviceTrust,
+  confirmDeviceTrust,
+  DEVICE_TRUST_MAXIMUM_ATTEMPTS,
+  DEVICE_TRUST_WINDOW_MS,
+  NEW_DEVICE_TEMPLATE_KEY,
+  readDeviceTrust,
+} from "./device-trust.ts";
 import {
   ANONYMOUS_AUTH_SURFACES,
   ANONYMOUS_REFUSAL,
@@ -9764,7 +9773,988 @@ async function checkSessionRotation(): Promise<void> {
     (file) => file.path.endsWith(".tsx") && file.source.includes("<SessionKeeper"),
   );
 
-  expectEqual(keepers.length, 2, "both signed-in pages keep their session rotating");
+  // The settings screen and the new device confirmation are the two signed-in pages of section 22;
+  // both keep the token rotating while the person reads them.
+  expectEqual(keepers.length, 3, "every signed-in page keeps its session rotating");
+}
+
+/**
+ * An in-memory picture of the four tables STEP 052 writes.
+ *
+ * The double keeps the two rules the migration enforces and the service depends on - one live
+ * challenge per device, one challenge per alert - because a double that accepted everything would
+ * prove nothing about the code that reads those answers. Everything else is a plain array with the
+ * filters the service sends.
+ */
+interface TrustDeviceRow {
+  id: string;
+  user_id: string;
+  label: string | null;
+  trusted_at: string | null;
+  revoked_at: string | null;
+  deleted_at: string | null;
+}
+
+interface TrustChallengeRow {
+  id: string;
+  company_id: string | null;
+  user_id: string;
+  device_proof_key_id: string;
+  alert_send_id: string | null;
+  attempts: number;
+  max_attempts: number;
+  issued_at: string;
+  expires_at: string;
+  consumed_at: string | null;
+  revoked_at: string | null;
+  deleted_at: string | null;
+}
+
+interface TrustAccountRow {
+  id: string;
+  email: string;
+  totp_secret_ciphertext: string | null;
+  totp_confirmed_at: string | null;
+  deleted_at: string | null;
+}
+
+interface TrustSendRow {
+  id: string;
+  company_id: string | null;
+  template_key: string;
+  recipient_email: string;
+  recipient_user_id: string | null;
+  subject: string;
+  provider: string;
+  status: string;
+  failure_reason: string | null;
+  reference_kind: string;
+  reference_id: string;
+}
+
+interface TrustWorld {
+  readonly devices: TrustDeviceRow[];
+  readonly challenges: TrustChallengeRow[];
+  readonly accounts: TrustAccountRow[];
+  readonly sends: TrustSendRow[];
+  readonly methods: readonly ("smtp" | "api")[];
+  readonly rest: RestClient;
+  /** Set by a test that wants the queue to refuse, which a deployment can do too. */
+  refuseQueue: boolean;
+  sequence(): number;
+}
+
+/** The value of one `name=eq.value` filter, or null when the query does not carry it. */
+function filterValue(query: string, name: string): string | null {
+  const match = new RegExp(`(?:^|[&])${name}=eq\\.([^&]+)`, "u").exec(query);
+  const value = match?.[1];
+
+  return value === undefined ? null : decodeURIComponent(value);
+}
+
+function createTrustWorld(options: {
+  readonly method?: "smtp" | "api";
+  readonly totp?: boolean;
+  readonly secret?: string;
+}): TrustWorld {
+  const devices: TrustDeviceRow[] = [];
+  const challenges: TrustChallengeRow[] = [];
+  const accounts: TrustAccountRow[] = [];
+  const sends: TrustSendRow[] = [];
+  const methods = options.method === undefined ? [] : [options.method];
+  let counter = 0;
+
+  function nextId(prefix: string): string {
+    counter += 1;
+
+    return `${prefix}-${String(counter).padStart(4, "0")}`;
+  }
+
+  const world: TrustWorld = {
+    devices,
+    challenges,
+    accounts,
+    sends,
+    methods,
+    refuseQueue: false,
+    sequence(): number {
+      return counter;
+    },
+    rest: {
+      select<TRow>(table: string, query: string): Promise<readonly TRow[]> {
+        if (table === "device_proof_keys") {
+          const id = filterValue(query, "id");
+          const userId = filterValue(query, "user_id");
+
+          return Promise.resolve(
+            devices
+              .filter((row) => row.revoked_at === null && row.deleted_at === null)
+              .filter((row) => id === null || row.id === id)
+              .filter((row) => userId === null || row.user_id === userId)
+              .map((row) => ({ id: row.id, label: row.label, trusted_at: row.trusted_at }))
+              .slice(0, 1) as unknown as readonly TRow[],
+          );
+        }
+
+        if (table === "device_trust_challenges") {
+          const deviceId = filterValue(query, "device_proof_key_id");
+
+          return Promise.resolve(
+            challenges
+              .filter((row) => row.consumed_at === null && row.revoked_at === null && row.deleted_at === null)
+              .filter((row) => deviceId === null || row.device_proof_key_id === deviceId)
+              .map((row) => ({
+                id: row.id,
+                alert_send_id: row.alert_send_id,
+                attempts: row.attempts,
+                max_attempts: row.max_attempts,
+                expires_at: row.expires_at,
+                consumed_at: row.consumed_at,
+              }))
+              .slice(0, 1) as unknown as readonly TRow[],
+          );
+        }
+
+        if (table === "users") {
+          const id = filterValue(query, "id");
+
+          return Promise.resolve(
+            accounts
+              .filter((row) => row.deleted_at === null)
+              .filter((row) => id === null || row.id === id)
+              .map((row) => ({
+                email: row.email,
+                totp_secret_ciphertext: row.totp_secret_ciphertext,
+                totp_confirmed_at: row.totp_confirmed_at,
+              }))
+              .slice(0, 1) as unknown as readonly TRow[],
+          );
+        }
+
+        if (table === "email_settings") {
+          return Promise.resolve(
+            methods.map((method) => ({ method })).slice(0, 1) as unknown as readonly TRow[],
+          );
+        }
+
+        return Promise.resolve([]);
+      },
+
+      insert<TRow>(): Promise<TRow> {
+        return Promise.reject(new AppError("INTERNAL_ERROR"));
+      },
+
+      insertReturning<TRow>(
+        table: string,
+        rows: readonly Readonly<Record<string, unknown>>[],
+      ): Promise<readonly TRow[]> {
+        if (table === "email_send_logs") {
+          if (world.refuseQueue) {
+            return Promise.reject(new AppError("DEPENDENCY_FAILED"));
+          }
+
+          const written = rows.map((row) => {
+            const send: TrustSendRow = {
+              id: nextId("send"),
+              company_id: (row["company_id"] as string | null | undefined) ?? null,
+              template_key: String(row["template_key"]),
+              recipient_email: String(row["recipient_email"]),
+              recipient_user_id: (row["recipient_user_id"] as string | null | undefined) ?? null,
+              subject: String(row["subject"]),
+              provider: String(row["provider"]),
+              status: "queued",
+              failure_reason: null,
+              reference_kind: String(row["reference_kind"]),
+              reference_id: String(row["reference_id"]),
+            };
+
+            sends.push(send);
+
+            return { id: send.id };
+          });
+
+          return Promise.resolve(written as unknown as readonly TRow[]);
+        }
+
+        if (table === "device_trust_challenges") {
+          const written: { id: string }[] = [];
+
+          for (const row of rows) {
+            const deviceId = String(row["device_proof_key_id"]);
+            const alertSendId = (row["alert_send_id"] as string | null | undefined) ?? null;
+            const live = challenges.some(
+              (existing) =>
+                existing.device_proof_key_id === deviceId &&
+                existing.consumed_at === null &&
+                existing.revoked_at === null &&
+                existing.deleted_at === null,
+            );
+
+            if (live || (alertSendId !== null && challenges.some((existing) => existing.alert_send_id === alertSendId))) {
+              throw new AppError("CONFLICT");
+            }
+
+            const challenge: TrustChallengeRow = {
+              id: nextId("challenge"),
+              company_id: (row["company_id"] as string | null | undefined) ?? null,
+              user_id: String(row["user_id"]),
+              device_proof_key_id: deviceId,
+              alert_send_id: alertSendId,
+              attempts: Number(row["attempts"] ?? 0),
+              max_attempts: Number(row["max_attempts"] ?? 5),
+              issued_at: String(row["issued_at"]),
+              expires_at: String(row["expires_at"]),
+              consumed_at: null,
+              revoked_at: null,
+              deleted_at: null,
+            };
+
+            challenges.push(challenge);
+            written.push({ id: challenge.id });
+          }
+
+          return Promise.resolve(written as unknown as readonly TRow[]);
+        }
+
+        return Promise.resolve([]);
+      },
+
+      update(table: string, query: string, values: Readonly<Record<string, unknown>>): Promise<void> {
+        if (table === "device_trust_challenges") {
+          const id = filterValue(query, "id");
+          const liveOnly = query.includes("consumed_at=is.null");
+
+          for (const row of challenges) {
+            if (id !== null && row.id !== id) {
+              continue;
+            }
+
+            if (liveOnly && (row.consumed_at !== null || row.revoked_at !== null)) {
+              continue;
+            }
+
+            if ("attempts" in values) {
+              row.attempts = Number(values["attempts"]);
+            }
+
+            if ("consumed_at" in values) {
+              row.consumed_at = String(values["consumed_at"]);
+            }
+
+            if ("revoked_at" in values) {
+              row.revoked_at = String(values["revoked_at"]);
+            }
+          }
+
+          return Promise.resolve();
+        }
+
+        if (table === "device_proof_keys") {
+          const id = filterValue(query, "id");
+          const untrustedOnly = query.includes("trusted_at=is.null");
+
+          for (const row of devices) {
+            if (id !== null && row.id !== id) {
+              continue;
+            }
+
+            if (untrustedOnly && row.trusted_at !== null) {
+              continue;
+            }
+
+            if ("trusted_at" in values) {
+              row.trusted_at = String(values["trusted_at"]);
+            }
+          }
+
+          return Promise.resolve();
+        }
+
+        if (table === "email_send_logs") {
+          const id = filterValue(query, "id");
+
+          for (const row of sends) {
+            if (id !== null && row.id !== id) {
+              continue;
+            }
+
+            if ("status" in values) {
+              row.status = String(values["status"]);
+            }
+
+            if ("failure_reason" in values) {
+              row.failure_reason = String(values["failure_reason"]);
+            }
+          }
+
+          return Promise.resolve();
+        }
+
+        return Promise.resolve();
+      },
+
+      rpc(): Promise<unknown> {
+        return Promise.resolve(null);
+      },
+    },
+  };
+
+  return world;
+}
+
+/** One refusal, with the rule it named so a test can tell two refusals apart. */
+function trustRefusalRule(error: AppError): string | null {
+  const details = error.details;
+
+  return details[0]?.rule ?? null;
+}
+
+/**
+ * STEP 052: new device detection, the alert, and the confirmation that turns the flag over.
+ *
+ * The gate proves five things, in the order the module decides them:
+ *
+ *   1. a device nobody has confirmed is challenged once, and the owner is told once, through the
+ *      section 23 queue in the shape that queue already uses;
+ *   2. a device that is already trusted, and a device that is not this account's, are answers rather
+ *      than errors, because the caller's job is to say "not trusted" and not to handle a failure;
+ *   3. a deployment with no sending method still records the challenge, and says so in the log;
+ *   4. the confirmation needs the authenticator code, spends an attempt on a wrong one, and refuses
+ *      a session that is bound to another device before it reads a code at all;
+ *   5. a spent budget, an ended challenge and an account that never finished its second factor are
+ *      different refusals, because each asks the person for something different.
+ */
+async function checkDeviceTrust(): Promise<void> {
+  const window = 24 * 60 * 60_000;
+
+  // ---- the constants the migration and the service agree on
+  expectEqual(DEVICE_TRUST_MAXIMUM_ATTEMPTS, 5, "the attempt budget is five codes");
+  expectEqual(DEVICE_TRUST_WINDOW_MS, window, "a challenge lives a day");
+  expectEqual(NEW_DEVICE_TEMPLATE_KEY, "new_device_alert", "the alert uses the template of section 23");
+
+  const migration = await readFile(
+    new URL("../../migrations/0090_device_trust_challenges.sql", import.meta.url),
+    "utf8",
+  );
+  const logMigration = await readFile(
+    new URL("../../migrations/0061_email_send_logs.sql", import.meta.url),
+    "utf8",
+  );
+
+  expect(migration.includes("interval '24 hours'"), "the migration bounds the window the service uses");
+  expect(migration.includes("attempts <= max_attempts"), "the migration bounds the budget the service spends");
+  expect(logMigration.includes("'new_device_alert'"), "the template the alert names is one the log accepts");
+
+  // ---- a challenge, and the alert that goes with it
+  const world = createTrustWorld({ method: "smtp", secret: base32Encode(new Uint8Array(20).fill(3)) });
+  const deviceId = "018f3b1c-2222-7c2a-9d1e-2b3c4d5e6f71";
+  const secret = base32Encode(new Uint8Array(20).fill(3));
+
+  world.devices.push({
+    id: deviceId,
+    user_id: USER_ID,
+    label: "Office laptop",
+    trusted_at: null,
+    revoked_at: null,
+    deleted_at: null,
+  });
+  world.accounts.push({
+    id: USER_ID,
+    email: "owner@example.com",
+    totp_secret_ciphertext: packSecretBox(
+      sealSecret(MASTER_KEY, secret, twoFactorContext(USER_ID)),
+    ),
+    totp_confirmed_at: new Date(NOW - 86_400_000).toISOString(),
+    deleted_at: null,
+  });
+
+  const audit = createInMemoryAuditTrail();
+  const logger = captureLogger().logger;
+  const dependencies = {
+    rest: world.rest,
+    audit,
+    logger,
+    masterKey: () => MASTER_KEY,
+    now: () => NOW,
+  };
+
+  const challengeInput = {
+    userId: USER_ID,
+    companyId: FIRM_ID,
+    deviceId,
+    ipAddress: "203.0.113.9",
+    userAgent: "gate",
+  };
+
+  const first = await challengeDeviceTrust(challengeInput, dependencies);
+
+  expectEqual(first.status, "challenged", "an unconfirmed device is challenged");
+  expectEqual(
+    first.status === "challenged" ? first.expiresAtEpochMs : 0,
+    NOW + window,
+    "the challenge expires a day after it was issued",
+  );
+  expectEqual(world.sends.length, 1, "the owner is told about the new device once");
+
+  const send = world.sends[0];
+
+  expectEqual(send?.template_key, "new_device_alert", "the alert is the template of section 23");
+  expectEqual(send?.status, "queued", "the alert is queued, not sent");
+  expectEqual(send?.provider, "smtp", "the alert uses the sending method the office made active");
+  expectEqual(send?.recipient_email, "owner@example.com", "the alert goes to the account's own address");
+  expectEqual(send?.reference_kind, "account", "the alert names the account it is about");
+  expectEqual(send?.reference_id, USER_ID, "and names it by id");
+  expectEqual(send?.subject, getMessage("email.newDevice.subject"), "the subject is a message, not a literal");
+  expect(
+    send !== undefined && send.subject.length > 20 && send.subject.length <= 200,
+    "the subject fits a mail header",
+  );
+
+  expectEqual(audit.entries.length, 1, "the challenge writes one audit entry");
+  expectEqual(audit.entries[0]?.action, "device.trust_challenged", "the entry names the challenge");
+  expectEqual(audit.entries[0]?.entityType, "device_proof_key", "the entry names the device it is about");
+  expectEqual(audit.entries[0]?.entityId, deviceId, "and names it by id");
+  expectEqual(audit.entries[0]?.payload["alert_queued"], true, "the entry records that the owner was told");
+  expect(
+    typeof audit.entries[0]?.action === "string" && /^[a-z][a-z0-9]*([.][a-z0-9_]+)+$/u.test(audit.entries[0].action),
+    "the action name fits the audit vocabulary",
+  );
+
+  // ---- a second bind is the same device, not a second email
+  const again = await challengeDeviceTrust(challengeInput, dependencies);
+
+  expectEqual(again.status, "already_open", "a live challenge is reused, not repeated");
+  expectEqual(world.sends.length, 1, "a second bind mails the owner nothing");
+  expectEqual(world.challenges.length, 1, "and writes no second row");
+  expectEqual(audit.entries.length, 1, "and writes no second audit entry");
+
+  // ---- a device that is already trusted is not a new device
+  const trustedWorld = createTrustWorld({ method: "smtp" });
+
+  trustedWorld.devices.push({
+    id: deviceId,
+    user_id: USER_ID,
+    label: null,
+    trusted_at: new Date(NOW - 86_400_000).toISOString(),
+    revoked_at: null,
+    deleted_at: null,
+  });
+
+  const trustedOutcome = await challengeDeviceTrust(challengeInput, {
+    ...dependencies,
+    rest: trustedWorld.rest,
+  });
+
+  expectEqual(trustedOutcome.status, "already_trusted", "a confirmed device is not challenged again");
+  expectEqual(trustedWorld.challenges.length, 0, "and writes no challenge");
+  expectEqual(trustedWorld.sends.length, 0, "and mails nobody");
+
+  // ---- a device of another account is not this account's device
+  const strangerWorld = createTrustWorld({ method: "smtp" });
+
+  strangerWorld.devices.push({
+    id: deviceId,
+    user_id: "018f3b1c-9999-7c2a-9d1e-2b3c4d5e6f79",
+    label: null,
+    trusted_at: null,
+    revoked_at: null,
+    deleted_at: null,
+  });
+
+  expectEqual(
+    (await challengeDeviceTrust(challengeInput, { ...dependencies, rest: strangerWorld.rest })).status,
+    "no_device",
+    "a device of somebody else answers no_device",
+  );
+
+  // ---- a deployment with no sending method still records the challenge
+  const silentWorld = createTrustWorld({});
+  const silentLogger = captureLogger();
+
+  silentWorld.devices.push({
+    id: deviceId,
+    user_id: USER_ID,
+    label: null,
+    trusted_at: null,
+    revoked_at: null,
+    deleted_at: null,
+  });
+  silentWorld.accounts.push({
+    id: USER_ID,
+    email: "owner@example.com",
+    totp_secret_ciphertext: null,
+    totp_confirmed_at: null,
+    deleted_at: null,
+  });
+
+  const silent = await challengeDeviceTrust(challengeInput, {
+    ...dependencies,
+    rest: silentWorld.rest,
+    audit: createInMemoryAuditTrail(),
+    logger: silentLogger.logger,
+  });
+
+  expectEqual(silent.status, "challenged", "a challenge without an email is still a challenge");
+  expectEqual(silent.status === "challenged" ? silent.alertSendId : "x", null, "the challenge names no alert");
+  expectEqual(silentWorld.sends.length, 0, "no alert row is written without a sending method");
+  expectEqual(silentWorld.challenges.length, 1, "the challenge itself is recorded");
+  expectEqual(silentLogger.warnings.length, 1, "the missing sender is logged rather than swallowed");
+
+  // ---- a queue that refuses does not stop the challenge
+  const brokenWorld = createTrustWorld({ method: "api" });
+
+  brokenWorld.devices.push({
+    id: deviceId,
+    user_id: USER_ID,
+    label: null,
+    trusted_at: null,
+    revoked_at: null,
+    deleted_at: null,
+  });
+  brokenWorld.accounts.push({
+    id: USER_ID,
+    email: "owner@example.com",
+    totp_secret_ciphertext: null,
+    totp_confirmed_at: null,
+    deleted_at: null,
+  });
+  brokenWorld.refuseQueue = true;
+
+  const broken = await challengeDeviceTrust(challengeInput, {
+    ...dependencies,
+    rest: brokenWorld.rest,
+    audit: createInMemoryAuditTrail(),
+    logger: captureLogger().logger,
+  });
+
+  expectEqual(broken.status, "challenged", "a queue that is down does not refuse the device");
+  expectEqual(broken.status === "challenged" ? broken.alertSendId : "x", null, "and the challenge names no alert");
+
+  // ---- the confirmation
+  const confirmWorld = createTrustWorld({ method: "smtp" });
+
+  confirmWorld.devices.push({
+    id: deviceId,
+    user_id: USER_ID,
+    label: "Office laptop",
+    trusted_at: null,
+    revoked_at: null,
+    deleted_at: null,
+  });
+  confirmWorld.accounts.push({
+    id: USER_ID,
+    email: "owner@example.com",
+    totp_secret_ciphertext: packSecretBox(
+      sealSecret(MASTER_KEY, secret, twoFactorContext(USER_ID)),
+    ),
+    totp_confirmed_at: new Date(NOW - 86_400_000).toISOString(),
+    deleted_at: null,
+  });
+
+  const confirmAudit = createInMemoryAuditTrail();
+  const confirmDependencies = {
+    rest: confirmWorld.rest,
+    audit: confirmAudit,
+    logger: captureLogger().logger,
+    masterKey: () => MASTER_KEY,
+    now: () => NOW,
+  };
+
+  await challengeDeviceTrust(challengeInput, confirmDependencies);
+
+  const key = base32Decode(secret) ?? new Uint8Array();
+
+  expectEqual(
+    (
+      await readDeviceTrust({ userId: USER_ID, deviceId }, { rest: confirmWorld.rest })
+    )?.attemptsRemaining,
+    DEVICE_TRUST_MAXIMUM_ATTEMPTS,
+    "a fresh challenge has its whole budget",
+  );
+
+  const wrongCode = await captureRejection(
+    () =>
+      confirmDeviceTrust(
+        {
+          userId: USER_ID,
+          companyId: FIRM_ID,
+          deviceId,
+          sessionDeviceId: deviceId,
+          code: "000000",
+          ipAddress: null,
+          userAgent: null,
+        },
+        confirmDependencies,
+      ),
+    "a wrong code is refused",
+  );
+
+  expectEqual(wrongCode.code, "VALIDATION_FAILED", "a wrong code is a form refusal");
+  expectEqual(trustRefusalRule(wrongCode), "invalid_code", "and says which form field is wrong");
+  expectEqual(confirmWorld.challenges[0]?.attempts, 1, "a wrong code spends an attempt");
+  expectEqual(confirmWorld.devices[0]?.trusted_at, null, "a wrong code does not trust the device");
+  expectEqual(confirmAudit.entries.at(-1)?.action, "device.trust_rejected", "a wrong code is audited");
+  expectEqual(
+    (
+      await readDeviceTrust({ userId: USER_ID, deviceId }, { rest: confirmWorld.rest })
+    )?.attemptsRemaining,
+    DEVICE_TRUST_MAXIMUM_ATTEMPTS - 1,
+    "the budget shrinks by one",
+  );
+
+  const otherDevice = await captureRejection(
+    () =>
+      confirmDeviceTrust(
+        {
+          userId: USER_ID,
+          companyId: FIRM_ID,
+          deviceId,
+          sessionDeviceId: "018f3b1c-3333-7c2a-9d1e-2b3c4d5e6f72",
+          code: totpCodeForStep(key, totpStep(NOW)),
+          ipAddress: null,
+          userAgent: null,
+        },
+        confirmDependencies,
+      ),
+    "a session bound to another device is refused",
+  );
+
+  expectEqual(otherDevice.code, "PERMISSION_DENIED", "a session on another device cannot trust this one");
+  expectEqual(confirmWorld.challenges[0]?.attempts, 1, "and spending nothing, not even an attempt");
+
+  const trusted = await confirmDeviceTrust(
+    {
+      userId: USER_ID,
+      companyId: FIRM_ID,
+      deviceId,
+      sessionDeviceId: deviceId,
+      code: totpCodeForStep(key, totpStep(NOW)),
+      ipAddress: "203.0.113.9",
+      userAgent: "gate",
+    },
+    confirmDependencies,
+  );
+
+  expectEqual(trusted.status, "trusted", "the right code trusts the device");
+  expectEqual(confirmWorld.devices[0]?.trusted_at, new Date(NOW).toISOString(), "the device is stamped");
+  expectEqual(confirmWorld.challenges[0]?.consumed_at, new Date(NOW).toISOString(), "the challenge is consumed");
+  expectEqual(confirmAudit.entries.at(-1)?.action, "device.trusted", "the decision is audited");
+  expectEqual(
+    confirmAudit.entries.at(-1)?.entityId,
+    deviceId,
+    "the entry names the device it trusted",
+  );
+
+  const state = await readDeviceTrust({ userId: USER_ID, deviceId }, { rest: confirmWorld.rest });
+
+  expectEqual(state?.trustedAtEpochMs, NOW, "a trusted device reports its instant");
+  expectEqual(state?.challengeExpiresAtEpochMs, null, "and reports no live challenge");
+  expectEqual(state?.label, "Office laptop", "and reports the label the account gave it");
+  expectEqual(
+    await readDeviceTrust({ userId: USER_ID, deviceId: "018f3b1c-4444-7c2a-9d1e-2b3c4d5e6f74" }, { rest: confirmWorld.rest }),
+    null,
+    "an unknown device reports nothing",
+  );
+
+  expectEqual(
+    (
+      await confirmDeviceTrust(
+        {
+          userId: USER_ID,
+          companyId: FIRM_ID,
+          deviceId,
+          sessionDeviceId: deviceId,
+          code: "000000",
+          ipAddress: null,
+          userAgent: null,
+        },
+        confirmDependencies,
+      )
+    ).status,
+    "already_trusted",
+    "a second confirmation is not an error and asks for no code",
+  );
+
+  // ---- the three refusals that ask for different things
+  const noChallengeWorld = createTrustWorld({ method: "smtp" });
+
+  noChallengeWorld.devices.push({
+    id: deviceId,
+    user_id: USER_ID,
+    label: null,
+    trusted_at: null,
+    revoked_at: null,
+    deleted_at: null,
+  });
+  noChallengeWorld.accounts.push({
+    id: USER_ID,
+    email: "owner@example.com",
+    totp_secret_ciphertext: packSecretBox(sealSecret(MASTER_KEY, secret, twoFactorContext(USER_ID))),
+    totp_confirmed_at: new Date(NOW - 86_400_000).toISOString(),
+    deleted_at: null,
+  });
+
+  const noChallenge = await captureRejection(
+    () =>
+      confirmDeviceTrust(
+        {
+          userId: USER_ID,
+          companyId: FIRM_ID,
+          deviceId,
+          sessionDeviceId: deviceId,
+          code: totpCodeForStep(key, totpStep(NOW)),
+          ipAddress: null,
+          userAgent: null,
+        },
+        { ...confirmDependencies, rest: noChallengeWorld.rest },
+      ),
+    "a device with no live challenge is refused",
+  );
+
+  expectEqual(trustRefusalRule(noChallenge), "no_live_challenge", "no challenge names the device field");
+
+  const expiredWorld = createTrustWorld({ method: "smtp" });
+
+  expiredWorld.devices.push({
+    id: deviceId,
+    user_id: USER_ID,
+    label: null,
+    trusted_at: null,
+    revoked_at: null,
+    deleted_at: null,
+  });
+  expiredWorld.accounts.push({
+    id: USER_ID,
+    email: "owner@example.com",
+    totp_secret_ciphertext: packSecretBox(sealSecret(MASTER_KEY, secret, twoFactorContext(USER_ID))),
+    totp_confirmed_at: new Date(NOW - 86_400_000).toISOString(),
+    deleted_at: null,
+  });
+  expiredWorld.challenges.push({
+    id: "challenge-expired",
+    company_id: FIRM_ID,
+    user_id: USER_ID,
+    device_proof_key_id: deviceId,
+    alert_send_id: null,
+    attempts: 0,
+    max_attempts: DEVICE_TRUST_MAXIMUM_ATTEMPTS,
+    issued_at: new Date(NOW - 2 * window).toISOString(),
+    expires_at: new Date(NOW - window).toISOString(),
+    consumed_at: null,
+    revoked_at: null,
+    deleted_at: null,
+  });
+
+  const expired = await captureRejection(
+    () =>
+      confirmDeviceTrust(
+        {
+          userId: USER_ID,
+          companyId: FIRM_ID,
+          deviceId,
+          sessionDeviceId: deviceId,
+          code: totpCodeForStep(key, totpStep(NOW)),
+          ipAddress: null,
+          userAgent: null,
+        },
+        { ...confirmDependencies, rest: expiredWorld.rest },
+      ),
+    "an expired challenge is refused",
+  );
+
+  expectEqual(trustRefusalRule(expired), "challenge_expired", "an expired challenge says so");
+  expectEqual(expiredWorld.devices[0]?.trusted_at, null, "an expired challenge trusts nothing");
+
+  const spentWorld = createTrustWorld({ method: "smtp" });
+
+  spentWorld.devices.push({
+    id: deviceId,
+    user_id: USER_ID,
+    label: null,
+    trusted_at: null,
+    revoked_at: null,
+    deleted_at: null,
+  });
+  spentWorld.accounts.push({
+    id: USER_ID,
+    email: "owner@example.com",
+    totp_secret_ciphertext: packSecretBox(sealSecret(MASTER_KEY, secret, twoFactorContext(USER_ID))),
+    totp_confirmed_at: new Date(NOW - 86_400_000).toISOString(),
+    deleted_at: null,
+  });
+  spentWorld.challenges.push({
+    id: "challenge-spent",
+    company_id: FIRM_ID,
+    user_id: USER_ID,
+    device_proof_key_id: deviceId,
+    alert_send_id: null,
+    attempts: DEVICE_TRUST_MAXIMUM_ATTEMPTS,
+    max_attempts: DEVICE_TRUST_MAXIMUM_ATTEMPTS,
+    issued_at: new Date(NOW - 1_000).toISOString(),
+    expires_at: new Date(NOW + window).toISOString(),
+    consumed_at: null,
+    revoked_at: null,
+    deleted_at: null,
+  });
+
+  const spent = await captureRejection(
+    () =>
+      confirmDeviceTrust(
+        {
+          userId: USER_ID,
+          companyId: FIRM_ID,
+          deviceId,
+          sessionDeviceId: deviceId,
+          code: totpCodeForStep(key, totpStep(NOW)),
+          ipAddress: null,
+          userAgent: null,
+        },
+        { ...confirmDependencies, rest: spentWorld.rest },
+      ),
+    "a spent budget is refused even for the right code",
+  );
+
+  expectEqual(trustRefusalRule(spent), "attempts_exhausted", "a spent budget says so");
+  expectEqual(spentWorld.devices[0]?.trusted_at, null, "a spent budget trusts nothing");
+
+  const unenrolledWorld = createTrustWorld({ method: "smtp" });
+
+  unenrolledWorld.devices.push({
+    id: deviceId,
+    user_id: USER_ID,
+    label: null,
+    trusted_at: null,
+    revoked_at: null,
+    deleted_at: null,
+  });
+  unenrolledWorld.accounts.push({
+    id: USER_ID,
+    email: "owner@example.com",
+    totp_secret_ciphertext: null,
+    totp_confirmed_at: null,
+    deleted_at: null,
+  });
+  unenrolledWorld.challenges.push({
+    id: "challenge-unenrolled",
+    company_id: FIRM_ID,
+    user_id: USER_ID,
+    device_proof_key_id: deviceId,
+    alert_send_id: null,
+    attempts: 0,
+    max_attempts: DEVICE_TRUST_MAXIMUM_ATTEMPTS,
+    issued_at: new Date(NOW - 1_000).toISOString(),
+    expires_at: new Date(NOW + window).toISOString(),
+    consumed_at: null,
+    revoked_at: null,
+    deleted_at: null,
+  });
+
+  const unenrolled = await captureRejection(
+    () =>
+      confirmDeviceTrust(
+        {
+          userId: USER_ID,
+          companyId: FIRM_ID,
+          deviceId,
+          sessionDeviceId: deviceId,
+          code: "123456",
+          ipAddress: null,
+          userAgent: null,
+        },
+        { ...confirmDependencies, rest: unenrolledWorld.rest },
+      ),
+    "an account with no second factor is refused",
+  );
+
+  expectEqual(trustRefusalRule(unenrolled), "two_factor_required", "and is told to enrol first");
+  expectEqual(unenrolledWorld.challenges[0]?.attempts, 0, "a missing second factor spends no attempt");
+
+  // ---- what the sensitive endpoints ask of a proof
+  const untrustedProof = {
+    deviceKeyId: deviceId,
+    algorithm: "ES256" as const,
+    trusted: false,
+    signedAtEpochMs: NOW,
+    nonce: "AAAAAAAAAAAAAAAAAAAAAA",
+  };
+
+  const refusedProof = await captureRejection(
+    () => Promise.resolve(requireTrustedDevice(untrustedProof)),
+    "an unconfirmed device is refused a dangerous action",
+  );
+
+  expectEqual(refusedProof.code, "PERMISSION_DENIED", "the refusal is a permission, not a sign in");
+  expect(
+    requireTrustedDevice({ ...untrustedProof, trusted: true }) === undefined,
+    "a confirmed device is allowed through",
+  );
+
+  // ---- the routes that carry it, on disk
+  //
+  // The import line is removed before searching, because a route that imports a guard and never
+  // calls it is exactly the mistake this part exists to catch: a substring search over the whole
+  // file would pass on the `import` alone.
+  const withoutImports = (source: string): string =>
+    source
+      .split("\n")
+      .filter((line) => !line.trimStart().startsWith("import "))
+      .join("\n");
+
+  const root = new URL("../../app/", import.meta.url);
+  const confirmRoute = await readFile(
+    new URL("api/auth/devices/confirm/route.ts", root),
+    "utf8",
+  ).catch(() => "");
+  const rotateRoute = await readFile(
+    new URL("api/auth/session/rotate/route.ts", root),
+    "utf8",
+  ).catch(() => "");
+  const confirmScreen = await readFile(new URL("(auth)/devices/confirm/page.tsx", root), "utf8").catch(
+    () => "",
+  );
+
+  const confirmRouteBody = withoutImports(confirmRoute);
+  const rotateRouteBody = withoutImports(rotateRoute);
+
+  expect(
+    confirmRouteBody.includes("confirmDeviceTrust("),
+    "the confirmation route calls the service",
+  );
+  expect(
+    confirmRouteBody.includes("sessionDeviceId: actor.deviceProofKeyId"),
+    "the confirmation route binds the session to the device it confirms",
+  );
+  expect(
+    confirmRouteBody.indexOf("readRequestActor(") < confirmRouteBody.indexOf("request.json()"),
+    "the confirmation route authenticates before it parses the body",
+  );
+  expect(
+    rotateRouteBody.includes("challengeDeviceTrust("),
+    "the rotation route detects a new device",
+  );
+  expect(
+    rotateRouteBody.includes("outcome.kind === \"bound\""),
+    "and does it on a bind, which is the request that starts a session",
+  );
+  expect(confirmScreen.includes("DeviceConfirmForm"), "the confirmation screen has its form");
+  expect(confirmScreen.includes("<SessionKeeper"), "and keeps the token rotating while it is open");
+  expect(
+    SESSION_AUTH_SURFACES.some((surface) => surface.path === "/api/auth/devices/confirm"),
+    "the confirmation is a session surface, so its codes are catalogued",
+  );
+
+  const sensitiveRoutes = await Promise.all(
+    SENSITIVE_ENDPOINTS.map((endpoint) =>
+      readFile(new URL(`.${endpoint.path}/route.ts`, root), "utf8").catch(() => ""),
+    ),
+  );
+
+  for (const [index, endpoint] of SENSITIVE_ENDPOINTS.entries()) {
+    expect(
+      withoutImports(sensitiveRoutes[index] ?? "").includes("requireTrustedDevice("),
+      `${endpoint.path} refuses an unconfirmed device`,
+    );
+  }
 }
 
 async function main(): Promise<void> {
@@ -9804,6 +10794,7 @@ async function main(): Promise<void> {
   await checkDeviceProofKey();
   await checkRequestProof();
   await checkSessionRotation();
+  await checkDeviceTrust();
 
   if (failures.length > 0) {
     process.stderr.write(`auth gate failed with ${failures.length} problem(s):\n`);

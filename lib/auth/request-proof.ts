@@ -54,12 +54,15 @@ import type { RequestActor } from "./types.ts";
  * attacker which part of the proof to fix. The difference lives in the audit entry, which only the
  * platform reads.
  *
- * ## What this module deliberately does not require
+ * ## Trust is reported here and enforced by the caller
  *
- * `trusted_at`. A row written by STEP 049 is untrusted until STEP 052 confirms the new device by
- * email and a second factor, and a check that refused an untrusted key would refuse every key the
- * platform itself created. The outcome reports `trusted` so a caller can say so in its own audit
- * entry, and STEP 052 decides what to do with it.
+ * `trusted_at` is read with the key and reported as `trusted`, because the two questions are
+ * different: the proof answers *which device*, and `device_proof_keys.trusted_at` answers *has the
+ * owner confirmed that device* (STEP 052). The verification itself does not refuse an unconfirmed
+ * key - every key the platform creates starts that way, and the sign in that enrols one has to be
+ * able to reach the screen that confirms it - so the decision belongs to the route that knows what
+ * the action costs. `requireTrustedDevice` is that decision, in one place: the three endpoints of
+ * the list all hand out a way in, and a device nobody has confirmed does not get one.
  */
 
 /** The code every refusal answers. */
@@ -220,6 +223,25 @@ export async function verifySensitiveRequest(
       .catch(() => undefined);
 
     throw new AppError(refusalCode);
+  }
+}
+
+/**
+ * Refuse an action whose proof came from a device the owner has not confirmed.
+ *
+ * STEP 052 is the step that makes the flag mean something. Until a session's device is confirmed -
+ * which needs the owner's authenticator code, not another email - the platform's dangerous actions
+ * stay closed: ten fresh backup codes and an approved reset are the two ways a stolen session turns
+ * into a stolen account, and neither is worth waiting for a genuine machine.
+ *
+ * `PERMISSION_DENIED` and not `AUTHENTICATION_REQUIRED`: the caller proved an account and a device,
+ * and is not allowed to do this until the device is confirmed. That is a difference the screen can
+ * act on - it sends the merchant to the confirmation - and a 401 would read as "sign in again",
+ * which is exactly what would not help.
+ */
+export function requireTrustedDevice(outcome: RequestProofOutcome): void {
+  if (!outcome.trusted) {
+    throw new AppError("PERMISSION_DENIED");
   }
 }
 

@@ -5,6 +5,7 @@ import { AppError } from "@/lib/errors/app-error";
 import { withErrorResponse } from "@/lib/errors/respond";
 import { readClientAddress, readUserAgent } from "@/lib/auth/client-address";
 import { encodeSessionCookies } from "@/lib/auth/cookies";
+import { challengeDeviceTrust } from "@/lib/auth/device-trust";
 import { readBoundSession } from "@/lib/auth/request-actor";
 import { getAuthRuntime } from "@/lib/auth/runtime";
 import { issueSessionToken } from "@/lib/auth/session-rotation";
@@ -32,6 +33,14 @@ const rotationBodySchema = z
 interface RotationResponseBody {
   readonly status: "bound" | "rotated" | "current";
   readonly expiresAtEpochMs: number;
+  /**
+   * Whether the device this session is now bound to still has to be confirmed.
+   *
+   * Present only on a bind, because only a bind is a new device: a rotation of a session that
+   * already named its device is the same machine asking again. The sign in reads it to decide
+   * between the page the merchant asked for and the confirmation of STEP 052.
+   */
+  readonly deviceTrust?: "trusted" | "untrusted";
 }
 
 /**
@@ -144,6 +153,43 @@ export const POST = withErrorResponse(
       );
     }
 
+    // STEP 052, on the one request that starts a session: if this device has never been confirmed,
+    // the owner is told (once, through the section 23 queue) and the answer says so. Nothing is
+    // refused here - a session that cannot exist yet cannot be asked to prove itself - and the
+    // confirmation is a separate route that needs the authenticator code.
+    const challenge =
+      outcome.kind === "bound"
+        ? await challengeDeviceTrust(
+            {
+              userId: session.actor.userId,
+              companyId: session.actor.companyId,
+              deviceId: parsedBody.data.deviceId,
+              ipAddress: readClientAddress(request.headers),
+              userAgent: readUserAgent(request.headers),
+            },
+            { rest: runtime.rest, audit: runtime.audit, logger, masterKey: runtime.masterKey },
+          )
+        : null;
+
+    // Three answers, and the third one is what keeps this honest: `challenged` and `already_open`
+    // mean the device has to be confirmed, `already_trusted` means it does not, and the two failures
+    // - a device row this account does not own, and a platform that could not read the account -
+    // name no trust state at all. Saying "trusted" for those would be a sentence this route cannot
+    // support, and the confirmation screen reads the state for itself anyway.
+    const deviceTrust =
+      challenge === null || challenge.status === "no_device" || challenge.status === "failed"
+        ? null
+        : challenge.status === "already_trusted"
+          ? ("trusted" as const)
+          : ("untrusted" as const);
+
+    if (deviceTrust === "untrusted") {
+      logger.info("a session bound to an unconfirmed device", {
+        userId: session.actor.userId,
+        deviceId: parsedBody.data.deviceId,
+      });
+    }
+
     // The new token replaces one field of the payload. The provider's pair is carried forward
     // exactly as the verified cookie held it - reissuing it is not this route's business - and the
     // expiry stays the provider's, because that is what decides when the access token stops working.
@@ -167,7 +213,11 @@ export const POST = withErrorResponse(
     });
 
     const response = NextResponse.json(
-      { status: outcome.kind, expiresAtEpochMs: outcome.expiresAtEpochMs } satisfies RotationResponseBody,
+      {
+        status: outcome.kind,
+        expiresAtEpochMs: outcome.expiresAtEpochMs,
+        ...(deviceTrust === null ? {} : { deviceTrust }),
+      } satisfies RotationResponseBody,
       { status: 200, headers: { "cache-control": "no-store" } },
     );
 

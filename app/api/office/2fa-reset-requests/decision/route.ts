@@ -4,7 +4,7 @@ import { AppError } from "@/lib/errors/app-error";
 import { withErrorResponse } from "@/lib/errors/respond";
 import { readRequestActor } from "@/lib/auth/request-actor";
 import { getAuthRuntime } from "@/lib/auth/runtime";
-import { verifySensitiveRequest } from "@/lib/auth/request-proof";
+import { requireTrustedDevice, verifySensitiveRequest } from "@/lib/auth/request-proof";
 import { decideTwoFactorReset } from "@/lib/auth/two-factor-reset";
 import { logger } from "@/lib/logger/logger";
 
@@ -74,9 +74,14 @@ export const POST = withErrorResponse(
     });
 
     // A proof before a parse: an altered body fails here rather than as a schema problem.
-    await verifySensitiveRequest(
-      { request, bodyText, actor },
-      { rest: runtime.rest, audit: runtime.audit },
+    // STEP 052: the proof says which device, and a device nobody has confirmed gets no way in.
+    // The refusal is `PERMISSION_DENIED`, so the screen can send the merchant to the confirmation
+    // instead of asking for a password that would change nothing.
+    requireTrustedDevice(
+      await verifySensitiveRequest(
+        { request, bodyText, actor },
+        { rest: runtime.rest, audit: runtime.audit },
+      ),
     );
 
     let body: unknown;

@@ -212,6 +212,32 @@ const catalog = {
     bindingFailed:
       "This browser could not finish setting up its device key, so the session cannot continue. Reload the page and sign in again.",
   },
+  deviceConfirm: {
+    eyebrow: "New device",
+    title: "Confirm this device",
+    description:
+      "This browser has not used your account before. Confirm it with the code from your authenticator app to keep using the account here. The account address was told about this sign in at the same time.",
+    codeLabel: "Code from the authenticator app",
+    codeHint: "The six digit code that changes every thirty seconds. A backup code works too.",
+    submit: "Confirm this device",
+    submitting: "Confirming",
+    invalidCode: "That code was not accepted. Check the app and type the code it shows now.",
+    expiredChallenge: "This confirmation expired. Sign in again to receive a new one.",
+    attemptsExhausted:
+      "Too many wrong codes for this confirmation. Sign in again to receive a new one.",
+    twoFactorRequired:
+      "This account has not finished setting up its authenticator app. Finish that first, then confirm this device.",
+    failed: "The confirmation was not saved. Try again.",
+    confirmedTitle: "This device is confirmed",
+    confirmedBody:
+      "The device was confirmed with your authenticator app. You can keep using the account here.",
+    unknownDevice:
+      "This browser is not registered as a device of this account. Sign in again on this browser.",
+    signInRequired: "Sign in to confirm a device.",
+    unavailable: "The device could not be read. Try again.",
+    enrolLink: "Authenticator app",
+    home: "Go to the home page",
+  },
   resetRequest: {
     eyebrow: "Account recovery",
     title: "Recover an account without the app",
@@ -289,6 +315,10 @@ const catalog = {
     accountUnlock: {
       /** Subject of the section 23 confirmation: the office ended the lock and the account works. */
       subject: "Your account was unlocked. Sign in and check your recent activity",
+    },
+    newDevice: {
+      /** Subject of the section 23 alert of section 22: an account was used from a new device. */
+      subject: "A new device signed in to your account. Confirm it with your authenticator",
     },
   },
   policies: {

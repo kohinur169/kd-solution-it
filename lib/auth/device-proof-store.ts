@@ -220,7 +220,17 @@ const rotationPath = "/api/auth/session/rotate";
 
 /** What a bind or a rotation produced, as far as this module cares. */
 export type SessionBindingOutcome =
-  | { readonly ok: true; readonly status: "bound" | "rotated" | "current" }
+  | {
+      readonly ok: true;
+      readonly status: "bound" | "rotated" | "current";
+      /**
+       * Whether the device this session was bound to still needs confirming (STEP 052).
+       *
+       * Only a bind answers it: a rotation is the same machine asking again. `unknown` is the honest
+       * value for a rotation, and for a bind whose answer did not say.
+       */
+      readonly deviceTrust: "trusted" | "untrusted" | "unknown";
+    }
   | { readonly ok: false; readonly reason: DeviceProofFailureReason };
 
 /**
@@ -289,7 +299,11 @@ export async function bindSession(): Promise<SessionBindingOutcome> {
     return { ok: false, reason: "unreadable" };
   }
 
-  return { ok: true, status };
+  const trust = (answer as { readonly deviceTrust?: unknown } | null)?.deviceTrust;
+  const deviceTrust =
+    trust === "trusted" || trust === "untrusted" ? trust : ("unknown" as const);
+
+  return { ok: true, status, deviceTrust };
 }
 
 /** Forget this browser's key. The platform's row is untouched: revoking a device is STEP 054's. */

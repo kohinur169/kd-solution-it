@@ -131,7 +131,9 @@ function readDeviceProofRequired(payload: unknown): boolean {
  * second key would be a second device. It is never skipped for the *binding*, because a sign in
  * always creates a fresh session.
  */
-async function establishSession(payload: unknown): Promise<boolean> {
+type SessionEstablishment = "trusted" | "untrusted" | "failed";
+
+async function establishSession(payload: unknown): Promise<SessionEstablishment> {
   const stored = await readStoredDeviceProofKey().catch(() => null);
 
   // Enrol when the server asked for a key, and also when this browser has none: an account whose
@@ -141,14 +143,24 @@ async function establishSession(payload: unknown): Promise<boolean> {
     const enrolled = await enrolDeviceProofKey().catch(() => null);
 
     if (enrolled === null || !enrolled.ok) {
-      return false;
+      return "failed";
     }
   }
 
   const bound = await bindSession().catch(() => null);
 
-  return bound !== null && bound.ok;
+  if (bound === null || !bound.ok) {
+    return "failed";
+  }
+
+  // STEP 052: a session bound to a device nobody has confirmed goes to the confirmation, not to the
+  // page the merchant asked for. The alert is already on its way, and the confirm screen is the only
+  // thing that turns the state over.
+  return bound.deviceTrust === "untrusted" ? "untrusted" : "trusted";
 }
+
+/** Where this browser goes once the cookie and the device are in place. */
+const deviceConfirmPath = "/devices/confirm";
 
 /**
  * Read the challenge out of a sign in answer.
@@ -306,7 +318,9 @@ export function SigninForm({ siteKey, afterSigninPath }: SigninFormProperties): 
         return;
       }
 
-      if (!(await establishSession(payload))) {
+      const establishment = await establishSession(payload);
+
+      if (establishment === "failed") {
         // The cookie exists but names no device, and every page that reads one would refuse it.
         // Saying so here is the only honest option: navigating would bounce the merchant back to
         // this form with nothing to read.
@@ -318,7 +332,9 @@ export function SigninForm({ siteKey, afterSigninPath }: SigninFormProperties): 
 
       // A full navigation, so the cookie written by this response is the one the next request
       // carries; a client side transition could render a page from the previous identity.
-      window.location.assign(afterSigninPath);
+      window.location.assign(
+        establishment === "untrusted" ? deviceConfirmPath : afterSigninPath,
+      );
     } catch {
       setMessage(getMessage("signin.unreadableResponse"));
       setSubmitting(false);
@@ -360,14 +376,18 @@ export function SigninForm({ siteKey, afterSigninPath }: SigninFormProperties): 
 
       const payload: unknown = await response.json().catch(() => null);
 
-      if (!(await establishSession(payload))) {
+      const establishment = await establishSession(payload);
+
+      if (establishment === "failed") {
         setMessage(getMessage("device.bindingFailed"));
         setVerifying(false);
 
         return;
       }
 
-      window.location.assign(afterSigninPath);
+      window.location.assign(
+        establishment === "untrusted" ? deviceConfirmPath : afterSigninPath,
+      );
     } catch {
       setMessage(getMessage("signin.unreadableResponse"));
       setVerifying(false);
