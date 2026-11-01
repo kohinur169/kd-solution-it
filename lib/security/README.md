@@ -4,11 +4,12 @@
 Owner: STEP 056 (input sanitiser for text, rich text and URLs), STEP 057 (the double submit token),
 STEP 058 (the destination rule), STEP 059 (the Content Security Policy), STEP 060 (the security headers),
 STEP 061 (the upload validator), STEP 062 (the rate limiter), STEP 063 (the audit writer), STEP 064
-(the encryption service), STEP 065 (the signed portal link) and STEP 066 (the fraud decision). Later STEPs
+(the encryption service), STEP 065 (the signed portal link), STEP 066 (the fraud decision) and STEP 067
+(the velocity counter). Later STEPs
 call these functions; they do not write a second escape, a second URL check, a second allowlist, a second
 CSRF token, a second DNS check, a second policy header, a second header table, a second file type check, a
-second counter, a second way to append to an audit chain, a second cipher, a second kind of signed link or
-a second risk decision.
+second counter, a second way to append to an audit chain, a second cipher, a second kind of signed link,
+a second risk decision or a second way to count one card.
 
 | File | Purpose |
 | --- | --- |
@@ -27,6 +28,7 @@ a second risk decision.
 | encryption.ts | AES-256-GCM for secrets and files: a keyring with rotation, a bound context, and a chunked file envelope |
 | portal-token.ts | The client portal link: what it claims, how long it lives, and how it is revoked |
 | fraud.ts | What a payment attempt must pass: six signals, one of three decisions, and the trace behind it |
+| velocity.ts | How often one card and one address may pay: one hit per attempt, counted by `0093`, audited once per window |
 | verify.ts | The gate behind `npm run check:security`, and the attack corpus it runs |
 
 ## The four rules
@@ -353,6 +355,47 @@ one behaviour that turns an outage into permission.
 The two liveness probes (`/api/health`, `/api/jobs/health`) are exempt by exact path, because a probe
 answered with `429` reports the platform as down - and the monitor would be right.
 
+## How often one card and one address may pay
+
+`velocity.ts` is the counter behind two of the six fraud signals: five attempts on one card in an hour,
+twenty from one address, each of them a default an operator replaces. Section 18 asks for the limits and
+section 5 for the hold on an unusual payment; both are counts, and a count has to survive a deploy and be
+shared by every instance, so it lives in the database.
+
+The table is `public.velocity_counters` of `0056`, and this STEP adds the one statement that moves it:
+`public.consume_velocity` in `0093`. The function aligns the window to the epoch, inserts the first hit or
+increments the row that already exists, and answers the same call: the count, the limit that applied, the
+window, whether the count reached the limit, and whether *this* is the hit that reached it. **One hit is one
+payment attempt**, so a reader that did not write would let an attacker retry for free; there is no
+read-only path, and `createVelocityReader` - the shape `fraud.ts` consumes - is one call per attempt.
+
+**The subject is never stored raw.** A card counter's key is the 64 hex fingerprint of the token the
+processor hands back, which is the same value `0055` blacklists and `0037` stores as `card_fingerprint`;
+a string that looks like a card number is refused rather than hashed, because a hash of a number is still a
+way to recognise the number. An address is canonicalised by STEP 062's `canonicalRateLimitAddress`, so the
+two spellings of one IPv6 address are one counter rather than two.
+
+**The limit is frozen in the window.** `0056` refuses an update that changes `limit_value`,
+`window_seconds` or `window_start`, so a window keeps the limit it was opened with: lowering a limit in
+the settings takes effect in the next window and never rewrites one that already decided a payment. That
+is why a reading reports the limit the row applied and not the one the policy has now.
+
+**The breach is written once, and audited once.** The count rises by one from one against a frozen limit,
+so `hits = limit` happens exactly once per window: `first_breach` is that hit. It writes
+`security.velocity_limited` with the fingerprint (for a card), the count, the limit and the window, and the
+hits after it write nothing - an attack otherwise turns the audit chain into a copy of itself. The counter
+is the platform's (`0056` forces `company_id` to null), so the entry is on the platform chain.
+
+**A count that cannot be made is a refusal.** A failed call, a row in any other shape and a clock that
+cannot place a window all raise `DEPENDENCY_FAILED` or `INTERNAL_ERROR`; none of them reads as the first
+attempt of a fresh window, because "the counter was down" and "this card is new" are opposite facts.
+
+**Old windows are removed, not hidden.** The migration gate forbids a forward file from deleting a row, so
+the sweep is not SQL: `sweepVelocityWindows` hands a cutoff to a client that can delete, and refuses a
+retention shorter than the widest window in force, because deleting a live counter frees its key for a
+fresh count of zero - the limit bypassed, silently. The schedule is the retention job's; this module only
+knows how to sweep and when it must refuse.
+
 ## What a file must be
 
 `upload.ts` answers three questions, in this order, and the second one is the only one that is evidence:
@@ -413,6 +456,13 @@ number of characters in every script.
 - **No nonce or header in `proxy.ts` for anything but the policy.** A proxy runs on every request,
   including the ones that must stay cheap; identity, redirects and body handling are the routes' work,
   and a security header is the whole of the proxy's job.
+- **No route and no cron entry in this STEP.** `createVelocityReader` is what the payment core passes to
+  `fraudDecide`, and `sweepVelocityWindows` is what the retention job calls; the route that creates a
+  payment belongs to the payment STEP, and the schedule belongs to the jobs STEP. A second caller written
+  here would be a second decision about when a payment is counted.
+- **No second counter.** `rate-limit.ts` counts requests and this module counts payment attempts, and both
+  go through a function that owns the increment. Two tables for one question would be two answers, and the
+  smaller one would be the one an attacker works under.
 - **No CSP reporting endpoint.** A `report-uri` is useful only with a collector, and a collector is a
   public `POST` that browsers send without a CSRF token - the one route that would have to be exempt
   from the rule of STEP 057. It belongs to the logging pipeline, with its rate limit and its retention,

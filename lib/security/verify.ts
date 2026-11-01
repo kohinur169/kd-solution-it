@@ -211,6 +211,39 @@ import {
   type RateLimitCounterClient,
   type RateLimitDependencies,
 } from "./rate-limit.ts";
+import {
+  canonicalVelocityAddress,
+  canonicalVelocitySubject,
+  consumeVelocity,
+  createVelocityReader,
+  isVelocitySubject,
+  sweepVelocityWindows,
+  velocityAuditEntry,
+  velocityCardFingerprint,
+  velocityRetryAfter,
+  velocityWindowStart,
+  VELOCITY_AUDIT_ACTION,
+  VELOCITY_CARD_FINGERPRINT_PATTERN,
+  VELOCITY_CONSUME_FUNCTION,
+  VELOCITY_DEFAULT_POLICY,
+  VELOCITY_MAXIMUM_CARD_TOKEN_LENGTH,
+  VELOCITY_MAXIMUM_LIMIT,
+  VELOCITY_MAXIMUM_WINDOW_SECONDS,
+  VELOCITY_MINIMUM_WINDOW_SECONDS,
+  VELOCITY_PROBLEMS,
+  VELOCITY_RETENTION_SECONDS,
+  VELOCITY_RULE,
+  VELOCITY_SUBJECTS,
+  VELOCITY_TABLE,
+  type VelocityAuditEntry,
+  type VelocityAuditTrail,
+  type VelocityCounterClient,
+  type VelocityCounterOptions,
+  type VelocityPolicy,
+  type VelocityReading,
+  type VelocitySweepClient,
+  type VelocitySubjectKind,
+} from "./velocity.ts";
 
 /**
  * The gate behind the input sanitiser.
@@ -4672,6 +4705,738 @@ async function checkFraudWiring(): Promise<void> {
   expectEqual(decisionWriters.sort().join(","), "lib/security/fraud.ts", "one module in the tree decides a payment's risk");
 }
 
+/** ---- Velocity: one card and one address, counted by the database and never by the service. */
+
+const velocityCardToken = "tok_visa_4242_opaque";
+const velocityFingerprint = velocityCardFingerprint(velocityCardToken);
+const velocitySecondToken = "tok_mastercard_5555_opaque";
+const velocityFixedNow = Date.parse("2026-11-01T10:00:30.000Z");
+const velocityAddress = "203.0.113.9";
+
+interface FakeVelocityCounterState {
+  hits: number;
+  limit: number;
+  windowStart: string;
+  windowSeconds: number;
+}
+
+interface FakeVelocityCounter {
+  readonly client: VelocityCounterClient;
+  readonly calls: Record<string, unknown>[];
+  readonly keys: () => number;
+}
+
+/**
+ * The counter of `0093`, kept in a map: the same window alignment, the same frozen limit, the same
+ * answer. The SQL itself is replayed against a real Postgres in the STEP's handoff; this fake exists
+ * so the service can be proved to read that shape and to refuse every other.
+ */
+function velocityCounter(): FakeVelocityCounter {
+  const rows = new Map<string, FakeVelocityCounterState>();
+  const calls: Record<string, unknown>[] = [];
+
+  return {
+    calls,
+    keys: (): number => rows.size,
+    client: {
+      rpc: async (functionName: string, arguments_: Readonly<Record<string, unknown>>): Promise<unknown> => {
+        if (functionName !== VELOCITY_CONSUME_FUNCTION) {
+          throw new AppError("DEPENDENCY_FAILED");
+        }
+
+        calls.push({ ...arguments_ });
+
+        const nowMs = Date.parse(String(arguments_["p_now"]));
+        const windowSeconds = Number(arguments_["p_window_seconds"]);
+        const limit = Number(arguments_["p_limit"]);
+        const subject = String(arguments_["p_subject"]);
+        const value = String(subject === "card" ? arguments_["p_card_fingerprint"] : arguments_["p_ip_address"]);
+        const windowStart = velocityWindowStart(nowMs, windowSeconds);
+        const key = `${subject}:${value}:${windowSeconds}:${windowStart}`;
+        const existing = rows.get(key);
+        const hits = (existing?.hits ?? 0) + 1;
+        const appliedLimit = existing?.limit ?? limit;
+        const state: FakeVelocityCounterState = {
+          hits,
+          limit: appliedLimit,
+          windowStart: new Date(windowStart * 1_000).toISOString(),
+          windowSeconds,
+        };
+
+        rows.set(key, state);
+
+        return [
+          {
+            counter_hits: state.hits,
+            counter_limit: state.limit,
+            counter_window_start: state.windowStart,
+            counter_window_seconds: state.windowSeconds,
+            counter_exceeded: state.hits >= state.limit,
+            counter_first_breach: state.hits === state.limit,
+          },
+        ];
+      },
+    },
+  };
+}
+
+/** A client that answers whatever a test tells it to, or fails. */
+function velocityAnswering(answer: unknown): VelocityCounterClient {
+  return {
+    rpc: async (): Promise<unknown> => answer,
+  };
+}
+
+function velocityFailing(): VelocityCounterClient {
+  return {
+    rpc: async (): Promise<unknown> => {
+      throw new Error("connection reset");
+    },
+  };
+}
+
+function velocityOptions(client: VelocityCounterClient, policy?: VelocityPolicy): VelocityCounterOptions {
+  return policy === undefined
+    ? { rest: client, now: (): number => velocityFixedNow }
+    : { rest: client, now: (): number => velocityFixedNow, policy };
+}
+
+/** One good answer of `0093`, which each malformed-answer case then breaks in one field. */
+function velocityRow(overrides: Readonly<Record<string, unknown>> = {}): Record<string, unknown> {
+  return {
+    counter_hits: 1,
+    counter_limit: 5,
+    counter_window_start: "2026-11-01T10:00:00.000Z",
+    counter_window_seconds: 3_600,
+    counter_exceeded: false,
+    counter_first_breach: false,
+    ...overrides,
+  };
+}
+
+function velocityReasonOf(error: AppError | null): string | undefined {
+  return (error?.cause as { reason?: string } | undefined)?.reason;
+}
+
+function checkVelocityVocabulary(): void {
+  expectEqual(VELOCITY_SUBJECTS.join(","), "card,ip", "a velocity counter has two subjects");
+  expectEqual(VELOCITY_RULE, "velocity", "and one rule name");
+  expectEqual(VELOCITY_CONSUME_FUNCTION, "consume_velocity", "the counting function is the migration's");
+  expectEqual(VELOCITY_TABLE, "velocity_counters", "and the table is STEP 056's");
+  expectEqual(VELOCITY_AUDIT_ACTION, "security.velocity_limited", "a breach has one audit action");
+  expect(AUDIT_ACTION_PATTERN.test(VELOCITY_AUDIT_ACTION), "which is the audit module's action shape");
+  expect(VELOCITY_AUDIT_ACTION.length <= AUDIT_MAXIMUM_ACTION_LENGTH, "and fits its ceiling");
+  expect(Object.isFrozen(VELOCITY_SUBJECTS), "the subject list is frozen");
+  expect(Object.isFrozen(VELOCITY_DEFAULT_POLICY), "and the default policy is frozen, so nothing edits a default");
+  expectEqual(VELOCITY_DEFAULT_POLICY.card.limit, 5, "five attempts on one card");
+  expectEqual(VELOCITY_DEFAULT_POLICY.card.windowSeconds, 3_600, "inside an hour");
+  expectEqual(VELOCITY_DEFAULT_POLICY.ip.limit, 20, "twenty attempts from one address");
+  expectEqual(VELOCITY_DEFAULT_POLICY.ip.windowSeconds, 3_600, "inside the same hour");
+  expectEqual(VELOCITY_RETENTION_SECONDS, VELOCITY_MAXIMUM_WINDOW_SECONDS, "a window is kept as long as the widest window can be");
+  expectEqual(VELOCITY_MINIMUM_WINDOW_SECONDS, 1, "the narrowest window is a second");
+  expectEqual(VELOCITY_MAXIMUM_WINDOW_SECONDS, 2_592_000, "the widest is thirty days, as 0056 states");
+  expectEqual(VELOCITY_MAXIMUM_LIMIT, 1_000_000, "and a limit is a small integer");
+  expectEqual(VELOCITY_CARD_FINGERPRINT_PATTERN.source, "^[0-9a-f]{64}$", "the fingerprint is the one 0055 stores");
+  expectEqual(VELOCITY_PROBLEMS.length, 5, "five reasons a hit cannot be counted");
+  expectEqual(new Set<string>(VELOCITY_PROBLEMS).size, VELOCITY_PROBLEMS.length, "each of them once");
+  expect(Object.isFrozen(VELOCITY_PROBLEMS), "and the list is frozen");
+  expect(VELOCITY_PROBLEMS.every((problem) => /^[a-z][a-z0-9_]*$/u.test(problem)), "each spelled as a machine reason");
+
+  for (const subject of VELOCITY_SUBJECTS) {
+    expect(isVelocitySubject(subject), `${subject} is a subject`);
+  }
+
+  expectEqual(isVelocitySubject("email"), false, "an address book is not a subject this counter has");
+  expectEqual(isVelocitySubject(undefined), false, "and neither is nothing");
+
+  // ---- the window, as 0093 aligns it
+  expectEqual(velocityWindowStart(Date.parse("2026-11-01T10:00:00.000Z"), 3_600), Date.parse("2026-11-01T10:00:00.000Z") / 1_000, "the top of the hour starts a window");
+  expectEqual(velocityWindowStart(Date.parse("2026-11-01T10:59:59.999Z"), 3_600), Date.parse("2026-11-01T10:00:00.000Z") / 1_000, "the last millisecond of it is still in it");
+  expectEqual(velocityWindowStart(Date.parse("2026-11-01T11:00:00.000Z"), 3_600), Date.parse("2026-11-01T11:00:00.000Z") / 1_000, "and the next millisecond starts the next one");
+  expectEqual(velocityWindowStart(Date.parse("2026-11-01T10:00:30.000Z"), 60), Date.parse("2026-11-01T10:00:00.000Z") / 1_000, "a minute window aligns to the minute");
+  expectEqual(velocityWindowStart(Date.parse("2026-11-01T10:00:30.900Z"), 1), Date.parse("2026-11-01T10:00:30.000Z") / 1_000, "a one second window to the second");
+
+  // ---- the wait, always positive because a caller reports it
+  expectEqual(velocityRetryAfter(velocityFixedNow, Date.parse("2026-11-01T10:00:00.000Z") / 1_000, 3_600), 3_570, "the wait is what is left of the window");
+  expectEqual(velocityRetryAfter(Date.parse("2026-11-01T10:59:59.500Z"), Date.parse("2026-11-01T10:00:00.000Z") / 1_000, 3_600), 1, "the last millisecond waits one second, never zero");
+  expectEqual(velocityRetryAfter(Date.parse("2026-11-01T10:00:00.000Z"), Date.parse("2026-11-01T10:00:00.000Z") / 1_000, 3_600), 3_600, "and a hit at the first instant waits the whole window");
+  expectEqual(velocityRetryAfter(Date.parse("2026-11-01T11:00:05.000Z"), Date.parse("2026-11-01T10:00:00.000Z") / 1_000, 3_600), 1, "an instant past the window still waits a second rather than none");
+
+  // ---- the fingerprint
+  expectEqual(velocityFingerprint, velocityFingerprint, "the same token hashes to the same fingerprint");
+  expect(VELOCITY_CARD_FINGERPRINT_PATTERN.test(velocityFingerprint), "which is the 64 hex digits 0056 enforces");
+  expect(velocityFingerprint !== velocityCardFingerprint(velocitySecondToken), "and two tokens are two cards");
+  expectEqual(velocityFingerprint.includes(velocityCardToken), false, "the token itself is nowhere in the fingerprint");
+
+  for (const [name, refused] of [
+    ["a card number", "4242424242424242"],
+    ["a fifteen digit card number", "424242424242424"],
+    ["a nineteen digit card number", "4242424242424242424"],
+    ["an empty token", ""],
+    ["a token with a space", "tok 4242"],
+    ["a token with a leading space", " tok_visa"],
+    ["a token with a trailing space", "tok_visa "],
+    ["a token past the ceiling", "t".repeat(VELOCITY_MAXIMUM_CARD_TOKEN_LENGTH + 1)],
+    ["a token with a newline", "tok\nvisa"],
+    ["a token with a non-ASCII character", "tok\u00e9"],
+  ] as const) {
+    const refusal = expectThrows(() => velocityCardFingerprint(refused), `${name} is refused rather than hashed`);
+
+    expectEqual(refusal?.code, "INTERNAL_ERROR", `${name} is a wiring mistake, not a payer's fault`);
+    expectEqual(velocityReasonOf(refusal), "subject_invalid", `${name} is refused as an invalid subject`);
+  }
+
+  expectEqual(
+    velocityCardFingerprint("t".repeat(VELOCITY_MAXIMUM_CARD_TOKEN_LENGTH)).length,
+    64,
+    "a token exactly at the ceiling is still hashed",
+  );
+
+  // ---- the subject in the form the row stores
+  expectEqual(canonicalVelocitySubject({ kind: "card", value: velocityCardToken }).value, velocityFingerprint, "a token becomes its fingerprint");
+  expectEqual(
+    canonicalVelocitySubject({ kind: "card", value: velocityFingerprint }).value,
+    velocityFingerprint,
+    "and a caller that already hashed the token names the same card",
+  );
+  expectEqual(canonicalSubjectKind(canonicalVelocitySubject({ kind: "card", value: velocityCardToken })), "card", "the kind travels with the value");
+  expectEqual(canonicalVelocityAddress("203.0.113.9"), velocityAddress, "an address is kept as it is written");
+  expectEqual(canonicalVelocityAddress("2001:0DB8:0:0:0:0:0:1"), canonicalVelocityAddress("2001:db8::1"), "two spellings of an address are one subject");
+  expectEqual(canonicalVelocitySubject({ kind: "ip", value: "2001:0db8:0:0::1" }).value, "2001:db8::1", "and the stored value is the canonical one");
+
+  const unknownSubject = expectThrows(
+    () => canonicalVelocitySubject({ kind: "email" as VelocitySubjectKind, value: "a@b.example" }),
+    "a kind that is not card or ip is refused",
+  );
+
+  expectEqual(velocityReasonOf(unknownSubject), "subject_invalid", "as an invalid subject");
+  expectEqual(velocityReasonOf(expectThrows(() => canonicalVelocityAddress("not-an-address"), "a string that is not an address is refused")), "subject_invalid", "and neither is it counted");
+  expectEqual(velocityReasonOf(expectThrows(() => canonicalVelocityAddress(""), "nor an empty one")), "subject_invalid", "which is a refusal rather than a free pass");
+}
+
+/** The kind of a canonical subject, as a string, so a check can compare it. */
+function canonicalSubjectKind(subject: { readonly kind: string }): string {
+  return subject.kind;
+}
+
+async function checkVelocityConsumption(): Promise<void> {
+  const counter = velocityCounter();
+  const first = await consumeVelocity({ kind: "card", value: velocityCardToken }, velocityOptions(counter.client));
+
+  expectEqual(counter.calls.length, 1, "one hit is one call");
+  expectEqual(
+    JSON.stringify(counter.calls[0]),
+    JSON.stringify({
+      p_subject: "card",
+      p_card_fingerprint: velocityFingerprint,
+      p_ip_address: null,
+      p_limit: 5,
+      p_window_seconds: 3_600,
+      p_now: "2026-11-01T10:00:30.000Z",
+    }),
+    "and the call is the six arguments 0093 declares, with the fingerprint rather than the token",
+  );
+  expectEqual(first.hits, 1, "the first hit counts one");
+  expectEqual(first.limit, 5, "against the default limit of the card rule");
+  expectEqual(first.kind, "card", "the reading names the subject kind");
+  expectEqual(first.value, velocityFingerprint, "and the canonical value, not the token");
+  expectEqual(first.windowStart, Date.parse("2026-11-01T10:00:00.000Z") / 1_000, "the window is the one the database answered");
+  expectEqual(first.windowSeconds, 3_600, "with its length");
+  expectEqual(first.exceeded, false, "one hit is not a breach");
+  expectEqual(first.firstBreach, false, "nor the first breach");
+  expectEqual(first.retryAfterSeconds, 3_570, "and the wait is the rest of the window");
+  expectEqual(Object.keys(first).sort().join(","), "exceeded,firstBreach,hits,kind,limit,retryAfterSeconds,value,windowSeconds,windowStart", "the reading is exactly nine fields");
+
+  const second = await consumeVelocity({ kind: "card", value: velocityCardToken }, velocityOptions(counter.client));
+  const third = await consumeVelocity({ kind: "card", value: velocityFingerprint }, velocityOptions(counter.client));
+
+  expectEqual(second.hits, 2, "the second hit counts two");
+  expectEqual(third.hits, 3, "and a caller that hands over the fingerprint counts the same card");
+  expectEqual(counter.keys(), 1, "one card is one row in the window");
+
+  // ---- the limit the row applied wins over the policy the caller now has
+  const changed = await consumeVelocity(
+    { kind: "card", value: velocityCardToken },
+    velocityOptions(counter.client, { card: { limit: 9, windowSeconds: 3_600 }, ip: { limit: 20, windowSeconds: 3_600 } }),
+  );
+
+  expectEqual(changed.hits, 4, "the fourth hit counts four");
+  expectEqual(changed.limit, 5, "and is held to the limit the window was opened with");
+  expectEqual(changed.exceeded, false, "which it has not reached");
+
+  const reached = await consumeVelocity({ kind: "card", value: velocityCardToken }, velocityOptions(counter.client));
+
+  expectEqual(reached.hits, 5, "the fifth hit counts five");
+  expectEqual(reached.limit, 5, "against the frozen limit");
+  expect(reached.exceeded, "which it has now reached");
+  expect(reached.firstBreach, "and this is the hit that reached it");
+
+  const past = await consumeVelocity({ kind: "card", value: velocityCardToken }, velocityOptions(counter.client));
+
+  expectEqual(past.hits, 6, "the sixth hit keeps counting");
+  expect(past.exceeded, "it is past the limit");
+  expectEqual(past.firstBreach, false, "but the first breach stays the first");
+
+  // ---- a second window is a second counter
+  const nextWindow = velocityCounter();
+  const beforeRoll = await consumeVelocity({ kind: "card", value: velocityCardToken }, velocityOptions(nextWindow.client));
+  const rollOptions: VelocityCounterOptions = { rest: nextWindow.client, now: (): number => Date.parse("2026-11-01T11:00:01.000Z") };
+  const afterRoll = await consumeVelocity({ kind: "card", value: velocityCardToken }, rollOptions);
+
+  expectEqual(beforeRoll.windowStart, Date.parse("2026-11-01T10:00:00.000Z") / 1_000, "the first window is this hour");
+  expectEqual(afterRoll.windowStart, Date.parse("2026-11-01T11:00:00.000Z") / 1_000, "the next hour is the next window");
+  expectEqual(afterRoll.hits, 1, "and starts again at one");
+  expectEqual(nextWindow.keys(), 2, "so one card is one row per window");
+
+  // ---- an address counter, and the one spelling of an address
+  const addresses = velocityCounter();
+  const ipOptions = velocityOptions(addresses.client, { card: { limit: 5, windowSeconds: 3_600 }, ip: { limit: 3, windowSeconds: 1_800 } });
+  const ipFirst = await consumeVelocity({ kind: "ip", value: velocityAddress }, ipOptions);
+  const ipSecond = await consumeVelocity({ kind: "ip", value: "2001:0db8:0:0:0:0:0:1" }, ipOptions);
+  const ipThird = await consumeVelocity({ kind: "ip", value: "2001:db8::1" }, ipOptions);
+
+  expectEqual(
+    JSON.stringify(addresses.calls[0]),
+    JSON.stringify({
+      p_subject: "ip",
+      p_card_fingerprint: null,
+      p_ip_address: velocityAddress,
+      p_limit: 3,
+      p_window_seconds: 1_800,
+      p_now: "2026-11-01T10:00:30.000Z",
+    }),
+    "an address counter sends the address and no card",
+  );
+  expectEqual(ipFirst.hits, 1, "the address counts from one");
+  expectEqual(ipFirst.limit, 3, "under the address rule");
+  expectEqual(ipFirst.windowSeconds, 1_800, "with its own window length");
+  expectEqual(ipSecond.value, "2001:db8::1", "the second spelling is stored canonically");
+  expectEqual(ipThird.hits, 2, "and both spellings are the same counter");
+  expectEqual(addresses.keys(), 2, "which is one row for the address plus one for the IPv6 address");
+
+  // ---- the policy is held to the bounds of 0056
+  for (const [name, policy] of [
+    ["a limit of zero", { card: { limit: 0, windowSeconds: 3_600 }, ip: { limit: 20, windowSeconds: 3_600 } }],
+    ["a negative limit", { card: { limit: -1, windowSeconds: 3_600 }, ip: { limit: 20, windowSeconds: 3_600 } }],
+    ["a fractional limit", { card: { limit: 1.5, windowSeconds: 3_600 }, ip: { limit: 20, windowSeconds: 3_600 } }],
+    ["a limit past the ceiling", { card: { limit: VELOCITY_MAXIMUM_LIMIT + 1, windowSeconds: 3_600 }, ip: { limit: 20, windowSeconds: 3_600 } }],
+    ["a window of zero", { card: { limit: 5, windowSeconds: 0 }, ip: { limit: 20, windowSeconds: 3_600 } }],
+    ["a window past thirty days", { card: { limit: 5, windowSeconds: VELOCITY_MAXIMUM_WINDOW_SECONDS + 1 }, ip: { limit: 20, windowSeconds: 3_600 } }],
+    ["a fractional window", { card: { limit: 5, windowSeconds: 1.5 }, ip: { limit: 20, windowSeconds: 3_600 } }],
+  ] as const) {
+    const refusal = await expectThrowsAsync(
+      () => consumeVelocity({ kind: "card", value: velocityCardToken }, velocityOptions(velocityCounter().client, policy)),
+      `${name} is refused`,
+    );
+
+    expectEqual(refusal?.code, "INTERNAL_ERROR", `${name} is a wiring mistake, not a payer's fault`);
+    expectEqual(velocityReasonOf(refusal), "policy_invalid", `${name} is refused as an invalid policy`);
+  }
+
+  const missingRule = await expectThrowsAsync(
+    () => consumeVelocity({ kind: "ip", value: velocityAddress }, velocityOptions(velocityCounter().client, { card: { limit: 5, windowSeconds: 3_600 } } as unknown as VelocityPolicy)),
+    "a policy with no rule for the subject is refused",
+  );
+
+  expectEqual(velocityReasonOf(missingRule), "policy_invalid", "rather than defaulting to zero, which would refuse every payment");
+
+  // ---- the clock
+  for (const [name, clock] of [
+    ["a clock that answers nothing", (): number => Number.NaN],
+    ["a clock before the epoch", (): number => -1],
+    ["a fractional clock", (): number => 1.5],
+    ["a clock that throws", (): number => {
+      throw new Error("no clock");
+    }],
+  ] as const) {
+    const refusal = await expectThrowsAsync(
+      () => consumeVelocity({ kind: "card", value: velocityCardToken }, { rest: velocityCounter().client, now: clock }),
+      `${name} is refused`,
+    );
+
+    expectEqual(velocityReasonOf(refusal), "clock_invalid", `${name} cannot place a window`);
+  }
+
+  // ---- a failed call is a refusal, never a free first attempt
+  const offline = await expectThrowsAsync(
+    () => consumeVelocity({ kind: "card", value: velocityCardToken }, velocityOptions(velocityFailing())),
+    "a counter that cannot be called is a dependency failure",
+  );
+
+  expectEqual(offline?.code, "DEPENDENCY_FAILED", "so the payment is not treated as the first attempt of the window");
+  expectEqual(velocityReasonOf(offline), "response_invalid", "and the reason is kept for the log");
+
+  // ---- an answer in any other shape is a dependency failure
+  for (const [name, answer] of [
+    ["no row", []],
+    ["two rows", [velocityRow(), velocityRow()]],
+    ["a scalar", 1],
+    ["a string", "ok"],
+    ["null", null],
+    ["a row with no count", [velocityRow({ counter_hits: undefined })]],
+    ["a count of zero", [velocityRow({ counter_hits: 0 })]],
+    ["a fractional count", [velocityRow({ counter_hits: 1.5 })]],
+    ["a count that is text", [velocityRow({ counter_hits: "1" })]],
+    ["a limit of zero", [velocityRow({ counter_limit: 0 })]],
+    ["a limit past the ceiling", [velocityRow({ counter_limit: VELOCITY_MAXIMUM_LIMIT + 1 })]],
+    ["a window of zero seconds", [velocityRow({ counter_window_seconds: 0 })]],
+    ["a window longer than thirty days", [velocityRow({ counter_window_seconds: VELOCITY_MAXIMUM_WINDOW_SECONDS + 1 })]],
+    ["a different window length than the one asked for", [velocityRow({ counter_window_seconds: 1_800 })]],
+    ["a window that is not this window", [velocityRow({ counter_window_start: "2026-11-01T09:00:00.000Z" })]],
+    ["a window that is not a timestamp", [velocityRow({ counter_window_start: "yesterday" })]],
+    ["a window that is a Date rather than the JSON a client answers", [velocityRow({ counter_window_start: new Date("2026-11-01T10:00:00.000Z") })]],
+    ["a window in the future", [velocityRow({ counter_window_start: "2026-11-01T11:00:00.000Z" })]],
+    ["a verdict that is text", [velocityRow({ counter_exceeded: "false" })]],
+    ["a first breach that is missing", [velocityRow({ counter_first_breach: undefined })]],
+    ["a breach the count does not support", [velocityRow({ counter_hits: 4, counter_exceeded: true })]],
+    ["a count at the limit that is not a breach", [velocityRow({ counter_hits: 5, counter_limit: 5, counter_exceeded: false })]],
+    ["a first breach that is not the first", [velocityRow({ counter_hits: 4, counter_first_breach: true })]],
+    ["a first breach the count does not support", [velocityRow({ counter_hits: 5, counter_limit: 5, counter_exceeded: true, counter_first_breach: false })]],
+  ] as const) {
+    const refusal = await expectThrowsAsync(
+      () => consumeVelocity({ kind: "card", value: velocityCardToken }, velocityOptions(velocityAnswering(answer))),
+      `an answer with ${name} is refused`,
+    );
+
+    expectEqual(refusal?.code, "DEPENDENCY_FAILED", `an answer with ${name} is a dependency failure`);
+    expectEqual(velocityReasonOf(refusal), "response_invalid", `and an answer with ${name} is recorded as an invalid response`);
+  }
+}
+
+interface FakeVelocityAuditTrail {
+  readonly trail: VelocityAuditTrail;
+  readonly entries: VelocityAuditEntry[];
+}
+
+function velocityAuditTrail(): FakeVelocityAuditTrail {
+  const entries: VelocityAuditEntry[] = [];
+
+  return {
+    entries,
+    trail: {
+      append: async (entry: VelocityAuditEntry): Promise<void> => {
+        entries.push(entry);
+      },
+    },
+  };
+}
+
+async function checkVelocityAudit(): Promise<void> {
+  const counter = velocityCounter();
+  const audit = velocityAuditTrail();
+  const reader = createVelocityReader({
+    ...velocityOptions(counter.client),
+    audit: audit.trail,
+    auditContext: { actorUserId: "018f2b8a-3333-4c2d-9c3e-0123456789ab", ipAddress: velocityAddress },
+  });
+
+  const readings: FraudVelocityReading[] = [];
+
+  for (let index = 0; index < 6; index += 1) {
+    readings.push(await reader({ kind: "card", value: velocityCardToken }));
+  }
+
+  expectEqual(readings.map((reading) => reading.hits).join(","), "1,2,3,4,5,6", "the reader counts every attempt");
+  expectEqual(readings.map((reading) => reading.limit).join(","), "5,5,5,5,5,5", "against the limit the window applies");
+  expectEqual(readings[0] === undefined ? "" : Object.keys(readings[0]).sort().join(","), "hits,limit", "and answers STEP 066's two fields and nothing else");
+  expectEqual(audit.entries.length, 1, "six attempts write one audit entry");
+
+  const entry = audit.entries[0];
+
+  expectEqual(entry?.action, VELOCITY_AUDIT_ACTION, "which is the velocity breach action");
+  expectEqual(entry?.payload["rule"], VELOCITY_RULE, "naming the rule");
+  expectEqual(entry?.payload["subject"], "card", "and the subject kind");
+  expectEqual(entry?.payload["card_fingerprint"], velocityFingerprint, "with the fingerprint, so an operator can find the card");
+  expectEqual(entry?.payload["hits"], 5, "the count that reached the limit");
+  expectEqual(entry?.payload["limit"], 5, "the limit it reached");
+  expectEqual(entry?.payload["window_start"], "2026-11-01T10:00:00.000Z", "the window it happened in");
+  expectEqual(entry?.payload["window_seconds"], 3_600, "and its length");
+  expectEqual(entry?.payload["retry_after_seconds"], 3_570, "with the wait the caller was told");
+  expectEqual(entry?.companyId, null, "the counter is the platform's, so the entry is on the platform chain");
+  expectEqual(entry?.entityType, null, "a window is not an entity");
+  expectEqual(entry?.entityId, null, "so it has no entity id");
+  expectEqual(entry?.actorUserId, "018f2b8a-3333-4c2d-9c3e-0123456789ab", "and it carries the attempt's actor");
+  expectEqual(entry?.ipAddress, velocityAddress, "and the payer's address from the caller");
+  expectEqual(entry?.sessionId, null, "a session that was not given is null rather than absent");
+  expectEqual(entry?.userAgent, null, "and so is the agent");
+  expectEqual(JSON.stringify(entry?.payload ?? {}).includes("velocity_counters"), false, "the payload names no table");
+  expectEqual(entry === undefined ? true : auditEntryProblem(entry) === null, true, "and the entry passes the audit module's own validation");
+
+  // ---- an address breach names the address in the entry, not in the payload
+  const addressCounter = velocityCounter();
+  const addressAudit = velocityAuditTrail();
+  const addressReader = createVelocityReader({
+    rest: addressCounter.client,
+    now: (): number => velocityFixedNow,
+    policy: { card: { limit: 5, windowSeconds: 3_600 }, ip: { limit: 2, windowSeconds: 3_600 } },
+    audit: addressAudit.trail,
+  });
+
+  await addressReader({ kind: "ip", value: velocityAddress });
+  await addressReader({ kind: "ip", value: velocityAddress });
+
+  const addressEntry = addressAudit.entries[0];
+
+  expectEqual(addressAudit.entries.length, 1, "the second attempt from one address is a breach of a limit of two");
+  expectEqual(addressEntry?.payload["subject"], "ip", "the entry names the address subject");
+  expectEqual(addressEntry?.payload["card_fingerprint"], null, "with no card");
+  expectEqual(addressEntry?.ipAddress, velocityAddress, "and the address in the entry's own field");
+  expectEqual(JSON.stringify(addressEntry?.payload ?? {}).includes("113.9"), false, "the payload does not repeat the address");
+  expectEqual(addressEntry === undefined ? true : auditEntryProblem(addressEntry) === null, true, "the address entry is valid too");
+
+  // ---- the entry factory itself
+  const reading: VelocityReading = {
+    kind: "card",
+    value: velocityFingerprint,
+    hits: 5,
+    limit: 5,
+    windowStart: Date.parse("2026-11-01T10:00:00.000Z") / 1_000,
+    windowSeconds: 3_600,
+    exceeded: true,
+    retryAfterSeconds: 3_570,
+    firstBreach: true,
+  };
+
+  expectEqual(JSON.stringify(velocityAuditEntry(reading)), JSON.stringify(velocityAuditEntry(reading)), "the factory is a function of the reading");
+  expectEqual(velocityAuditEntry({ ...reading, firstBreach: false }), null, "and writes nothing for a hit that is not the first breach");
+  expectEqual(velocityAuditEntry({ ...reading, hits: 6, firstBreach: false }), null, "nor for the hit after it");
+  expectEqual(velocityAuditEntry(reading, { ipAddress: velocityAddress })?.ipAddress, velocityAddress, "the caller's address is carried when it is given");
+
+  // ---- a trail that fails never fails the payment
+  const failingCounter = velocityCounter();
+  const failingTrail: VelocityAuditTrail = {
+    append: async (): Promise<void> => {
+      throw new Error("audit store offline");
+    },
+  };
+  const failingReader = createVelocityReader({
+    rest: failingCounter.client,
+    now: (): number => velocityFixedNow,
+    policy: { card: { limit: 1, windowSeconds: 3_600 }, ip: { limit: 20, windowSeconds: 3_600 } },
+    audit: failingTrail,
+  });
+
+  const survived = await failingReader({ kind: "card", value: velocityCardToken });
+
+  expectEqual(survived.hits, 1, "the counter moved before the audit entry was written");
+  expectEqual(survived.limit, 1, "so the reading stands even when the audit writer is down");
+
+  // ---- and no trail at all is no audit entry, not a failure
+  const quietReader = createVelocityReader({
+    rest: velocityCounter().client,
+    now: (): number => velocityFixedNow,
+    policy: { card: { limit: 1, windowSeconds: 3_600 }, ip: { limit: 20, windowSeconds: 3_600 } },
+  });
+
+  expectEqual((await quietReader({ kind: "card", value: velocityCardToken })).hits, 1, "a reader without a trail still counts");
+}
+
+interface FakeVelocitySweep {
+  readonly client: VelocitySweepClient;
+  readonly calls: { table: string; column: string; before: string }[];
+}
+
+function velocitySweeper(answer: number | (() => Promise<number>)): FakeVelocitySweep {
+  const calls: { table: string; column: string; before: string }[] = [];
+
+  return {
+    calls,
+    client: {
+      deleteBefore: async (table: string, column: string, before: string): Promise<number> => {
+        calls.push({ table, column, before });
+
+        return typeof answer === "function" ? answer() : answer;
+      },
+    },
+  };
+}
+
+async function checkVelocitySweep(): Promise<void> {
+  const sweeper = velocitySweeper(3);
+  const removed = await sweepVelocityWindows({ client: sweeper.client, now: (): number => velocityFixedNow });
+
+  expectEqual(removed, 3, "the sweep answers what it removed");
+  expectEqual(sweeper.calls.length, 1, "in one statement");
+  expectEqual(sweeper.calls[0]?.table, VELOCITY_TABLE, "on the velocity table");
+  expectEqual(sweeper.calls[0]?.column, "window_start", "by the window it starts at");
+  expectEqual(sweeper.calls[0]?.before, "2026-10-02T10:00:30.000Z", "and everything older than the retention, which is thirty days");
+  expectEqual(
+    Date.parse(sweeper.calls[0]?.before ?? "") === velocityFixedNow - VELOCITY_RETENTION_SECONDS * 1_000,
+    true,
+    "the cutoff is the clock minus the retention, to the millisecond",
+  );
+
+  const shortRetention = await expectThrowsAsync(
+    () => sweepVelocityWindows({ client: velocitySweeper(0).client, retentionSeconds: 60, now: (): number => velocityFixedNow }),
+    "a retention shorter than the window it would delete is refused",
+  );
+
+  expectEqual(velocityReasonOf(shortRetention), "retention_invalid", "because deleting a live counter is the limit bypassed");
+  expectEqual(shortRetention?.code, "INTERNAL_ERROR", "and it is a configuration mistake");
+
+  const wideWindow = await expectThrowsAsync(
+    () =>
+      sweepVelocityWindows({
+        client: velocitySweeper(0).client,
+        policy: { card: { limit: 5, windowSeconds: 3_600 }, ip: { limit: 20, windowSeconds: 86_400 } },
+        retentionSeconds: 3_600,
+        now: (): number => velocityFixedNow,
+      }),
+    "a retention shorter than the widest window in force is refused",
+  );
+
+  expectEqual(velocityReasonOf(wideWindow), "retention_invalid", "whatever the rule that has the wide window");
+
+  const atTheWidest = await sweepVelocityWindows({
+    client: velocitySweeper(0).client,
+    policy: { card: { limit: 5, windowSeconds: 3_600 }, ip: { limit: 20, windowSeconds: VELOCITY_MAXIMUM_WINDOW_SECONDS } },
+    retentionSeconds: VELOCITY_MAXIMUM_WINDOW_SECONDS,
+    now: (): number => velocityFixedNow,
+  });
+
+  expectEqual(atTheWidest, 0, "the widest window is kept for its whole length and no longer");
+
+  for (const [name, retention] of [
+    ["a retention of zero", 0],
+    ["a negative retention", -1],
+    ["a fractional retention", 1.5],
+  ] as const) {
+    const refusal = await expectThrowsAsync(
+      () => sweepVelocityWindows({ client: velocitySweeper(0).client, retentionSeconds: retention, now: (): number => velocityFixedNow }),
+      `${name} is refused`,
+    );
+
+    expectEqual(velocityReasonOf(refusal), "retention_invalid", `${name} is a configuration mistake`);
+  }
+
+  const offline = await expectThrowsAsync(
+    () =>
+      sweepVelocityWindows({
+        client: velocitySweeper(async (): Promise<number> => {
+          throw new Error("connection reset");
+        }).client,
+        now: (): number => velocityFixedNow,
+      }),
+    "a sweep that cannot reach the store is a dependency failure",
+  );
+
+  expectEqual(offline?.code, "DEPENDENCY_FAILED", "rather than a sweep that removed nothing and said nothing");
+
+  for (const [name, answer] of [
+    ["a fractional count", 1.5],
+    ["a negative count", -1],
+    ["a count that is not a number", Number.NaN],
+  ] as const) {
+    const refusal = await expectThrowsAsync(
+      () => sweepVelocityWindows({ client: velocitySweeper(answer).client, now: (): number => velocityFixedNow }),
+      `${name} from the store is refused`,
+    );
+
+    expectEqual(velocityReasonOf(refusal), "response_invalid", `${name} is not a sweep result`);
+  }
+
+  const noClock = await expectThrowsAsync(
+    () => sweepVelocityWindows({ client: velocitySweeper(0).client, now: (): number => Number.NaN }),
+    "a sweep with no clock is refused",
+  );
+
+  expectEqual(velocityReasonOf(noClock), "clock_invalid", "because the cutoff would be meaningless");
+}
+
+async function checkVelocityWiring(): Promise<void> {
+  const source = await readFile(new URL("./velocity.ts", import.meta.url), "utf8");
+  const fraud = await readFile(new URL("./fraud.ts", import.meta.url), "utf8");
+  const migration = await readFile(new URL("../../migrations/0093_velocity_counter_consume.sql", import.meta.url), "utf8");
+  const rollback = await readFile(new URL("../../migrations/0093_velocity_counter_consume.down.sql", import.meta.url), "utf8");
+  const counters = await readFile(new URL("../../migrations/0056_velocity_counters.sql", import.meta.url), "utf8");
+  const securityRoot = new URL("./", import.meta.url);
+  const securityFiles = (await readdir(securityRoot)).filter((name) => name.endsWith(".ts"));
+
+  expectEqual(source.split("\n")[0], "// path: lib/security/velocity.ts", "the module states its own path on its first line");
+  expect(securityFiles.includes("velocity.ts"), "and it is one file in the security tree");
+  expect(source.includes('from "./rate-limit.ts"'), "the address rule is STEP 062's, not a second parser");
+  expect(source.includes("canonicalRateLimitAddress"), "which is the one function that decides an address");
+  expect(source.includes('from "./fraud.ts"'), "and the counter speaks STEP 066's contract by importing its type");
+  expectEqual(fraud.includes('from "./velocity.ts"'), false, "while the fraud module knows nothing of this one, so the arrow has one direction");
+  expect(fraud.includes("readVelocity"), "the contract STEP 066 declares is the one this module fills");
+  expect(source.includes('from "node:crypto"'), "a fingerprint is hashed here");
+  expect(source.includes("createHash"), "with the platform's one digest");
+  expectEqual(source.includes("console."), false, "nothing is logged, so no card and no address is");
+  expectEqual(source.includes("process.env"), false, "the module reads no environment variable");
+  expectEqual(source.includes("fetch("), false, "and makes no request");
+  expectEqual(source.includes("supabase"), false, "the client is the caller's");
+  expectEqual(source.includes("Math.random"), false, "and nothing is random");
+  expectEqual(source.includes("card_number"), false, "no card number is named, because none may arrive");
+  expectEqual(source.includes("cvv"), false, "and no CVV either");
+  expectEqual(/:\s*any\b/u.test(source), false, "the module writes no any");
+  expect(source.includes("velocityCardFingerprint"), "the fingerprint a payment page needs is exported, so hashing happens in one file");
+  expect(source.includes("VELOCITY_DEFAULT_POLICY"), "the defaults are declared once");
+  expectEqual(source.includes("delete from"), false, "the service writes no SQL of its own");
+  expectEqual(source.includes("on conflict"), false, "the counting is the function's, not a statement assembled here");
+
+  // ---- the migration and its rollback
+  expectEqual((migration.match(/create function public\.consume_velocity/gu) ?? []).length, 1, "0093 defines the counting function once");
+  expectEqual((migration.match(/on conflict \(card_fingerprint, window_start, window_seconds\)/gu) ?? []).length, 1, "with one branch for the card index");
+  expectEqual((migration.match(/on conflict \(ip_address, window_start, window_seconds\)/gu) ?? []).length, 1, "and one for the address index");
+  expect(migration.includes("where card_fingerprint is not null and deleted_at is null"), "each naming the partial index it infers");
+  expect(migration.includes("where ip_address is not null and deleted_at is null"), "exactly as 0056 declares it");
+  expectEqual((migration.match(/hit_count = counter_row\.hit_count \+ 1/gu) ?? []).length, 2, "both branches count one hit and not a count the caller sent");
+  expectEqual((migration.match(/greatest\(counter_row\.last_hit_at, excluded\.last_hit_at\)/gu) ?? []).length, 2, "and move the last hit forward only");
+  expectEqual((migration.match(/counter_row\.hit_count \+ 1 >= counter_row\.limit_value/gu) ?? []).length, 2, "writing the breach on the hit that reaches the limit");
+  expectEqual((migration.match(/when counter_row\.exceeded_at is null/gu) ?? []).length, 2, "and only when no breach was written before");
+  expectEqual((migration.match(/v_hits = v_limit;/gu) ?? []).length, 1, "the first breach is the count equal to the limit, so it happens once");
+  expectEqual((migration.match(/v_hits >= v_limit,/gu) ?? []).length, 1, "and exceeded is the count reaching it");
+  expectEqual(migration.includes("set search_path = ''"), true, "the function cannot be redirected by a caller's search path");
+  expectEqual((migration.match(/public\./gu) ?? []).length >= 2, true, "every object it names is schema qualified");
+  expectEqual(migration.includes("limit_value = "), false, "the update never rewrites the limit, which 0056 freezes");
+  expectEqual(migration.includes("window_start = "), false, "nor the window");
+  expectEqual(migration.includes("deleted_at = "), false, "nor retires a counter, which is the sweep's job");
+  expectEqual(migration.includes("delete from"), false, "and a forward migration deletes no row");
+  expectEqual(migration.includes("truncate"), false, "nor empties a table");
+  expectEqual(rollback.includes("drop function if exists public.consume_velocity"), true, "the rollback removes exactly the function");
+  expectEqual(rollback.includes(VELOCITY_TABLE), false, "and leaves the windows, which are 0056's record");
+
+  // ---- the constants are the schema's, spelled once
+  expectEqual(
+    counters.includes(`window_seconds between ${VELOCITY_MINIMUM_WINDOW_SECONDS} and ${VELOCITY_MAXIMUM_WINDOW_SECONDS}`),
+    true,
+    "0056 states the window bounds, which this module's ceiling repeats",
+  );
+  expectEqual(counters.includes("^[0-9a-f]{64}$"), true, "but it is the table's pattern");
+  expectEqual(counters.includes("company_id is null"), true, "the counter is the platform's, as the entry this module writes states");
+  expectEqual(counters.includes("hit_count >= limit_value"), true, "and a breach is the count reaching the limit, which is the comparison here");
+
+  // ---- one function counts velocity in the whole repository
+  const migrationRoot = new URL("../../migrations/", import.meta.url);
+  const definers: string[] = [];
+
+  for (const file of (await readdir(migrationRoot)).filter((name) => name.endsWith(".sql"))) {
+    const text = file.endsWith(".down.sql") ? "" : await readFile(new URL(file, migrationRoot), "utf8");
+
+    if (text.includes("function public.consume_velocity")) {
+      definers.push(file);
+    }
+  }
+
+  expectEqual(definers.join(","), "0093_velocity_counter_consume.sql", "one migration in the tree defines the counter");
+
+  const readers: string[] = [];
+
+  for (const file of securityFiles) {
+    if (file === "velocity.ts" || file === "verify.ts") {
+      continue;
+    }
+
+    const text = await readFile(new URL(file, securityRoot), "utf8");
+
+    if (text.includes("consume_velocity")) {
+      readers.push(file);
+    }
+  }
+
+  expectEqual(readers.length, 0, "and one module calls it, because two counters for one card would be two answers");
+}
+
 async function checkTree(): Promise<void> {
   const securityRoot = new URL("./", import.meta.url);
   const securityFiles = (await readdir(securityRoot)).filter((name) => name.endsWith(".ts"));
@@ -4774,6 +5539,11 @@ async function main(): Promise<void> {
   await checkFraudLookups();
   await checkFraudAudit();
   await checkFraudWiring();
+  checkVelocityVocabulary();
+  await checkVelocityConsumption();
+  await checkVelocityAudit();
+  await checkVelocitySweep();
+  await checkVelocityWiring();
   await checkTree();
 
   if (failures.length > 0) {
