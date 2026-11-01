@@ -333,6 +333,25 @@ the authority. A permission check uses the record, never a claim.
     compensation learned two guards on the way: it never soft closes a `users` row this request did
     not insert, and it never deletes a provider account the provider did not say it created, so a
     duplicate cannot close, delete or otherwise disturb the account it collided with.
+63. The private half never leaves the browser. `generateProofKeyPair` asks WebCrypto for a key
+    pair whose private half is **non-extractable**, exports only the SPKI public half and posts that;
+    no route in this platform accepts a private key, and the pair is kept in IndexedDB because
+    `localStorage` keeps strings - which is the one thing this design must not have. Section 22's
+    proof key is therefore a key the browser can use and a machine cannot carry away.
+64. The server computes the fingerprint it stores. `inspectProofKey` refuses a string that is not
+    its own canonical base64url, parses the DER with `createPublicKey`, checks the curve against the
+    declared algorithm (P-256 for ES256, P-384 for ES384, Ed25519 for EdDSA), re-exports SPKI and
+    hashes *those* bytes. A client-supplied fingerprint is not even an input field:
+    `deviceEnrolmentSchema` is strict, so a third field is refused rather than ignored.
+65. Enrolling a device is not trusting it. Every row this platform writes has `trusted_at` null;
+    section 22 trusts a new device only after the email and second factor confirmation of STEP 052.
+    An enrolment therefore adds a key and changes nothing about the session that made the call,
+    which is why STEP 050 has to verify a signature before any endpoint acts on one.
+66. Enrolment is idempotent, bounded and audited. The same live fingerprint answers
+    `already_enrolled` and moves `last_seen_at`; a race with `device_proof_keys_live_key` resolves the
+    same way from the losing side; past ten live devices the answer is `CONFLICT` and nothing is
+    written; and every written or refreshed row appends `user.device_enrolled` or
+    `user.device_proof_refreshed` with the algorithm and the device label, never the key.
 
 ## Adding an operation
 

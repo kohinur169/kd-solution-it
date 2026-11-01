@@ -3,6 +3,7 @@
 
 import Script from "next/script";
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { enrolDeviceProofKey } from "@/lib/auth/device-proof-store";
 import { formatMessage, getMessage } from "@/lib/i18n/messages";
 
 /**
@@ -18,6 +19,16 @@ import { formatMessage, getMessage } from "@/lib/i18n/messages";
  * they look the same on the wire. The single exception is the lock of section 22, which answers 423
  * only once the password is known to be right, and therefore tells a stranger nothing about whether
  * the account exists.
+ *
+ * ## The device proof key
+ *
+ * Both success paths - the single factor one and the one that follows a correct code - carry
+ * `deviceProofRequired`, which the server answers from the live `device_proof_keys` rows. When it is
+ * true this browser generates a pair, keeps the private half in IndexedDB and registers the public
+ * half before the navigation. The enrolment is awaited but never awaited *for its result*: a browser
+ * without WebCrypto, a storage that refuses, or an endpoint that is down leaves the merchant signed
+ * in with the server asking again next time, because refusing the sign in would be punishing the
+ * merchant for a feature that protects the platform.
  */
 
 const turnstileScriptUrl =
@@ -88,6 +99,38 @@ const fieldClassName =
 
 const codeFieldClassName =
   "mt-1 w-full rounded-lg border border-border bg-background px-3 py-2 font-mono text-lg tracking-[0.3em] text-foreground outline-none focus-visible:ring-2 focus-visible:ring-primary";
+
+/**
+ * Whether the platform asked this browser to enrol a proof key.
+ *
+ * Absent is false. The field is a hint from the server, and a component that treated a missing field
+ * as "enrol" would generate keys for every browser talking to an older server.
+ */
+function readDeviceProofRequired(payload: unknown): boolean {
+  if (typeof payload !== "object" || payload === null) {
+    return false;
+  }
+
+  return (payload as { readonly deviceProofRequired?: unknown }).deviceProofRequired === true;
+}
+
+/**
+ * Register this browser's proof key when the answer asked for one.
+ *
+ * Every failure is swallowed on purpose: the sign in has already succeeded, and the only durable
+ * consequence of a missing key is that the next sign in asks again.
+ */
+async function enrolDeviceProofKeyWhenRequired(payload: unknown): Promise<void> {
+  if (!readDeviceProofRequired(payload)) {
+    return;
+  }
+
+  try {
+    await enrolDeviceProofKey();
+  } catch {
+    // Nothing to say and nothing to undo: the session is the server's, not the key's.
+  }
+}
 
 /**
  * Read the challenge out of a sign in answer.
@@ -245,6 +288,8 @@ export function SigninForm({ siteKey, afterSigninPath }: SigninFormProperties): 
         return;
       }
 
+      await enrolDeviceProofKeyWhenRequired(payload);
+
       // A full navigation, so the cookie written by this response is the one the next request
       // carries; a client side transition could render a page from the previous identity.
       window.location.assign(afterSigninPath);
@@ -286,6 +331,10 @@ export function SigninForm({ siteKey, afterSigninPath }: SigninFormProperties): 
 
         return;
       }
+
+      const payload: unknown = await response.json().catch(() => null);
+
+      await enrolDeviceProofKeyWhenRequired(payload);
 
       window.location.assign(afterSigninPath);
     } catch {

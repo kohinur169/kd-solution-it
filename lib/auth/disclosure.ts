@@ -113,6 +113,10 @@ export const ANONYMOUS_AUTH_SURFACES: readonly AnonymousSurface[] = deepFreeze([
 /** Surfaces that answer only to a signed-in merchant, listed so none is forgotten. */
 export const SESSION_AUTH_SURFACES: readonly SessionSurface[] = deepFreeze([
   {
+    path: "/api/auth/devices",
+    note: "The signed-in merchant registers the public half of this browser's proof key. The answer names a device of the caller's own account and is never reachable without a session.",
+  },
+  {
     path: "/api/auth/2fa/enroll",
     note: "The merchant starts the enrolment of their own second factor.",
   },

@@ -14,6 +14,18 @@ import {
   signAuditHash,
 } from "./audit.ts";
 import { isAddress, readClientAddress, readUserAgent } from "./client-address.ts";
+import { deviceEnrolmentSchema, enrolDeviceProofKey, inspectProofKey } from "./device-enrolment.ts";
+import {
+  decodeBase64Url,
+  encodeBase64Url,
+  generateProofKeyPair,
+  isPublicKeyShape,
+  isStoredProofKey,
+  PROOF_KEY_FINGERPRINT_PATTERN,
+  PROOF_KEY_LABEL_MAXIMUM_LENGTH,
+  proofKeyLabel,
+  publicProofKeyOf,
+} from "./proof-key.ts";
 import {
   ANONYMOUS_AUTH_SURFACES,
   ANONYMOUS_REFUSAL,
@@ -7631,6 +7643,448 @@ async function checkDisclosure(): Promise<void> {
   expectEqual(renderedEnvelope(lockedStrangerError), canonical, "a locked account without its password renders the canonical refusal");
 }
 
+/* ------------------------------------------------ device proof key (049) */
+
+/** The row `0009` creates, as the gate's fake table keeps it. */
+interface DeviceKeyRow {
+  readonly id: string;
+  readonly user_id: string;
+  readonly company_id: string | null;
+  readonly fingerprint: string;
+  readonly public_key: string;
+  readonly algorithm: string;
+  readonly label: string | null;
+  readonly first_seen_at: string;
+  readonly last_seen_at: string;
+  readonly trusted_at: string | null;
+  readonly revoked_at: string | null;
+  readonly deleted_at: string | null;
+}
+
+interface DeviceKeyTable {
+  readonly rows: readonly DeviceKeyRow[];
+  readonly updates: readonly { readonly id: string; readonly values: Readonly<Record<string, unknown>> }[];
+  seed(values: {
+    readonly user_id: string;
+    readonly fingerprint: string;
+    readonly revoked_at?: string | null;
+  }): string;
+  readonly rest: RestClient;
+}
+
+/**
+ * A fake `public.device_proof_keys` that enforces the checks `0009` enforces.
+ *
+ * `blindSelects` makes the next N reads answer nothing, which is how the race against
+ * `device_proof_keys_live_key` is reproduced without threads: the service reads, sees no key, and
+ * the insert it then attempts collides with a row that became live in between.
+ */
+function createDeviceKeyTable(options: { readonly blindSelects?: number } = {}): DeviceKeyTable {
+  const rows: DeviceKeyRow[] = [];
+  const updates: { id: string; values: Readonly<Record<string, unknown>> }[] = [];
+  let blind = options.blindSelects ?? 0;
+
+  const matches = (query: string): readonly DeviceKeyRow[] => {
+    const userId = /(?:^|[&?])user_id=eq\.([^&]+)/u.exec(query)?.[1] ?? null;
+    const fingerprint = /(?:^|[&?])fingerprint=eq\.([^&]+)/u.exec(query)?.[1] ?? null;
+    const limit = Number.parseInt(/limit=(\d+)/u.exec(query)?.[1] ?? "", 10);
+    const live = query.includes("revoked_at=is.null")
+      ? rows.filter((row) => row.revoked_at === null && row.deleted_at === null)
+      : rows;
+
+    return live
+      .filter((row) => userId === null || row.user_id === decodeURIComponent(userId))
+      .filter((row) => fingerprint === null || row.fingerprint === decodeURIComponent(fingerprint))
+      .slice(0, Number.isFinite(limit) ? limit : rows.length);
+  };
+
+  const write = (batch: readonly Readonly<Record<string, unknown>>[]): readonly DeviceKeyRow[] =>
+    batch.map((values) => {
+      const fingerprint = String(values["fingerprint"]);
+      const publicKey = String(values["public_key"]);
+      const rawLabel = values["label"];
+      const label = rawLabel === null || rawLabel === undefined ? null : String(rawLabel);
+      const userId = String(values["user_id"]);
+
+      if (!PROOF_KEY_FINGERPRINT_PATTERN.test(fingerprint)) {
+        throw new AppError("VALIDATION_FAILED");
+      }
+
+      if (!isPublicKeyShape(publicKey)) {
+        throw new AppError("VALIDATION_FAILED");
+      }
+
+      // device_proof_keys_label_check: trimmed, one to eighty characters.
+      if (label !== null && (label !== label.trim() || label.length > PROOF_KEY_LABEL_MAXIMUM_LENGTH)) {
+        throw new AppError("VALIDATION_FAILED");
+      }
+
+      // device_proof_keys_live_key: one live row per account and fingerprint.
+      if (
+        rows.some(
+          (row) =>
+            row.user_id === userId &&
+            row.fingerprint === fingerprint &&
+            row.revoked_at === null &&
+            row.deleted_at === null,
+        )
+      ) {
+        throw new AppError("CONFLICT");
+      }
+
+      const row: DeviceKeyRow = {
+        id: `device-${String(rows.length + 1)}`,
+        user_id: userId,
+        company_id: (values["company_id"] as string | null | undefined) ?? null,
+        fingerprint,
+        public_key: publicKey,
+        algorithm: String(values["algorithm"]),
+        label,
+        first_seen_at: String(values["first_seen_at"]),
+        last_seen_at: String(values["last_seen_at"]),
+        trusted_at: null,
+        revoked_at: null,
+        deleted_at: null,
+      };
+
+      rows.push(row);
+
+      return row;
+    });
+
+  return {
+    rows,
+    updates,
+    seed(values) {
+      const row: DeviceKeyRow = {
+        id: `seed-${String(rows.length + 1)}`,
+        user_id: values.user_id,
+        company_id: FIRM_ID,
+        fingerprint: values.fingerprint,
+        public_key: "x".repeat(122),
+        algorithm: "ES256",
+        label: "seeded",
+        first_seen_at: new Date(NOW - 86_400_000).toISOString(),
+        last_seen_at: new Date(NOW - 86_400_000).toISOString(),
+        trusted_at: new Date(NOW - 86_400_000).toISOString(),
+        revoked_at: values.revoked_at ?? null,
+        deleted_at: null,
+      };
+
+      rows.push(row);
+
+      return row.id;
+    },
+    rest: {
+      select<TRow>(table: string, query: string): Promise<readonly TRow[]> {
+        if (table !== "device_proof_keys") {
+          return Promise.resolve([]);
+        }
+
+        if (blind > 0) {
+          blind -= 1;
+
+          return Promise.resolve([]);
+        }
+
+        return Promise.resolve(matches(query) as unknown as readonly TRow[]);
+      },
+      insert(table: string, batch: readonly Readonly<Record<string, unknown>>[]): Promise<void> {
+        if (table === "device_proof_keys") {
+          write(batch);
+        }
+
+        return Promise.resolve();
+      },
+      insertReturning<TRow>(
+        table: string,
+        batch: readonly Readonly<Record<string, unknown>>[],
+      ): Promise<readonly TRow[]> {
+        if (table !== "device_proof_keys") {
+          return Promise.resolve([]);
+        }
+
+        return Promise.resolve(write(batch).map((row) => ({ id: row.id }) as unknown as TRow));
+      },
+      update(table: string, query: string, values: Readonly<Record<string, unknown>>): Promise<void> {
+        if (table !== "device_proof_keys") {
+          return Promise.resolve();
+        }
+
+        const id = decodeURIComponent(/(?:^|[&?])id=eq\.([^&]+)/u.exec(query)?.[1] ?? "");
+        const index = rows.findIndex((row) => row.id === id && row.revoked_at === null && row.deleted_at === null);
+        const current = index === -1 ? undefined : rows[index];
+
+        if (current === undefined) {
+          return Promise.resolve();
+        }
+
+        updates.push({ id, values });
+        rows[index] = { ...current, ...values } as DeviceKeyRow;
+
+        return Promise.resolve();
+      },
+      rpc(): Promise<unknown> {
+        return Promise.resolve(null);
+      },
+    },
+  };
+}
+
+const chromeAgent =
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+
+/**
+ * The device proof key: generation in the browser, and the row the server writes.
+ *
+ * The three halves of the feature are proven where they run. Generation and the fingerprint are the
+ * *same module* the browser loads, executed here under Node's WebCrypto, so the values the gate
+ * compares are the values a browser produces. The parse is the server's, with `createPublicKey`
+ * behind it. The row, the cap, the race and the audit entry are the service's, against a table that
+ * enforces the checks `0009` enforces.
+ *
+ * What cannot be proven here is IndexedDB itself; the store's guard (`isStoredProofKey`) is, because
+ * that guard is what decides whether a record read back from a browser is used or replaced.
+ */
+async function checkDeviceProofKey(): Promise<void> {
+  // ---- the shared half: base64url in both directions
+  const bytes = new Uint8Array(32).map((_value, index) => (index * 7 + 3) % 256);
+  const encoded = encodeBase64Url(bytes);
+
+  expect(encoded.length > 0 && !encoded.includes("="), "base64url carries no padding");
+  expect(/^[A-Za-z0-9_-]+$/u.test(encoded), "base64url uses only the two safe symbols");
+  expectEqual(decodeBase64Url(encoded)?.length, 32, "base64url round trips to the same length");
+  expectEqual(decodeBase64Url(encoded)?.[31], bytes[31], "base64url round trips the last byte");
+  expectEqual(decodeBase64Url(`${encoded}==`), null, "a padded string is refused rather than repaired");
+  expectEqual(decodeBase64Url("a+b/"), null, "the standard alphabet is refused");
+  expectEqual(decodeBase64Url(""), null, "an empty string is not a key");
+  expectEqual(decodeBase64Url("a"), null, "a length that cannot be base64 is refused");
+
+  // ---- a real pair, the way the browser generates it
+  const generated = await generateProofKeyPair();
+
+  expectEqual(generated.algorithm, "ES256", "a browser generates ES256 by default");
+  expectEqual(generated.privateKey.extractable, false, "the private half cannot be exported");
+  expectEqual(generated.publicKey.extractable, true, "the public half can be exported");
+  expect(generated.privateKey.usages.includes("sign"), "the private half is allowed to sign");
+  expectEqual(isPublicKeyShape(generated.publicKeyBase64Url), true, "the exported key fits the column");
+  expectEqual(generated.fingerprint.length, 43, "the fingerprint is a SHA-256 in base64url");
+  expect(PROOF_KEY_FINGERPRINT_PATTERN.test(generated.fingerprint), "the fingerprint fits 0009's check");
+
+  const otherPair = await generateProofKeyPair();
+
+  expect(generated.fingerprint !== otherPair.fingerprint, "two devices have two fingerprints");
+
+  // ---- the server parses what the browser produced
+  const inspection = await inspectProofKey(generated.publicKeyBase64Url, "ES256");
+
+  expectEqual(inspection?.canonicalBase64Url, generated.publicKeyBase64Url, "the server stores the encoding it received");
+  expectEqual(inspection?.fingerprint, generated.fingerprint, "both sides compute one fingerprint");
+  expectEqual(inspection?.algorithm, "ES256", "the server keeps the declared algorithm");
+
+  const p384 = await generateProofKeyPair("ES384");
+  const p384Inspection = await inspectProofKey(p384.publicKeyBase64Url, "ES384");
+
+  expectEqual(p384Inspection?.fingerprint, p384.fingerprint, "an ES384 key is accepted as ES384");
+  expectEqual(await inspectProofKey(p384.publicKeyBase64Url, "ES256"), null, "a P-384 key is not an ES256 key");
+
+  const ed = await generateProofKeyPair("EdDSA");
+  const edInspection = await inspectProofKey(ed.publicKeyBase64Url, "EdDSA");
+
+  expectEqual(edInspection?.fingerprint, ed.fingerprint, "an Ed25519 key is accepted as EdDSA");
+  expectEqual(await inspectProofKey(ed.publicKeyBase64Url, "ES256"), null, "an Ed25519 key is not an ES256 key");
+
+  expectEqual(await inspectProofKey("not-a-key-at-all-not-a-key-at-all-0000", "ES256"), null, "bytes that are not DER are refused");
+  expectEqual(await inspectProofKey(`${generated.publicKeyBase64Url}==`, "ES256"), null, "a padded key is refused");
+  expectEqual(await inspectProofKey(generated.publicKeyBase64Url.slice(0, 31), "ES256"), null, "a short string is refused");
+  expectEqual(await inspectProofKey(generated.publicKeyBase64Url, "RS256"), null, "an algorithm outside the column is refused");
+  expectEqual(await inspectProofKey(42, "ES256"), null, "a number is not a key");
+
+  // ---- the row, the cap, the race
+  const table = createDeviceKeyTable();
+  const audit = createInMemoryAuditTrail();
+  const dependencies = { rest: table.rest, audit, now: () => NOW, maximumDevices: 4 };
+  const actor = { userId: USER_ID, companyId: FIRM_ID, sessionId: "session-1" };
+
+  const enrolled = await enrolDeviceProofKey(
+    { request: publicProofKeyOf({ ...generated }), userAgent: chromeAgent, remoteIp: "203.0.113.9" },
+    actor,
+    dependencies,
+  );
+
+  expectEqual(enrolled.status, "enrolled", "a first key is enrolled");
+  expectEqual(table.rows.length, 1, "one row is written");
+  expectEqual(enrolled.device.deviceId, table.rows[0]?.id, "the answer names the row");
+  expectEqual(table.rows[0]?.trusted_at, null, "a new device is not trusted before STEP 052");
+  expectEqual(table.rows[0]?.label, "Chrome on macOS", "the label comes from the user agent");
+  expectEqual(table.rows[0]?.user_id, USER_ID, "the key belongs to the signed in account");
+  expectEqual(table.rows[0]?.company_id, FIRM_ID, "the key carries the tenant of the account");
+  expectEqual(table.rows[0]?.public_key, generated.publicKeyBase64Url, "the canonical key is stored");
+  expectEqual(table.rows[0]?.fingerprint, generated.fingerprint, "the server computed the fingerprint");
+  expectEqual(table.rows[0]?.algorithm, "ES256", "the algorithm is stored");
+  expectEqual(audit.entries[0]?.action, "user.device_enrolled", "the enrolment is audited");
+  expectEqual(audit.entries[0]?.entityType, "device_proof_key", "the entry names a device");
+  expectEqual(audit.entries[0]?.entityId, enrolled.device.deviceId, "the entry names the row");
+  expectEqual(audit.entries[0]?.payload["trusted"], false, "the entry records that trust is pending");
+  expectEqual(audit.entries[0]?.payload["algorithm"], "ES256", "the entry records the algorithm");
+  expect(
+    JSON.stringify(audit.entries[0]?.payload).includes(generated.publicKeyBase64Url.slice(0, 32)) === false,
+    "the audit entry carries no key material",
+  );
+
+  // ---- the same browser asking twice
+  const again = await enrolDeviceProofKey(
+    { request: publicProofKeyOf({ ...generated }), userAgent: chromeAgent, remoteIp: "203.0.113.9" },
+    actor,
+    dependencies,
+  );
+
+  expectEqual(again.status, "already_enrolled", "a second call for the same key is not a new device");
+  expectEqual(table.rows.length, 1, "the second call writes no second row");
+  expectEqual(table.updates.length, 1, "the second call moves the seen instant");
+  expectEqual(table.updates[0]?.values["last_seen_at"], new Date(NOW).toISOString(), "the seen instant is now");
+  expectEqual(audit.entries[1]?.action, "user.device_proof_refreshed", "the refresh is audited");
+
+  // ---- another account holding the same fingerprint is not this account's business
+  table.seed({ user_id: OTHER_USER_ID, fingerprint: otherPair.fingerprint });
+
+  const neighbour = await enrolDeviceProofKey(
+    { request: publicProofKeyOf({ ...otherPair }), userAgent: chromeAgent, remoteIp: null },
+    actor,
+    dependencies,
+  );
+
+  expectEqual(neighbour.status, "enrolled", "the same key under another account does not block this one");
+  expectEqual(table.rows.length, 3, "the neighbour's row is untouched and this one is added");
+
+  // ---- the cap
+  const capped = createDeviceKeyTable();
+  const cappedAudit = createInMemoryAuditTrail();
+  const oneDevice = { rest: capped.rest, audit: cappedAudit, now: () => NOW, maximumDevices: 1 };
+
+  await enrolDeviceProofKey(
+    { request: publicProofKeyOf({ ...generated }), userAgent: chromeAgent, remoteIp: null },
+    actor,
+    oneDevice,
+  );
+
+  const thirdPair = await generateProofKeyPair();
+  const capError = await captureRejection(
+    () =>
+      enrolDeviceProofKey(
+        { request: publicProofKeyOf({ ...thirdPair }), userAgent: chromeAgent, remoteIp: null },
+        actor,
+        oneDevice,
+      ),
+    "a key past the device ceiling is refused",
+  );
+
+  expectEqual(capError.code, "CONFLICT", "the ceiling is a conflict, not a form problem");
+  expectEqual(capped.rows.length, 1, "the refused key writes no row");
+  expectEqual(cappedAudit.entries.length, 1, "the refused key writes no audit entry");
+
+  // ---- the race the unique index decides
+  const racing = createDeviceKeyTable({ blindSelects: 1 });
+
+  racing.seed({ user_id: USER_ID, fingerprint: generated.fingerprint });
+
+  const raced = await enrolDeviceProofKey(
+    { request: publicProofKeyOf({ ...generated }), userAgent: chromeAgent, remoteIp: null },
+    { ...actor, sessionId: null },
+    { rest: racing.rest, audit: createInMemoryAuditTrail(), now: () => NOW, maximumDevices: 4 },
+  );
+
+  expectEqual(raced.status, "already_enrolled", "the loser of the race answers like a second call");
+  expectEqual(racing.rows.length, 1, "the loser writes no second row");
+
+  // ---- a revoked key may be replaced
+  const revokedTable = createDeviceKeyTable();
+
+  revokedTable.seed({
+    user_id: USER_ID,
+    fingerprint: generated.fingerprint,
+    revoked_at: new Date(NOW - 1_000).toISOString(),
+  });
+
+  const replaced = await enrolDeviceProofKey(
+    { request: publicProofKeyOf({ ...generated }), userAgent: chromeAgent, remoteIp: null },
+    actor,
+    { rest: revokedTable.rest, audit: createInMemoryAuditTrail(), now: () => NOW, maximumDevices: 4 },
+  );
+
+  expectEqual(replaced.status, "enrolled", "a revoked device frees its fingerprint again");
+  expectEqual(revokedTable.rows.length, 2, "the revoked row stays as history");
+
+  // ---- what a request may and may not contain
+  const refused = await captureRejection(
+    () =>
+      enrolDeviceProofKey(
+        { request: { algorithm: "ES256" }, userAgent: chromeAgent, remoteIp: null },
+        actor,
+        dependencies,
+      ),
+    "a body without a key is refused",
+  );
+
+  expectEqual(refused.code, "VALIDATION_FAILED", "a missing key is a form problem");
+  expectEqual(refused.details[0]?.field, "publicKey", "the detail names the field");
+  expectEqual(refused.details[0]?.rule, "invalid_key", "the detail names no value");
+
+  const wrongCurve = await captureRejection(
+    () =>
+      enrolDeviceProofKey(
+        {
+          request: { publicKey: p384.publicKeyBase64Url, algorithm: "ES256" },
+          userAgent: chromeAgent,
+          remoteIp: null,
+        },
+        actor,
+        dependencies,
+      ),
+    "a key whose curve contradicts its algorithm is refused",
+  );
+
+  expectEqual(wrongCurve.code, "VALIDATION_FAILED", "the curve mismatch is a form problem");
+
+  expectEqual(
+    deviceEnrolmentSchema.safeParse({
+      publicKey: generated.publicKeyBase64Url,
+      algorithm: "ES256",
+      label: "x",
+    }).success,
+    false,
+    "the form refuses a field the endpoint does not have",
+  );
+  expectEqual(
+    deviceEnrolmentSchema.safeParse(publicProofKeyOf({ ...generated })).success,
+    true,
+    "the shape the browser sends is the shape the endpoint accepts",
+  );
+
+  // ---- the label, and the store's guard
+  expectEqual(proofKeyLabel("  Chrome on macOS  "), "Chrome on macOS", "a label is trimmed");
+  expectEqual(proofKeyLabel("x".repeat(200)).length, PROOF_KEY_LABEL_MAXIMUM_LENGTH, "a label is cut to the column");
+  expectEqual(proofKeyLabel(`${"ab"}${" ".repeat(78)}cd`), "ab", "a cut that lands on spaces ends without one");
+  expectEqual(proofKeyLabel("   "), "an unknown device", "an empty label still names a device");
+
+  const stored = {
+    privateKey: generated.privateKey,
+    publicKey: generated.publicKey,
+    publicKeyBase64Url: generated.publicKeyBase64Url,
+    fingerprint: generated.fingerprint,
+    algorithm: generated.algorithm,
+    deviceId: null,
+    trusted: false,
+    createdAtEpochMs: NOW,
+  };
+
+  expectEqual(isStoredProofKey(stored), true, "the record this module writes is read back");
+  expectEqual(isStoredProofKey({ ...stored, fingerprint: "short" }), false, "a record with a bad fingerprint is discarded");
+  expectEqual(isStoredProofKey({ ...stored, algorithm: "RS256" }), false, "a record with an unknown algorithm is discarded");
+  expectEqual(isStoredProofKey({ ...stored, privateKey: "not a key" }), false, "a record whose pair is not a pair is discarded");
+  expectEqual(isStoredProofKey(null), false, "nothing is not a record");
+}
+
 async function main(): Promise<void> {
   checkConfig();
   checkClaims();
@@ -7665,6 +8119,7 @@ async function main(): Promise<void> {
   await checkLockAlert();
   await checkAccountUnlock();
   await checkDisclosure();
+  await checkDeviceProofKey();
 
   if (failures.length > 0) {
     process.stderr.write(`auth gate failed with ${failures.length} problem(s):\n`);
