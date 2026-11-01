@@ -41,6 +41,11 @@ export function isSecretBox(value: {
 }): value is SecretBox {
   // The lengths are part of the shape: 12 bytes is 16 base64url characters and 16 bytes is 22, so a
   // row that is truncated or padded is caught here as bad data rather than inside the cipher.
+  //
+  // The ciphertext ceiling is the widest column any table gives a box (`auth_challenges` after
+  // `0083`), because a box this module sealed must be a box this module can open: a smaller cap here
+  // than the column there turns a legitimate value into "not a box this build wrote", which is a
+  // refusal no operator could diagnose and no retry could fix.
   return (
     value.iv !== null &&
     value.tag !== null &&
@@ -48,7 +53,7 @@ export function isSecretBox(value: {
     value.iv.length === 16 &&
     value.tag.length === 22 &&
     value.ciphertext.length >= 1 &&
-    value.ciphertext.length <= 8_192 &&
+    value.ciphertext.length <= 16_384 &&
     base64UrlPattern.test(value.iv) &&
     base64UrlPattern.test(value.tag) &&
     base64UrlPattern.test(value.ciphertext)

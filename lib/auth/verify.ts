@@ -73,6 +73,7 @@ import { createAuthHttp, type AuthAnswer, type AuthFetch, type AuthHttp } from "
 import {
   claimsAreCurrent,
   decodeSessionClaims,
+  MAXIMUM_ACCESS_TOKEN_LENGTH,
   millisecondsUntilExpiry,
   SESSION_CLAIM_CLOCK_SKEW_MS,
 } from "./jwt.ts";
@@ -4548,6 +4549,64 @@ async function checkTwoFactorLogin(): Promise<void> {
   );
   expectEqual(secondBackup.state.challenge?.attempt_count, 1, "a used backup code counts an attempt");
   expectEqual(secondBackup.audit.entries.length, 0, "a used backup code writes no audit entry");
+
+  // ---- a pair at the documented maxima must fit the column it is sealed into
+  const largest = twoFactorLoginFixture();
+  const largestSecret = generateTotpSecret();
+  largest.state.user.totp_secret_ciphertext = packSecretBox(
+    sealSecret(MASTER_KEY, largestSecret, twoFactorContext(USER_ID)),
+  );
+
+  const largestIssued = await issueTwoFactorChallenge(
+    {
+      userId: USER_ID,
+      companyId: FIRM_ID,
+      session: {
+        accessToken: "a".repeat(MAXIMUM_ACCESS_TOKEN_LENGTH),
+        refreshToken: "r".repeat(2_048),
+        expiresAtEpochMs: NOW + 3_600_000,
+        sessionId: SESSION_ID,
+      },
+      device: readDeviceContext(null),
+      remoteIp: null,
+      userAgent: null,
+    },
+    largest.dependencies,
+  );
+  const packed = largest.state.challenge?.secret_ciphertext ?? "";
+
+  expect(packed.length > 4_096, "a pair at the documented maxima is larger than the 0082 ceiling");
+  expect(packed.length < 16_384, "a pair at the documented maxima fits the ceiling 0083 sets");
+
+  const largestKey = base32Decode(largestSecret) ?? new Uint8Array();
+  const largestCompleted = await completeTwoFactorChallenge(
+    {
+      challengeToken: largestIssued.token,
+      code: totpCodeForStep(largestKey, totpStep(NOW)),
+      remoteIp: null,
+      userAgent: null,
+    },
+    largest.dependencies,
+  );
+
+  expect(
+    largestCompleted.cookies.length > 1,
+    "a pair at the documented maxima is split across several cookies",
+  );
+  expect(
+    largestCompleted.cookies.length <= AUTH_COOKIE_MAXIMUM_CHUNKS,
+    "the split stays inside the chunk ceiling",
+  );
+  expectEqual(
+    decodeSessionCookies(cookiePolicy(), bareCookies(largestCompleted.cookies))?.assuranceLevel,
+    "aal2",
+    "the chunked cookies assemble back into the signed payload",
+  );
+  expectEqual(
+    largestCompleted.userId,
+    USER_ID,
+    "the largest pair answers the account it belongs to",
+  );
 
   // ---- the password step stops when the account has a second factor
   const challenged = signinFixture({

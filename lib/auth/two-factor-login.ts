@@ -61,7 +61,7 @@ const challengeRowSchema = z.object({
   id: z.string().min(1).max(64),
   user_id: z.string().min(1).max(64),
   company_id: z.string().min(1).max(64).nullable(),
-  secret_ciphertext: z.string().min(32).max(4_096),
+  secret_ciphertext: z.string().min(32).max(16_384),
   attempt_count: z.number().int().nonnegative(),
   expires_at: z.string().min(1),
   consumed_at: z.string().nullable(),
