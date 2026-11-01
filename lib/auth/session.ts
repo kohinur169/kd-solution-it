@@ -94,6 +94,8 @@ export function toRequestActor(claims: SessionClaims, record: ActorRecord): Requ
     // two in once the payload's token resolves to a live row.
     deviceProofKeyId: null,
     sessionFamilyId: null,
+    mfaVerifiedAtEpochMs: null,
+    reauthenticatedAtEpochMs: null,
   };
 }
 

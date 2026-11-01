@@ -153,6 +153,21 @@ export interface RequestActor {
   readonly deviceProofKeyId: string | null;
   /** The family this session belongs to, so one revocation can end the whole login. */
   readonly sessionFamilyId: string | null;
+  /**
+   * When the second factor was satisfied for this session, from `sessions.mfa_verified_at`.
+   *
+   * Null before the session is bound, and null for a session the platform never saw a second factor
+   * for. STEP 053 reads it as one of the two instants that make a proof fresh.
+   */
+  readonly mfaVerifiedAtEpochMs: number | null;
+  /**
+   * When this session last proved the second factor *again*, from `sessions.reauthenticated_at`.
+   *
+   * STEP 053 writes it, `0091` bounds it and the guard reads it. Null means this session has never
+   * been reauthenticated, which is not a failure: a session that proved the second factor a moment
+   * ago is fresh without it.
+   */
+  readonly reauthenticatedAtEpochMs: number | null;
 }
 
 /**

@@ -430,6 +430,30 @@ the authority. A permission check uses the record, never a claim.
     enrolment has to be reachable from the device that has to be confirmed - and
     `requireTrustedDevice` turns the report into the refusal at the three endpoints that hand out a
     way in: ten fresh backup codes, an approved reset and an unlock.
+80. Freshness is two instants on the session, not a flag in a cookie. `sessions.mfa_verified_at`
+    (`0010`) records when the second factor was satisfied at sign in and `sessions.reauthenticated_at`
+    (`0091`, STEP 053) when it was proved again inside the session. `readStepUpState` takes the later
+    of the two and the proof counts for `STEP_UP_WINDOW_MS` (ten minutes), so a merchant who signed in
+    a minute ago is not asked for the same code twice while a session left open all afternoon cannot
+    unlock an account. Both instants are carried onto the actor by `readBoundSession`, which is the
+    only place that reads the row, so the guard itself does no I/O and the gate can hold its edges.
+81. The step-up proof is the second factor, not the password again. The session already proved the
+    password; the authenticator code is the part a stolen password and a stolen cookie both cannot
+    supply, and it is verified against the sealed secret in `users`. A backup code is accepted for
+    exactly the case section 22 built them for, and using one spends it. `POST /api/auth/session/reauth`
+    is therefore a signed endpoint of STEP 050's list and refuses an unconfirmed device of STEP 052
+    before it reads a code.
+82. One guard, one call, and an answer a screen can act on. `requireFreshReauthentication` answers
+    `403 PERMISSION_DENIED` with `{ field: "session", rule: "reauth_required" }` - not `401`, which
+    would send the person to a sign in form that changes nothing - and the endpoints of section 22's
+    list call it after the proof and the device trust, so a session that may not act here at all never
+    learns how fresh it is. `POST /api/office/account-locks/unlock` is the first caller; gateway keys,
+    payouts and KYC decisions call the same line when their STEPs arrive.
+83. A rotation carries the proof. `rotate` copies `mfa_verified_at` and `reauthenticated_at` into the
+    child row, so replacing a token fifteen minutes after a step-up cannot undo the step-up itself -
+    the freshness belongs to the login, not to one rotation of it. The lock of section 22 is asked
+    before the code, so a locked account cannot be used to test one, and `0091` bounds the instant
+    from both sides: after `issued_at`, before `expires_at`.
 
 ## Adding an operation
 

@@ -130,6 +130,8 @@ export async function readBoundSession(
       sessionId: resolution.row.id,
       deviceProofKeyId: resolution.row.deviceProofKeyId,
       sessionFamilyId: resolution.row.familyId,
+      mfaVerifiedAtEpochMs: resolution.row.mfaVerifiedAtEpochMs,
+      reauthenticatedAtEpochMs: resolution.row.reauthenticatedAtEpochMs,
     },
     sessionToken: state.sessionToken,
     bound: true,

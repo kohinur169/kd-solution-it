@@ -212,6 +212,29 @@ const catalog = {
     bindingFailed:
       "This browser could not finish setting up its device key, so the session cannot continue. Reload the page and sign in again.",
   },
+  reauth: {
+    eyebrow: "Confirm it is you",
+    title: "Prove your second factor again",
+    description:
+      "This action changes something that needs a recent proof. Enter the code from your authenticator app, or one of your backup codes, to continue.",
+    codeLabel: "Code from the authenticator app",
+    codeHint: "The six digit code that changes every thirty seconds. A backup code works too.",
+    submit: "Continue",
+    submitting: "Checking",
+    invalidCode: "That code was not accepted. Check the app and type the code it shows now.",
+    locked: "Too many failed attempts. This account cannot continue for another {minutes} minutes.",
+    twoFactorRequired:
+      "This account has not finished setting up its authenticator app. Finish that first, then come back.",
+    backupCodeUsed:
+      "That backup code was accepted and is no longer usable. {remaining} codes are left.",
+    failed: "The code could not be checked. Try again.",
+    signedOut: "Sign in again to continue.",
+    unavailable: "The session could not be read. Try again.",
+    alreadyFreshTitle: "You are already confirmed",
+    alreadyFreshBody:
+      "Your second factor was proved a moment ago, so this action can continue without another code.",
+    home: "Go to the home page",
+  },
   deviceConfirm: {
     eyebrow: "New device",
     title: "Confirm this device",

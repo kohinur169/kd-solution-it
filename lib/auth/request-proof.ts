@@ -103,6 +103,11 @@ export const SENSITIVE_ENDPOINTS: readonly SensitiveEndpoint[] = [
   },
   {
     method: "POST",
+    path: "/api/auth/session/reauth",
+    note: "Section 22's step-up: a stale session buys ten more minutes of freshness here, so the request that buys it is signed like the actions it unlocks.",
+  },
+  {
+    method: "POST",
     path: "/api/office/account-locks/unlock",
     note: "Section 22: an unlock ends the lock that stopped a password guess.",
   },
@@ -238,6 +243,9 @@ export async function verifySensitiveRequest(
  * and is not allowed to do this until the device is confirmed. That is a difference the screen can
  * act on - it sends the merchant to the confirmation - and a 401 would read as "sign in again",
  * which is exactly what would not help.
+ *
+ * STEP 053 added the step-up endpoint to the list for the same reason: it is the request that makes
+ * a stale session fresh, so it is signed like the actions it unlocks.
  */
 export function requireTrustedDevice(outcome: RequestProofOutcome): void {
   if (!outcome.trusted) {

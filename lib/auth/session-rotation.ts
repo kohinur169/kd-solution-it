@@ -105,6 +105,7 @@ const sessionRowSchema = z.object({
   revocation_reason: z.string().min(1).max(32).nullable(),
   replay_detected_at: z.string().min(20).max(40).nullable(),
   mfa_verified_at: z.string().min(20).max(40).nullable(),
+  reauthenticated_at: z.string().min(20).max(40).nullable(),
 });
 
 /** One session row, in the shape the decisions below use. */
@@ -122,11 +123,14 @@ export interface SessionRow {
   readonly revocationReason: string | null;
   readonly replayDetectedAtEpochMs: number | null;
   readonly mfaVerifiedAtEpochMs: number | null;
+  /** When this session last proved the second factor again (STEP 053), or null. */
+  readonly reauthenticatedAtEpochMs: number | null;
 }
 
 const columns =
   "select=id,user_id,company_id,device_proof_key_id,family_id,rotated_from_session_id,issued_at," +
-  "expires_at,absolute_expires_at,revoked_at,revocation_reason,replay_detected_at,mfa_verified_at";
+  "expires_at,absolute_expires_at,revoked_at,revocation_reason,replay_detected_at,mfa_verified_at," +
+  "reauthenticated_at";
 
 function toSessionRow(row: z.infer<typeof sessionRowSchema>): SessionRow {
   return {
@@ -144,6 +148,8 @@ function toSessionRow(row: z.infer<typeof sessionRowSchema>): SessionRow {
     replayDetectedAtEpochMs:
       row.replay_detected_at === null ? null : Date.parse(row.replay_detected_at),
     mfaVerifiedAtEpochMs: row.mfa_verified_at === null ? null : Date.parse(row.mfa_verified_at),
+    reauthenticatedAtEpochMs:
+      row.reauthenticated_at === null ? null : Date.parse(row.reauthenticated_at),
   };
 }
 
@@ -157,6 +163,8 @@ export interface NewSessionRow {
   readonly expiresAtEpochMs: number;
   readonly absoluteExpiresAtEpochMs: number;
   readonly mfaVerifiedAtEpochMs: number | null;
+  /** Carried from the parent on a rotation, so a fresh proof survives the token being replaced. */
+  readonly reauthenticatedAtEpochMs: number | null;
   readonly ipAddress: string | null;
   readonly userAgent: string | null;
   /** Set for a rotation, null for the row that starts a family. */
@@ -225,6 +233,10 @@ export function createRestSessionTokenStore(rest: RestClient): SessionTokenStore
               row.mfaVerifiedAtEpochMs === null
                 ? null
                 : new Date(row.mfaVerifiedAtEpochMs).toISOString(),
+            reauthenticated_at:
+              row.reauthenticatedAtEpochMs === null
+                ? null
+                : new Date(row.reauthenticatedAtEpochMs).toISOString(),
             ip_address: row.ipAddress,
             user_agent: row.userAgent,
             last_seen_at: new Date(row.issuedAtEpochMs).toISOString(),
@@ -578,6 +590,7 @@ async function openFamily(
     expiresAtEpochMs,
     absoluteExpiresAtEpochMs,
     mfaVerifiedAtEpochMs: input.assuranceLevel === "aal2" ? nowEpochMs : null,
+    reauthenticatedAtEpochMs: null,
     ipAddress: input.ipAddress,
     userAgent: input.userAgent,
     familyId: null,
@@ -668,6 +681,9 @@ async function rotate(
       expiresAtEpochMs,
       absoluteExpiresAtEpochMs: row.absoluteExpiresAtEpochMs,
       mfaVerifiedAtEpochMs: row.mfaVerifiedAtEpochMs,
+      // The proof belongs to the login, not to one rotation of it: a token replaced one second after
+      // a reauthentication must not send the person back to the code field.
+      reauthenticatedAtEpochMs: row.reauthenticatedAtEpochMs,
       ipAddress: input.ipAddress,
       userAgent: input.userAgent,
       familyId: row.familyId,

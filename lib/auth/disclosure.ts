@@ -121,6 +121,10 @@ export const SESSION_AUTH_SURFACES: readonly SessionSurface[] = deepFreeze([
     note: "The signed-in merchant registers the public half of this browser's proof key. The answer names a device of the caller's own account and is never reachable without a session.",
   },
   {
+    path: "/api/auth/session/reauth",
+    note: "Section 22's step-up: the signed-in person proves their second factor again so a stale session can perform a sensitive action (STEP 053). The answer carries a window, never an account.",
+  },
+  {
     path: "/api/auth/devices/confirm",
     note: "Section 22: the merchant confirms the device this session is bound to with their authenticator code (STEP 052). The answer names a device of the caller's own account and never a person.",
   },

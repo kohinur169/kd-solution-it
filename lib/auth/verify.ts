@@ -60,6 +60,13 @@ import {
   verifySensitiveRequest,
 } from "./request-proof.ts";
 import {
+  readStepUpState,
+  REAUTHENTICATION_REQUIRED_RULE,
+  reauthenticateSession,
+  requireFreshReauthentication,
+  STEP_UP_WINDOW_MS,
+} from "./step-up.ts";
+import {
   challengeDeviceTrust,
   confirmDeviceTrust,
   DEVICE_TRUST_MAXIMUM_ATTEMPTS,
@@ -5438,6 +5445,8 @@ function resetActor(options: { readonly roles?: readonly PlatformRole[] } = {}):
     twoFactorEnrolmentRequired: false,
     deviceProofKeyId: null,
     sessionFamilyId: null,
+    mfaVerifiedAtEpochMs: null,
+    reauthenticatedAtEpochMs: null,
   };
 }
 
@@ -6871,6 +6880,8 @@ function officeActor(options: {
     twoFactorEnrolmentRequired: false,
     deviceProofKeyId: null,
     sessionFamilyId: null,
+    mfaVerifiedAtEpochMs: null,
+    reauthenticatedAtEpochMs: null,
   };
 }
 
@@ -8468,6 +8479,8 @@ async function checkRequestProof(): Promise<void> {
     twoFactorEnrolmentRequired: false,
     deviceProofKeyId: "device-050",
     sessionFamilyId: "family-050",
+    mfaVerifiedAtEpochMs: NOW - 60_000,
+    reauthenticatedAtEpochMs: null,
   };
   const path = "/api/office/account-locks/unlock";
   const body = '{"lockId":"018f3b1c-6666-7c2a-9d1e-2b3c4d5e6f75","note":"called the owner"}';
@@ -8870,6 +8883,7 @@ interface SessionTableRow {
   revocation_reason: string | null;
   replay_detected_at: number | null;
   mfa_verified_at: number | null;
+  reauthenticated_at: number | null;
   deleted_at: number | null;
 }
 
@@ -8934,6 +8948,7 @@ function createSessionTable(): SessionTable {
       revocationReason: row.revocation_reason,
       replayDetectedAtEpochMs: row.replay_detected_at,
       mfaVerifiedAtEpochMs: row.mfa_verified_at,
+      reauthenticatedAtEpochMs: row.reauthenticated_at,
     };
   }
 
@@ -8986,6 +9001,7 @@ function createSessionTable(): SessionTable {
         revocation_reason: null,
         replay_detected_at: null,
         mfa_verified_at: row.mfaVerifiedAtEpochMs,
+        reauthenticated_at: row.reauthenticatedAtEpochMs,
         deleted_at: null,
       };
       rows.push(created);
@@ -9524,6 +9540,7 @@ async function checkSessionRotation(): Promise<void> {
     expiresAtEpochMs: NOW + SESSION_ROTATION_WINDOW_MS,
     absoluteExpiresAtEpochMs: NOW + SESSION_ABSOLUTE_WINDOW_MS,
     mfaVerifiedAtEpochMs: null,
+    reauthenticatedAtEpochMs: null,
     ipAddress: null,
     userAgent: null,
     familyId: (forked as { familyId: string }).familyId,
@@ -9773,9 +9790,9 @@ async function checkSessionRotation(): Promise<void> {
     (file) => file.path.endsWith(".tsx") && file.source.includes("<SessionKeeper"),
   );
 
-  // The settings screen and the new device confirmation are the two signed-in pages of section 22;
-  // both keep the token rotating while the person reads them.
-  expectEqual(keepers.length, 3, "every signed-in page keeps its session rotating");
+  // The settings screen, the new device confirmation and the step-up screen are the three signed-in
+  // pages of section 22; each keeps the token rotating while the person reads it.
+  expectEqual(keepers.length, 4, "every signed-in page keeps its session rotating");
 }
 
 /**
@@ -10757,6 +10774,561 @@ async function checkDeviceTrust(): Promise<void> {
   }
 }
 
+/**
+ * An in-memory picture of the three tables a step-up touches.
+ *
+ * `users` is read for the sealed secret and the backup verifiers, `account_locks` decides whether a
+ * correct code is even looked at, and `sessions` is the row the instant is written on - which is the
+ * whole point of the STEP, so the double records exactly which update was sent.
+ */
+interface StepUpAccountRow {
+  id: string;
+  company_id: string | null;
+  status: string;
+  deleted_at: string | null;
+  totp_secret_ciphertext: string | null;
+  totp_confirmed_at: string | null;
+  backup_code_hashes: readonly string[];
+}
+
+interface StepUpLockRow {
+  triggered_by: "password" | "totp";
+  locked_at: string;
+  expires_at: string;
+}
+
+interface StepUpWorld {
+  readonly account: StepUpAccountRow;
+  readonly locks: StepUpLockRow[];
+  /** Every update the service sent to `sessions`, in order. */
+  readonly sessionUpdates: { sessionId: string; query: string; values: Readonly<Record<string, unknown>> }[];
+  /** Every update the service sent to `users`, in order. */
+  readonly userUpdates: Readonly<Record<string, unknown>>[];
+  readonly rest: RestClient;
+}
+
+function createStepUpWorld(options: {
+  readonly totpSecret: string | null;
+  readonly backupCodes?: readonly string[];
+  readonly status?: string;
+  readonly locked?: boolean;
+}): StepUpWorld {
+  const userUpdates: Readonly<Record<string, unknown>>[] = [];
+  const locks: StepUpLockRow[] = [];
+
+  if (options.locked === true) {
+    locks.push({
+      triggered_by: "totp",
+      locked_at: new Date(NOW - 60_000).toISOString(),
+      expires_at: new Date(NOW + 3_600_000).toISOString(),
+    });
+  }
+
+  const account: StepUpAccountRow = {
+    id: USER_ID,
+    company_id: FIRM_ID,
+    status: options.status ?? "active",
+    deleted_at: null,
+    totp_secret_ciphertext:
+      options.totpSecret === null
+        ? null
+        : packSecretBox(sealSecret(MASTER_KEY, options.totpSecret, twoFactorContext(USER_ID))),
+    totp_confirmed_at:
+      options.totpSecret === null ? null : new Date(NOW - 86_400_000).toISOString(),
+    backup_code_hashes: options.backupCodes ?? [],
+  };
+
+  const world: StepUpWorld = {
+    account,
+    locks,
+    sessionUpdates: [],
+    userUpdates,
+    rest: {
+      select<TRow>(table: string): Promise<readonly TRow[]> {
+        if (table === "users") {
+          return Promise.resolve([
+            {
+              id: account.id,
+              company_id: account.company_id,
+              status: account.status,
+              deleted_at: account.deleted_at,
+              totp_secret_ciphertext: account.totp_secret_ciphertext,
+              totp_confirmed_at: account.totp_confirmed_at,
+              backup_code_hashes: account.backup_code_hashes,
+            },
+          ] as unknown as readonly TRow[]);
+        }
+
+        if (table === "account_locks") {
+          return Promise.resolve(
+            locks.slice(0, 1) as unknown as readonly TRow[],
+          );
+        }
+
+        return Promise.resolve([]);
+      },
+      insert(): Promise<void> {
+        return Promise.resolve();
+      },
+      insertReturning(): Promise<readonly never[]> {
+        return Promise.resolve([]);
+      },
+      update(table: string, _query: string, values: Readonly<Record<string, unknown>>): Promise<void> {
+        if (table === "users") {
+          userUpdates.push(values);
+        }
+
+        return Promise.resolve();
+      },
+      rpc(): Promise<unknown> {
+        return Promise.resolve(null);
+      },
+    },
+  };
+
+  return world;
+}
+
+/** The session store a step-up writes to: one live row, and a record of what was asked of it. */
+function createStepUpSessions(world: StepUpWorld, instant: number): SessionTokenStore {
+  const row: SessionRow = {
+    id: "session-053",
+    userId: USER_ID,
+    companyId: FIRM_ID,
+    deviceProofKeyId: "device-053",
+    familyId: "family-053",
+    rotatedFromSessionId: null,
+    issuedAtEpochMs: instant - 60_000,
+    expiresAtEpochMs: instant + SESSION_ROTATION_WINDOW_MS,
+    absoluteExpiresAtEpochMs: instant + SESSION_ABSOLUTE_WINDOW_MS,
+    revokedAtEpochMs: null,
+    revocationReason: null,
+    replayDetectedAtEpochMs: null,
+    mfaVerifiedAtEpochMs: instant - 60_000,
+    reauthenticatedAtEpochMs: null,
+  };
+
+  return {
+    findByHash(): Promise<SessionRow | null> {
+      return Promise.resolve(row);
+    },
+    findLiveInFamily(): Promise<SessionRow | null> {
+      return Promise.resolve(row);
+    },
+    insert(): Promise<SessionRow> {
+      return Promise.resolve(row);
+    },
+    update(sessionId: string, query: string, values: Readonly<Record<string, unknown>>): Promise<void> {
+      world.sessionUpdates.push({ sessionId, query, values });
+
+      return Promise.resolve();
+    },
+    revokeFamily(): Promise<number> {
+      return Promise.resolve(0);
+    },
+    revokeDevice(): Promise<number> {
+      return Promise.resolve(0);
+    },
+  };
+}
+
+/**
+ * STEP 053: the step-up guard, the code that satisfies it, and the endpoints that ask.
+ *
+ * The gate proves five things:
+ *
+ *   1. freshness is the later of two instants on the session row, and the window has edges;
+ *   2. a stale session answers `403` with `reauth_required`, which is not the same answer as "this
+ *      account may not do this";
+ *   3. the second factor is the proof: a wrong code is refused and counted, a right one is written
+ *      on the session row, and a backup code is spent;
+ *   4. section 22's lock still applies - a locked account is refused before its code is looked at;
+ *   5. a rotation carries the instant, so replacing the token does not undo a fresh proof.
+ */
+async function checkStepUp(): Promise<void> {
+  // ---- the window, as a value
+  expectEqual(STEP_UP_WINDOW_MS, 10 * 60_000, "a proof counts for ten minutes");
+  expectEqual(REAUTHENTICATION_REQUIRED_RULE, "reauth_required", "the rule a stale session answers");
+
+  const none = readStepUpState({ mfaVerifiedAtEpochMs: null, reauthenticatedAtEpochMs: null }, NOW);
+
+  expectEqual(none.satisfied, false, "a session with no proof is not fresh");
+  expectEqual(none.proof, "none", "and says it has no proof");
+  expectEqual(none.provenAtEpochMs, null, "and names no instant");
+  expectEqual(none.freshUntilEpochMs, null, "and no window");
+
+  const afterSignIn = readStepUpState(
+    { mfaVerifiedAtEpochMs: NOW - 60_000, reauthenticatedAtEpochMs: null },
+    NOW,
+  );
+
+  expectEqual(afterSignIn.satisfied, true, "a sign in a minute ago is a fresh proof");
+  expectEqual(afterSignIn.proof, "sign-in", "and says where it came from");
+  expectEqual(afterSignIn.freshUntilEpochMs, NOW - 60_000 + STEP_UP_WINDOW_MS, "and when it stops counting");
+
+  const stale = readStepUpState({ mfaVerifiedAtEpochMs: NOW - 3_600_000, reauthenticatedAtEpochMs: null }, NOW);
+
+  expectEqual(stale.satisfied, false, "a sign in an hour ago is not a fresh proof");
+
+  const afterReauth = readStepUpState(
+    { mfaVerifiedAtEpochMs: NOW - 3_600_000, reauthenticatedAtEpochMs: NOW - 1_000 },
+    NOW,
+  );
+
+  expectEqual(afterReauth.satisfied, true, "a reauthentication is fresher than the sign in");
+  expectEqual(afterReauth.proof, "reauthenticated", "and is the one that counts");
+
+  // The later of the two, whichever order they arrive in.
+  expectEqual(
+    readStepUpState({ mfaVerifiedAtEpochMs: NOW - 1_000, reauthenticatedAtEpochMs: NOW - 5_000 }, NOW).proof,
+    "sign-in",
+    "the sign in still counts when it is the later of the two",
+  );
+
+  // The edges of the window: satisfied up to the millisecond before it ends.
+  expectEqual(readStepUpState({ mfaVerifiedAtEpochMs: NOW, reauthenticatedAtEpochMs: null }, NOW).satisfied, true, "the instant of the proof itself counts");
+  expectEqual(
+    readStepUpState(
+      { mfaVerifiedAtEpochMs: NOW - STEP_UP_WINDOW_MS + 1, reauthenticatedAtEpochMs: null },
+      NOW,
+    ).satisfied,
+    true,
+    "one millisecond inside the window counts",
+  );
+  expectEqual(
+    readStepUpState(
+      { mfaVerifiedAtEpochMs: NOW - STEP_UP_WINDOW_MS, reauthenticatedAtEpochMs: null },
+      NOW,
+    ).satisfied,
+    false,
+    "the millisecond the window ends does not",
+  );
+
+  // ---- the guard
+  const guardAudit = createInMemoryAuditTrail();
+  void guardAudit;
+
+  expect(
+    requireFreshReauthentication(
+      { mfaVerifiedAtEpochMs: NOW - 60_000, reauthenticatedAtEpochMs: null },
+      NOW,
+    ).satisfied,
+    "the guard lets a fresh session through",
+  );
+
+  const refused = await captureRejection(
+    () =>
+      Promise.resolve(
+        requireFreshReauthentication(
+          { mfaVerifiedAtEpochMs: NOW - 3_600_000, reauthenticatedAtEpochMs: null },
+          NOW,
+        ),
+      ),
+    "a stale session is refused",
+  );
+
+  expectEqual(refused.code, "PERMISSION_DENIED", "the refusal is a permission, not a sign in");
+  expectEqual(refused.status, 403, "and it is a 403");
+  expectEqual(refused.details[0]?.field, "session", "the detail names the session");
+  expectEqual(refused.details[0]?.rule, "reauth_required", "and the rule a screen acts on");
+  expect(
+    isDisclosingDetail(refused.details[0]?.rule ?? "") === false,
+    "the rule tells a stranger nothing about an account",
+  );
+
+  // ---- the proof itself
+  const secret = base32Encode(new Uint8Array(20).fill(9));
+  const key = base32Decode(secret) ?? new Uint8Array();
+  const world = createStepUpWorld({ totpSecret: secret });
+  const audit = createInMemoryAuditTrail();
+  const attempts = createInMemoryLoginAttemptRecorder();
+  const sessions = createStepUpSessions(world, NOW);
+  const dependencies = {
+    rest: world.rest,
+    audit,
+    sessions,
+    attempts,
+    masterKey: () => MASTER_KEY,
+    now: () => NOW,
+  };
+
+  const rejected = await captureRejection(
+    () =>
+      reauthenticateSession(
+        {
+          userId: USER_ID,
+          companyId: FIRM_ID,
+          sessionId: "session-053",
+          code: "000000",
+          ipAddress: null,
+          userAgent: null,
+        },
+        dependencies,
+      ),
+    "a wrong code is refused",
+  );
+
+  expectEqual(rejected.code, "VALIDATION_FAILED", "a wrong code is a form refusal");
+  expectEqual(rejected.details[0]?.rule, "invalid_code", "and names the field");
+  expectEqual(world.sessionUpdates.length, 0, "a wrong code writes no instant on the session");
+  expectEqual(attempts.attempts.length, 1, "a wrong code is recorded as a failed attempt");
+  expectEqual(attempts.attempts[0]?.factor, "totp", "against the second factor");
+  expectEqual(attempts.attempts[0]?.outcome, "failed", "as a failure");
+  expectEqual(audit.entries.at(-1)?.action, "session.reauth_rejected", "and is audited");
+  expectEqual(audit.entries.at(-1)?.entityType, "session", "against the session");
+
+  const confirmed = await reauthenticateSession(
+    {
+      userId: USER_ID,
+      companyId: FIRM_ID,
+      sessionId: "session-053",
+      code: totpCodeForStep(key, totpStep(NOW)),
+      ipAddress: "203.0.113.9",
+      userAgent: "gate",
+    },
+    dependencies,
+  );
+
+  expectEqual(confirmed.status, "reauthenticated", "the right code satisfies the step-up");
+  expectEqual(confirmed.proof, "totp", "and says which factor proved it");
+  expectEqual(confirmed.freshUntilEpochMs, NOW + STEP_UP_WINDOW_MS, "and answers the new window");
+  expectEqual(world.sessionUpdates.length, 1, "one write, on the session row");
+  expectEqual(world.sessionUpdates[0]?.sessionId, "session-053", "the caller's own row");
+  expectEqual(
+    world.sessionUpdates[0]?.values["reauthenticated_at"],
+    new Date(NOW).toISOString(),
+    "the row carries the instant the proof was made",
+  );
+  expect(
+    world.sessionUpdates[0]?.query.includes("revoked_at=is.null") === true,
+    "and only while the session is still live",
+  );
+  expectEqual(audit.entries.at(-1)?.action, "session.reauthenticated", "the decision is audited");
+  expectEqual(audit.entries.at(-1)?.sessionId, "session-053", "against the session it happened in");
+  expectEqual(audit.entries.at(-1)?.payload["method"], "totp", "with the method that proved it");
+  expect(
+    typeof audit.entries.at(-1)?.action === "string" &&
+      /^[a-z][a-z0-9]*([.][a-z0-9_]+)+$/u.test(audit.entries.at(-1)?.action ?? ""),
+    "the action name fits the audit vocabulary",
+  );
+
+  // A backup code, and what spending it costs.
+  const backupCode = "a1b2c3d4e5";
+  const backupWorld = createStepUpWorld({
+    totpSecret: secret,
+    backupCodes: [
+      await hashPassword(backupCode),
+      await hashPassword("f6e5d4c3b2"),
+    ],
+  });
+  const backupSessions = createStepUpSessions(backupWorld, NOW);
+  const backupAudit = createInMemoryAuditTrail();
+  const backupOutcome = await reauthenticateSession(
+    {
+      userId: USER_ID,
+      companyId: FIRM_ID,
+      sessionId: "session-053",
+      code: backupCode,
+      ipAddress: null,
+      userAgent: null,
+    },
+    {
+      rest: backupWorld.rest,
+      audit: backupAudit,
+      sessions: backupSessions,
+      attempts: createInMemoryLoginAttemptRecorder(),
+      masterKey: () => MASTER_KEY,
+      now: () => NOW,
+    },
+  );
+
+  expectEqual(backupOutcome.proof, "backup_code", "a backup code satisfies the step-up too");
+  expectEqual(backupOutcome.remainingBackupCodes, 1, "and one code is spent");
+  expectEqual(backupWorld.userUpdates.length, 1, "the account's verifiers are rewritten");
+  expectEqual(
+    (backupWorld.userUpdates[0]?.["backup_code_hashes"] as readonly string[]).length,
+    1,
+    "with the used code removed",
+  );
+  expectEqual(backupSessions.update !== undefined, true, "and the session is still stamped");
+  expectEqual(backupAudit.entries.at(-1)?.action, "session.reauthenticated", "the entry names the proof");
+
+  // An account with no second factor cannot step up, and is not told it typed a wrong code.
+  const unenrolled = await captureRejection(
+    () =>
+      reauthenticateSession(
+        {
+          userId: USER_ID,
+          companyId: FIRM_ID,
+          sessionId: "session-053",
+          code: totpCodeForStep(key, totpStep(NOW)),
+          ipAddress: null,
+          userAgent: null,
+        },
+        { ...dependencies, rest: createStepUpWorld({ totpSecret: null }).rest },
+      ),
+    "an account with no second factor is refused",
+  );
+
+  expectEqual(unenrolled.code, "VALIDATION_FAILED", "and it is a form refusal");
+  expectEqual(unenrolled.details[0]?.rule, "two_factor_required", "that sends them to the enrolment");
+
+  // Section 22's lock survives a correct code.
+  const lockedWorld = createStepUpWorld({ totpSecret: secret, locked: true });
+  const locked = await captureRejection(
+    () =>
+      reauthenticateSession(
+        {
+          userId: USER_ID,
+          companyId: FIRM_ID,
+          sessionId: "session-053",
+          code: totpCodeForStep(key, totpStep(NOW)),
+          ipAddress: null,
+          userAgent: null,
+        },
+        { ...dependencies, rest: lockedWorld.rest, sessions: createStepUpSessions(lockedWorld, NOW) },
+      ),
+    "a locked account cannot step up, even with the right code",
+  );
+
+  expectEqual(locked.code, "ACCOUNT_LOCKED", "the lock answers as it does everywhere else");
+  expectEqual(lockedWorld.sessionUpdates.length, 0, "and nothing is written on the session");
+
+  // A session that is not bound cannot reauthenticate: there is no row to write it on.
+  const unbound = await captureRejection(
+    () =>
+      reauthenticateSession(
+        {
+          userId: USER_ID,
+          companyId: FIRM_ID,
+          sessionId: null,
+          code: totpCodeForStep(key, totpStep(NOW)),
+          ipAddress: null,
+          userAgent: null,
+        },
+        dependencies,
+      ),
+    "an unbound session cannot step up",
+  );
+
+  expectEqual(unbound.code, "AUTHENTICATION_REQUIRED", "and is told to sign in");
+
+  // ---- a rotation carries the instant
+  const rotationTable = createSessionTable();
+  const rotationToken = createRawSessionToken();
+
+  await rotationTable.insert({
+    userId: USER_ID,
+    companyId: FIRM_ID,
+    deviceProofKeyId: "device-053",
+    tokenHash: hashSessionToken(rotationToken),
+    issuedAtEpochMs: NOW - SESSION_ROTATION_INTERVAL_MS,
+    expiresAtEpochMs: NOW + SESSION_ROTATION_WINDOW_MS,
+    absoluteExpiresAtEpochMs: NOW + SESSION_ABSOLUTE_WINDOW_MS,
+    mfaVerifiedAtEpochMs: NOW - SESSION_ROTATION_INTERVAL_MS,
+    reauthenticatedAtEpochMs: NOW - 60_000,
+    ipAddress: null,
+    userAgent: null,
+    familyId: null,
+    rotatedFromSessionId: null,
+  });
+
+  const rotated = await issueSessionToken(
+    {
+      presentedToken: rotationToken,
+      userId: USER_ID,
+      companyId: FIRM_ID,
+      deviceProofKeyId: "device-053",
+      assuranceLevel: "aal2",
+      ipAddress: null,
+      userAgent: null,
+      claimSessionId: null,
+    },
+    { sessions: rotationTable, audit: createInMemoryAuditTrail(), now: () => NOW },
+  );
+
+  expectEqual(rotated.kind, "rotated", "the token is replaced");
+
+  const child = rotationTable.rows.find(
+    (row) => row.rotated_from_session_id === rotationTable.rows[0]?.id,
+  );
+
+  expectEqual(
+    child?.reauthenticated_at,
+    NOW - 60_000,
+    "a rotation carries the proof forward, so a new token does not undo it",
+  );
+  expectEqual(child?.mfa_verified_at, NOW - SESSION_ROTATION_INTERVAL_MS, "and the sign in instant with it");
+
+  // ---- the endpoints that carry it, on disk
+  const root = new URL("../../app/", import.meta.url);
+  const reauthRoute = await readFile(new URL("api/auth/session/reauth/route.ts", root), "utf8").catch(
+    () => "",
+  );
+  const unlockRoute = await readFile(
+    new URL("api/office/account-locks/unlock/route.ts", root),
+    "utf8",
+  ).catch(() => "");
+  const reauthPage = await readFile(new URL("(auth)/reauth/page.tsx", root), "utf8").catch(() => "");
+  const reauthForm = await readFile(new URL("(auth)/reauth/reauth-form.tsx", root), "utf8").catch(
+    () => "",
+  );
+  const actorSource = await readFile(new URL("../../lib/auth/request-actor.ts", import.meta.url), "utf8");
+
+  expect(reauthRoute.includes("reauthenticateSession"), "the step-up route calls the service");
+  expect(
+    reauthRoute.indexOf("readRequestActor(") < reauthRoute.indexOf("JSON.parse("),
+    "and never parses a body before it knows whose session it is",
+  );
+  expectEqual(
+    reauthRoute.split("request.text()").length - 1,
+    1,
+    "and reads the body exactly once, because the signature covers those bytes",
+  );
+  expect(
+    reauthRoute.indexOf("verifySensitiveRequest(") < reauthRoute.indexOf("JSON.parse("),
+    "and verifies the proof before it parses the body",
+  );
+  expect(reauthRoute.includes("requireTrustedDevice("), "and refuses an unconfirmed device");
+  expect(
+    unlockRoute.includes("requireFreshReauthentication("),
+    "the account unlock of section 22 asks for a fresh proof",
+  );
+  expect(
+    unlockRoute.indexOf("requireTrustedDevice(") < unlockRoute.indexOf("requireFreshReauthentication("),
+    "and asks it after the device trust, so a stranger learns nothing about freshness",
+  );
+  expect(reauthPage.includes("readStepUpState("), "the step-up screen reads the state it shows");
+  expect(reauthPage.includes("<SessionKeeper"), "and keeps the token rotating while it is open");
+  expect(
+    reauthForm.includes('deviceProofHeaders("POST", "/api/auth/session/reauth"'),
+    "the form signs the request with the device key",
+  );
+  expect(
+    isSensitivePath("/api/auth/session/reauth"),
+    "the step-up endpoint is one the platform will not act on without a proof",
+  );
+  expect(
+    actorSource.includes("reauthenticatedAtEpochMs: resolution.row.reauthenticatedAtEpochMs"),
+    "the session row is where the guard reads the instant from",
+  );
+  expect(
+    actorSource.includes("mfaVerifiedAtEpochMs: resolution.row.mfaVerifiedAtEpochMs"),
+    "and the sign in instant beside it",
+  );
+
+  const migration = await readFile(
+    new URL("../../migrations/0091_sessions_reauthenticated_at.sql", import.meta.url),
+    "utf8",
+  );
+
+  expect(
+    migration.includes("sessions_reauthenticated_after_issue_check") &&
+      migration.includes("sessions_reauthenticated_within_row_check"),
+    "and the database bounds the instant from both sides",
+  );
+}
+
 async function main(): Promise<void> {
   checkConfig();
   checkClaims();
@@ -10795,6 +11367,7 @@ async function main(): Promise<void> {
   await checkRequestProof();
   await checkSessionRotation();
   await checkDeviceTrust();
+  await checkStepUp();
 
   if (failures.length > 0) {
     process.stderr.write(`auth gate failed with ${failures.length} problem(s):\n`);

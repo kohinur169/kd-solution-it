@@ -5,6 +5,7 @@ import { withErrorResponse } from "@/lib/errors/respond";
 import { unlockAccountLock } from "@/lib/auth/account-unlock";
 import { requireTrustedDevice, verifySensitiveRequest } from "@/lib/auth/request-proof";
 import { readRequestActor } from "@/lib/auth/request-actor";
+import { requireFreshReauthentication } from "@/lib/auth/step-up";
 import { getAuthRuntime } from "@/lib/auth/runtime";
 import { logger } from "@/lib/logger/logger";
 
@@ -72,6 +73,13 @@ export const POST = withErrorResponse(
         { rest: runtime.rest, audit: runtime.audit },
       ),
     );
+
+    // STEP 053: section 22 names account unlocks among the actions that need a proof from *now*, so
+    // a session that was signed in this morning cannot end a lock this afternoon without somebody
+    // holding the authenticator. The refusal is `403` with `reauth_required`, which the office screen
+    // turns into a link to the reauthentication, and it is asked after the proof and the device
+    // trust so a session that is not allowed here at all never learns how fresh it is.
+    requireFreshReauthentication(actor);
 
     let body: unknown;
 
