@@ -1,0 +1,58 @@
+/* path: app/globals.css */
+@import "tailwindcss";
+@import "../styles/tokens.css";
+
+/*
+ * Base layer: document defaults only. Every colour below comes from a semantic token, so
+ * this file never holds a literal and never restates what the token layer already decides.
+ */
+@layer base {
+  html {
+    -webkit-text-size-adjust: 100%;
+    text-size-adjust: 100%;
+  }
+
+  body {
+    margin: 0;
+    background-color: var(--kd-background);
+    color: var(--kd-foreground);
+    font-family: var(--font-sans);
+    font-size: 1rem;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+  }
+
+  h1,
+  h2,
+  h3,
+  h4 {
+    text-wrap: balance;
+  }
+
+  p {
+    text-wrap: pretty;
+  }
+
+  ::selection {
+    background-color: var(--kd-secondary);
+    color: var(--kd-secondary-foreground);
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--kd-ring);
+    outline-offset: 2px;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms;
+      animation-iteration-count: 1;
+      transition-duration: 0.01ms;
+      scroll-behavior: auto;
+    }
+  }
+}

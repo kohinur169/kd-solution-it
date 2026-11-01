@@ -1,0 +1,47 @@
+{
+  "name": "kd-solution-it",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "description": "KD Solution IT - enterprise multi-tenant SaaS payment facilitator platform",
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=26.13.0",
+    "npm": ">=10.9.0"
+  },
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "check:structure": "node scripts/verify-structure.mjs",
+    "verify": "npm run check:structure && npm run check:env && npm run check:config && npm run check:i18n && npm run check:logger && npm run check:errors && npm run check:lint && npm run check:shell && npm run check:jobs && npm run check:migrations && npm run typecheck && npm run lint && npm run build",
+    "env:example": "node lib/env/generate-example.ts",
+    "check:env": "node lib/env/generate-example.ts --check",
+    "check:config": "node config/verify.ts",
+    "check:i18n": "node lib/i18n/verify.ts",
+    "check:logger": "node lib/logger/verify.ts",
+    "check:errors": "node lib/errors/verify.ts",
+    "check:lint": "node scripts/verify-lint-rules.mjs",
+    "check:shell": "node scripts/verify-shell.mjs",
+    "check:jobs": "node lib/jobs/verify.ts",
+    "check:migrations": "node migrations/verify.ts"
+  },
+  "dependencies": {
+    "next": "16.4.3",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "4.3.3",
+    "@types/node": "26.6.6",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "eslint": "9.39.5",
+    "eslint-config-next": "16.4.3",
+    "tailwindcss": "4.3.3",
+    "typescript": "5.9.3"
+  }
+}

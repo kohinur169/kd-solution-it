@@ -1,0 +1,128 @@
+{
+  "path": "config/structure.json",
+  "version": 1,
+  "maintainedBy": "STEP 001",
+  "note": "Canonical repository tree. scripts/verify-structure.mjs fails when a listed directory or root file is missing, so this file is the single machine readable statement of the structure defined in docs/final/STEP_PLAN_250.md.",
+  "directories": [
+    {
+      "path": "app",
+      "owner": "STEP 001",
+      "purpose": "Next.js App Router entry point: root layout, root page, route groups and route handlers."
+    },
+    {
+      "path": "app/(public)",
+      "owner": "STEP 231-238",
+      "purpose": "Public website, CMS pages, blog, legal pages and status page surfaces that need the public shell."
+    },
+    {
+      "path": "app/(auth)",
+      "owner": "STEP 037-055",
+      "purpose": "Signup, email verification, login, two factor authentication, password reset and login lock screens."
+    },
+    {
+      "path": "app/(dashboard)",
+      "owner": "STEP 079-126",
+      "purpose": "Merchant owner area: onboarding, underwriting, KYC, clients, products, invoices, estimates, payouts and settings."
+    },
+    {
+      "path": "app/(admin)",
+      "owner": "STEP 068-078",
+      "purpose": "Office dashboards for super_admin, ceo, compliance_kyc, finance_ops, support and blogger, plus platform settings screens."
+    },
+    {
+      "path": "app/(client-portal)",
+      "owner": "STEP 181-190",
+      "purpose": "Tokenized client surfaces under i/[token] and e/[token] with no login."
+    },
+    {
+      "path": "app/api",
+      "owner": "STEP 001 (health only), later STEPs own their handlers",
+      "purpose": "Route handlers. Each handler validates input, writes minimal rows and enqueues heavy work."
+    },
+    {
+      "path": "components",
+      "owner": "STEP 001 (root), later STEPs own their component folders",
+      "purpose": "Shared React components. Server Components by default, client components only where interaction requires it."
+    },
+    {
+      "path": "config",
+      "owner": "STEP 001-011 (foundation configuration)",
+      "purpose": "Typed application configuration, feature defaults, business limits and the canonical structure manifest."
+    },
+    {
+      "path": "docs",
+      "owner": "STEP 001",
+      "purpose": "Product documents, planning notes and step handoffs."
+    },
+    {
+      "path": "docs/handoffs",
+      "owner": "STEP 001 creates the folder, every STEP adds its own file",
+      "purpose": "One completed handoff file per finished STEP, copied from docs/final/HANDOFF_TEMPLATE.md."
+    },
+    {
+      "path": "lib",
+      "owner": "STEP 001 (root), later STEPs own their libraries",
+      "purpose": "Foundation libraries: environment schema, configuration, i18n, logging, security, storage, payments, tax, email and API clients."
+    },
+    {
+      "path": "migrations",
+      "owner": "STEP 012-036 and every STEP that adds a table",
+      "purpose": "Append-only numbered SQL migrations, each paired with a rollback file and never edited after commit."
+    },
+    {
+      "path": "scripts",
+      "owner": "STEP 001",
+      "purpose": "Dependency free repository verification and maintenance scripts run through npm scripts."
+    },
+    {
+      "path": "styles",
+      "owner": "STEP 003",
+      "purpose": "Central design tokens. The single owner of colour, radius, elevation, typography and easing."
+    },
+    {
+      "path": "services",
+      "owner": "STEP 001 (root), later STEPs own their services",
+      "purpose": "Domain services that hold business rules: clients, products, invoices, payments, ledger, refunds, disputes, billing, support and company accounting."
+    }
+  ],
+  "rootFiles": [
+    ".editorconfig",
+    ".env.example",
+    ".gitignore",
+    ".npmrc",
+    ".nvmrc",
+    "README.md",
+    "eslint.config.mjs",
+    "instrumentation.ts",
+    "next.config.mjs",
+    "package-lock.json",
+    "package.json",
+    "postcss.config.mjs",
+    "tsconfig.json"
+  ],
+  "sourceRoots": [
+    "app",
+    "styles",
+    "components",
+    "config",
+    "lib",
+    "scripts",
+    "services"
+  ],
+  "sourceExtensions": [
+    ".ts",
+    ".tsx",
+    ".mjs",
+    ".cjs",
+    ".md",
+    ".css"
+  ],
+  "forbiddenMarkers": [
+    "TODO",
+    "FIXME",
+    "XXX",
+    "lorem ipsum",
+    "coming soon",
+    "console.log"
+  ]
+}

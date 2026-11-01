@@ -1,0 +1,32 @@
+# path: .gitignore
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Next.js build output and generated artifacts
+.next/
+out/
+build/
+dist/
+next-env.d.ts
+*.tsbuildinfo
+.turbo/
+
+# Runtime and deployment output
+.vercel
+.netlify
+coverage/
+sentry.server.config.local
+
+# Environment files: only .env.example is ever committed
+.env
+.env.*
+!.env.example
+
+# Editor and operating system files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

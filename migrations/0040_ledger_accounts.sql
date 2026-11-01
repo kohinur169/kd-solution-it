@@ -1,0 +1,169 @@
+-- path: migrations/0040_ledger_accounts.sql
+-- STEP 025 - the chart of accounts of section 11.
+--
+-- "Every merchant has a full payment ledger." "Double-entry method: every money movement writes a
+-- debit entry and a credit entry and the pair always balances to zero." "Ledger covers payment
+-- received, platform fee, hold, reserve, settlement, payout, refund, chargeback, chargeback fee and
+-- subscription charge."
+--
+-- Eight accounts produce every one of those movements, and the list is closed on purpose:
+--
+--   processor_clearing   asset      money the platform holds at the processor
+--   merchant_payable     liability  what the platform owes the merchant
+--   platform_fee_income  income     the section 10 fee the platform keeps
+--   sales_tax_payable    liability  the section 7 tax collected for the state
+--   reserve_held         liability  the section 10 rolling reserve
+--   chargeback_loss      expense    the money a lost chargeback takes
+--   chargeback_fee       expense    the section 18 chargeback fee
+--   subscription_income  income     the section 12 subscription charge
+--
+-- A ninth account is a new migration, which is what keeps "the ledger covers these ten movements" a
+-- statement the database can hold. The kind and the normal side must agree - an asset or an expense is
+-- a debit account, a liability or an income is a credit account - because a row whose side is wrong
+-- silently inverts every balance that reads it.
+--
+-- A chart exists twice: once for the platform, where `company_id` is null and the fee, the tax, the
+-- reserve, the chargeback and the subscription accounts live, and once per merchant, where the payable
+-- and clearing accounts live. A plain unique index does not dedupe nulls, so there are two partial
+-- indexes, one per scope, and neither lets the same code appear twice.
+--
+-- The identity of a row is fixed once written. The guard refuses a changed code, kind, side or owner,
+-- so a wrong account is closed and a corrected one is opened beside it, and the entries that pointed at
+-- the old row still mean what they meant when they posted.
+
+begin;
+
+create function public.ledger_accounts_guard_chart()
+returns trigger
+language plpgsql
+set search_path = ''
+as $$
+begin
+  if new.company_id is distinct from old.company_id
+     or new.account_code is distinct from old.account_code
+     or new.account_kind is distinct from old.account_kind
+     or new.normal_side is distinct from old.normal_side
+     or new.opened_at is distinct from old.opened_at then
+    raise exception 'a ledger account keeps its code, its kind, its side and its owner'
+      using errcode = 'check_violation';
+  end if;
+
+  return new;
+end;
+$$;
+
+comment on function public.ledger_accounts_guard_chart() is
+  'Freezes the identity of a chart row so a posted entry keeps its meaning.';
+
+create table public.ledger_accounts (
+  id uuid not null default public.uuid_generate_v7(),
+  company_id uuid,
+  account_code text not null,
+  display_name text not null,
+  account_kind text not null,
+  normal_side text not null,
+  is_active boolean not null default true,
+  opened_at timestamptz not null default now(),
+  closed_at timestamptz,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  deleted_at timestamptz,
+  version integer not null default 1,
+  constraint ledger_accounts_pkey primary key (id),
+  constraint ledger_accounts_company_fkey foreign key (company_id) references public.companies (id),
+  constraint ledger_accounts_code_check check (
+    account_code in ('processor_clearing', 'merchant_payable', 'platform_fee_income',
+                     'sales_tax_payable', 'reserve_held', 'chargeback_loss', 'chargeback_fee',
+                     'subscription_income')
+  ),
+  constraint ledger_accounts_name_check check (
+    char_length(display_name) between 1 and 80 and display_name = btrim(display_name)
+  ),
+  constraint ledger_accounts_kind_check check (
+    account_kind in ('asset', 'liability', 'income', 'expense')
+  ),
+  constraint ledger_accounts_side_check check (normal_side in ('debit', 'credit')),
+  constraint ledger_accounts_pairing_check check (
+    (account_kind in ('asset', 'expense') and normal_side = 'debit')
+    or (account_kind in ('liability', 'income') and normal_side = 'credit')
+  ),
+  constraint ledger_accounts_active_check check (is_active = (closed_at is null)),
+  constraint ledger_accounts_closed_check check (closed_at is null or closed_at >= opened_at),
+  constraint ledger_accounts_row_version_check check (version > 0),
+  constraint ledger_accounts_updated_check check (updated_at >= created_at),
+  constraint ledger_accounts_deleted_check check (deleted_at is null or deleted_at >= created_at)
+);
+
+comment on table public.ledger_accounts is
+  'The closed section 11 chart: eight account codes, their kind and their normal side.';
+
+comment on column public.ledger_accounts.id is
+  'UUID v7 primary key. Time ordered, generated by public.uuid_generate_v7().';
+
+comment on column public.ledger_accounts.company_id is
+  'Null for a platform account, set for a merchant account. Never changed after insert.';
+
+comment on column public.ledger_accounts.account_code is
+  'One of the eight section 11 codes. A ninth account is a new migration.';
+
+comment on column public.ledger_accounts.display_name is
+  'What the ledger screen shows, trimmed, 1 to 80 characters.';
+
+comment on column public.ledger_accounts.account_kind is
+  'asset, liability, income or expense.';
+
+comment on column public.ledger_accounts.normal_side is
+  'debit for an asset or an expense, credit for a liability or an income.';
+
+comment on column public.ledger_accounts.is_active is
+  'True while the account may receive new entries.';
+
+comment on column public.ledger_accounts.opened_at is
+  'When the account entered the chart. Frozen after insert.';
+
+comment on column public.ledger_accounts.closed_at is
+  'Set exactly when the account is no longer active.';
+
+comment on column public.ledger_accounts.created_at is
+  'When the chart row was written.';
+
+comment on column public.ledger_accounts.updated_at is
+  'Set by the ledger_accounts_set_row_metadata trigger on every update.';
+
+comment on column public.ledger_accounts.deleted_at is
+  'Soft delete marker. A closed account stays readable for the entries it holds.';
+
+comment on column public.ledger_accounts.version is
+  'Optimistic locking counter. Incremented by the ledger_accounts_set_row_metadata trigger.';
+
+-- The platform chart: one row per code, and null company ids are not deduped by a plain unique index.
+create unique index ledger_accounts_platform_code_key
+  on public.ledger_accounts (account_code)
+  where company_id is null and deleted_at is null;
+
+-- The merchant chart: one row per code inside one merchant.
+create unique index ledger_accounts_company_code_key
+  on public.ledger_accounts (company_id, account_code)
+  where company_id is not null and deleted_at is null;
+
+create trigger ledger_accounts_guard_chart
+  before update on public.ledger_accounts
+  for each row
+  execute function public.ledger_accounts_guard_chart();
+
+create trigger ledger_accounts_set_row_metadata
+  before update on public.ledger_accounts
+  for each row
+  execute function public.set_row_metadata();
+
+alter table public.ledger_accounts enable row level security;
+
+create policy ledger_accounts_default_deny
+  on public.ledger_accounts
+  as permissive
+  for all
+  to public
+  using (false)
+  with check (false);
+
+commit;
