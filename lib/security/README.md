@@ -2,9 +2,10 @@
 # lib/security/
 
 Owner: STEP 056 (input sanitiser for text, rich text and URLs), STEP 057 (the double submit token),
-STEP 058 (the destination rule) and STEP 059 (the Content Security Policy). Later STEPs call these
-functions; they do not write a second escape, a second URL check, a second allowlist, a second CSRF
-token, a second DNS check or a second policy header.
+STEP 058 (the destination rule), STEP 059 (the Content Security Policy) and STEP 060 (the security
+headers). Later STEPs call these functions; they do not write a second escape, a second URL check, a
+second allowlist, a second CSRF token, a second DNS check, a second policy header or a second header
+table.
 
 | File | Purpose |
 | --- | --- |
@@ -16,6 +17,7 @@ token, a second DNS check or a second policy header.
 | csrf-client.ts | The browser half: read the cookie, add the header, ask `/api/auth/csrf` when absent |
 | ssrf.ts | The destination rule: the allowlist, the resolver, and the three checks a URL must pass |
 | csp.ts | The Content Security Policy: the nonce, the fifteen directives, and what each allowance is for |
+| headers.ts | The security headers of every response, in two scopes: a document and a static file |
 | verify.ts | The gate behind `npm run check:security`, and the attack corpus it runs |
 
 ## The four rules
@@ -109,6 +111,44 @@ A directive that is not listed falls back to `default-src 'self'`, which is the 
 `frame-ancestors 'none'` is sent in production and **not** in development, where the platform is
 embedded in a preview frame: a policy that blocks the frame the work is reviewed in gets switched off,
 and a switched-off policy is worse than a documented exception.
+
+## The headers of every response
+
+`headers.ts` is a table, not a function: nine headers, each with the sentence that explains why it is
+there, and each tagged with the scopes it belongs on. `proxy.ts` writes them on every response it sees -
+a page, a route handler, a 404, a redirect, a static chunk - and `headersFor({ development, scope })`
+answers the subset that matters for that kind of response.
+
+| Header | Document | Asset | What it stops |
+| --- | --- | --- | --- |
+| `x-content-type-options: nosniff` | yes | yes | a browser treating an uploaded `.txt` as a document, or a document as a script |
+| `referrer-policy: no-referrer` | yes | no | a token in `/i/<token>` or `/e/<token>` travelling to the next origin as a `Referer` |
+| `permissions-policy: ...=()` | yes | no | a sensor, camera, location or payment sheet that no code on the platform asks for |
+| `cross-origin-opener-policy: same-origin` | yes | no | a hostile page holding a window handle into this one |
+| `cross-origin-resource-policy: same-origin` | yes | yes | another site embedding any of this platform's files |
+| `x-dns-prefetch-control: off` | yes | no | a host name resolved before a click, and therefore leaked |
+| `x-permitted-cross-domain-policies: none` | yes | no | a cross-domain policy file nobody meant to serve |
+| `strict-transport-security` | production | no | a downgrade to plain http, for two years and every subdomain |
+| `x-frame-options: DENY` | production | no | framing, in the one browser family that does not read `frame-ancestors` |
+
+Two of them are production only, for reasons that are not obvious: a development server speaks plain
+http on loopback, so an HSTS header would poison `localhost` for every other project on the machine;
+and a development deployment is embedded in a preview frame, so refusing to be framed would break the
+window the work is reviewed in. The gate asserts both omissions.
+
+`cross-origin-embedder-policy: require-corp` is deliberately absent: it would force every subresource to
+opt in with CORP, and the one capability it unlocks (`SharedArrayBuffer`) is used by nothing here.
+
+### Why the asset test is a prefix and not a file extension
+
+The first version of STEP 060 classified a request as a static file by its extension, which is the
+obvious rule and the wrong one: `/missing.css` does not exist, so the framework answers it with the
+application's own 404 page - a rendered document whose script tags need a nonce. The proxy had skipped
+the nonce because the path looked like a file, `app/layout.tsx` refused to render without one, and the
+response was a 500. Serving it is what found it, and the fix is the rule this file now states: only
+`/_next/static/` and `/_next/image` are build output, because those are the paths the framework itself
+serves as files. Everything else is a document, and pays one nonce for the guarantee that a page can
+never be rendered without a policy.
 
 ## Ceilings
 

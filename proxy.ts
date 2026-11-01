@@ -6,58 +6,73 @@ import {
   createCspNonce,
   CSP_HEADER_NAME,
   CSP_NONCE_HEADER_NAME,
+  isFrameworkAssetPath,
 } from "@/lib/security/csp";
+import { headersFor } from "@/lib/security/headers";
 
 /**
- * The one place a request gets its Content Security Policy.
+ * The one place a response gets its security headers.
  *
  * Next 16 replaced `middleware.ts` with `proxy.ts`, and this file is that convention: it runs before
- * every page and every route handler the matcher lets through, mints one nonce, and attaches the policy
- * to the request as well as the response. Both halves are load bearing:
+ * every page, every route handler and every framework asset the matcher admits, and writes two things.
  *
- *   - the **request** header is what the framework reads to stamp its own script tags, so without it the
- *     nonce in the response header would protect nothing (see the header comment of
- *     `lib/security/csp.ts`);
- *   - the **response** header is what the browser enforces.
+ *   1. **The Content Security Policy**, for a response that is rendered rather than served
+ *      (`lib/security/csp.ts`). A nonce is minted per rendered response and travels on the request as
+ *      well as the response, because the framework reads it from the request to stamp its own script
+ *      tags. A static asset gets no policy: a nonce on a `.css` file is a header written for nobody.
+ *   2. **The security headers** (`lib/security/headers.ts`), on every response without exception -
+ *      `nosniff` and `cross-origin-resource-policy` on build output, and the full document set on
+ *      anything a browser renders or treats as data.
  *
- * It also sets `x-nonce`, which is how `app/layout.tsx` gets the same value for the one script tag this
- * repository writes itself - the pre-paint theme script, which would otherwise be a blocked inline
- * script and a light flash before a dark page.
- *
- * Two rules for anything added here later: it must not read or write a body, and it must not decide
- * anything about identity. A proxy runs on every request including the ones that must stay cheap, and a
- * security header is the whole of its job.
+ * Both halves are data in `lib/security/`; this file only decides which response gets which, which is
+ * the one thing a proxy should be trusted to decide. It reads no body, writes no cookie and never asks
+ * who the caller is: identity is the routes' work, and a proxy that starts deciding it becomes a second
+ * authorisation system that nothing else knows about.
  */
 
 export function proxy(request: NextRequest): NextResponse {
-  const nonce = createCspNonce();
-  // The environment is read through the validated accessor of STEP 004, never from the raw environment
-  // directly (the lint gate refuses the raw read anywhere but `lib/env/`), and the value is memoised
-  // after the first call, so a policy costs one nonce and one string on every path after boot.
-  const policy = buildContentSecurityPolicy({ nonce, development: getServerConfig().isDevelopment });
+  const asset = isFrameworkAssetPath(request.nextUrl.pathname);
+
+  // No header in the asset scope is production only, so the environment cannot change that answer and
+  // a static file does not pay for reading the configuration.
+  const development = asset ? false : getServerConfig().isDevelopment;
 
   const requestHeaders = new Headers(request.headers);
-  requestHeaders.set(CSP_HEADER_NAME, policy);
-  requestHeaders.set(CSP_NONCE_HEADER_NAME, nonce);
+  let nonce: string | null = null;
+  let policy: string | null = null;
+
+  if (!asset) {
+    nonce = createCspNonce();
+    policy = buildContentSecurityPolicy({ nonce, development });
+
+    requestHeaders.set(CSP_HEADER_NAME, policy);
+    requestHeaders.set(CSP_NONCE_HEADER_NAME, nonce);
+  }
 
   const response = NextResponse.next({ request: { headers: requestHeaders } });
-  response.headers.set(CSP_HEADER_NAME, policy);
-  response.headers.set(CSP_NONCE_HEADER_NAME, nonce);
+
+  for (const header of headersFor({ development, scope: asset ? "asset" : "document" })) {
+    response.headers.set(header.name, header.value);
+  }
+
+  if (policy !== null && nonce !== null) {
+    // The response carries the same policy the request did: the request header is what the framework
+    // reads, the response header is what the browser enforces, and they must not drift apart.
+    response.headers.set(CSP_HEADER_NAME, policy);
+    response.headers.set(CSP_NONCE_HEADER_NAME, nonce);
+  }
 
   return response;
 }
 
 /**
- * Which requests get a policy.
+ * Which requests run through the proxy.
  *
- * Everything a browser renders or fetches as data, and nothing that is already a file: the framework's
- * build output is immutable and content addressed, an image or a font cannot execute, and rewriting the
- * policy on each of them would be a header on every asset for no gain. The exclusion list is the
- * framework's own static prefixes plus one extension pattern, and it is asserted by
- * `lib/security/verify.ts` so that a later edit cannot quietly drop a page from the policy.
+ * Everything but the development hot reload socket, which is a websocket upgrade rather than a
+ * response: STEP 060's contract is that *every* response carries the security headers, and a static
+ * chunk is a response. The cost is one function call per asset, and it buys a header set that cannot be
+ * bypassed by asking for a file instead of a page.
  */
 export const config = {
-  matcher: [
-    "/((?!_next/static|_next/image|favicon.ico|.*\\.(?:svg|png|jpg|jpeg|gif|webp|avif|ico|css|js|map|txt|xml|woff|woff2)$).*)",
-  ],
+  matcher: ["/((?!_next/webpack-hmr).*)"],
 };

@@ -32,9 +32,18 @@ import {
   buildCspDirectives,
   createCspNonce,
   CSP_NONCE_PATTERN,
+  FRAMEWORK_ASSET_PREFIXES,
   isCspNonce,
+  isFrameworkAssetPath,
   type CspDirective,
 } from "./csp.ts";
+import {
+  headersFor,
+  isSecurityHeaderName,
+  SECURITY_HEADERS,
+  SECURITY_HEADER_NAMES,
+  type ResolvedHeader,
+} from "./headers.ts";
 
 /**
  * The gate behind the input sanitiser.
@@ -767,7 +776,22 @@ async function checkCspWiring(): Promise<void> {
   expect(proxySource.includes("requestHeaders.set(CSP_HEADER_NAME"), "the policy is set on the request, which is what the framework reads");
   expect(proxySource.includes("response.headers.set(CSP_HEADER_NAME"), "and on the response, which is what the browser enforces");
   expect(proxySource.includes("CSP_NONCE_HEADER_NAME, nonce"), "the nonce travels to the layout in its own header");
-  expect(proxySource.includes("_next/static") && proxySource.includes("_next/image"), "immutable assets are not given a policy");
+  expect(proxySource.includes("isFrameworkAssetPath(request.nextUrl.pathname)"), "the proxy asks whether the request is build output");
+  expect(proxySource.includes("if (!asset)"), "and only a rendered response is given a policy");
+  expect(
+    FRAMEWORK_ASSET_PREFIXES.includes("/_next/static/") && FRAMEWORK_ASSET_PREFIXES.includes("/_next/image"),
+    "because build output is a file, not a document",
+  );
+  expectEqual(isFrameworkAssetPath("/_next/static/chunks/app.js"), true, "a chunk is an asset");
+  expectEqual(
+    isFrameworkAssetPath("/missing.css"),
+    false,
+    "a path that is not build output is a document even when it looks like a file, because a missing one renders the 404 page",
+  );
+  expectEqual(isFrameworkAssetPath("/favicon.ico"), false, "and a public file is treated as one too");
+  expectEqual(isFrameworkAssetPath("/_next/image?url=x"), true, "an optimized image is one");
+  expectEqual(isFrameworkAssetPath("/signin"), false, "a page is not");
+  expectEqual(isFrameworkAssetPath("/api/auth/signin"), false, "and neither is a route handler");
   expect(proxySource.includes("getServerConfig()"), "the development decision is read through the validated configuration");
   expectEqual(proxySource.includes("process.env"), false, "and never from a raw environment read");
 
@@ -810,6 +834,186 @@ async function checkCspWiring(): Promise<void> {
     "lib/security/csp.ts",
     "no module writes the header by hand, and the constant lives in one file",
   );
+}
+
+/* ------------------------------------------------------------------ 8. the headers */
+
+/**
+ * The security headers of STEP 060.
+ *
+ * A header list is the easiest thing in a repository to weaken, because every weakening still renders
+ * a page. So this half is written negatively where it can be: no value may carry a control character,
+ * a wildcard or a non-ASCII byte; `strict-transport-security` may never be sent by a development
+ * server; `x-frame-options` may not be sent where the preview embeds the platform; and no module
+ * outside `lib/security/headers.ts` may name `strict-transport-security` at all. What is left is a
+ * table a reader can check against the reasons in the file's header comment.
+ */
+function checkSecurityHeaders(): void {
+  expect(Object.isFrozen(SECURITY_HEADERS), "the table is frozen, so a caller cannot edit a header at runtime");
+
+  const names = SECURITY_HEADER_NAMES;
+
+  expectEqual(new Set(names).size, names.length, "no header is listed twice");
+  expectEqual(names.length, SECURITY_HEADERS.length, "the name list and the table agree");
+
+  for (const header of SECURITY_HEADERS) {
+    expect(/^[a-z0-9]+(-[a-z0-9]+)*$/u.test(header.name), `${header.name} is a lower case header name`);
+    expect(header.value.length > 0, `${header.name} has a value`);
+    expect(header.value.length <= 512, `${header.name} has a value short enough to be a header`);
+    expect(/^[\u0020-\u007e]+$/u.test(header.value), `${header.name} is printable ASCII, so no control character can split it`);
+    expect(header.value.includes("\r") === false && header.value.includes("\n") === false, `${header.name} cannot split a response`);
+    expect(header.value.includes("*") === false, `${header.name} is not a wildcard`);
+    expect(header.scopes.length > 0, `${header.name} belongs on at least one kind of response`);
+    expect(
+      header.scopes.every((scope) => scope === "document" || scope === "asset"),
+      `${header.name} has only scopes this module knows`,
+    );
+  }
+
+  const document = headersFor({ development: false, scope: "document" });
+  const documentValues = new Map(document.map((header) => [header.name, header.value]));
+  const documentNames = document.map((header) => header.name);
+
+  expectEqual(
+    documentNames.join(","),
+    [
+      "x-content-type-options",
+      "referrer-policy",
+      "permissions-policy",
+      "cross-origin-opener-policy",
+      "cross-origin-resource-policy",
+      "x-dns-prefetch-control",
+      "x-permitted-cross-domain-policies",
+      "strict-transport-security",
+      "x-frame-options",
+    ].join(","),
+    "a production document carries exactly these headers, in this order",
+  );
+
+  const development = headersFor({ development: true, scope: "document" });
+
+  expectEqual(
+    development.map((header) => header.name).includes("strict-transport-security"),
+    false,
+    "a development server never sends hsts, because it speaks plain http",
+  );
+  expectEqual(
+    development.map((header) => header.name).includes("x-frame-options"),
+    false,
+    "and never refuses to be framed, because the preview embeds it",
+  );
+  expectEqual(document.length - development.length, 2, "which is the whole difference between the two environments");
+  expectEqual(
+    development.every((header) => documentValues.get(header.name) === header.value),
+    true,
+    "and every other header is sent byte for byte in both",
+  );
+
+  expectEqual(documentValues.get("x-content-type-options"), "nosniff", "a document may not be sniffed into another type");
+  expectEqual(documentValues.get("referrer-policy"), "no-referrer", "and never refers another origin to a tokenised URL");
+  expectEqual(documentValues.get("cross-origin-opener-policy"), "same-origin", "and is isolated from a cross-origin opener");
+  expectEqual(documentValues.get("cross-origin-resource-policy"), "same-origin", "and may not be embedded elsewhere");
+  expectEqual(documentValues.get("x-dns-prefetch-control"), "off", "and does not resolve a host before a click");
+  expectEqual(documentValues.get("x-permitted-cross-domain-policies"), "none", "and serves no cross domain policy file");
+  expectEqual(documentValues.get("x-frame-options"), "DENY", "and is framed by nobody in production");
+  expectEqual(
+    documentValues.get("strict-transport-security"),
+    "max-age=63072000; includeSubDomains",
+    "hsts lasts two years and covers subdomains",
+  );
+  expectEqual(
+    documentValues.get("strict-transport-security")?.includes("preload") ?? true,
+    false,
+    "but is not preloaded, which is a deployment decision rather than a header",
+  );
+
+  const permissions = documentValues.get("permissions-policy") ?? "";
+
+  for (const feature of ["camera", "microphone", "geolocation", "payment", "usb", "display-capture", "serial", "hid"]) {
+    expect(permissions.includes(`${feature}=()`), `the browser feature ${feature} is denied to every origin`);
+  }
+
+  expectEqual(permissions.includes("*"), false, "no browser feature is granted to every origin");
+  expectEqual(permissions.endsWith(","), false, "and the list does not end in a separator");
+
+  const assetProduction = headersFor({ development: false, scope: "asset" });
+  const assetDevelopment = headersFor({ development: true, scope: "asset" });
+
+  expectEqual(
+    assetProduction.map((header) => header.name).join(","),
+    "x-content-type-options,cross-origin-resource-policy",
+    "a static file carries the two headers that mean something for a file",
+  );
+  expectEqual(
+    toComparable(assetDevelopment),
+    toComparable(assetProduction),
+    "and the environment cannot change them, which is why the proxy does not read the configuration for one",
+  );
+  expectEqual(assetProduction.length < document.length, true, "an asset deliberately carries a shorter set");
+  expect(
+    assetProduction.every((header) => documentValues.get(header.name) === header.value),
+    "and every asset header is the same value the document sends",
+  );
+
+  expectEqual(
+    toComparable(headersFor({ development: false, scope: "document" })),
+    toComparable(document),
+    "one scope and one environment, one answer, every time",
+  );
+  expect(Object.isFrozen(assetProduction), "the answer is frozen, because a caller must not edit a response's headers");
+
+  expectEqual(isSecurityHeaderName("x-content-type-options"), true, "a header this table writes is recognised");
+  expectEqual(isSecurityHeaderName("X-Frame-Options"), true, "in any case");
+  expectEqual(isSecurityHeaderName("content-security-policy"), false, "and the policy is not one of them, because it is built per response");
+  expectEqual(isSecurityHeaderName(""), false, "an empty name is not a header");
+}
+
+function toComparable(headers: readonly ResolvedHeader[]): string {
+  return headers.map((header) => `${header.name}=${header.value}`).join("|");
+}
+
+/** The tree: one writer, no duplicate table, and the framework config does not carry a second copy. */
+async function checkSecurityHeaderWiring(): Promise<void> {
+  const root = new URL("../../", import.meta.url);
+  const headersSource = await readFile(new URL("./headers.ts", import.meta.url), "utf8");
+  const proxySource = await readFile(new URL("proxy.ts", root), "utf8");
+  const configSource = await readFile(new URL("next.config.mjs", root), "utf8");
+
+  expectEqual(headersSource.includes("import "), false, "the header table imports nothing, so any runtime can load it");
+  expectEqual(headersSource.includes("process.env"), false, "and reads no environment of its own");
+
+  expect(proxySource.includes("headersFor({ development, scope: asset ? \"asset\" : \"document\" })"), "the proxy resolves the scope of the response");
+  expect(proxySource.includes("response.headers.set(header.name, header.value)"), "and writes every header the table answers");
+  expect(proxySource.includes('matcher: ["/((?!_next/webpack-hmr).*)"]'), "it runs for every response, including a static file");
+  expect(
+    proxySource.includes("const development = asset ? false : getServerConfig().isDevelopment"),
+    "and reads the configuration only where the environment can change an answer",
+  );
+
+  expectEqual(configSource.includes("headers"), false, "next.config.mjs carries no second header table");
+  expect(configSource.includes("poweredByHeader: false"), "and still hides the framework's version");
+
+  const scanned: string[] = [];
+
+  for (const entry of ["app", "components", "lib", "scripts"]) {
+    const entries = (await readdir(new URL(`${entry}/`, root), { recursive: true }))
+      .map((name) => name.replaceAll("\\", "/"))
+      .filter((name) => name.endsWith(".ts") || name.endsWith(".tsx"));
+
+    for (const name of entries) {
+      if (name.endsWith("verify.ts")) {
+        continue;
+      }
+
+      const source = await readFile(new URL(`${entry}/${name}`, root), "utf8");
+
+      if (source.includes("strict-transport-security")) {
+        scanned.push(`${entry}/${name}`);
+      }
+    }
+  }
+
+  expectEqual(scanned.join(","), "lib/security/headers.ts", "no module writes a security header by hand");
 }
 
 async function checkTree(): Promise<void> {
@@ -881,7 +1085,9 @@ async function main(): Promise<void> {
 
   await checkOutboundAddresses(outbound);
   checkCsp();
+  checkSecurityHeaders();
   await checkCspWiring();
+  await checkSecurityHeaderWiring();
   await checkTree();
 
   if (failures.length > 0) {

@@ -63,6 +63,30 @@ export const CSP_NONCE_BYTES = 16;
 /** A nonce as this platform writes it: base64url, unpadded, 22 characters. */
 export const CSP_NONCE_PATTERN = /^[A-Za-z0-9_-]{22}$/u;
 
+/**
+ * The paths that are build output rather than a document.
+ *
+ * A framework chunk or an optimized image is immutable, content addressed and served by the framework's
+ * own handler; it cannot render a page. It gets no policy - a nonce on a `.css` file is a header written
+ * for nobody - and STEP 060 gives it the two headers that mean something for a static file (`nosniff`
+ * and `cross-origin-resource-policy`).
+ *
+ * The test is the **prefix**, and it deliberately is not the file extension. `/missing.css` does not
+ * exist, so the framework answers it with the application's own 404 page: a rendered document whose
+ * scripts need a nonce, and a rule based on `.css` would classify it as a file and render a page with no
+ * policy at all (which is what the first version of this STEP did, and what serving it proved). A public
+ * file such as `/favicon.ico` is treated as a document for the same reason: it costs one header set and
+ * one nonce, and it cannot produce a page without them.
+ */
+export const FRAMEWORK_ASSET_PREFIXES: readonly string[] = Object.freeze(["/_next/static/", "/_next/image"]);
+
+/** True when a request is for framework build output rather than a rendered response. */
+export function isFrameworkAssetPath(pathname: string): boolean {
+  const lower = pathname.toLowerCase();
+
+  return FRAMEWORK_ASSET_PREFIXES.some((prefix) => lower.startsWith(prefix));
+}
+
 /** One directive of the policy: a name and the sources it allows. */
 export interface CspDirective {
   readonly name: string;
