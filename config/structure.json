@@ -103,6 +103,7 @@
     "package-lock.json",
     "package.json",
     "postcss.config.mjs",
+    "proxy.ts",
     "tsconfig.json"
   ],
   "sourceRoots": [

@@ -27,6 +27,14 @@ import {
   type OutboundRejectionReason,
 } from "./ssrf.ts";
 import { isSafeRedirect, requireHttpUrl, sanitizeHttpUrl, sanitizeRelativePath } from "./url.ts";
+import {
+  buildContentSecurityPolicy,
+  buildCspDirectives,
+  createCspNonce,
+  CSP_NONCE_PATTERN,
+  isCspNonce,
+  type CspDirective,
+} from "./csp.ts";
 
 /**
  * The gate behind the input sanitiser.
@@ -627,6 +635,183 @@ async function checkOutboundAddresses(policy: OutboundPolicy): Promise<void> {
   );
 }
 
+/* ------------------------------------------------------------------ 7. the policy */
+
+/**
+ * The Content Security Policy of STEP 059.
+ *
+ * A CSP is the one header where a small relaxation is invisible: add `'unsafe-inline'` to
+ * `script-src` and every page still renders, every proof still passes, and the protection is gone.
+ * This corpus therefore asserts the policy *negatively* as well as positively - that no directive
+ * carries a wildcard, a bare scheme in `script-src`, `'unsafe-inline'` for scripts, or a directive
+ * nobody reviewed - and it reads the tree to prove that the nonce the policy names is the nonce the
+ * proxy minted and the layout used.
+ */
+function checkCsp(): void {
+  const nonce = createCspNonce();
+
+  expect(CSP_NONCE_PATTERN.test(nonce), "a minted nonce has the shape the pattern allows");
+  expectEqual(nonce.length, 22, "and is 22 base64url characters, which is 128 bits");
+  expectEqual(createCspNonce() === createCspNonce(), false, "two nonces are never the same one");
+  expectEqual(isCspNonce(nonce), true, "and the value is recognised as a nonce");
+  expectEqual(isCspNonce("short"), false, "a short value is not a nonce");
+  expectEqual(isCspNonce(`${nonce}=`), false, "nor is a padded one");
+  expectEqual(isCspNonce(`${"a".repeat(21)}!`), false, "nor one with a symbol");
+  expectEqual(isCspNonce(""), false, "and an empty value is not a nonce");
+
+  const production = buildCspDirectives({ nonce, development: false });
+  const development = buildCspDirectives({ nonce, development: true });
+
+  const sourceOf = (directives: readonly CspDirective[], name: string): readonly string[] =>
+    directives.find((directive) => directive.name === name)?.values ?? [];
+
+  expectEqual(
+    production.map((directive) => directive.name).join(","),
+    [
+      "script-src",
+      "style-src",
+      "img-src",
+      "font-src",
+      "connect-src",
+      "form-action",
+      "base-uri",
+      "object-src",
+      "frame-src",
+      "worker-src",
+      "media-src",
+      "manifest-src",
+      "frame-ancestors",
+      "upgrade-insecure-requests",
+      "default-src",
+    ].join(","),
+    "the policy has exactly the directives this STEP reviewed, in order",
+  );
+  expectEqual(
+    development.map((directive) => directive.name).includes("frame-ancestors"),
+    false,
+    "a development deployment is not told it may not be framed, because the preview embeds it",
+  );
+  expectEqual(
+    development.map((directive) => directive.name).includes("upgrade-insecure-requests"),
+    false,
+    "and is not told to upgrade a plain http request, because it serves plain http",
+  );
+
+  const script = sourceOf(production, "script-src");
+
+  expect(script.includes(`'nonce-${nonce}'`), "the script source list names this response's nonce");
+  expect(script.includes("'strict-dynamic'"), "and carries the nonce onward to the chunks the bootstrap loads");
+  expect(script.includes("'self'"), "with the same-origin fallback for a browser without strict-dynamic");
+  expectEqual(script.includes("'unsafe-inline'"), false, "an inline script is never allowed without a nonce");
+  expectEqual(script.includes("'unsafe-eval'"), false, "and a production policy never allows eval");
+  expectEqual(script.includes("*"), false, "no script source is a wildcard");
+  expectEqual(script.includes("http:"), false, "and no scheme source is allowed");
+  expectEqual(script.includes("https:"), false, "in either spelling, because a scheme source is every host");
+  expectEqual(sourceOf(development, "script-src").includes("'unsafe-eval'"), true, "a development policy allows eval for React Refresh");
+  expectEqual(sourceOf(development, "script-src").includes("'unsafe-inline'"), false, "and still refuses an inline script without a nonce");
+
+  expectEqual(sourceOf(production, "style-src").join(" "), "'self' 'unsafe-inline'", "styles allow an inline block and nothing else");
+  expectEqual(sourceOf(production, "img-src").join(" "), "'self' data: blob:", "images come from this origin or from a data URL");
+  expectEqual(sourceOf(production, "connect-src").join(" "), "'self'", "a production browser may only call this origin");
+  expectEqual(sourceOf(development, "connect-src").join(" "), "'self' ws: wss:", "and a development one speaks to its own websocket");
+  expectEqual(sourceOf(production, "default-src").join(" "), "'self'", "the fallback for every unlisted directive is this origin");
+
+  for (const [name, expected] of [
+    ["form-action", "'self'"],
+    ["base-uri", "'none'"],
+    ["object-src", "'none'"],
+    ["frame-src", "'none'"],
+    ["worker-src", "'none'"],
+    ["media-src", "'none'"],
+    ["frame-ancestors", "'none'"],
+  ] as const) {
+    expectEqual(sourceOf(production, name).join(" "), expected, `${name} is ${expected}`);
+  }
+
+  expectEqual(
+    production.filter((directive) => directive.values.length === 0).map((directive) => directive.name).join(","),
+    "upgrade-insecure-requests",
+    "a directive without a source list is only the one that takes none",
+  );
+
+  const serialised = buildContentSecurityPolicy({ nonce, development: false });
+
+  expectEqual(serialised, buildContentSecurityPolicy({ nonce, development: false }), "one input, one header, every time");
+  expectEqual(serialised.includes("\n"), false, "the header is one line");
+  expectEqual(serialised.split(`'nonce-${nonce}'`).length - 1, 1, "the nonce appears once");
+  expect(serialised.endsWith("default-src 'self'"), "and the policy ends with its fallback");
+  expectEqual(serialised.split(";").length, production.length, "one semicolon per directive, no empty ones");
+  expectEqual(buildContentSecurityPolicy({ nonce: createCspNonce(), development: false }) === serialised, false, "a new nonce is a new policy");
+
+  for (const bad of ["", "short", `${"a".repeat(21)}=`, `${"a".repeat(23)}`, "has a space in it here"]) {
+    expectRejects(
+      () => buildCspDirectives({ nonce: bad, development: false }),
+      `a policy is not built for ${JSON.stringify(bad)} as a nonce`,
+    );
+  }
+}
+
+/** The tree: one writer of the header, one reader of the nonce, and the manifest agrees. */
+async function checkCspWiring(): Promise<void> {
+  const root = new URL("../../", import.meta.url);
+  const cspSource = await readFile(new URL("./csp.ts", import.meta.url), "utf8");
+  const proxySource = await readFile(new URL("proxy.ts", root), "utf8");
+  const layoutSource = await readFile(new URL("app/layout.tsx", root), "utf8");
+
+  expectEqual(cspSource.includes("import "), false, "the policy module imports nothing, so every runtime can load it");
+  expectEqual(cspSource.includes('from "node:'), false, "including no Node builtin");
+  expect(cspSource.includes("crypto.getRandomValues"), "the nonce comes from the platform's random source");
+
+  expect(proxySource.startsWith("// path: proxy.ts"), "the proxy is the file the framework looks for");
+  expect(proxySource.includes("export function proxy("), "and exports the function Next 16 expects");
+  expect(proxySource.includes("requestHeaders.set(CSP_HEADER_NAME"), "the policy is set on the request, which is what the framework reads");
+  expect(proxySource.includes("response.headers.set(CSP_HEADER_NAME"), "and on the response, which is what the browser enforces");
+  expect(proxySource.includes("CSP_NONCE_HEADER_NAME, nonce"), "the nonce travels to the layout in its own header");
+  expect(proxySource.includes("_next/static") && proxySource.includes("_next/image"), "immutable assets are not given a policy");
+  expect(proxySource.includes("getServerConfig()"), "the development decision is read through the validated configuration");
+  expectEqual(proxySource.includes("process.env"), false, "and never from a raw environment read");
+
+  expect(layoutSource.includes('export const dynamic = "force-dynamic"'), "the layout is rendered per request, because a nonce is per response");
+  expect(layoutSource.includes("(await headers()).get(CSP_NONCE_HEADER_NAME)"), "the layout reads the nonce the proxy minted");
+  expect(layoutSource.includes("!isCspNonce(nonce)"), "and validates the value instead of trusting the header");
+  expect(layoutSource.includes('throw new Error("the Content Security Policy nonce is missing'), "so a page whose script would be blocked is never rendered");
+  expectEqual(layoutSource.split("<script").length - 1, 1, "the document has one hand written script tag");
+  expect(layoutSource.includes("<script nonce={nonce}"), "and that tag carries the nonce");
+  expect(layoutSource.includes("dangerouslySetInnerHTML={{ __html: THEME_SCRIPT }}"), "with the theme constant as its only content");
+
+  const manifest = JSON.parse(await readFile(new URL("config/structure.json", root), "utf8")) as {
+    readonly rootFiles: readonly string[];
+  };
+
+  expectEqual(manifest.rootFiles.includes("proxy.ts"), true, "the structure manifest lists the proxy as a root file");
+
+  const scanned: string[] = [];
+
+  for (const entry of ["app", "components", "lib", "scripts"]) {
+    const entries = (await readdir(new URL(`${entry}/`, root), { recursive: true }))
+      .map((name) => name.replaceAll("\\", "/"))
+      .filter((name) => name.endsWith(".ts") || name.endsWith(".tsx"));
+
+    for (const name of entries) {
+      if (name.endsWith("verify.ts")) {
+        continue;
+      }
+
+      const source = await readFile(new URL(`${entry}/${name}`, root), "utf8");
+
+      if (source.includes('"content-security-policy"')) {
+        scanned.push(`${entry}/${name}`);
+      }
+    }
+  }
+
+  expectEqual(
+    scanned.join(","),
+    "lib/security/csp.ts",
+    "no module writes the header by hand, and the constant lives in one file",
+  );
+}
+
 async function checkTree(): Promise<void> {
   const securityRoot = new URL("./", import.meta.url);
   const securityFiles = (await readdir(securityRoot)).filter((name) => name.endsWith(".ts"));
@@ -695,6 +880,8 @@ async function main(): Promise<void> {
   const outbound = checkOutboundStrings();
 
   await checkOutboundAddresses(outbound);
+  checkCsp();
+  await checkCspWiring();
   await checkTree();
 
   if (failures.length > 0) {

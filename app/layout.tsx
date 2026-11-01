@@ -1,5 +1,6 @@
 // path: app/layout.tsx
 import type { Metadata, Viewport } from "next";
+import { headers } from "next/headers";
 import Link from "next/link";
 import type { ReactNode } from "react";
 import { AppProviders } from "@/components/providers/app-providers";
@@ -7,6 +8,7 @@ import { THEME_SCRIPT } from "@/components/providers/theme";
 import { ThemeToggle } from "@/components/ui/theme-toggle";
 import { getMessage } from "@/lib/i18n/messages";
 import { en } from "@/lib/i18n/strings/en";
+import { CSP_NONCE_HEADER_NAME, isCspNonce } from "@/lib/security/csp";
 import "./globals.css";
 
 /**
@@ -24,9 +26,15 @@ import "./globals.css";
  *     routes that do not exist yet would be a broken promise;
  *   - `AppProviders` is the single client boundary, mounted once around the tree.
  *
- * STEP 059 adds the Content Security Policy nonce to the script element below. Nothing else here
- * changes for it.
+ * The pre-paint script is the one script tag this repository writes itself, so it is the one tag that
+ * needs the Content Security Policy nonce by hand (`proxy.ts` sets up every policy, and the framework
+ * stamps its own tags from the request header). A nonce that is missing is an error rather than a
+ * warning: the script would be blocked, the page would paint the wrong theme, and the only sign would be
+ * a line in a browser console. `force-dynamic` is declared because a prerendered document cannot carry
+ * a per-response nonce; `lib/security/csp.ts` explains why that is the price of this policy.
  */
+
+export const dynamic = "force-dynamic";
 
 export const metadata: Metadata = {
   title: en.brand.name,
@@ -52,13 +60,19 @@ const headerInnerClasses =
 const brandLinkClasses =
   "rounded-sm text-sm font-semibold tracking-tight text-foreground hover:text-primary";
 
-export default function RootLayout({
+export default async function RootLayout({
   children,
-}: Readonly<{ children: ReactNode }>): ReactNode {
+}: Readonly<{ children: ReactNode }>): Promise<ReactNode> {
+  const nonce = (await headers()).get(CSP_NONCE_HEADER_NAME);
+
+  if (nonce === null || !isCspNonce(nonce)) {
+    throw new Error("the Content Security Policy nonce is missing from the request");
+  }
+
   return (
     <html lang={en.locale.code} dir={en.locale.direction} suppressHydrationWarning>
       <head>
-        <script dangerouslySetInnerHTML={{ __html: THEME_SCRIPT }} />
+        <script nonce={nonce} dangerouslySetInnerHTML={{ __html: THEME_SCRIPT }} />
       </head>
       <body className="min-h-dvh bg-background text-foreground antialiased">
         <AppProviders>

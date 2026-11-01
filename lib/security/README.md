@@ -1,9 +1,10 @@
 // path: lib/security/README.md
 # lib/security/
 
-Owner: STEP 056 (input sanitiser for text, rich text and URLs), STEP 057 (the double submit token)
-and STEP 058 (the destination rule). Later STEPs call these functions; they do not write a second
-escape, a second URL check, a second allowlist, a second CSRF token or a second DNS check.
+Owner: STEP 056 (input sanitiser for text, rich text and URLs), STEP 057 (the double submit token),
+STEP 058 (the destination rule) and STEP 059 (the Content Security Policy). Later STEPs call these
+functions; they do not write a second escape, a second URL check, a second allowlist, a second CSRF
+token, a second DNS check or a second policy header.
 
 | File | Purpose |
 | --- | --- |
@@ -14,6 +15,7 @@ escape, a second URL check, a second allowlist, a second CSRF token or a second 
 | csrf.ts | The server half of the double submit token: mint, cookie, compare, `requireCsrfToken` |
 | csrf-client.ts | The browser half: read the cookie, add the header, ask `/api/auth/csrf` when absent |
 | ssrf.ts | The destination rule: the allowlist, the resolver, and the three checks a URL must pass |
+| csp.ts | The Content Security Policy: the nonce, the fifteen directives, and what each allowance is for |
 | verify.ts | The gate behind `npm run check:security`, and the attack corpus it runs |
 
 ## The four rules
@@ -83,6 +85,31 @@ cross-site form post carries neither - but a same-site subdomain, or a browser t
 a cookie, and cannot read a value to put in a header. The cookie is therefore **readable by design**,
 and the one place that fact is allowed to look like a mistake is this paragraph.
 
+## The policy is per response, and that decides the rendering mode
+
+`csp.ts` builds one header from one nonce. `proxy.ts` (the Next 16 name for middleware) mints the nonce
+and sets the policy on the **request** as well as the response, because the framework reads the nonce
+out of the request header to stamp its own script tags - a response header alone looks right in a
+browser and leaves every framework script without a nonce.
+
+That choice has one consequence a reader must know about: a prerendered document is served from the
+build and its inline `self.__next_f` bootstrap scripts were written before any nonce existed, so a nonce
+policy blocks them, and a build-time hash cannot cover scripts that differ per build. `app/layout.tsx`
+therefore declares `force-dynamic`, and the seven routes that were static in STEP 058 are rendered per
+request. The alternative - staying static and allowing `'unsafe-inline'` - is a policy that protects
+nothing, which is why it is not offered as an option here.
+
+The allowances, each with the reason it exists: `style-src 'unsafe-inline'` because the framework
+injects critical CSS and an inline style cannot execute script; `'self'` in `script-src` as the fallback
+for a browser without `'strict-dynamic'`; `data:` and `blob:` in `img-src` for the same framework
+reason; `ws:`/`wss:` in `connect-src` and `'unsafe-eval'` in `script-src` for a development server only.
+A directive that is not listed falls back to `default-src 'self'`, which is the point of listing
+`default-src` last.
+
+`frame-ancestors 'none'` is sent in production and **not** in development, where the platform is
+embedded in a preview frame: a policy that blocks the frame the work is reviewed in gets switched off,
+and a switched-off policy is worse than a documented exception.
+
 ## Ceilings
 
 | Value | Ceiling | Why |
@@ -109,3 +136,10 @@ number of characters in every script.
   package request in the STEP 056 handoff, because `package.json` is not a STEP's to edit.
 - **No CSRF token in `text.ts`.** A token is not text that a user typed; it is 32 random bytes with a
   comparison rule, and it lives in `csrf.ts` beside the cookie policy it has to agree with.
+- **No nonce or header in `proxy.ts` for anything but the policy.** A proxy runs on every request,
+  including the ones that must stay cheap; identity, redirects and body handling are the routes' work,
+  and a security header is the whole of the proxy's job.
+- **No CSP reporting endpoint.** A `report-uri` is useful only with a collector, and a collector is a
+  public `POST` that browsers send without a CSRF token - the one route that would have to be exempt
+  from the rule of STEP 057. It belongs to the logging pipeline, with its rate limit and its retention,
+  not to the STEP that writes the policy.
