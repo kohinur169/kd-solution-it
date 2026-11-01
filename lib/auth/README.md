@@ -226,6 +226,32 @@ the authority. A permission check uses the record, never a claim.
     password alone and enrols again through STEP 041. Documents are a reference string because the
     encrypted upload pipeline is STEP 100's; the audit records that a reference existed, not its text.
 
+44. The lock is a row, not a memory. `account_locks` (`0012`) holds one row per lock, refuses a lock
+    longer than two hours in a check, allows one open lock per account through a partial unique index,
+    and closes a row exactly one way: an office unlock or the clock. Nothing about a lock lives in a
+    process, so a restart cannot release one - which is the "survive server restarts" sentence of
+    section 22 taken literally.
+45. Two consecutive failures, counted per factor. `recordFailedSignIn` writes the attempt row and then
+    counts the newest `login_attempts` rows of that account and that factor (`0085` indexes exactly
+    that query). `account_locks.triggered_by` names which factor reached two, because `0012` says so.
+    A success ends the streak; a `blocked` or `challenged` row neither counts nor ends it, and the
+    second consecutive failure opens the lock.
+46. The lock is asked after the password, never before it. A lock that answered before the credential
+    check would confirm that an address has an account, so a wrong password on a locked account gets
+    the one generic sentence and the attempt is recorded as `failed`. Once the password is right, the
+    answer is `ACCOUNT_LOCKED` (423) with `retryAfterSeconds`: it tells the owner what happened and
+    tells a stranger nothing. The provider session that exchange created is signed out again, because
+    no sign in happened.
+47. Failing closed on the read, best effort on the count. `readAccountLock` and
+    `assertAccountUnlocked` propagate a storage failure, so "the database did not answer" can never be
+    reported as "the account is open". `recordFailedSignIn` swallows one: the refusal it accompanies
+    has already been decided, and a missing counter row must not turn "wrong password" into an
+    outage sentence.
+48. A lock is not cleared by anything a merchant can do. The module never writes `users`, so changing
+    the password cannot touch a lock; an expired row is closed by the next failure before a new lock is
+    written, because the live key would otherwise make the account unlockable by time and lockable by
+    nothing. The office unlock is STEP 047's, through the `0012` columns this module never writes.
+
 ## Adding an operation
 
 1. Add the method to the `AuthClient` or `AdminAuthClient` interface and its implementation,

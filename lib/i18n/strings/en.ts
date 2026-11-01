@@ -70,6 +70,8 @@ const catalog = {
     payloadTooLarge: "The request is larger than this endpoint accepts.",
     unsupportedMediaType: "This endpoint accepts JSON request bodies only.",
     rateLimited: "Too many requests. Wait a moment and try again.",
+    accountLocked:
+      "This account is locked after too many failed attempts. Signing in does not work until the lock ends, and the office unlocks it only after confirming it with the owner by email.",
     dependencyFailed: "A connected service did not answer correctly. Try again shortly.",
     serviceUnavailable: "The service is temporarily unavailable. Try again shortly.",
     timeout: "The request took too long to complete. Try again.",
@@ -124,6 +126,11 @@ const catalog = {
     secondFactorCodeLabel: "Authenticator code or backup code",
     secondFactorSubmit: "Verify and sign in",
     secondFactorSubmitting: "Verifying",
+    lockedTitle: "Account locked",
+    locked:
+      "Too many failed attempts. This account cannot sign in for another {minutes} minutes. The office unlocks it only after confirming it with the owner by email.",
+    secondFactorLocked:
+      "Too many failed codes. This account cannot sign in for another {minutes} minutes. The office unlocks it only after confirming it with the owner by email.",
     secondFactorRejected:
       "That code was not accepted. Wait for the next one in the app, or use a backup code.",
     secondFactorExpired:

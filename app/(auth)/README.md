@@ -32,3 +32,9 @@ unavailable, ready - rather than a loading shell; the only client action posts t
 codes. It renders without a session - the person who needs it cannot sign in - and posts an address and
 a description to `/api/auth/2fa/reset`, which answers one `202` sentence whether or not the address has
 an account. `/2fa` and `/signin` both link to it, and the office side lives in `app/office`.
+
+The sign in screen now answers the lock of STEP 045. `POST /api/auth/signin` and
+`POST /api/auth/2fa/verify` answer `423 ACCOUNT_LOCKED` with `retryAfterSeconds` - and the form prints
+the remaining minutes instead of asking for the password again - only once the password is known to be
+right, so the lock never becomes an oracle for whether an address has an account. A wrong password on
+a locked account keeps the one generic sentence.

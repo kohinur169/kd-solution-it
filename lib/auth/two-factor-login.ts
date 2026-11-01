@@ -8,6 +8,7 @@ import { encodeSessionCookies, type AuthCookiePolicy, type SessionCookiePayload 
 import { credentialRejectionError } from "./failures.ts";
 import type { DeviceContext } from "./device-context.ts";
 import type { LoginAttemptRecorder } from "./login-attempts.ts";
+import { accountLockError, readAccountLock, recordFailedSignIn } from "./locks.ts";
 import { verifyPasswordHash } from "./password.ts";
 import type { RestClient } from "./rest.ts";
 import { openSecret, packSecretBox, sealSecret, unpackSecretBox } from "./secrets.ts";
@@ -360,6 +361,43 @@ export async function completeTwoFactorChallenge(
     throw credentialRejectionError();
   }
 
+  // The lock of section 22 is asked here, after the handle proved the password step and before any
+  // code is looked at: a locked account refuses even a correct code, which is the only way two wrong
+  // codes can be a lock rather than a retry. Asking it here also keeps the answer out of the
+  // pre-password path, where it would confirm that an address has an account.
+  const lock = await readAccountLock(dependencies.rest, account.id, instant);
+
+  if (lock.locked) {
+    await recordAttempt(dependencies, {
+      factor: "totp",
+      outcome: "blocked",
+      companyId: account.company_id,
+      userId: account.id,
+      emailHash: null,
+      ipAddress: input.remoteIp,
+      userAgent: input.userAgent,
+    });
+    await dependencies.audit
+      .append({
+        action: "user.signin_blocked",
+        actorUserId: account.id,
+        entityType: "user",
+        entityId: account.id,
+        companyId: account.company_id,
+        payload: {
+          lock_checked_at: "totp",
+          locked_until: lock.expiresAt,
+          remaining_seconds: lock.remainingSeconds,
+          triggered_by: lock.triggeredBy,
+        },
+        ipAddress: input.remoteIp,
+        userAgent: input.userAgent,
+      })
+      .catch(() => undefined);
+
+    throw accountLockError(lock);
+  }
+
   const secret = account.totp_secret_ciphertext;
   const rejected = async (): Promise<never> => {
     const attempts = challenge.attempt_count + 1;
@@ -372,15 +410,23 @@ export async function completeTwoFactorChallenge(
         : { attempt_count: attempts },
     );
 
-    await recordAttempt(dependencies, {
-      factor: "totp",
-      outcome: "failed",
-      companyId: account.company_id,
-      userId: account.id,
-      emailHash: null,
-      ipAddress: input.remoteIp,
-      userAgent: input.userAgent,
-    });
+    // Two consecutive wrong codes lock the account for two hours, exactly as two wrong passwords do;
+    // the row and the lock are written by the same service the password step uses.
+    await recordFailedSignIn(
+      {
+        userId: account.id,
+        companyId: account.company_id,
+        factor: "totp",
+        ipAddress: input.remoteIp,
+        userAgent: input.userAgent,
+      },
+      {
+        rest: dependencies.rest,
+        attempts: dependencies.attempts,
+        audit: dependencies.audit,
+        now: () => instant,
+      },
+    );
 
     throw credentialRejectionError();
   };

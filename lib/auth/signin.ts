@@ -12,6 +12,7 @@ import { emailHash, readDeviceContext, type DeviceContext } from "./device-conte
 import { credentialRejectionError } from "./failures.ts";
 import { decodeSessionClaims } from "./jwt.ts";
 import type { LoginAttemptRecorder } from "./login-attempts.ts";
+import { accountLockError, readAccountLock, recordFailedSignIn } from "./locks.ts";
 import type { RestClient } from "./rest.ts";
 import type { TurnstileGuard } from "./turnstile.ts";
 import type { AuthFailure } from "./types.ts";
@@ -38,12 +39,24 @@ import { issueTwoFactorChallenge } from "./two-factor-login.ts";
  * the route. Uniformity is not politeness here: an endpoint that answers "no such account" in
  * 200 ms and "wrong password" in 600 ms is an account directory.
  *
- * ## What this STEP does not do
+ * ## The lock, and why the address is read first
  *
- * The lock (STEP 045) sits before the exchange and answers `blocked`; the rate limiter (STEP 055)
- * sits before the route; the device proof key (STEP 049) and the rotating session (STEP 051) change
- * what the cookie means and add the `sessions` row. Each of them reads the same attempt row this
- * file writes, so none of them needs a new recorder.
+ * STEP 045 needs two facts this file could not answer before: which account a failed password
+ * belongs to, and whether that account is locked.
+ *
+ * The account is resolved from the address *before* the exchange - one lookup on `users_email_key` -
+ * because a failure recorded by an address hash alone can never count toward the two consecutive
+ * failures of section 22. The lookup changes no answer: it decides what the attempt row says, not
+ * what the stranger reads, and an unknown address simply has no row to attribute.
+ *
+ * The lock is asked *after* the exchange, and that order is the security property. A locked account
+ * answering before the password is checked would confirm to anybody that the address exists, which
+ * section 22 forbids; once the password is known to be right, the person in front of the screen is
+ * the owner and "locked until 14:05" is the only useful sentence - and the provider session this
+ * exchange created is signed out again rather than left alive for a sign in that did not happen.
+ *
+ * What is still not here: the owner alert (STEP 046), the office unlock (STEP 047), the IP rate
+ * limiter (STEP 055), the device proof key (STEP 049) and the rotating session (STEP 051).
  */
 
 /** The sign in form. An address is not shape checked beyond a bound, to avoid a shape oracle. */
@@ -201,22 +214,45 @@ export async function signInMerchant(
     throw turnstileError(challenge.failure);
   }
 
-  // STEP 045 inserts the lock question here: a locked account answers `blocked` before the exchange
-  // and never reaches the provider, so a correct password during a lock proves nothing.
+  // The account behind the address, if there is one. Read here and not after the exchange because a
+  // failure has to be attributed to an account for the lock of section 22 to count it.
+  const knownAccount = await readAccountByEmail(dependencies.rest, request.email);
+
   const provider = await dependencies.auth.signInWithPassword({
     email: request.email,
     password: request.password,
   });
 
   if (!provider.ok) {
-    await recordAttempt(dependencies, {
-      factor: "password",
-      outcome: "failed",
-      companyId: null,
-      ...identityOf(null, request.email),
-      ipAddress: input.remoteIp,
-      userAgent: input.userAgent,
-    });
+    if (knownAccount === null) {
+      // No account to attribute the failure to: the row names the address by its hash, which is what
+      // lets STEP 055 throttle one address without learning whose it is.
+      await recordAttempt(dependencies, {
+        factor: "password",
+        outcome: "failed",
+        companyId: null,
+        ...identityOf(null, request.email),
+        ipAddress: input.remoteIp,
+        userAgent: input.userAgent,
+      });
+    } else {
+      // A known account: the row names it, and the second consecutive failure locks it.
+      await recordFailedSignIn(
+        {
+          userId: knownAccount.id,
+          companyId: knownAccount.company_id,
+          factor: "password",
+          ipAddress: input.remoteIp,
+          userAgent: input.userAgent,
+        },
+        {
+          rest: dependencies.rest,
+          attempts: dependencies.attempts,
+          audit: dependencies.audit,
+          now,
+        },
+      );
+    }
 
     throw providerError(provider.failure);
   }
@@ -228,12 +264,12 @@ export async function signInMerchant(
     throw new AppError("DEPENDENCY_FAILED");
   }
 
-  const rows = await dependencies.rest.select(
-    "users",
-    `select=id,company_id,status,email_verified_at,deleted_at,totp_confirmed_at&id=eq.${encodeURIComponent(claims.subject)}&limit=1`,
-    userRowSchema,
-  );
-  const user = rows[0];
+  // The row found by address is used when it is the account the provider signed in; otherwise the
+  // provider's subject is read directly, so an address that changed mid flight still resolves.
+  const user =
+    knownAccount !== null && knownAccount.id === claims.subject
+      ? knownAccount
+      : await readAccountById(dependencies.rest, claims.subject);
   const refusal = readRefusal(user);
 
   if (refusal !== null) {
@@ -250,6 +286,43 @@ export async function signInMerchant(
   }
 
   const account = user as z.infer<typeof userRowSchema>;
+
+  // The account is open, verified and owned by the person with the correct password. If the two hour
+  // lock of section 22 is running, that password still does not sign in: the provider session is
+  // ended, the attempt is recorded as `blocked`, and the answer names the lock rather than the
+  // account - a stranger without the password reaches the generic rejection above instead.
+  const lock = await readAccountLock(dependencies.rest, account.id, now());
+
+  if (lock.locked) {
+    await dependencies.auth.signOut(session.accessToken).catch(() => undefined);
+    await recordAttempt(dependencies, {
+      factor: "password",
+      outcome: "blocked",
+      companyId: account.company_id,
+      userId: account.id,
+      emailHash: null,
+      ipAddress: input.remoteIp,
+      userAgent: input.userAgent,
+    });
+    await dependencies.audit
+      .append({
+        action: "user.signin_blocked",
+        actorUserId: account.id,
+        entityType: "user",
+        entityId: account.id,
+        companyId: account.company_id,
+        payload: {
+          locked_until: lock.expiresAt,
+          remaining_seconds: lock.remainingSeconds,
+          triggered_by: lock.triggeredBy,
+        },
+        ipAddress: input.remoteIp,
+        userAgent: input.userAgent,
+      })
+      .catch(() => undefined);
+
+    throw accountLockError(lock);
+  }
 
   const proofKeys = await dependencies.rest.select(
     "device_proof_keys",
@@ -372,6 +445,34 @@ function identityOf(
   return userId === null
     ? { userId: null, emailHash: emailHash(email) }
     : { userId, emailHash: null };
+}
+
+/** The account behind an address, or null. `users_email_key` makes this one index lookup. */
+async function readAccountByEmail(
+  rest: RestClient,
+  email: string,
+): Promise<z.infer<typeof userRowSchema> | null> {
+  const rows = await rest.select(
+    "users",
+    `select=id,company_id,status,email_verified_at,deleted_at,totp_confirmed_at&email=eq.${encodeURIComponent(email)}&limit=1`,
+    userRowSchema,
+  );
+
+  return rows[0] ?? null;
+}
+
+/** The account the provider's token names. */
+async function readAccountById(
+  rest: RestClient,
+  userId: string,
+): Promise<z.infer<typeof userRowSchema> | undefined> {
+  const rows = await rest.select(
+    "users",
+    `select=id,company_id,status,email_verified_at,deleted_at,totp_confirmed_at&id=eq.${encodeURIComponent(userId)}&limit=1`,
+    userRowSchema,
+  );
+
+  return rows[0];
 }
 
 function readRefusal(user: z.infer<typeof userRowSchema> | undefined): AccountRefusal | null {

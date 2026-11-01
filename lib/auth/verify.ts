@@ -3,6 +3,7 @@ import { Buffer } from "node:buffer";
 import process from "node:process";
 import { z } from "zod";
 import { AppError } from "../errors/app-error.ts";
+import { ERROR_CODES } from "../errors/codes.ts";
 import { createAuthAdminClient } from "./admin-client.ts";
 import {
   AUDIT_SIGNING_KEY_ID,
@@ -124,6 +125,15 @@ import {
   type PolicyPage,
 } from "./policies.ts";
 import { companySlug, registerMerchant } from "./registration.ts";
+import {
+  accountLockError,
+  assertAccountUnlocked,
+  countConsecutiveFailures,
+  LOGIN_LOCK_DURATION_MS,
+  LOGIN_LOCK_FAILURE_THRESHOLD,
+  readAccountLock,
+  recordFailedSignIn,
+} from "./locks.ts";
 import type { RestClient } from "./rest.ts";
 import { isSecretBox, openSecret, packSecretBox, sealSecret, unpackSecretBox } from "./secrets.ts";
 import {
@@ -3313,6 +3323,120 @@ async function checkLoginAttempts(): Promise<void> {
 
 /* ------------------------------------------------------------------ 21. sign in */
 
+/**
+ * The `account_locks` table of `0012`, in memory, with its two rules.
+ *
+ * A second open lock for one account is refused (`account_locks_live_key`) and a lock may not outlive
+ * two hours (`account_locks_window_check`), so the service is asked to survive the same refusals a
+ * database would give it. The rows are readable, which is how a check proves what was written without
+ * a database.
+ */
+interface LockRow {
+  id: string;
+  user_id: string;
+  company_id: string | null;
+  triggered_by: "password" | "totp";
+  locked_at: string;
+  expires_at: string;
+  unlocked_at: string | null;
+  unlocked_by: string | null;
+  expired_at: string | null;
+  version: number;
+}
+
+interface LockTable {
+  readonly rows: LockRow[];
+  readonly insertCount: number;
+  select(query: string): readonly Readonly<Record<string, unknown>>[];
+  insert(rows: readonly Readonly<Record<string, unknown>>[]): void;
+  update(query: string, values: Readonly<Record<string, unknown>>): void;
+}
+
+function createLockTable(): LockTable {
+  const rows: LockRow[] = [];
+  let inserts = 0;
+  const table: LockTable = {
+    rows,
+    get insertCount(): number {
+      return inserts;
+    },
+    select(query: string): readonly Readonly<Record<string, unknown>>[] {
+      const userId = /user_id=eq\.([^&]+)/u.exec(query)?.[1] ?? "";
+      const live = query.includes("unlocked_at=is.null")
+        ? rows.filter((row) => row.unlocked_at === null && row.expired_at === null)
+        : rows;
+
+      return live
+        .filter((row) => row.user_id === decodeURIComponent(userId))
+        .sort((left, right) => Date.parse(right.locked_at) - Date.parse(left.locked_at))
+        .map((row) => ({ ...row }));
+    },
+    insert(batch: readonly Readonly<Record<string, unknown>>[]): void {
+      inserts += 1;
+
+      for (const values of batch) {
+        const userId = String(values["user_id"]);
+        const lockedAt = String(values["locked_at"]);
+        const expiresAt = String(values["expires_at"]);
+
+        // account_locks_window_check: never later than locked_at plus two hours.
+        if (Date.parse(expiresAt) - Date.parse(lockedAt) > LOGIN_LOCK_DURATION_MS) {
+          throw new AppError("VALIDATION_FAILED");
+        }
+
+        // account_locks_live_key: one open lock per account.
+        if (rows.some((row) => row.user_id === userId && row.unlocked_at === null && row.expired_at === null)) {
+          throw new AppError("CONFLICT");
+        }
+
+        rows.push({
+          id: `lock-${String(rows.length + 1)}`,
+          user_id: userId,
+          company_id: (values["company_id"] as string | null | undefined) ?? null,
+          triggered_by: String(values["triggered_by"]) as "password" | "totp",
+          locked_at: lockedAt,
+          expires_at: expiresAt,
+          unlocked_at: null,
+          unlocked_by: null,
+          expired_at: null,
+          version: 1,
+        });
+      }
+    },
+    update(query: string, values: Readonly<Record<string, unknown>>): void {
+      const userId = /user_id=eq\.([^&]+)/u.exec(query)?.[1];
+      const deadline = /expires_at=lte\.([^&]+)/u.exec(query)?.[1];
+      const targets = rows.filter(
+        (row) =>
+          (userId === undefined || row.user_id === decodeURIComponent(userId)) &&
+          (deadline === undefined || Date.parse(row.expires_at) <= Date.parse(decodeURIComponent(deadline))) &&
+          (row.unlocked_at === null && row.expired_at === null),
+      );
+
+      for (const row of targets) {
+        Object.assign(row, values);
+        row.version += 1;
+      }
+    },
+  };
+
+  return table;
+}
+
+/** The streak query of `lib/auth/locks.ts`, answered from the attempt rows the fixture kept. */
+function streakRows(
+  attempts: readonly { readonly userId: string | null; readonly factor: string; readonly outcome: string }[],
+  query: string,
+): readonly { outcome: string }[] {
+  const userId = decodeURIComponent(/user_id=eq\.([^&]+)/u.exec(query)?.[1] ?? "");
+  const factor = decodeURIComponent(/factor=eq\.([^&]+)/u.exec(query)?.[1] ?? "");
+
+  return [...attempts]
+    .filter((attempt) => attempt.userId === userId && attempt.factor === factor)
+    .reverse()
+    .map((attempt) => ({ outcome: attempt.outcome }));
+}
+
 interface SigninRestOptions {
   readonly user?: Readonly<Record<string, unknown>> | null;
   readonly proofKeys?: number;
@@ -3321,17 +3445,26 @@ interface SigninRestOptions {
 
 interface SigninFixture {
   readonly dependencies: Parameters<typeof signInMerchant>[1];
+  /** The account row the fixture answers with, mutable so a check can change a column. */
+  readonly user: Record<string, unknown> | null;
   readonly attempts: ReturnType<typeof createInMemoryLoginAttemptRecorder>;
   readonly audit: ReturnType<typeof createInMemoryAuditTrail>;
   readonly inserts: { table: string; rows: readonly Readonly<Record<string, unknown>>[] }[];
+  /** Access tokens whose provider session the service ended, because no sign in happened. */
+  readonly signOuts: readonly string[];
 }
 
 function signinFixture(options: SigninRestOptions & {
   readonly signIn?: AuthOutcome<AuthSession>;
   readonly turnstileEnabled?: boolean;
+  /** The lock table of `0012`. Omitted means an account that has never been locked. */
+  readonly locks?: LockTable;
 } = {}): SigninFixture {
   const inserts: { table: string; rows: readonly Readonly<Record<string, unknown>>[] }[] = [];
-  const user =
+  const attempts = createInMemoryLoginAttemptRecorder();
+  const locks = options.locks ?? null;
+  const signOuts: string[] = [];
+  const user: Record<string, unknown> | null =
     options.user === undefined
       ? {
           id: USER_ID,
@@ -3349,9 +3482,19 @@ function signinFixture(options: SigninRestOptions & {
   };
 
   const rest: RestClient = {
-    select<TRow>(table: string): Promise<readonly TRow[]> {
+    select<TRow>(table: string, query: string): Promise<readonly TRow[]> {
       if (table === "users") {
         return Promise.resolve(user === null ? [] : ([{ ...user }] as unknown as readonly TRow[]));
+      }
+
+      if (table === "account_locks") {
+        return Promise.resolve(
+          (locks === null ? [] : locks.select(query)) as unknown as readonly TRow[],
+        );
+      }
+
+      if (table === "login_attempts") {
+        return Promise.resolve(streakRows(attempts.attempts, query) as unknown as readonly TRow[]);
       }
 
       if (table === "device_proof_keys") {
@@ -3367,21 +3510,39 @@ function signinFixture(options: SigninRestOptions & {
     insert(table: string, rows: readonly Readonly<Record<string, unknown>>[]): Promise<void> {
       inserts.push({ table, rows });
 
+      if (table === "account_locks" && locks !== null) {
+        locks.insert(rows);
+      }
+
       return Promise.resolve();
     },
     insertReturning: <TRow>(): Promise<readonly TRow[]> => Promise.resolve([]),
-    update: (): Promise<void> => Promise.resolve(),
+    update(table: string, query: string, values: Readonly<Record<string, unknown>>): Promise<void> {
+      if (table === "account_locks" && locks !== null) {
+        locks.update(query, values);
+      }
+
+      return Promise.resolve();
+    },
     rpc: (): Promise<unknown> => Promise.resolve(null),
   };
-  const attempts = createInMemoryLoginAttemptRecorder();
   const audit = createInMemoryAuditTrail();
 
   return {
     inserts,
     attempts,
     audit,
+    signOuts,
+    user,
     dependencies: {
-      auth: stubAuthClient({ signInWithPassword: () => Promise.resolve(options.signIn ?? { ok: true, value: session }) }),
+      auth: stubAuthClient({
+        signInWithPassword: () => Promise.resolve(options.signIn ?? { ok: true, value: session }),
+        signOut: (accessToken: string) => {
+          signOuts.push(accessToken);
+
+          return Promise.resolve({ ok: true, value: undefined });
+        },
+      }),
       rest,
       turnstile: createTurnstileGuard({
         settings: createInMemorySettings({ "turnstile.enabled": options.turnstileEnabled ?? false }),
@@ -4088,6 +4249,8 @@ function twoFactorLoginFixture(options: {
   readonly totpConfirmed?: boolean;
   readonly secret?: string;
   readonly backupCodeHashes?: readonly string[];
+  /** The lock table of `0012`. Omitted means an account that has never been locked. */
+  readonly locks?: LockTable;
 } = {}): {
   readonly state: ChallengeState;
   readonly updates: { table: string; query: string; values: Readonly<Record<string, unknown>> }[];
@@ -4114,9 +4277,21 @@ function twoFactorLoginFixture(options: {
     },
   };
   const updates: { table: string; query: string; values: Readonly<Record<string, unknown>> }[] = [];
+  const attempts = createInMemoryLoginAttemptRecorder();
+  const locks = options.locks ?? null;
 
   const rest: RestClient = {
     select<TRow>(table: string, query: string): Promise<readonly TRow[]> {
+      if (table === "account_locks") {
+        return Promise.resolve(
+          (locks === null ? [] : locks.select(query)) as unknown as readonly TRow[],
+        );
+      }
+
+      if (table === "login_attempts") {
+        return Promise.resolve(streakRows(attempts.attempts, query) as unknown as readonly TRow[]);
+      }
+
       if (table === "auth_challenges") {
         const wanted = /token_hash=eq\.([0-9a-f]{64})/u.exec(query)?.[1] ?? "";
         const row = state.challenge;
@@ -4133,6 +4308,12 @@ function twoFactorLoginFixture(options: {
       return Promise.resolve([]);
     },
     insert(table: string, rows: readonly Readonly<Record<string, unknown>>[]): Promise<void> {
+      if (table === "account_locks" && locks !== null) {
+        locks.insert(rows);
+
+        return Promise.resolve();
+      }
+
       if (table !== "auth_challenges") {
         return Promise.resolve();
       }
@@ -4169,6 +4350,10 @@ function twoFactorLoginFixture(options: {
         }
       }
 
+      if (table === "account_locks" && locks !== null) {
+        locks.update(query, values);
+      }
+
       if (table === "users" && "backup_code_hashes" in values) {
         state.user.backup_code_hashes = values["backup_code_hashes"] as readonly string[];
       }
@@ -4177,7 +4362,6 @@ function twoFactorLoginFixture(options: {
     },
     rpc: (): Promise<unknown> => Promise.resolve(null),
   };
-  const attempts = createInMemoryLoginAttemptRecorder();
   const audit = createInMemoryAuditTrail();
 
   return {
@@ -5411,6 +5595,572 @@ async function checkTwoFactorReset(): Promise<void> {
   );
 }
 
+/* ------------------------------------------------------- login lock (045) */
+
+/** A failed sign in the way a route would see it: the provider rejected the credentials. */
+const rejectedSignIn: AuthOutcome<AuthSession> = {
+  ok: false,
+  failure: { kind: "rejected", status: 400, code: "invalid_credentials", retryAfterSeconds: null },
+};
+
+/**
+ * The rest client of the lock service alone: two tables, both in memory.
+ *
+ * The lock module reads and writes `account_locks` and `login_attempts` and nothing else, so the gate
+ * gives it exactly those two and records every other name it is asked for. A select on any other
+ * table is a check that forgot what this service is allowed to touch, and the recorded writes are how
+ * the "changing the password cannot clear the lock" sentence of section 22 is proven.
+ */
+function lockRest(
+  table: LockTable,
+  attempts: ReturnType<typeof createInMemoryLoginAttemptRecorder>,
+  touched: string[] = [],
+): RestClient {
+  return {
+    select<TRow>(name: string, query: string): Promise<readonly TRow[]> {
+      touched.push(`select:${name}`);
+
+      if (name === "account_locks") {
+        return Promise.resolve(table.select(query) as unknown as readonly TRow[]);
+      }
+
+      if (name === "login_attempts") {
+        return Promise.resolve(streakRows(attempts.attempts, query) as unknown as readonly TRow[]);
+      }
+
+      return Promise.resolve([] as readonly TRow[]);
+    },
+    insert(name: string, rows: readonly Readonly<Record<string, unknown>>[]): Promise<void> {
+      touched.push(`insert:${name}`);
+
+      if (name === "account_locks") {
+        table.insert(rows);
+      }
+
+      return Promise.resolve();
+    },
+    insertReturning: <TRow>(): Promise<readonly TRow[]> => Promise.resolve([]),
+    update(name: string, query: string, values: Readonly<Record<string, unknown>>): Promise<void> {
+      touched.push(`update:${name}`);
+
+      if (name === "account_locks") {
+        table.update(query, values);
+      }
+
+      return Promise.resolve();
+    },
+    rpc: (): Promise<unknown> => Promise.resolve(null),
+  };
+}
+
+async function checkLoginLock(): Promise<void> {
+  expectEqual(LOGIN_LOCK_FAILURE_THRESHOLD, 2, "the lock starts at two consecutive failures");
+  expectEqual(LOGIN_LOCK_DURATION_MS, 7_200_000, "the lock lasts two hours");
+
+  // ---- an account that was never locked
+  const empty = createLockTable();
+  const emptyRest = lockRest(empty, createInMemoryLoginAttemptRecorder());
+  const neverLocked = await readAccountLock(emptyRest, USER_ID, NOW);
+
+  expectEqual(neverLocked.locked, false, "an account with no lock row is not locked");
+  expectEqual(neverLocked.remainingSeconds, null, "an unlocked account has no remaining time");
+  expectEqual(neverLocked.triggeredBy, null, "an unlocked account names no triggering factor");
+  expectEqual(empty.insertCount, 0, "reading a lock writes nothing");
+
+  // ---- one failure is not a lock, and it is attributed to the account
+  const table = createLockTable();
+  const audit = createInMemoryAuditTrail();
+  const attempts = createInMemoryLoginAttemptRecorder();
+  const touched: string[] = [];
+  const rest = lockRest(table, attempts, touched);
+  let instant = NOW;
+  const dependencies = { rest, attempts, audit, now: (): number => instant };
+  const failure = {
+    userId: USER_ID,
+    companyId: FIRM_ID,
+    factor: "password" as const,
+    ipAddress: "203.0.113.9",
+    userAgent: "gate",
+  };
+
+  const first = await recordFailedSignIn(failure, dependencies);
+
+  expectEqual(first.opened, false, "one failed password does not open a lock");
+  expectEqual(first.recorded, true, "the failure is recorded as an attempt");
+  expectEqual(table.rows.length, 0, "one failed password writes no lock row");
+  expectEqual(attempts.attempts.length, 1, "the failure is one attempt row");
+  expectEqual(attempts.attempts[0]?.userId, USER_ID, "the attempt names the account it failed on");
+  expectEqual(attempts.attempts[0]?.outcome, "failed", "the attempt is a failure");
+  expectEqual(attempts.attempts[0]?.factor, "password", "the attempt names the password factor");
+  expectEqual(attempts.attempts[0]?.emailHash, null, "a known account is not recorded by its hash");
+
+  // ---- the second consecutive failure opens the lock
+  const second = await recordFailedSignIn(failure, dependencies);
+
+  expectEqual(second.opened, true, "the second consecutive failure opens the lock");
+  expectEqual(second.lock.locked, true, "the answer reports the account as locked");
+  expectEqual(table.rows.length, 1, "one lock row exists");
+  expectEqual(table.rows[0]?.triggered_by, "password", "the lock names the factor that reached two");
+  expectEqual(
+    Date.parse(table.rows[0]?.expires_at ?? "") - Date.parse(table.rows[0]?.locked_at ?? ""),
+    LOGIN_LOCK_DURATION_MS,
+    "the lock ends exactly two hours after it starts",
+  );
+  expectEqual(audit.entries.at(-1)?.action, "user.login_locked", "the lock start is audited");
+  expectEqual(audit.entries.at(-1)?.payload["failed_attempts"], 2, "the entry counts the failures");
+  expectEqual(audit.entries.at(-1)?.payload["triggered_by"], "password", "the entry names the factor");
+  expectEqual(audit.entries.at(-1)?.actorUserId, null, "nobody was signed in when the lock started");
+
+  const locked = await readAccountLock(rest, USER_ID, NOW);
+
+  expectEqual(locked.locked, true, "the lock is readable");
+  expectEqual(locked.remainingSeconds, 7_200, "a fresh lock has two hours left");
+  expectEqual(locked.triggeredBy, "password", "the state names the triggering factor");
+
+  // ---- a third failure does not create a second lock
+  const third = await recordFailedSignIn(failure, dependencies);
+
+  expectEqual(third.opened, false, "a third failure opens no second lock");
+  expectEqual(table.rows.length, 1, "the live key keeps one lock row");
+  expectEqual(
+    audit.entries.filter((entry) => entry.action === "user.login_locked").length,
+    1,
+    "the lock start is audited once",
+  );
+
+  // ---- a success ends the streak
+  const broken = createLockTable();
+  const brokenAttempts = createInMemoryLoginAttemptRecorder();
+  const brokenDependencies = {
+    rest: lockRest(broken, brokenAttempts),
+    attempts: brokenAttempts,
+    audit: createInMemoryAuditTrail(),
+    now: () => NOW,
+  };
+
+  await recordFailedSignIn(failure, brokenDependencies);
+  await brokenAttempts.record({
+    factor: "password",
+    outcome: "succeeded",
+    userId: USER_ID,
+    companyId: FIRM_ID,
+    emailHash: null,
+    ipAddress: "203.0.113.9",
+    userAgent: "gate",
+  });
+  const afterSuccess = await recordFailedSignIn(failure, brokenDependencies);
+
+  expectEqual(afterSuccess.opened, false, "a success between two failures keeps the account open");
+  expectEqual(broken.rows.length, 0, "a broken streak writes no lock row");
+
+  // ---- a Turnstile refusal is not a credential check, so it neither counts nor resets
+  const challengedTable = createLockTable();
+  const challengedAttempts = createInMemoryLoginAttemptRecorder();
+  const challengedDependencies = {
+    rest: lockRest(challengedTable, challengedAttempts),
+    attempts: challengedAttempts,
+    audit: createInMemoryAuditTrail(),
+    now: () => NOW,
+  };
+
+  await recordFailedSignIn(failure, challengedDependencies);
+  await challengedAttempts.record({
+    factor: "password",
+    outcome: "challenged",
+    userId: USER_ID,
+    companyId: FIRM_ID,
+    emailHash: null,
+    ipAddress: "203.0.113.9",
+    userAgent: "gate",
+  });
+  const afterChallenge = await recordFailedSignIn(failure, challengedDependencies);
+
+  expectEqual(afterChallenge.opened, true, "a challenge between two failures does not break the streak");
+
+  // ---- a blocked attempt does not erase the streak that caused the block
+  const blockedTable = createLockTable();
+  const blockedAttempts = createInMemoryLoginAttemptRecorder();
+  const blockedDependencies = {
+    rest: lockRest(blockedTable, blockedAttempts),
+    attempts: blockedAttempts,
+    audit: createInMemoryAuditTrail(),
+    now: () => NOW,
+  };
+
+  await recordFailedSignIn(failure, blockedDependencies);
+  await blockedAttempts.record({
+    factor: "password",
+    outcome: "blocked",
+    userId: USER_ID,
+    companyId: FIRM_ID,
+    emailHash: null,
+    ipAddress: "203.0.113.9",
+    userAgent: "gate",
+  });
+  const afterBlocked = await recordFailedSignIn(failure, blockedDependencies);
+
+  expectEqual(afterBlocked.opened, true, "a blocked attempt does not erase the streak");
+
+  // ---- the two factors are counted apart, and the lock names the one that reached two
+  const factors = createLockTable();
+  const factorAttempts = createInMemoryLoginAttemptRecorder();
+  const factorDependencies = {
+    rest: lockRest(factors, factorAttempts),
+    attempts: factorAttempts,
+    audit: createInMemoryAuditTrail(),
+    now: () => NOW,
+  };
+
+  await recordFailedSignIn(failure, factorDependencies);
+  const oneCodeFailure = await recordFailedSignIn({ ...failure, factor: "totp" }, factorDependencies);
+
+  expectEqual(oneCodeFailure.opened, false, "one wrong password and one wrong code are not two of a kind");
+
+  const twoCodeFailures = await recordFailedSignIn({ ...failure, factor: "totp" }, factorDependencies);
+
+  expectEqual(twoCodeFailures.opened, true, "two consecutive wrong codes open the lock");
+  expectEqual(factors.rows[0]?.triggered_by, "totp", "the lock names the code factor");
+
+  // ---- the guard the password reset of a later STEP uses
+  const expiry = table.rows[0]?.expires_at ?? "";
+
+  await expectRejects(
+    () => assertAccountUnlocked(rest, USER_ID, NOW),
+    "ACCOUNT_LOCKED",
+    "the guard refuses a locked account",
+  );
+  expectEqual(
+    (await assertAccountUnlocked(rest, USER_ID, Date.parse(expiry) + 1_000)).locked,
+    false,
+    "the guard passes once the lock has run out",
+  );
+
+  // ---- the two hours run out: the state says open, and the next pair writes a second row
+  instant = Date.parse(expiry) + 1;
+
+  expectEqual(
+    (await readAccountLock(rest, USER_ID, instant)).locked,
+    false,
+    "a lock whose two hours passed is not a lock",
+  );
+
+  // The streak is still long (nothing has succeeded), so the very next failure is the one that
+  // writes the new lock - after closing the row the clock ended.
+  const relocked = await recordFailedSignIn(failure, dependencies);
+  const afterRelock = await recordFailedSignIn(failure, dependencies);
+
+  expectEqual(relocked.opened, true, "an expired lock can be followed by a new one");
+  expectEqual(afterRelock.opened, false, "the new lock is still one row");
+  expectEqual(table.rows.length, 2, "the expired row stays as history and a new row is written");
+  expectEqual(
+    table.rows[0]?.expired_at,
+    new Date(instant).toISOString(),
+    "the expired row records the instant it was closed",
+  );
+  expectEqual(table.rows[1]?.expired_at, null, "the newest row is open");
+  expectEqual(table.rows[1]?.triggered_by, "password", "the new row names the factor again");
+
+  // ---- an office unlock frees the account the same way an expiry does
+  const office = createLockTable();
+  const officeAttempts = createInMemoryLoginAttemptRecorder();
+  const officeDependencies = {
+    rest: lockRest(office, officeAttempts),
+    attempts: officeAttempts,
+    audit: createInMemoryAuditTrail(),
+    now: () => NOW,
+  };
+
+  await recordFailedSignIn(failure, officeDependencies);
+  await recordFailedSignIn(failure, officeDependencies);
+
+  expectEqual(office.rows.length, 1, "the account is locked before the unlock");
+
+  const officeLock = office.rows[0];
+
+  if (officeLock !== undefined) {
+    officeLock.unlocked_at = new Date(NOW + 60_000).toISOString();
+    officeLock.unlocked_by = OTHER_USER_ID;
+  }
+
+  expectEqual(
+    (await readAccountLock(officeDependencies.rest, USER_ID, NOW + 120_000)).locked,
+    false,
+    "an unlock by the office ends the lock",
+  );
+
+  const relockedAfterUnlock = await recordFailedSignIn(failure, {
+    ...officeDependencies,
+    now: () => NOW + 180_000,
+  });
+
+  expectEqual(relockedAfterUnlock.opened, true, "an unlocked account can be locked again");
+
+  // ---- the lock service never writes the account row, which is why a password change cannot clear
+  expectEqual(
+    touched.every((name) => name === "select:account_locks" || name === "select:login_attempts" || name === "update:account_locks" || name === "insert:account_locks"),
+    true,
+    "the lock service touches only its own table and the attempt counter",
+  );
+
+  // ---- the error a locked account answers
+  const lockError = accountLockError(locked);
+
+  expectEqual(lockError.code, "ACCOUNT_LOCKED", "a locked account answers its own code");
+  expectEqual(lockError.retryAfterSeconds, 7_200, "the answer says how long the lock has left");
+  expectEqual(ERROR_CODES.ACCOUNT_LOCKED.status, 423, "the lock answers 423");
+  expectEqual(ERROR_CODES.ACCOUNT_LOCKED.retryable, true, "the lock is worth retrying later");
+
+  // ---- sign in: a correct password on a locked account does not sign in
+  const lockedTable = createLockTable();
+  const lockedFixture = signinFixture({ locks: lockedTable });
+
+  lockedTable.insert([
+    {
+      company_id: FIRM_ID,
+      user_id: USER_ID,
+      triggered_by: "password",
+      locked_at: new Date(NOW - 600_000).toISOString(),
+      expires_at: new Date(NOW + 6_600_000).toISOString(),
+    },
+  ]);
+
+  const blockedSignIn = await captureRejection(
+    () =>
+      signInMerchant(
+        { request: signinRequest(), remoteIp: "203.0.113.9", userAgent: "gate" },
+        lockedFixture.dependencies,
+      ),
+    "a correct password on a locked account is refused",
+  );
+
+  expectEqual(blockedSignIn.code, "ACCOUNT_LOCKED", "the refusal names the lock");
+  expectEqual(blockedSignIn.retryAfterSeconds, 6_600, "the refusal says how long is left");
+  expectEqual(lockedFixture.attempts.attempts.length, 1, "the blocked sign in is one attempt row");
+  expectEqual(lockedFixture.attempts.attempts[0]?.outcome, "blocked", "the attempt is a block");
+  expectEqual(lockedFixture.attempts.attempts[0]?.userId, USER_ID, "the attempt names the account");
+  expectEqual(lockedFixture.signOuts.length, 1, "the provider session of a refused sign in is ended");
+  expectEqual(
+    lockedFixture.audit.entries.at(-1)?.action,
+    "user.signin_blocked",
+    "the blocked sign in is audited",
+  );
+  expectEqual(
+    lockedFixture.audit.entries.at(-1)?.payload["remaining_seconds"],
+    6_600,
+    "the entry records how long the lock had left",
+  );
+  expectEqual(
+    lockedFixture.audit.entries.some((entry) => entry.action === "user.signed_in"),
+    false,
+    "no sign in is audited for a locked account",
+  );
+
+  // ---- sign in: changing the password of a locked account does not help
+  if (lockedFixture.user !== null) {
+    lockedFixture.user["password_hash"] = "scrypt$1$16384$8$c2FsdA$aGFzaA";
+    lockedFixture.user["password_updated_at"] = new Date(NOW + 1_000).toISOString();
+  }
+
+  await expectRejects(
+    () =>
+      signInMerchant(
+        { request: signinRequest(), remoteIp: "203.0.113.9", userAgent: "gate" },
+        lockedFixture.dependencies,
+      ),
+    "ACCOUNT_LOCKED",
+    "a changed password does not clear the lock",
+  );
+
+  // ---- sign in: a wrong password on a locked account reveals nothing
+  const wrongOnLocked = signinFixture({ locks: lockedTable, signIn: rejectedSignIn });
+  const wrongOnLockedError = await captureRejection(
+    () =>
+      signInMerchant(
+        { request: signinRequest(), remoteIp: "203.0.113.9", userAgent: "gate" },
+        wrongOnLocked.dependencies,
+      ),
+    "a wrong password on a locked account is refused",
+  );
+
+  expectEqual(
+    wrongOnLockedError.code,
+    "AUTHENTICATION_REQUIRED",
+    "a stranger without the password learns nothing about the lock",
+  );
+  expectEqual(
+    wrongOnLocked.attempts.attempts.some((attempt) => attempt.outcome === "blocked"),
+    false,
+    "a wrong password is never answered as a block",
+  );
+  expectEqual(
+    wrongOnLocked.attempts.attempts[0]?.userId,
+    USER_ID,
+    "a wrong password on a known account is attributed to it",
+  );
+
+  // ---- sign in: two wrong passwords lock the account
+  const failingTable = createLockTable();
+  const failing = signinFixture({ locks: failingTable, signIn: rejectedSignIn });
+
+  await expectRejects(
+    () =>
+      signInMerchant(
+        { request: signinRequest(), remoteIp: "203.0.113.9", userAgent: "gate" },
+        failing.dependencies,
+      ),
+    "AUTHENTICATION_REQUIRED",
+    "the first wrong password is refused",
+  );
+
+  expectEqual(failingTable.rows.length, 0, "one wrong password does not lock the account");
+
+  await expectRejects(
+    () =>
+      signInMerchant(
+        { request: signinRequest(), remoteIp: "203.0.113.9", userAgent: "gate" },
+        failing.dependencies,
+      ),
+    "AUTHENTICATION_REQUIRED",
+    "the second wrong password is refused",
+  );
+
+  expectEqual(failingTable.rows.length, 1, "two wrong passwords lock the account");
+  expectEqual(failingTable.rows[0]?.triggered_by, "password", "the lock names the password factor");
+  expectEqual(failingTable.rows[0]?.user_id, USER_ID, "the lock names the account of the address");
+  expectEqual(
+    failing.audit.entries.some((entry) => entry.action === "user.login_locked"),
+    true,
+    "the lock start is audited",
+  );
+
+  // ---- sign in: an address with no account locks nothing
+  const unknownTable = createLockTable();
+  const unknown = signinFixture({ locks: unknownTable, signIn: rejectedSignIn, user: null });
+
+  for (let index = 0; index < 3; index += 1) {
+    await expectRejects(
+      () =>
+        signInMerchant(
+          {
+            request: signinRequest({ email: "nobody@example.com" }),
+            remoteIp: "203.0.113.9",
+            userAgent: "gate",
+          },
+          unknown.dependencies,
+        ),
+      "AUTHENTICATION_REQUIRED",
+      "an address with no account is refused",
+    );
+  }
+
+  expectEqual(unknownTable.rows.length, 0, "an address with no account locks nothing");
+  expectEqual(
+    unknown.attempts.attempts.every((attempt) => attempt.userId === null),
+    true,
+    "an unknown address is recorded without an account",
+  );
+  expectEqual(
+    unknown.attempts.attempts.every((attempt) => attempt.emailHash !== null),
+    true,
+    "an unknown address is recorded by the hash of the address",
+  );
+
+  // ---- the second factor: two wrong codes lock, and a lock refuses even a correct code
+  const codeTable = createLockTable();
+  const codeFixture = twoFactorLoginFixture({ locks: codeTable });
+  const codeSecret = openEnrolledSecret(
+    codeFixture.state.user.totp_secret_ciphertext ?? "",
+    USER_ID,
+    MASTER_KEY,
+  );
+  const goodCode = totpCodeForStep(base32Decode(codeSecret) ?? new Uint8Array(), totpStep(NOW));
+  const issue = async (): Promise<string> =>
+    (
+      await issueTwoFactorChallenge(
+        {
+          userId: USER_ID,
+          companyId: FIRM_ID,
+          session: {
+            accessToken: makeAccessToken(baseClaims()),
+            refreshToken: "refresh-token-000000000000000000",
+            expiresAtEpochMs: NOW + 3_600_000,
+            sessionId: SESSION_ID,
+          },
+          device: readDeviceContext("gate"),
+          remoteIp: "203.0.113.9",
+          userAgent: "gate",
+        },
+        codeFixture.dependencies,
+      )
+    ).token;
+
+  const firstHandle = await issue();
+  const wrongCode = await captureRejection(
+    () =>
+      completeTwoFactorChallenge(
+        { challengeToken: firstHandle, code: "000000", remoteIp: "203.0.113.9", userAgent: "gate" },
+        codeFixture.dependencies,
+      ),
+    "a wrong code is refused",
+  );
+
+  expectEqual(wrongCode.code, "AUTHENTICATION_REQUIRED", "a wrong code is the generic rejection");
+  expectEqual(codeTable.rows.length, 0, "one wrong code does not lock the account");
+  expectEqual(
+    codeFixture.attempts.attempts.at(-1)?.factor,
+    "totp",
+    "the wrong code is recorded against the code factor",
+  );
+
+  const secondHandle = await issue();
+
+  await expectRejects(
+    () =>
+      completeTwoFactorChallenge(
+        { challengeToken: secondHandle, code: "000000", remoteIp: "203.0.113.9", userAgent: "gate" },
+        codeFixture.dependencies,
+      ),
+    "AUTHENTICATION_REQUIRED",
+    "the second wrong code is refused",
+  );
+
+  expectEqual(codeTable.rows.length, 1, "two wrong codes lock the account");
+  expectEqual(codeTable.rows[0]?.triggered_by, "totp", "the lock names the code factor");
+
+  const thirdHandle = await issue();
+  const lockedCorrectCode = await captureRejection(
+    () =>
+      completeTwoFactorChallenge(
+        { challengeToken: thirdHandle, code: goodCode, remoteIp: "203.0.113.9", userAgent: "gate" },
+        codeFixture.dependencies,
+      ),
+    "a correct code on a locked account is refused",
+  );
+
+  expectEqual(lockedCorrectCode.code, "ACCOUNT_LOCKED", "the lock refuses a correct code too");
+  expect(
+    (lockedCorrectCode.retryAfterSeconds ?? 0) > 0,
+    "the refusal says how long the lock has left",
+  );
+  expectEqual(
+    codeFixture.audit.entries.some((entry) => entry.action === "user.signed_in"),
+    false,
+    "no session is issued for a locked account",
+  );
+  expectEqual(
+    codeFixture.attempts.attempts.at(-1)?.outcome,
+    "blocked",
+    "the refused attempt is recorded as a block",
+  );
+
+  // A count of the streak is public so a screen can explain it: two wrong codes read as two.
+  expectEqual(
+    await countConsecutiveFailures(codeFixture.dependencies.rest, USER_ID, "totp"),
+    2,
+    "the streak of the code factor reads two after two wrong codes",
+  );
+}
+
 /* ------------------------------------------------------------------ main */
 
 async function main(): Promise<void> {
@@ -5443,6 +6193,7 @@ async function main(): Promise<void> {
   await checkTwoFactorLogin();
   await checkBackupCodeRegeneration();
   await checkTwoFactorReset();
+  await checkLoginLock();
 
   if (failures.length > 0) {
     process.stderr.write(`auth gate failed with ${failures.length} problem(s):\n`);

@@ -3,7 +3,7 @@
 
 import Script from "next/script";
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
-import { getMessage } from "@/lib/i18n/messages";
+import { formatMessage, getMessage } from "@/lib/i18n/messages";
 
 /**
  * The sign in form.
@@ -15,7 +15,9 @@ import { getMessage } from "@/lib/i18n/messages";
  *
  * The failure it shows is one sentence, whatever happened: a wrong password, an address with no
  * account, an unconfirmed address and a closed account all look the same in this component because
- * they look the same on the wire.
+ * they look the same on the wire. The single exception is the lock of section 22, which answers 423
+ * only once the password is known to be right, and therefore tells a stranger nothing about whether
+ * the account exists.
  */
 
 const turnstileScriptUrl =
@@ -44,6 +46,25 @@ export interface SigninFormProperties {
   readonly siteKey: string | null;
   /** Where the browser goes once the cookie exists. */
   readonly afterSigninPath: string;
+}
+
+/**
+ * The minutes a locked account has left, from `retryAfterSeconds`.
+ *
+ * Rounded up and floored at one, because "0 minutes" reads as "try again now" on the one screen where
+ * trying again cannot work. A payload without the field still says the account is locked; the number
+ * is a convenience, not the message.
+ */
+function lockedMinutes(payload: unknown): number {
+  if (typeof payload !== "object" || payload === null) {
+    return 1;
+  }
+
+  const seconds = (payload as { readonly retryAfterSeconds?: unknown }).retryAfterSeconds;
+
+  return typeof seconds === "number" && Number.isFinite(seconds)
+    ? Math.max(1, Math.ceil(seconds / 60))
+    : 1;
 }
 
 function readErrorMessage(payload: unknown): string | null {
@@ -197,7 +218,14 @@ export function SigninForm({ siteKey, afterSigninPath }: SigninFormProperties): 
       if (!response.ok) {
         const payload: unknown = await response.json().catch(() => null);
 
-        setMessage(readErrorMessage(payload) ?? getMessage("signin.unreadableResponse"));
+        // 423 is the lock of section 22: the password was right and the account is closed to sign in
+        // for a while, so the sentence names the lock and how long it lasts rather than asking for
+        // the password again.
+        setMessage(
+          response.status === 423
+            ? formatMessage("signin.locked", { minutes: String(lockedMinutes(payload)) })
+            : (readErrorMessage(payload) ?? getMessage("signin.unreadableResponse")),
+        );
         setSubmitting(false);
         resetChallenge();
 
@@ -247,9 +275,11 @@ export function SigninForm({ siteKey, afterSigninPath }: SigninFormProperties): 
         const payload: unknown = await response.json().catch(() => null);
 
         setMessage(
-          response.status === 401
-            ? getMessage("signin.secondFactorRejected")
-            : (readErrorMessage(payload) ?? getMessage("signin.unreadableResponse")),
+          response.status === 423
+            ? formatMessage("signin.secondFactorLocked", { minutes: String(lockedMinutes(payload)) })
+            : response.status === 401
+              ? getMessage("signin.secondFactorRejected")
+              : (readErrorMessage(payload) ?? getMessage("signin.unreadableResponse")),
         );
         setCode("");
         setVerifying(false);
