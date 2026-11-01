@@ -4,10 +4,11 @@
 Owner: STEP 056 (input sanitiser for text, rich text and URLs), STEP 057 (the double submit token),
 STEP 058 (the destination rule), STEP 059 (the Content Security Policy), STEP 060 (the security headers),
 STEP 061 (the upload validator), STEP 062 (the rate limiter), STEP 063 (the audit writer), STEP 064
-(the encryption service) and STEP 065 (the signed portal link). Later STEPs call these functions; they do
-not write a second escape, a second URL check, a second allowlist, a second CSRF token, a second DNS
-check, a second policy header, a second header table, a second file type check, a second counter, a
-second way to append to an audit chain, a second cipher or a second kind of signed link.
+(the encryption service), STEP 065 (the signed portal link) and STEP 066 (the fraud decision). Later STEPs
+call these functions; they do not write a second escape, a second URL check, a second allowlist, a second
+CSRF token, a second DNS check, a second policy header, a second header table, a second file type check, a
+second counter, a second way to append to an audit chain, a second cipher, a second kind of signed link or
+a second risk decision.
 
 | File | Purpose |
 | --- | --- |
@@ -25,6 +26,7 @@ second way to append to an audit chain, a second cipher or a second kind of sign
 | audit.ts | How an entry enters the chain: the policy, the redaction, the link, and the proof the chain still verifies |
 | encryption.ts | AES-256-GCM for secrets and files: a keyring with rotation, a bound context, and a chunked file envelope |
 | portal-token.ts | The client portal link: what it claims, how long it lives, and how it is revoked |
+| fraud.ts | What a payment attempt must pass: six signals, one of three decisions, and the trace behind it |
 | verify.ts | The gate behind `npm run check:security`, and the attack corpus it runs |
 
 ## The four rules
@@ -238,6 +240,51 @@ The seam with the portal STEPs of 181-190: they mint with `mintPortalToken`, ope
 and pass the expectation - kind, company, resource, capability - of the page they are rendering. This
 module decides whether a link is genuine, in date and not revoked. It never decides what the link is
 allowed to show.
+
+## What a payment must pass, and what the decision means
+
+`fraud.ts` turns five sentences of FEATURE_LIST section 18 - and one of section 5 - into the value the
+`payments` table already stores as `risk_decision`: `allow`, `review` or `reject`. Six signals are
+evaluated in a fixed order and every one of them produces a result:
+
+| signal | clear | review | reject |
+| --- | --- | --- | --- |
+| `provider_signal` | the processor said clear | the processor said suspicious | the processor said fraud |
+| `card_blacklist` | not listed, or no card | - | the fingerprint is blocked in `0055` |
+| `card_velocity` | under the card's limit | - | at or over it, which is card testing |
+| `ip_velocity` | under the address's limit | at or over it | - |
+| `three_ds_verification` | authenticated, or both addresses matched | neither | - |
+| `amount_review` | below the operator's threshold | at or above it | - |
+
+**Every signal is evaluated, and the decision is the maximum.** A short circuit would be cheaper and
+would lose the one thing this platform keeps: a record of what was checked. The trace says which signals
+cleared and which fired, the decision is the highest outcome present, and a later signal can raise a
+verdict but never lower one.
+
+**The words are the schema's words.** `payments_risk_check` already allows exactly these three, and the
+capture rule here is `payments_three_ds_capture_check` written once more in TypeScript: a payment may be
+captured when 3D Secure authenticated or when the billing postal code and the payer IP country both
+matched. The gate reads `0037` and compares the literals, so the service and the row cannot drift.
+
+**A review is a hold.** `captureAllowed` is true only for `allow`, so a held or refused payment moves no
+money; a person clears it, and the `threeDsVerified` rule still applies to the capture that follows,
+because the database will refuse it otherwise.
+
+**Fail closed.** The blacklist and the velocity counters are outside this module and either can fail. A
+failed lookup raises `DEPENDENCY_FAILED` rather than clearing the signal, and so does an answer in the
+wrong shape - a counter that reports a negative count, a fractional one or a limit below one is not a
+counter this module will act on. "We could not check" and "we checked and it was fine" are opposite
+facts, and only one of them is safe to write down.
+
+**The trace is words, not data.** Every detail is one of fifteen fixed vocabulary entries, so the audit
+row cannot carry a fingerprint, an address or a count by accident; the fingerprint travels in the payload
+as a hash, which is the one card value section 18 allows the platform to know. A decision that was not
+`allow` gets an entry (`payment.fraud_evaluated`), and the entry is validated by the audit module's own
+predicate in the gate.
+
+**No clock, no randomness, no state.** The evaluation is a function of the attempt, the policy and two
+lookups, so the same attempt always produces the same decision and the whole corpus runs without a
+database.
 
 ## How an entry enters the audit chain
 

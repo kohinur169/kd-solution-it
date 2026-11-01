@@ -114,6 +114,36 @@ import {
   type PortalTokenRequest,
 } from "./portal-token.ts";
 import {
+  evaluateFraudSignals,
+  fraudAuditEntry,
+  fraudDecisionOf,
+  isFraudPaymentMethod,
+  isFraudProviderSignal,
+  isFraudThreeDsOutcome,
+  threeDsVerified,
+  FRAUD_AUDIT_ACTION,
+  FRAUD_CARD_FINGERPRINT_PATTERN,
+  FRAUD_CURRENCY,
+  FRAUD_DECISIONS,
+  FRAUD_DEFAULT_POLICY,
+  FRAUD_DETAILS,
+  FRAUD_FAILURE_CODE,
+  FRAUD_OUTCOMES,
+  FRAUD_PAYMENT_METHODS,
+  FRAUD_PROBLEMS,
+  FRAUD_PROVIDER_SIGNALS,
+  FRAUD_RULE,
+  FRAUD_SIGNALS,
+  FRAUD_THREE_DS_OUTCOMES,
+  FRAUD_VELOCITY_LIMIT_MINIMUM,
+  type FraudAttempt,
+  type FraudDecision,
+  type FraudPolicy,
+  type FraudSignalLookups,
+  type FraudVelocityReading,
+  type FraudVelocitySubject,
+} from "./fraud.ts";
+import {
   auditEntryProblem,
   auditPayloadBytes,
   buildAuditEntry,
@@ -4030,6 +4060,618 @@ async function checkPortalTokenWiring(): Promise<void> {
   expectEqual(tokenUsers.sort().join(","), "lib/security/portal-token.ts", "and exactly one module writes a link");
 }
 
+/** ---- Fraud: five sentences of section 18, six signals, one decision. */
+
+const fraudCompanyId = "018f2b8a-0000-4000-8000-0000000000c2";
+const fraudPaymentId = "018f2b8a-0000-4000-8000-0000000000d2";
+const fraudActorId = "018f2b8a-0000-4000-8000-0000000000e2";
+const fraudFingerprint = "0123456789abcdef".repeat(4);
+const fraudOtherFingerprint = "fedcba9876543210".repeat(4);
+const fraudIpAddress = "203.0.113.9";
+
+function fraudAttempt(overrides: Partial<FraudAttempt> = {}): FraudAttempt {
+  return {
+    companyId: fraudCompanyId,
+    amountMinor: 4_999n,
+    currency: "USD",
+    paymentMethod: "card",
+    providerSignal: "clear",
+    threeDsOutcome: "authenticated",
+    postalCodeMatched: false,
+    ipCountryMatched: false,
+    cardFingerprint: fraudFingerprint,
+    ipAddress: fraudIpAddress,
+    ...overrides,
+  };
+}
+
+interface FraudLookupCalls {
+  readonly fingerprints: string[];
+  readonly subjects: FraudVelocitySubject[];
+}
+
+function fraudLookups(
+  options: {
+    readonly blocked?: boolean;
+    readonly card?: FraudVelocityReading;
+    readonly ip?: FraudVelocityReading;
+    readonly calls?: FraudLookupCalls;
+    readonly blacklist?: () => Promise<boolean>;
+    readonly velocity?: (subject: FraudVelocitySubject) => Promise<FraudVelocityReading>;
+  } = {},
+): FraudSignalLookups {
+  return {
+    isCardBlocked: async (fingerprint: string): Promise<boolean> => {
+      options.calls?.fingerprints.push(fingerprint);
+
+      return options.blacklist === undefined ? options.blocked ?? false : options.blacklist();
+    },
+    readVelocity: async (subject: FraudVelocitySubject): Promise<FraudVelocityReading> => {
+      options.calls?.subjects.push(subject);
+
+      if (options.velocity !== undefined) {
+        return options.velocity(subject);
+      }
+
+      return subject.kind === "card" ? options.card ?? { hits: 1, limit: 4 } : options.ip ?? { hits: 1, limit: 9 };
+    },
+  };
+}
+
+async function fraudDecide(
+  overrides: Partial<FraudAttempt> = {},
+  options: { readonly policy?: FraudPolicy; readonly lookups?: FraudSignalLookups } = {},
+): Promise<FraudDecision> {
+  const lookups = options.lookups ?? fraudLookups();
+
+  return options.policy === undefined
+    ? evaluateFraudSignals(fraudAttempt(overrides), { lookups })
+    : evaluateFraudSignals(fraudAttempt(overrides), { lookups, policy: options.policy });
+}
+
+/** One refusal of an attempt, counted whether or not it was refused. */
+async function expectFraudRefusal(
+  overrides: Partial<FraudAttempt>,
+  description: string,
+  options: { readonly policy?: FraudPolicy; readonly lookups?: FraudSignalLookups } = {},
+): Promise<AppError | null> {
+  checks += 1;
+
+  try {
+    await fraudDecide(overrides, options);
+  } catch (error) {
+    if (error instanceof AppError) {
+      return error;
+    }
+
+    failures.push(`${description} (the rejection must be an AppError)`);
+
+    return null;
+  }
+
+  failures.push(`${description} (nothing was rejected)`);
+
+  return null;
+}
+
+function fraudSignalsOf(decision: FraudDecision): string {
+  return decision.signals.map((result) => `${result.signal}:${result.outcome}`).join(",");
+}
+
+function checkFraudVocabulary(): void {
+  expectEqual(FRAUD_RULE, "fraud", "the module states the rule a failure came from");
+  expectEqual(FRAUD_CURRENCY, "USD", "the platform charges in dollars, so a threshold is a number of cents");
+  expectEqual(FRAUD_AUDIT_ACTION, "payment.fraud_evaluated", "a decision that is not an allow is audited as one action");
+  expect(AUDIT_ACTION_PATTERN.test(FRAUD_AUDIT_ACTION), "and that action is in the shape the audit table stores");
+  expect(AUDIT_ACTION_PATTERN.test("payment.fraud_evaluated"), "which the pattern agrees with");
+  expect(FRAUD_AUDIT_ACTION.length <= AUDIT_MAXIMUM_ACTION_LENGTH, "and inside the action ceiling");
+  expectEqual(FRAUD_FAILURE_CODE, "risk_rejected", "a rejected payment carries one failure code");
+  expectEqual(FRAUD_FAILURE_CODE.length <= 64, true, "which fits `payments_failure_code_check`");
+  expectEqual(FRAUD_FAILURE_CODE.trim(), FRAUD_FAILURE_CODE, "and is already trimmed, as that check requires");
+  expectEqual(FRAUD_PROVIDER_SIGNALS.join(","), "clear,suspicious,fraud", "a provider says one of three things");
+  expectEqual(FRAUD_THREE_DS_OUTCOMES.join(","), "authenticated,attempted,not_completed,not_requested", "3D Secure has four outcomes");
+  expectEqual(FRAUD_PAYMENT_METHODS.join(","), "card,bank_transfer,e_wallet", "and a payment has three methods");
+  expectEqual(
+    FRAUD_SIGNALS.join(","),
+    "provider_signal,card_blacklist,card_velocity,ip_velocity,three_ds_verification,amount_review",
+    "six signals are evaluated, in this order",
+  );
+  expectEqual(FRAUD_OUTCOMES.join(","), "clear,review,reject", "a signal clears, reviews or rejects");
+  expectEqual(FRAUD_DECISIONS.join(","), "allow,review,reject", "and the decision is the three words the payments table stores");
+  expectEqual(FRAUD_DETAILS.length, 15, "there are fifteen details a signal may report");
+  expectEqual(new Set(FRAUD_DETAILS).size, 15, "and no two of them are the same word");
+  expectEqual(FRAUD_DETAILS.every((detail) => /^[a-z]+(_[a-z]+)*$/u.test(detail)), true, "every detail is lower case words and nothing else");
+  expectEqual(FRAUD_DETAILS.every((detail) => !/[0-9]/u.test(detail)), true, "so no detail can carry a number, an amount or a count");
+  expectEqual(FRAUD_PROBLEMS.join(","), "attempt_invalid,policy_invalid,lookup_failed", "three things can stop an evaluation");
+  expectEqual(FRAUD_DEFAULT_POLICY.reviewAmountMinor, 1_000_000n, "ten thousand dollars is the default hold threshold");
+  expect(Object.isFrozen(FRAUD_DEFAULT_POLICY), "and the default cannot be changed at runtime");
+  expect(Object.isFrozen(FRAUD_SIGNALS), "the signal list cannot be extended");
+  expect(Object.isFrozen(FRAUD_DETAILS), "nor the vocabulary");
+  expect(Object.isFrozen(FRAUD_DECISIONS), "nor the decision words");
+  expectEqual(FRAUD_VELOCITY_LIMIT_MINIMUM, 1, "a velocity limit is at least one, the floor the counter table states");
+
+  expectEqual(FRAUD_CARD_FINGERPRINT_PATTERN.test(fraudFingerprint), true, "a sixty-four character hex fingerprint is one");
+  expectEqual(FRAUD_CARD_FINGERPRINT_PATTERN.test(fraudFingerprint.toUpperCase()), false, "an upper case one is not");
+  expectEqual(FRAUD_CARD_FINGERPRINT_PATTERN.test(fraudFingerprint.slice(0, 63)), false, "nor is sixty-three characters");
+  expectEqual(FRAUD_CARD_FINGERPRINT_PATTERN.test(`${fraudFingerprint}0`), false, "nor sixty-five");
+  expectEqual(FRAUD_CARD_FINGERPRINT_PATTERN.test("0".repeat(64)), true, "and a fingerprint may begin with a zero");
+
+  expectEqual(isFraudProviderSignal("fraud"), true, "a provider fraud signal is one");
+  expectEqual(isFraudProviderSignal("blocked"), false, "and an invented verdict is not");
+  expectEqual(isFraudProviderSignal(1), false, "nor is a number");
+  expectEqual(isFraudThreeDsOutcome("not_completed"), true, "a 3DS outcome that failed is one");
+  expectEqual(isFraudThreeDsOutcome("declined"), false, "and a word the table does not store is not");
+  expectEqual(isFraudPaymentMethod("bank_transfer"), true, "a bank transfer is a method");
+  expectEqual(isFraudPaymentMethod("crypto"), false, "and an unsupported method is not");
+
+  for (const outcome of FRAUD_THREE_DS_OUTCOMES) {
+    for (const [postalCodeMatched, ipCountryMatched] of [
+      [false, false],
+      [false, true],
+      [true, false],
+      [true, true],
+    ] as const) {
+      const expected = outcome === "authenticated" || (postalCodeMatched && ipCountryMatched);
+
+      expectEqual(
+        threeDsVerified({ threeDsOutcome: outcome, postalCodeMatched, ipCountryMatched }),
+        expected,
+        `${outcome} with postal ${postalCodeMatched} and country ${ipCountryMatched} is ${expected ? "verified" : "unverified"}`,
+      );
+    }
+  }
+
+  const clear = { signal: "amount_review", outcome: "clear", detail: "amount_within_limits" } as const;
+  const review = { signal: "ip_velocity", outcome: "review", detail: "ip_over_limit" } as const;
+  const reject = { signal: "provider_signal", outcome: "reject", detail: "provider_fraud" } as const;
+
+  expectEqual(fraudDecisionOf([]), "allow", "no signal at all is an allow");
+  expectEqual(fraudDecisionOf([clear]), "allow", "a clear signal is an allow");
+  expectEqual(fraudDecisionOf([review]), "review", "one review is a review");
+  expectEqual(fraudDecisionOf([reject]), "reject", "one reject is a reject");
+  expectEqual(fraudDecisionOf([clear, review]), "review", "a review among clears is a review");
+  expectEqual(fraudDecisionOf([review, reject]), "reject", "and a reject outranks a review whatever the order");
+  expectEqual(fraudDecisionOf([reject, review, clear]), "reject", "the highest outcome wins");
+  expectEqual(fraudDecisionOf([clear, clear, clear]), "allow", "and clears alone are an allow");
+}
+
+async function checkFraudAttempts(): Promise<void> {
+  const decision = await fraudDecide();
+
+  expectEqual(decision.decision, "allow", "an ordinary authenticated card payment is allowed");
+  expectEqual(decision.captureAllowed, true, "and may be captured now");
+  expectEqual(decision.reasons.length, 0, "with nothing to report");
+  expectEqual(
+    fraudSignalsOf(decision),
+    "provider_signal:clear,card_blacklist:clear,card_velocity:clear,ip_velocity:clear,three_ds_verification:clear,amount_review:clear",
+    "every signal is evaluated and cleared",
+  );
+  expectEqual(decision.signals.length, FRAUD_SIGNALS.length, "the trace names every signal once");
+  expectEqual(decision.signals.map((result) => result.signal).join(","), FRAUD_SIGNALS.join(","), "in the declared order");
+  expect(Object.isFrozen(decision), "the decision cannot be edited by a caller");
+  expect(Object.isFrozen(decision.signals), "nor its trace");
+
+  for (const [overrides, description] of [
+    [{ companyId: "not-a-uuid" }, "a company id that is not a uuid"],
+    [{ currency: "EUR" }, "a currency that is not dollars"],
+    [{ currency: "usd" }, "a currency in lower case"],
+    [{ amountMinor: 0n }, "an amount of zero"],
+    [{ amountMinor: -1n }, "a negative amount"],
+    [{ amountMinor: 5 as unknown as bigint }, "an amount that is not a bigint"],
+    [{ paymentMethod: "crypto" as FraudAttempt["paymentMethod"] }, "an unsupported payment method"],
+    [{ providerSignal: "blocked" as FraudAttempt["providerSignal"] }, "an invented provider verdict"],
+    [{ threeDsOutcome: "declined" as FraudAttempt["threeDsOutcome"] }, "an invented 3DS outcome"],
+    [{ postalCodeMatched: "yes" as unknown as boolean }, "a postal code result that is not a boolean"],
+    [{ ipCountryMatched: 1 as unknown as boolean }, "and a country result that is not one"],
+    [{ cardFingerprint: null }, "a card payment with no fingerprint to check"],
+    [{ cardFingerprint: fraudFingerprint.toUpperCase() }, "a fingerprint in upper case"],
+    [{ cardFingerprint: "abc" }, "a fingerprint of three characters"],
+    [{ paymentMethod: "bank_transfer" as const }, "a bank transfer that carries a card fingerprint"],
+    [{ ipAddress: "not-an-ip" }, "a payer address that is not an address"],
+    [{ ipAddress: "" }, "and no payer address at all"],
+    [{ ipAddress: "203.0.113.9/24" }, "a network instead of an address"],
+  ] as readonly (readonly [Partial<FraudAttempt>, string])[]) {
+    expectEqual(
+      encryptionReason(await expectFraudRefusal(overrides, `${description} is refused`)),
+      "attempt_invalid",
+      `and ${description} is an attempt failure`,
+    );
+  }
+
+  expectEqual(
+    (await expectFraudRefusal({ currency: "EUR" }, "a currency that is not dollars is refused"))?.code,
+    "INTERNAL_ERROR",
+    "a malformed attempt is this platform's fault, not the client's",
+  );
+  expectEqual(
+    encryptionReason(await expectFraudRefusal({}, "a negative threshold is refused", { policy: { reviewAmountMinor: -1n } })),
+    "policy_invalid",
+    "a policy cannot hold every payment",
+  );
+  expectEqual(
+    encryptionReason(
+      await expectFraudRefusal({}, "a threshold that is not a bigint is refused", {
+        policy: { reviewAmountMinor: 10 as unknown as bigint },
+      }),
+    ),
+    "policy_invalid",
+    "and a threshold that is not a number of cents is not a threshold",
+  );
+
+  const nonCard = await fraudDecide({ paymentMethod: "bank_transfer", cardFingerprint: null });
+
+  expectEqual(nonCard.decision, "allow", "a bank transfer with authenticated 3DS is allowed");
+  expectEqual(nonCard.signals[1]?.detail, "no_card", "the blacklist has no card to check");
+  expectEqual(nonCard.signals[2]?.detail, "no_card", "and the card velocity has no card either");
+}
+
+async function checkFraudSignals(): Promise<void> {
+  expectEqual((await fraudDecide({ providerSignal: "suspicious" })).decision, "review", "a suspicious provider verdict holds the payment");
+  expectEqual((await fraudDecide({ providerSignal: "suspicious" })).reasons.join(","), "provider_suspicious", "saying why");
+  expectEqual((await fraudDecide({ providerSignal: "fraud" })).decision, "reject", "a provider fraud signal rejects it");
+  expectEqual((await fraudDecide({ providerSignal: "fraud" })).captureAllowed, false, "with no capture");
+  expectEqual((await fraudDecide({ providerSignal: "fraud" })).signals[0]?.outcome, "reject", "as a reject in the first signal");
+
+  const blocked = await fraudDecide({}, { lookups: fraudLookups({ blocked: true }) });
+
+  expectEqual(blocked.decision, "reject", "a blacklisted card is rejected");
+  expectEqual(blocked.reasons.join(","), "blacklisted", "by name");
+  expectEqual(blocked.captureAllowed, false, "and nothing is captured");
+  expectEqual((await fraudDecide({}, { lookups: fraudLookups({ blocked: false }) })).signals[1]?.detail, "not_listed", "a card that is not listed clears");
+
+  const cardAtLimit = await fraudDecide({}, { lookups: fraudLookups({ card: { hits: 4, limit: 4 } }) });
+
+  expectEqual(cardAtLimit.decision, "reject", "a card that reached its limit is rejected");
+  expectEqual(cardAtLimit.reasons.join(","), "card_over_limit", "as a card velocity breach");
+  expectEqual(
+    (await fraudDecide({}, { lookups: fraudLookups({ card: { hits: 3, limit: 4 } }) })).decision,
+    "allow",
+    "one hit below the limit is still allowed",
+  );
+  expectEqual(
+    (await fraudDecide({}, { lookups: fraudLookups({ card: { hits: 5, limit: 4 } }) })).signals[2]?.detail,
+    "card_over_limit",
+    "and one above it is not",
+  );
+
+  const ipAtLimit = await fraudDecide({}, { lookups: fraudLookups({ ip: { hits: 10, limit: 10 } }) });
+
+  expectEqual(ipAtLimit.decision, "review", "an address that reached its limit is held for review, not refused");
+  expectEqual(ipAtLimit.reasons.join(","), "ip_over_limit", "as an address velocity breach");
+  expectEqual(ipAtLimit.captureAllowed, false, "so nothing is captured before a person looks");
+  expectEqual(
+    (await fraudDecide({}, { lookups: fraudLookups({ ip: { hits: 9, limit: 10 } }) })).decision,
+    "allow",
+    "one hit below the address limit is allowed",
+  );
+
+  const threeDsCases = [
+    [{ threeDsOutcome: "authenticated" as const }, "allow", "three_ds_authenticated"],
+    [{ threeDsOutcome: "not_completed" as const, postalCodeMatched: true, ipCountryMatched: true }, "allow", "three_ds_verified_by_billing"],
+    [{ threeDsOutcome: "attempted" as const, postalCodeMatched: true, ipCountryMatched: true }, "allow", "three_ds_verified_by_billing"],
+    [{ threeDsOutcome: "not_completed" as const, postalCodeMatched: true, ipCountryMatched: false }, "review", "three_ds_unverified"],
+    [{ threeDsOutcome: "not_completed" as const, postalCodeMatched: false, ipCountryMatched: true }, "review", "three_ds_unverified"],
+    [{ threeDsOutcome: "not_requested" as const }, "review", "three_ds_unverified"],
+  ] as const;
+
+  for (const [overrides, expected, detail] of threeDsCases) {
+    const caseDecision = await fraudDecide(overrides);
+
+    expectEqual(caseDecision.decision, expected, `3DS ${overrides.threeDsOutcome} with the addresses it had is ${expected}`);
+    expectEqual(caseDecision.signals[4]?.detail, detail, `and the 3DS signal says ${detail}`);
+  }
+
+  const verifiedWithoutThreeDs = await fraudDecide({
+    threeDsOutcome: "not_completed",
+    postalCodeMatched: true,
+    ipCountryMatched: true,
+  });
+
+  expectEqual(verifiedWithoutThreeDs.captureAllowed, true, "a payment verified by both addresses may be captured without 3DS");
+
+  const amountAtThreshold = await fraudDecide({ amountMinor: 1_000_000n });
+
+  expectEqual(amountAtThreshold.decision, "review", "an amount at the threshold is held");
+  expectEqual(amountAtThreshold.reasons.join(","), "amount_over_review", "as an unusually large transaction");
+  expectEqual(amountAtThreshold.captureAllowed, false, "and not captured");
+  expectEqual((await fraudDecide({ amountMinor: 999_999n })).decision, "allow", "one cent below it is allowed");
+  expectEqual(
+    (await fraudDecide({ amountMinor: 1_000_000n }, { policy: { reviewAmountMinor: 2_000_000n } })).decision,
+    "allow",
+    "and the operator's threshold decides, not the default",
+  );
+  expectEqual(
+    (await fraudDecide({ amountMinor: 0n + 2_000_000n }, { policy: { reviewAmountMinor: 2_000_000n } })).decision,
+    "review",
+    "which bites at its own value",
+  );
+
+  const everything = await fraudDecide(
+    { providerSignal: "fraud", amountMinor: 9_000_000n, threeDsOutcome: "not_completed" },
+    { lookups: fraudLookups({ blocked: true, card: { hits: 9, limit: 2 }, ip: { hits: 9, limit: 2 } }) },
+  );
+
+  expectEqual(everything.decision, "reject", "when several signals fire the decision is the highest");
+  expectEqual(
+    everything.reasons.join(","),
+    "provider_fraud,blacklisted,card_over_limit,ip_over_limit,three_ds_unverified,amount_over_review",
+    "while the trace keeps every one of them, in order",
+  );
+
+  const threeDsCombinations = [
+    [false, false],
+    [false, true],
+    [true, false],
+    [true, true],
+  ] as const;
+
+  const allowedDecisions = await Promise.all(
+    FRAUD_THREE_DS_OUTCOMES.flatMap((outcome) =>
+      threeDsCombinations.map(async ([postalCodeMatched, ipCountryMatched]) => ({
+        outcome,
+        postalCodeMatched,
+        ipCountryMatched,
+        decision: await fraudDecide({ threeDsOutcome: outcome, postalCodeMatched, ipCountryMatched }),
+      })),
+    ),
+  );
+
+  for (const entry of allowedDecisions) {
+    expectEqual(
+      entry.decision.decision === "allow",
+      threeDsVerified(fraudAttempt({ threeDsOutcome: entry.outcome, postalCodeMatched: entry.postalCodeMatched, ipCountryMatched: entry.ipCountryMatched })),
+      `an allow with ${entry.outcome} and postal ${entry.postalCodeMatched} means the 3DS rule was satisfied`,
+    );
+  }
+}
+
+async function checkFraudLookups(): Promise<void> {
+  const calls: FraudLookupCalls = { fingerprints: [], subjects: [] };
+
+  await fraudDecide({}, { lookups: fraudLookups({ calls }) });
+
+  expectEqual(calls.fingerprints.join(","), fraudFingerprint, "the blacklist is asked once, about this attempt's card");
+  expectEqual(calls.subjects.length, 2, "and the counters are asked twice");
+  expectEqual(calls.subjects[0]?.kind, "card", "first about the card");
+  expectEqual(calls.subjects[0]?.value, fraudFingerprint, "by its fingerprint");
+  expectEqual(calls.subjects[1]?.kind, "ip", "then about the address");
+  expectEqual(calls.subjects[1]?.value, fraudIpAddress, "by the address");
+
+  const nonCardCalls: FraudLookupCalls = { fingerprints: [], subjects: [] };
+
+  await fraudDecide({ paymentMethod: "bank_transfer", cardFingerprint: null }, { lookups: fraudLookups({ calls: nonCardCalls }) });
+
+  expectEqual(nonCardCalls.fingerprints.length, 0, "a bank transfer asks the blacklist nothing");
+  expectEqual(nonCardCalls.subjects.length, 1, "and reads one counter, not two");
+  expectEqual(nonCardCalls.subjects[0]?.kind, "ip", "the address one");
+
+  const otherCalls: FraudLookupCalls = { fingerprints: [], subjects: [] };
+
+  await fraudDecide({ cardFingerprint: fraudOtherFingerprint }, { lookups: fraudLookups({ calls: otherCalls }) });
+
+  expectEqual(otherCalls.fingerprints.join(","), fraudOtherFingerprint, "a second attempt is asked about its own card, not the first one");
+  expectEqual(otherCalls.fingerprints.includes(fraudFingerprint), false, "so one card's list is never consulted for another");
+
+  const failing = await expectFraudRefusal({}, "a blacklist that throws stops the evaluation", {
+    lookups: fraudLookups({
+      blacklist: async () => {
+        throw new Error("the blacklist is down");
+      },
+    }),
+  });
+
+  expectEqual(encryptionReason(failing), "lookup_failed", "and the reason is the lookup, not the card");
+  expectEqual(failing?.code, "DEPENDENCY_FAILED", "which is a dependency failure");
+  expectEqual(failing?.status, 502, "reported as a bad gateway rather than a refusal of the payment");
+  expectEqual(
+    encryptionReason(
+      await expectFraudRefusal({}, "a blacklist that answers with a non-boolean stops the evaluation", {
+        lookups: fraudLookups({ blacklist: async () => "no" as unknown as boolean }),
+      }),
+    ),
+    "lookup_failed",
+    "an answer that is not a boolean is not an answer",
+  );
+
+  for (const [reading, description] of [
+    [{ hits: -1, limit: 5 }, "a negative count"],
+    [{ hits: 1.5, limit: 5 }, "a fractional count"],
+    [{ hits: Number.NaN, limit: 5 }, "a count that is not a number"],
+    [{ hits: 1, limit: 0 }, "a limit below the counter's floor"],
+    [{ hits: 1, limit: -5 }, "a negative limit"],
+    [{ hits: 1, limit: 2.5 }, "a fractional limit"],
+    [{ hits: Number.POSITIVE_INFINITY, limit: 5 }, "a count that is infinite"],
+  ] as readonly (readonly [FraudVelocityReading, string])[]) {
+    expectEqual(
+      encryptionReason(
+        await expectFraudRefusal({}, `${description} is not a reading`, {
+          lookups: fraudLookups({ velocity: async () => reading }),
+        }),
+      ),
+      "lookup_failed",
+      `${description} is a dependency failure`,
+    );
+  }
+
+  expectEqual(
+    encryptionReason(
+      await expectFraudRefusal({}, "a counter that throws stops the evaluation", {
+        lookups: fraudLookups({
+          velocity: async () => {
+            throw new Error("the counters are down");
+          },
+        }),
+      }),
+    ),
+    "lookup_failed",
+    "a counter that cannot be read cannot be cleared",
+  );
+  expectEqual(
+    (await fraudDecide({}, { lookups: fraudLookups({ card: { hits: 0, limit: 1 }, ip: { hits: 0, limit: 1 } }) })).decision,
+    "allow",
+    "a counter at zero with a limit of one is still clear",
+  );
+  expectEqual(
+    (await fraudDecide({}, { lookups: fraudLookups({ card: { hits: Number.MAX_SAFE_INTEGER, limit: 1 } }) })).decision,
+    "reject",
+    "and a count at the safe integer ceiling is read rather than refused",
+  );
+}
+
+async function checkFraudAudit(): Promise<void> {
+  const allowed = await fraudDecide();
+
+  expectEqual(fraudAuditEntry(fraudAttempt(), allowed), null, "a cleared payment writes no fraud entry of its own");
+
+  const reviewed = await fraudDecide({ amountMinor: 4_000_000n });
+  const entry = fraudAuditEntry(fraudAttempt({ amountMinor: 4_000_000n }), reviewed);
+
+  expect(entry !== null, "a held payment writes one");
+  expectEqual(entry?.action, FRAUD_AUDIT_ACTION, "with the action this module owns");
+  expectEqual(entry?.payload["decision"], "review", "the decision");
+  expectEqual(entry?.payload["capture_allowed"], false, "whether money may move");
+  expectEqual(entry?.payload["amount_minor"], "4000000", "the amount as a string, because a bigint is not JSON");
+  expectEqual(entry?.payload["payment_method"], "card", "the method");
+  expectEqual(entry?.payload["currency"], "USD", "and the currency");
+  expectEqual(entry?.payload["three_ds_outcome"], "authenticated", "the 3DS outcome it decided on");
+  expectEqual(entry?.payload["card_fingerprint"], fraudFingerprint, "and the fingerprint, so an investigation can ask about the card");
+  expectEqual((entry?.payload["signals"] as readonly unknown[]).length, FRAUD_SIGNALS.length, "every signal is in the payload");
+  expectEqual((entry?.payload["reasons"] as readonly unknown[]).join(","), "amount_over_review", "with the reasons");
+  expectEqual(entry?.entityType, null, "with no entity, because the attempt is evaluated before its row exists");
+  expectEqual(entry?.entityId, null, "so the pair is empty rather than half filled");
+  expectEqual(entry?.companyId, fraudCompanyId, "and the company it belongs to");
+  expectEqual(JSON.stringify(entry?.payload).includes(fraudIpAddress), false, "the payload carries no address, only the audit row's own field");
+  expectEqual(JSON.stringify(entry?.payload).includes("rejected_by"), false, "and no invented key");
+
+  const withPayment = fraudAuditEntry(fraudAttempt({ amountMinor: 4_000_000n }), reviewed, {
+    paymentId: fraudPaymentId,
+    actorUserId: fraudActorId,
+    ipAddress: fraudIpAddress,
+    userAgent: "Mozilla/5.0 (compatible; KD test)",
+    sessionId: null,
+  });
+
+  expectEqual(withPayment?.entityType, "payment", "a decision about a row that exists names it");
+  expectEqual(withPayment?.entityId, fraudPaymentId, "by id");
+  expectEqual(withPayment?.actorUserId, fraudActorId, "and keeps the actor");
+  expectEqual(withPayment?.ipAddress, fraudIpAddress, "and the address in the field the audit table expects");
+
+  const rejected = await fraudDecide({ providerSignal: "fraud" });
+  const rejectedEntry = fraudAuditEntry(fraudAttempt({ providerSignal: "fraud" }), rejected, { paymentId: fraudPaymentId });
+
+  expectEqual(rejectedEntry?.payload["decision"], "reject", "a rejected payment is recorded as one");
+  expectEqual(rejectedEntry?.payload["capture_allowed"], false, "with no capture");
+  expectEqual((rejectedEntry?.payload["reasons"] as readonly unknown[]).join(","), "provider_fraud", "and the reason");
+
+  for (const candidate of [entry, withPayment, rejectedEntry]) {
+    expect(candidate !== null && auditEntryProblem(candidate) === null, "the entry passes the audit module's own validation");
+  }
+
+  expect(auditPayloadBytes(entry?.payload ?? {}) < AUDIT_MAXIMUM_PAYLOAD_BYTES, "and fits the payload ceiling with room to spare");
+
+  const redacted = redactAuditPayload(entry?.payload ?? {});
+
+  expectEqual(redacted["card_fingerprint"], fraudFingerprint, "the redaction pass keeps the fingerprint: it is not a credential");
+  expectEqual(redacted["decision"], "review", "and keeps the decision");
+  expectEqual(JSON.stringify(redacted).includes(AUDIT_REDACTED), false, "nothing in the payload is a secret");
+  expect(buildAuditEntry(entry as AuditEntry).payload["signals"] !== undefined, "and the audit module builds it without complaint");
+}
+
+async function checkFraudWiring(): Promise<void> {
+  const source = await readFile(new URL("./fraud.ts", import.meta.url), "utf8");
+  const payments = await readFile(new URL("../../migrations/0037_payments.sql", import.meta.url), "utf8");
+  const blacklist = await readFile(new URL("../../migrations/0055_card_blacklist.sql", import.meta.url), "utf8");
+  const velocity = await readFile(new URL("../../migrations/0056_velocity_counters.sql", import.meta.url), "utf8");
+
+  expect(source.includes('from "./host.ts"'), "the address rule is STEP 058's, not a second parser");
+  expect(source.includes("isIpLiteral"), "which is the one function that decides an address");
+  expect(source.includes('from "../errors/app-error.ts"'), "a failure is an AppError");
+  expectEqual(source.includes("console."), false, "nothing is logged, so no attempt is");
+  expectEqual(source.includes("process.env"), false, "the module reads no environment variable");
+  expectEqual(source.includes("fetch("), false, "and makes no request");
+  expectEqual(source.includes("Date.now"), false, "and holds no clock: a decision is a function of its inputs");
+  expectEqual(source.includes("Math.random"), false, "nor randomness");
+  expectEqual(source.includes("aes-256-gcm"), false, "a fingerprint is never computed here: it arrives hashed");
+  expectEqual(source.includes("supabase"), false, "and the two lookups are the caller's, not this module's client");
+  expectEqual(source.includes("card_number"), false, "no card number is named, because none may arrive");
+  expectEqual(source.includes("cvv"), false, "and no CVV either");
+  expectEqual(source.includes("card_fingerprint"), true, "the fingerprint is the one card value this module knows");
+
+  for (const signal of FRAUD_SIGNALS) {
+    expect(source.includes(`"${signal}"`), `${signal} is a signal in the source`);
+  }
+
+  for (let index = 1; index < FRAUD_SIGNALS.length; index += 1) {
+    const previous = FRAUD_SIGNALS[index - 1] ?? "";
+    const current = FRAUD_SIGNALS[index] ?? "";
+
+    expect(
+      source.indexOf(`  "${previous}",\n`) < source.indexOf(`  "${current}",\n`),
+      `${previous} is declared before ${current}`,
+    );
+  }
+
+  const assembly = [
+    "providerSignalResult(attempt)",
+    "cardBlacklistResult(attempt, blocked)",
+    "cardVelocityResult(attempt, cardReading)",
+    "ipVelocityResult(ipReading)",
+    "threeDsResult(attempt)",
+    "amountResult(attempt, policy)",
+  ];
+
+  for (let index = 1; index < assembly.length; index += 1) {
+    const previous = assembly[index - 1] ?? "";
+    const current = assembly[index] ?? "";
+
+    expect(source.indexOf(previous) < source.indexOf(current), `the assembly evaluates ${previous} before ${current}`);
+  }
+
+  expect(payments.includes("risk_decision in ('allow', 'review', 'reject')"), "the payments table states the three decisions");
+  expect(
+    payments.includes(`risk_decision in (${FRAUD_DECISIONS.map((decision) => `'${decision}'`).join(", ")})`),
+    "and they are the words this module returns",
+  );
+  expect(payments.includes("three_ds_outcome = 'authenticated'"), "the table states the 3DS capture rule");
+  expect(payments.includes("(postal_code_matched and ip_country_matched)"), "as both addresses matching");
+  expect(
+    payments.includes(`three_ds_outcome in (${FRAUD_THREE_DS_OUTCOMES.map((outcome) => `'${outcome}'`).join(", ")})`),
+    "and the four outcomes this module reads",
+  );
+  expect(
+    payments.includes(`payment_method in (${FRAUD_PAYMENT_METHODS.map((method) => `'${method}'`).join(", ")})`),
+    "with the three payment methods it accepts",
+  );
+  expect(payments.includes("risk_decision <> 'reject' or status = 'failed'"), "a reject only ever sits on a failed payment");
+
+  expect(blacklist.includes("card_fingerprint ~ '^[0-9a-f]{64}$'"), "the blacklist stores the same 64 hex fingerprint");
+  expectEqual(FRAUD_CARD_FINGERPRINT_PATTERN.source, "^[0-9a-f]{64}$", "which is this module's pattern, spelled once");
+  expect(velocity.includes("hit_count integer not null default 0"), "the counters store a count");
+  expect(velocity.includes("limit_value integer not null"), "and the limit they applied");
+  expect(velocity.includes("limit_value >= 1"), "with a floor of one, which this module enforces on a reading");
+  expect(velocity.includes("hit_count >= limit_value"), "and a breach recorded when the count reaches the limit, which is the comparison here");
+
+  const roots = [new URL("../../lib/", import.meta.url), new URL("../../app/", import.meta.url)];
+  const decisionWriters: string[] = [];
+
+  for (const root of roots) {
+    const prefix = root.pathname.endsWith("/lib/") ? "lib/" : "app/";
+    const entries = (await readdir(root, { recursive: true }))
+      .map((entry) => entry.replaceAll("\\", "/"))
+      .filter((entry) => entry.endsWith(".ts") || entry.endsWith(".tsx"));
+
+    for (const entry of entries) {
+      const text = await readFile(new URL(entry, root), "utf8");
+
+      if (!entry.endsWith("verify.ts") && text.includes("payment.fraud_evaluated")) {
+        decisionWriters.push(`${prefix}${entry}`);
+      }
+    }
+  }
+
+  expectEqual(decisionWriters.sort().join(","), "lib/security/fraud.ts", "one module in the tree decides a payment's risk");
+}
+
 async function checkTree(): Promise<void> {
   const securityRoot = new URL("./", import.meta.url);
   const securityFiles = (await readdir(securityRoot)).filter((name) => name.endsWith(".ts"));
@@ -4116,6 +4758,7 @@ async function main(): Promise<void> {
   checkPortalTokenMint();
   checkPortalTokenOpen();
   checkPortalTokenRevocation();
+  checkFraudVocabulary();
   await checkCspWiring();
   await checkSecurityHeaderWiring();
   await checkUploadWiring();
@@ -4126,6 +4769,11 @@ async function main(): Promise<void> {
   await checkAuditWiring();
   await checkEncryptionWiring();
   await checkPortalTokenWiring();
+  await checkFraudAttempts();
+  await checkFraudSignals();
+  await checkFraudLookups();
+  await checkFraudAudit();
+  await checkFraudWiring();
   await checkTree();
 
   if (failures.length > 0) {
