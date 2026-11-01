@@ -83,7 +83,14 @@ const catalog = {
     fullNameLabel: "Your full name",
     emailLabel: "Work email",
     passwordLabel: "Password",
-    passwordHint: "At least twelve characters, and not your email address.",
+    passwordRulesTitle: "Your password must have",
+    passwordRuleLength: "At least twelve characters.",
+    passwordRuleKinds: "Three of four kinds: lower case, upper case, a digit, a symbol.",
+    passwordRulePersonal: "Nothing from your email address, your name or your business name.",
+    passwordRuleBreach: "No appearance in a known data breach.",
+    passwordBreached:
+      "That password has appeared in a known data breach. Choose one you have never used anywhere else.",
+    passwordTooWeak: "That password does not meet the rules below. Choose a different one.",
     companyNameLabel: "Business name",
     policiesTitle: "Policies you accept",
     policiesNotice:

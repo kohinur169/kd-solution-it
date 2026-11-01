@@ -2,6 +2,11 @@
 import { getServerConfig } from "../../config/server.ts";
 import { serverEnv } from "../env/server.ts";
 import { createAuthAdminClient, type AdminAuthClient } from "./admin-client.ts";
+import {
+  BREACH_RANGE_MAXIMUM_BYTES,
+  createBreachCheck,
+  type BreachCheck,
+} from "./breach-check.ts";
 import { createRestAuditTrail, type AuditTrail } from "./audit.ts";
 import { createAuthClient, type AuthClient } from "./client.ts";
 import { createAuthCookiePolicy, type AuthCookiePolicy } from "./cookies.ts";
@@ -46,6 +51,7 @@ export interface AuthRuntime {
   readonly client: AuthClient;
   readonly admin: AdminAuthClient;
   readonly turnstile: TurnstileGuard;
+  readonly breachCheck: BreachCheck;
   readonly policies: PolicyCatalog;
   readonly audit: AuditTrail;
   readonly attempts: LoginAttemptRecorder;
@@ -63,6 +69,11 @@ export function getAuthRuntime(): AuthRuntime {
   const http = createAuthHttpForConfig(config);
   const server = getServerConfig();
   const settings = createRestSettings(config, http, () => serverEnv().ENCRYPTION_MASTER_KEY);
+  // A breached password range is plain text of a few hundred kilobytes, so this endpoint needs its
+  // own ceiling; every other call keeps the 64 KiB identity provider bound.
+  const rangeHttp = createAuthHttpForConfig(config, {
+    maximumResponseBytes: BREACH_RANGE_MAXIMUM_BYTES,
+  });
 
   runtime = {
     config,
@@ -74,6 +85,11 @@ export function getAuthRuntime(): AuthRuntime {
     turnstile: createTurnstileGuard({
       settings,
       http,
+      isProduction: server.isProduction,
+    }),
+    breachCheck: createBreachCheck({
+      settings,
+      http: rangeHttp,
       isProduction: server.isProduction,
     }),
     policies: createRestPolicyCatalog(config, http),

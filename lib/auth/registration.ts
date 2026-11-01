@@ -4,7 +4,8 @@ import { AppError } from "../errors/app-error.ts";
 import type { AdminAuthClient } from "./admin-client.ts";
 import type { AuditTrail } from "./audit.ts";
 import type { AuthClient } from "./client.ts";
-import { assertPasswordAcceptable, hashPassword } from "./password.ts";
+import type { BreachCheck, BreachVerdict } from "./breach-check.ts";
+import { assertPasswordAcceptable, hashPassword, passwordRuleFailure } from "./password.ts";
 import {
   acceptsEveryRequiredPolicy,
   catalogIsComplete,
@@ -97,6 +98,7 @@ export interface RegistrationDependencies {
   readonly rest: RestClient;
   readonly policies: PolicyCatalog;
   readonly turnstile: TurnstileGuard;
+  readonly breachCheck: BreachCheck;
   readonly audit: AuditTrail;
   readonly now?: () => number;
   /** Where the confirmation link returns the merchant, when the provider is told about it. */
@@ -206,7 +208,11 @@ export async function registerMerchant(
   const request = parsed.data;
   const acceptedKeys = readAcceptedPolicies(request.acceptedPolicies);
 
-  assertPasswordAcceptable(request.password, request.email);
+  assertPasswordAcceptable(request.password, {
+    email: request.email,
+    companyName: request.companyName,
+    fullName: request.fullName,
+  });
 
   const challenge = await dependencies.turnstile.check({
     token: request.turnstileToken,
@@ -216,6 +222,20 @@ export async function registerMerchant(
   if (!challenge.ok) {
     throw turnstileError(challenge.failure);
   }
+
+  // The corpus is asked after the challenge, so a bot cannot spend the platform's quota on it, and
+  // before the provider, so a breached password never becomes an account.
+  const breach = await dependencies.breachCheck.check(request.password);
+
+  if (!breach.ok) {
+    throw providerError(breach.failure);
+  }
+
+  if (breach.value === "breached") {
+    throw passwordRuleFailure("breached");
+  }
+
+  const breachVerdict: BreachVerdict = breach.value;
 
   const published = await dependencies.policies.published(acceptedKeys);
 
@@ -292,6 +312,7 @@ export async function registerMerchant(
       payload: {
         policies: policyPayload(published),
         turnstile: challenge.value,
+        breach_check: breachVerdict,
         email_verification: verificationRequired ? "pending" : "not_required",
       },
       ipAddress: input.remoteIp,

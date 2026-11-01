@@ -4,9 +4,9 @@
 Owner: STEP 037 (Supabase Auth client and server helpers with typed session access), extended by
 STEPs 038-055. STEP 038 added signup, the setting registry, the Turnstile guard, the policy
 catalog, the password verifier, the audit trail and the confirmation link; STEP 039 added sign in,
-the attempt record and the device label. Later STEPs add the device proof key, the rotating token
-and the lock; they do not add a second way to read a session, a second cookie or a second error
-vocabulary.
+the attempt record and the device label; STEP 040 replaced the interim password shape with the
+policy and the breach check. Later STEPs add the device proof key, the rotating token and the lock;
+they do not add a second way to read a session, a second cookie or a second error vocabulary.
 
 | File | Purpose |
 | --- | --- |
@@ -26,7 +26,8 @@ vocabulary.
 | settings.ts | `platform_settings`: a JSON value or a secret, never both |
 | turnstile.ts | The Cloudflare Turnstile guard: enabled, secret, siteverify, one verdict |
 | policies.ts | The twelve policy keys, the published catalog and the text hash of a page |
-| password.ts | The scrypt verifier, and the interim password shape STEP 040 replaces |
+| password.ts | The password policy of section 22, and the scrypt verifier |
+| breach-check.ts | The breached password range query, by SHA-1 prefix and never by password |
 | audit.ts | The hash chain and the Ed25519 signature an audit entry is written with |
 | registration.ts | Merchant signup: validate, challenge, provider account, rows, acceptances, audit |
 | email-verification.ts | A followed confirmation link: token, verification instant, audit, cookie |
@@ -129,7 +130,21 @@ the authority. A permission check uses the record, never a claim.
     the factor and the outcome, so STEP 045's lock survives a restart because it counts rows and
     not a number in memory. A refused attempt is recorded too, and a record that fails never changes
     the answer to the merchant.
-25. The device is recorded, the proof key is not invented. `device-context.ts` derives a bounded
+25. A password is refused by rule, never by sentence. `password.ts` returns the first rule a value
+    breaks and the failure detail carries `{field: "password", rule}`, so a form can point at the
+    field and a log can count refusals without either recording what was typed. Twelve characters,
+    three of four character kinds, six distinct characters, nothing from the person's address, name
+    or business name, and no surrounding space.
+26. A breached password is checked by prefix, never sent. `breach-check.ts` hashes with SHA-1
+    because that is the corpus index, sends five hexadecimal characters to the range endpoint with
+    `add-padding`, and reads the answer as text through the same transport with the ceiling this
+    endpoint needs. A corpus that cannot answer is `DEPENDENCY_FAILED`: a check nobody performs is
+    worse than no check, because someone believes in it.
+27. The breach verdict is audited. `merchant.signed_up` carries `breach_check: "clear" | "skipped"`,
+    so the database answers "was this password checked" without trusting a log line. The switch
+    `password.breach_check.enabled` is seeded open by `0081`; closed outside production is skipped,
+    closed inside production is refused.
+28. The device is recorded, the proof key is not invented. `device-context.ts` derives a bounded
     label from a user agent, and the sign in reports `deviceProofRequired` from the live
     `device_proof_keys` rows. The key pair itself is STEP 049's browser work and the `sessions` row
     that binds it is STEP 051's, because `0009` needs a client public key and `0010` needs the key

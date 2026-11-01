@@ -54,10 +54,23 @@ import {
   requireAnyRole,
   requireCompanyId,
 } from "./session.ts";
+import {
+  BREACH_CHECK_ENABLED_SETTING,
+  breachHashParts,
+  createBreachCheck,
+  createFixedBreachCheck,
+  readBreachRange,
+  type BreachCheck,
+} from "./breach-check.ts";
 import { completeEmailVerification } from "./email-verification.ts";
 import {
   assertPasswordAcceptable,
+  characterKindsIn,
   hashPassword,
+  PASSWORD_MAXIMUM_LENGTH,
+  PASSWORD_MINIMUM_CHARACTER_KINDS,
+  PASSWORD_MINIMUM_LENGTH,
+  passwordRuleViolation,
   verifyPasswordHash,
 } from "./password.ts";
 import {
@@ -197,6 +210,9 @@ async function captureRejection(
   return new AppError("INTERNAL_ERROR");
 }
 
+/** A password that passes the STEP 040 policy: length, three kinds, no identity word. */
+const COMPLIANT_PASSWORD = "Correct-Horse-Battery-9";
+
 const NOW = 1_800_000_000_000;
 const USER_ID = "018f3b1c-1111-7c2a-9d1e-2b3c4d5e6f70";
 const OTHER_USER_ID = "018f3b1c-3333-7c2a-9d1e-2b3c4d5e6f72";
@@ -264,6 +280,7 @@ interface AuthRequestRecord {
   readonly body: unknown;
   readonly form: unknown;
   readonly headers: unknown;
+  readonly responseFormat: string | undefined;
 }
 
 function createStubHttp(
@@ -284,6 +301,7 @@ function createStubHttp(
           body: request.body,
           form: request.form,
           headers: request.headers,
+          responseFormat: request.responseFormat,
         });
 
         const answer = answers[index] ?? okAnswer(500, { code: "gate_missing_answer" });
@@ -2337,44 +2355,157 @@ async function checkPolicies(): Promise<void> {
 /* ------------------------------------------------------------------ 15. password */
 
 async function checkPassword(): Promise<void> {
-  assertPasswordAcceptable("correct horse battery", "owner@example.com");
+  const context = { email: "owner@example.com", companyName: "Acme Payments", fullName: "Owner Name" };
+
+  assertPasswordAcceptable(COMPLIANT_PASSWORD, context);
   checkCount += 1;
 
-  expectAppError(
-    () => assertPasswordAcceptable("short-pass1", "owner@example.com"),
-    "VALIDATION_FAILED",
-    "a password below the floor is refused",
-  );
-  expectAppError(
-    () => assertPasswordAcceptable(` ${"a".repeat(20)}`, "owner@example.com"),
-    "VALIDATION_FAILED",
-    "a password with surrounding whitespace is refused",
-  );
-  expectAppError(
-    () => assertPasswordAcceptable("aaaaaaaaaaaa", "owner@example.com"),
-    "VALIDATION_FAILED",
-    "a password of one repeated character is refused",
-  );
-  expectAppError(
-    () => assertPasswordAcceptable("owner-is-my-password", "owner@example.com"),
-    "VALIDATION_FAILED",
-    "a password containing the address is refused",
-  );
-  expectAppError(
-    () => assertPasswordAcceptable(`${"a".repeat(128)}B1`, "owner@example.com"),
-    "VALIDATION_FAILED",
-    "a password above the ceiling is refused",
+  expectEqual(PASSWORD_MINIMUM_LENGTH, 12, "the policy floor is twelve characters");
+  expectEqual(PASSWORD_MAXIMUM_LENGTH, 128, "the policy ceiling is one hundred and twenty eight");
+  expectEqual(PASSWORD_MINIMUM_CHARACTER_KINDS, 3, "three of four kinds are required");
+  expectEqual(characterKindsIn("aA1!"), 4, "four kinds are counted");
+  expectEqual(characterKindsIn("abc"), 1, "one kind is counted");
+  expectEqual(characterKindsIn("ab1"), 2, "two kinds are counted");
+  expectEqual(
+    passwordRuleViolation(COMPLIANT_PASSWORD, context),
+    null,
+    "a compliant password breaks no rule",
   );
 
-  const stored = await hashPassword("correct horse battery");
+  for (const [password, rule, label] of [
+    ["short-pass1", "too_short", "a short password"],
+    [` ${"a".repeat(20)}`, "surrounding_whitespace", "a password with a leading space"],
+    ["aaaaaaaaaaaa", "too_repetitive", "a password of one character"],
+    ["alllowercaseletters", "not_enough_character_kinds", "a password of one kind"],
+    ["owner-is-my-password1", "contains_email_address", "a password containing the address"],
+    ["acme-payments-2026", "contains_company_name", "a password containing the business name"],
+    ["my-name-is-here-1", "contains_person_name", "a password containing the person"],
+    [`${"A".repeat(128)}b1!`, "too_long", "a password above the ceiling"],
+  ] as const) {
+    const error = await expectRejects(
+      () => Promise.resolve().then(() => assertPasswordAcceptable(password, context)),
+      "VALIDATION_FAILED",
+      `${label} is refused`,
+    );
+
+    expectEqual(error, undefined, `${label} is a validation failure`);
+    expectEqual(passwordRuleViolation(password, context), rule, `${label} names its rule`);
+  }
+
+  await expectRejects(
+    () => Promise.resolve().then(() => assertPasswordAcceptable("short-pass1", context)),
+    "VALIDATION_FAILED",
+    "the detail names the password field",
+  );
+
+  const stored = await hashPassword(COMPLIANT_PASSWORD);
 
   expect(stored.startsWith("scrypt$16384$8$1$"), "the stored hash names its parameters");
   expect(stored.length >= 20 && stored.length <= 255, "the stored hash fits the column");
-  expect(await verifyPasswordHash("correct horse battery", stored), "the right password verifies");
-  expect(!(await verifyPasswordHash("correct horse batterY", stored)), "a wrong password fails");
-  expect(!(await verifyPasswordHash("correct horse battery", "not-a-hash")), "a broken row fails");
-  expect(!(await verifyPasswordHash("correct horse battery", "scrypt$1$8$1$a$b")), "an unknown cost fails");
-  expect((await hashPassword("correct horse battery")) !== stored, "two hashes of one password differ");
+  expect(await verifyPasswordHash(COMPLIANT_PASSWORD, stored), "the right password verifies");
+  expect(!(await verifyPasswordHash(`${COMPLIANT_PASSWORD}x`, stored)), "a wrong password fails");
+  expect(!(await verifyPasswordHash(COMPLIANT_PASSWORD, "not-a-hash")), "a broken row fails");
+  expect(!(await verifyPasswordHash(COMPLIANT_PASSWORD, "scrypt$1$8$1$a$b")), "an unknown cost fails");
+  expect((await hashPassword(COMPLIANT_PASSWORD)) !== stored, "two hashes of one password differ");
+}
+
+/* ------------------------------------------------------------------ 15b. breach check */
+
+async function checkBreachCheck(): Promise<void> {
+  const parts = breachHashParts("password");
+
+  expectEqual(parts.prefix, "5BAA6", "the range prefix is the first five hex characters");
+  expectEqual(parts.prefix.length + parts.suffix.length, 40, "the two halves are one SHA-1");
+  expectEqual(breachHashParts("Password").prefix === parts.prefix, false, "the hash is case sensitive");
+
+  const suffix = "1E4C9B93F3F0682250B6CF8331B7EE68FD8";
+  const answer = [
+    "003D68EB55068C33ACE09247EE4C639306B:3",
+    `${suffix}:3303003`,
+    "1E4C9B93F3F0682250B6CF8331B7EE68FD9:0",
+  ].join("\r\n");
+
+  expectEqual(readBreachRange(answer, suffix), "breached", "a counted suffix is a breach");
+  expectEqual(readBreachRange(answer, "0000000000000000000000000000000000F"), "clear", "a padded suffix is clear");
+  expectEqual(readBreachRange("", suffix), "clear", "an empty range is clear");
+  expectEqual(readBreachRange("not a range at all", suffix), null, "a body that is not a range is refused");
+
+  const endpoint = "https://range.gate/range/";
+  const enabledSettings = createInMemorySettings({ "password.breach_check.enabled": true });
+  const foundStub = createStubHttp(okAnswer(200, answer));
+  const found = await createBreachCheck({
+    settings: enabledSettings,
+    http: foundStub.http,
+    isProduction: true,
+    endpoint,
+  }).check("password");
+
+  expect(found.ok && found.value === "breached", "a corpus hit is a breach");
+
+  const request = firstRequest(foundStub.requests, "the check asked the corpus");
+
+  if (request !== null) {
+    expectEqual(request.method, "GET", "the range is a GET");
+    expectEqual(request.url, `${endpoint}${parts.prefix}`, "only the five character prefix leaves");
+    expect(
+      request.url.includes(suffix) === false,
+      "the rest of the hash never appears in the request",
+    );
+    expectEqual(request.apiKey, "", "the corpus takes no key");
+    expectEqual(request.responseFormat, "text", "the range is read as text");
+    expectEqual(
+      (request.headers as Readonly<Record<string, string>>)["add-padding"],
+      "true",
+      "the answer is padded",
+    );
+  }
+
+  const clear = await createBreachCheck({
+    settings: enabledSettings,
+    http: createStubHttp(okAnswer(200, "003D68EB55068C33ACE09247EE4C639306B:3")).http,
+    isProduction: true,
+    endpoint,
+  }).check("password");
+
+  expect(clear.ok && clear.value === "clear", "a suffix outside the range is clear");
+
+  const skipped = await createBreachCheck({
+    settings: createInMemorySettings({ "password.breach_check.enabled": false }),
+    http: createStubHttp().http,
+    isProduction: false,
+    endpoint,
+  }).check("password");
+
+  expect(skipped.ok && skipped.value === "skipped", "a closed switch outside production is skipped");
+
+  const refused = await createBreachCheck({
+    settings: createInMemorySettings({ "password.breach_check.enabled": false }),
+    http: createStubHttp().http,
+    isProduction: true,
+    endpoint,
+  }).check("password");
+
+  expect(!refused.ok && refused.failure.kind === "upstream", "a closed switch in production refuses");
+
+  const down = await createBreachCheck({
+    settings: enabledSettings,
+    http: createStubHttp(okAnswer(503, "")).http,
+    isProduction: true,
+    endpoint,
+  }).check("password");
+
+  expect(!down.ok && down.failure.kind === "upstream", "a corpus outage is an upstream failure");
+
+  const garbage = await createBreachCheck({
+    settings: enabledSettings,
+    http: createStubHttp(okAnswer(200, "<html>nope</html>")).http,
+    isProduction: true,
+    endpoint,
+  }).check("password");
+
+  expect(!garbage.ok && garbage.failure.kind === "malformed-response", "an answer that is not a range is malformed");
+
+  expectEqual(BREACH_CHECK_ENABLED_SETTING, "password.breach_check.enabled", "the switch key is documented");
 }
 
 /* ------------------------------------------------------------------ 16. registration */
@@ -2495,6 +2626,7 @@ function registrationFixture(options: {
   readonly pages?: readonly PolicyPage[];
   readonly failInsertTable?: string;
   readonly turnstileEnabled?: boolean;
+  readonly breachCheck?: BreachCheck;
   readonly provider?: AuthOutcome<{ readonly userId: string; readonly session: AuthSession | null }>;
 }): RegistrationFixture {
   const rest = createStubRest(
@@ -2504,6 +2636,7 @@ function registrationFixture(options: {
   const audit = createInMemoryAuditTrail();
   const provider: AuthOutcome<{ readonly userId: string; readonly session: AuthSession | null }> =
     options.provider ?? { ok: true, value: { userId: USER_ID, session: null } };
+  const breachCheck = options.breachCheck ?? createFixedBreachCheck("clear");
 
   return {
     rest,
@@ -2522,6 +2655,7 @@ function registrationFixture(options: {
         isProduction: false,
         endpoint: "https://turnstile.gate/siteverify",
       }),
+      breachCheck,
       audit,
       now: () => NOW,
     },
@@ -2532,7 +2666,7 @@ function signupRequest(overrides: Readonly<Record<string, unknown>> = {}): Recor
   return {
     fullName: "Owner Name",
     email: "owner@example.com",
-    password: "correct horse battery",
+    password: COMPLIANT_PASSWORD,
     companyName: "Acme Payments",
     acceptedPolicies: [...REQUIRED_POLICY_KEYS],
     turnstileToken: null,
@@ -2611,6 +2745,11 @@ async function checkRegistration(): Promise<void> {
 
   expectEqual(fixture.audit.entries.length, 1, "the signup writes one audit entry");
   expectEqual(fixture.audit.entries[0]?.action, "merchant.signed_up", "the entry names the action");
+  expectEqual(
+    fixture.audit.entries[0]?.payload["breach_check"],
+    "clear",
+    "the entry records the breach verdict",
+  );
   expectEqual(fixture.audit.entries[0]?.entityType, "company", "the entry names the company");
   expectEqual(fixture.audit.entries[0]?.ipAddress, "203.0.113.9", "the entry carries the address");
 
@@ -2728,10 +2867,38 @@ async function checkRegistration(): Promise<void> {
     "a confirmed signup records the verification instant",
   );
 
-  const storage = await hashPassword("correct horse battery");
+  const breached = registrationFixture({ breachCheck: createFixedBreachCheck("breached") });
+  const breachedError = await captureRejection(
+    () =>
+      registerMerchant(
+        { request: signupRequest(), remoteIp: null, userAgent: null },
+        breached.dependencies,
+      ),
+    "a breached password stops the signup",
+  );
+
+  expectEqual(breachedError.code, "VALIDATION_FAILED", "a breach is a form failure");
+  expectEqual(breachedError.details[0]?.field, "password", "the breach names the password field");
+  expectEqual(breachedError.details[0]?.rule, "breached", "the breach names its rule");
+  expectEqual(breached.rest.calls.length, 0, "a breached password writes no row");
+
+  const skippedBreach = registrationFixture({ breachCheck: createFixedBreachCheck("skipped") });
+  const skippedResult = await registerMerchant(
+    { request: signupRequest(), remoteIp: null, userAgent: null },
+    skippedBreach.dependencies,
+  );
+
+  expectEqual(skippedResult.userId, USER_ID, "a skipped check still signs the merchant up");
+  expectEqual(
+    skippedBreach.audit.entries[0]?.payload["breach_check"],
+    "skipped",
+    "the audit entry records that the corpus was not asked",
+  );
+
+  const storage = await hashPassword(COMPLIANT_PASSWORD);
 
   expect(
-    !storage.includes("correct horse battery"),
+    !storage.includes(COMPLIANT_PASSWORD),
     "the stored verifier never contains the password",
   );
 }
@@ -3107,7 +3274,7 @@ function signinFixture(options: SigninRestOptions & {
 function signinRequest(overrides: Readonly<Record<string, unknown>> = {}): Record<string, unknown> {
   return {
     email: "owner@example.com",
-    password: "correct horse battery",
+    password: COMPLIANT_PASSWORD,
     turnstileToken: null,
     ...overrides,
   };
@@ -3355,6 +3522,7 @@ async function main(): Promise<void> {
   await checkRestAuditTrail();
   await checkPolicies();
   await checkPassword();
+  await checkBreachCheck();
   await checkRegistration();
   await checkEmailVerification();
   checkClientAddress();

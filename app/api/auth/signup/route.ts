@@ -78,6 +78,7 @@ export const POST = withErrorResponse(async (request: Request): Promise<NextResp
       rest: runtime.rest,
       policies: runtime.policies,
       turnstile: runtime.turnstile,
+      breachCheck: runtime.breachCheck,
       audit: runtime.audit,
     },
   );

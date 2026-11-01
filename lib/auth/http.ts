@@ -20,7 +20,8 @@ import type { AuthFailure, AuthOutcome } from "./types.ts";
  *      the project cannot quietly become the recipient of a key;
  *   3. a response is bounded. The declared length is refused before the body is read and the
  *      actual length is checked after, so a hostile or broken endpoint cannot exhaust memory;
- *   4. a body that is not JSON is a typed failure, never an exception in a request handler.
+ *   4. a body that is not JSON is a typed failure, never an exception in a request handler,
+ *      unless the caller asked for `text` because the endpoint answers plain text.
  *
  * The result carries the status and the parsed body, and nothing else. Deciding what a status
  * means is `failures.ts`, and the split matters: this file cannot accidentally decide that a
@@ -49,6 +50,12 @@ export interface AuthRequest {
   readonly form?: Readonly<Record<string, string>>;
   /** Extra request headers. A reserved header is never overridden by this field. */
   readonly headers?: Readonly<Record<string, string>>;
+  /**
+   * How to read the answer. `json` is the identity provider contract; `text` is for the one
+   * endpoint that answers plain text (the breached password range of STEP 040), where a JSON parse
+   * would turn a correct answer into a malformed one.
+   */
+  readonly responseFormat?: "json" | "text";
   readonly signal?: AbortSignal;
 }
 
@@ -241,6 +248,17 @@ export function createAuthHttp(options: AuthHttpOptions = {}): AuthHttp {
       }
 
       const text = read.value;
+
+      if (request.responseFormat === "text") {
+        return {
+          ok: true,
+          value: {
+            status: response.status,
+            body: text,
+            retryAfterSeconds: parseRetryAfter(response.headers.get("retry-after"), Date.now()),
+          },
+        };
+      }
 
       if (text.trim() === "") {
         return {

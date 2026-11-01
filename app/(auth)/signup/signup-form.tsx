@@ -54,6 +54,39 @@ export interface SignupFormProperties {
 
 type SubmitState = "idle" | "submitting" | "succeeded";
 
+/** The rule of a password detail, so the form can say which rule was broken. */
+function readPasswordRule(payload: unknown): string | null {
+  if (typeof payload !== "object" || payload === null) {
+    return null;
+  }
+
+  const error = (payload as { readonly error?: unknown }).error;
+
+  if (typeof error !== "object" || error === null) {
+    return null;
+  }
+
+  const details = (error as { readonly details?: unknown }).details;
+
+  if (!Array.isArray(details)) {
+    return null;
+  }
+
+  for (const detail of details) {
+    if (typeof detail !== "object" || detail === null) {
+      continue;
+    }
+
+    const record = detail as { readonly field?: unknown; readonly rule?: unknown };
+
+    if (record.field === "password" && typeof record.rule === "string") {
+      return record.rule;
+    }
+  }
+
+  return null;
+}
+
 function readErrorMessage(payload: unknown): string | null {
   if (typeof payload !== "object" || payload === null) {
     return null;
@@ -146,7 +179,15 @@ export function SignupForm({ siteKey, policies }: SignupFormProperties): ReactNo
       const payload: unknown = await response.json().catch(() => null);
 
       if (!response.ok) {
-        setMessage(readErrorMessage(payload) ?? getMessage("signup.unreadableResponse"));
+        const rule = readPasswordRule(payload);
+
+        setMessage(
+          rule === "breached"
+            ? getMessage("signup.passwordBreached")
+            : rule !== null
+              ? getMessage("signup.passwordTooWeak")
+              : readErrorMessage(payload) ?? getMessage("signup.unreadableResponse"),
+        );
         setState("idle");
         resetChallenge();
 
@@ -255,8 +296,17 @@ export function SignupForm({ siteKey, policies }: SignupFormProperties): ReactNo
           }}
         />
         <span id="signup-password-hint" className="mt-1 block text-xs font-normal text-muted-foreground">
-          {getMessage("signup.passwordHint")}
+          {getMessage("signup.passwordRulesTitle")}
         </span>
+        <ul
+          className="mt-1 ml-4 list-disc text-xs font-normal text-muted-foreground"
+          aria-describedby="signup-password-hint"
+        >
+          <li>{getMessage("signup.passwordRuleLength")}</li>
+          <li>{getMessage("signup.passwordRuleKinds")}</li>
+          <li>{getMessage("signup.passwordRulePersonal")}</li>
+          <li>{getMessage("signup.passwordRuleBreach")}</li>
+        </ul>
       </label>
 
       <fieldset className="rounded-lg border border-border p-3">
