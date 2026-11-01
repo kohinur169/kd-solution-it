@@ -121,6 +121,11 @@ export const SENSITIVE_ENDPOINTS: readonly SensitiveEndpoint[] = [
     path: "/api/office/sessions/revoke",
     note: "Section 22's instant revocation (STEP 054) for an office role: the request that signs a merchant out is signed, so a copied office cookie cannot spend it.",
   },
+  {
+    method: "POST",
+    path: "/api/office/gateways",
+    note: "Section 6's gateway page (STEP 069): storing a provider key or changing a provider's state is the request that decides where money is routed, so it is signed by the browser holding the key.",
+  },
 ];
 
 /** True when this path is one this platform requires a proof for. */
