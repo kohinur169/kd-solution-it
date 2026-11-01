@@ -2,6 +2,7 @@
 import { SESSION_MANAGEMENT_OFFICE_ROLES } from "../../lib/auth/session-list.ts";
 import { TWO_FACTOR_RESET_OFFICE_ROLES } from "../../lib/auth/two-factor-reset.ts";
 import { PLATFORM_ROLES, type PlatformRole, type RequestActor } from "../../lib/auth/types.ts";
+import { APPROVAL_QUEUE_ROLES } from "../../lib/approvals/registry.ts";
 import { GATEWAY_MANAGEMENT_ROLES, OFFICE_DASHBOARD_ROLES } from "../../lib/gateways/registry.ts";
 import type { MessagePath } from "../../lib/i18n/messages.ts";
 import { deepFreeze } from "../../lib/utils/freeze.ts";
@@ -76,16 +77,22 @@ export interface OfficeSection {
   readonly roles: readonly PlatformRole[];
 }
 
-export type OfficeSectionKey = "workspace" | "dashboard" | "gateways" | "sessions" | "twoFactorResets";
+export type OfficeSectionKey =
+  | "workspace"
+  | "dashboard"
+  | "ceo"
+  | "gateways"
+  | "sessions"
+  | "twoFactorResets";
 
 /**
  * Every office screen that exists today, in the order the sidebar shows them.
  *
  * The first entry is the workspace index of STEP 068; the dashboard and the gateway page are STEP
- * 069's two screens, inside the admin group like the workspace; the last two are the office screens
- * the authentication block built (`app/office/`), which is why their hrefs sit outside the group. A
- * link to a page that exists is the only kind this shell offers, which is why an entry arrives in the
- * same commit as its `page.tsx`.
+ * 069's two screens and the CEO's home is STEP 070's, all inside the admin group like the workspace;
+ * the last two are the office screens the authentication block built (`app/office/`), which is why
+ * their hrefs sit outside the group. A link to a page that exists is the only kind this shell offers,
+ * which is why an entry arrives in the same commit as its `page.tsx`.
  */
 export const OFFICE_NAVIGATION: readonly OfficeSection[] = deepFreeze([
   {
@@ -101,6 +108,13 @@ export const OFFICE_NAVIGATION: readonly OfficeSection[] = deepFreeze([
     labelKey: "office.sectionDashboard",
     descriptionKey: "office.sectionDashboardDescription",
     roles: OFFICE_DASHBOARD_ROLES,
+  },
+  {
+    key: "ceo",
+    href: "/ceo",
+    labelKey: "office.sectionCeo",
+    descriptionKey: "office.sectionCeoDescription",
+    roles: APPROVAL_QUEUE_ROLES,
   },
   {
     key: "gateways",

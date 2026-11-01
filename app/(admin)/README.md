@@ -42,8 +42,10 @@ Since STEP 069 the group also serves:
 | --- | --- | --- |
 | `/dashboard` (`dashboard/page.tsx`) | super_admin | the office home: gateway readiness, the roles held, the freshness of the second factor, and the screens the roles open |
 | `/gateways` (`gateways/page.tsx`) | super_admin | section 6's provider panel: store, test, enable and disable, with only the last four characters of a key ever read back |
+| `/ceo` (`ceo/page.tsx`) | ceo and super_admin | section 2's approval queue at both desks, the form that raises a request, and the country and KYC counts the chain decides |
 
-Both read through `lib/gateways/service.ts`, whose role constants the navigation imports, so the
+Each reads through the service that owns the screen - `lib/gateways/service.ts` and
+`lib/approvals/service.ts` - and the navigation imports those services' role constants, so the
 sidebar and the service cannot disagree about who may enter.
 
 ## One rule per screen
@@ -57,7 +59,7 @@ decides all seven roles. Run it with `node components/office/verify.ts`; the pac
 
 ## Later STEPs
 
-`070`-`078` build the remaining dashboards and the platform screens. Each one adds its page under this group,
+`071`-`078` build the remaining dashboards and the platform screens. Each one adds its page under this group,
 its entry to `OFFICE_NAVIGATION` in the same commit, and - where it adds a mutation - its own audit
 entry through `lib/security/audit.ts`. Step-up reauthentication for a sensitive action is STEP 053's
 `lib/auth/step-up.ts`, and the approval chain of `072` sits between the requester and the action.

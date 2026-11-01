@@ -80,6 +80,7 @@ export const CSRF_PROTECTED_PATHS: readonly string[] = Object.freeze([
   "/api/auth/sessions/revoke",
   "/api/office/2fa-reset-requests/decision",
   "/api/office/account-locks/unlock",
+  "/api/office/approvals",
   "/api/office/gateways",
   "/api/office/sessions/revoke",
 ]);

@@ -123,6 +123,11 @@ export const SENSITIVE_ENDPOINTS: readonly SensitiveEndpoint[] = [
   },
   {
     method: "POST",
+    path: "/api/office/approvals",
+    note: "Section 2's approval chain (STEP 070): a request into the queue says that money may move, so the browser that raises it is the one that signs.",
+  },
+  {
+    method: "POST",
     path: "/api/office/gateways",
     note: "Section 6's gateway page (STEP 069): storing a provider key or changing a provider's state is the request that decides where money is routed, so it is signed by the browser holding the key.",
   },
