@@ -284,6 +284,58 @@ The document, the theme and the header are built once in `app/layout.tsx`.
   colour literal or a palette step utility under `app/` and `components/`, and refuses a layout
   that lost the script, the skip link, the catalog driven attributes or the provider boundary.
 
+## Authentication and sessions
+
+`lib/auth/` is the contract every later authentication STEP is written against. STEP 037 builds the
+Supabase Auth client, the typed session reader and the gate over both; STEPs 038 to 055 add the
+routes, the pages, the device proof key, the rotating token and the login lock, and they extend
+this module rather than replace it.
+
+- `readSession(cookieHeader, { directory, cookiePolicy })` answers one of two values: an
+  authenticated `RequestActor`, or `unauthenticated` with a reason. `requireActor` turns the second
+  into `AUTHENTICATION_REQUIRED`, `requireAnyRole` answers `PERMISSION_DENIED`, and the reason is
+  written to the log and never to a response, because section 22 forbids an authentication error
+  that reveals anything about an account.
+- A token is evidence and the database is the authority. The claims of the access token give the
+  subject, the expiry and the assurance level; the roles, the company, the verification instant and
+  the confirmed TOTP come from `public.users` and the live rows of `public.role_assignments`, read
+  by primary key in one PostgREST request. `claims.subject` is `public.users.id`, so no mapping
+  table exists.
+- `buildAuthConfig` derives the Auth and PostgREST endpoints from `SUPABASE_URL`, and refuses the
+  four ways that pair can be wrong: http outside a local development environment, a path, query or
+  credential in the project URL, two identical keys, and a secret key in the anonymous slot or a
+  publishable key in the service role slot.
+- One transport performs every call: a ten second timeout combined with the caller's own signal,
+  a 64 KiB body ceiling checked before and after reading, `redirect: "error"` so a key never
+  follows a `Location`, no process cookie jar, the key as a header and never in a URL, and a failure
+  type with no message field.
+- The session cookie is `__Host-kd_session` wherever the environment is not development, and
+  `kd_session` there: `HttpOnly`, `SameSite=Strict`, `Path=/`, `Secure` between the two of them,
+  no `Domain`, and split into numbered 3180 byte chunks when a token pair does not fit. The
+  `__Host-` prefix is a browser enforced rule - a host only, Secure, path rooted cookie and no
+  `Domain` accepted - so a sibling subdomain cannot toss a forged session cookie onto the origin.
+  A missing chunk, a whole cookie beside chunks, or a payload whose user and token disagree is not
+  a session.
+- `failures.ts` collapses the provider's reasons into the platform's catalogue: a wrong password,
+  an unknown address and an unconfirmed address all become `AUTHENTICATION_REQUIRED` and nothing
+  else, a 429 keeps the `retry-after` delay, a 5xx becomes `DEPENDENCY_FAILED`, and a timeout is
+  `TIMEOUT`. The upstream code stays in the failure for the log and never reaches a response.
+- Two clients share the transport. `client.ts` is the anonymous path (sign up, password sign in,
+  email token, resend, recovery, refresh, sign out, get user); `admin-client.ts` is the service role
+  path (create with a platform chosen id, update, delete, read one, revoke every session of one
+  account) and it has no list-all-accounts method. The two anonymous mail endpoints treat a
+  rejection as accepted, so they cannot confirm whether an address has an account.
+- There is no browser client, by design: STEP 004 keeps the project URL and both keys on the
+  server, so the browser speaks only to the platform's own routes and holds nothing but an opaque
+  HttpOnly cookie.
+- `node lib/auth/verify.ts` drives the whole module through an injected transport and an in memory
+  directory: configuration refusals, claim reading, cookie round trip and chunking, failure
+  mapping, transport limits, the primary key lookup, every session rejection and both method sets.
+  The `check:auth` script line is an integrator request recorded in the STEP 037 handoff.
+- No migration, no environment variable and no error code was added by STEP 037: the tables and the
+  contract already existed, and the catalogue already describes every failure this module can
+  produce.
+
 ## Database schema and migrations
 
 `migrations/` holds the append-only SQL that builds the database; `npm run check:migrations` is

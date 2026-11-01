@@ -1,0 +1,1794 @@
+// path: lib/auth/verify.ts
+import { Buffer } from "node:buffer";
+import process from "node:process";
+import { AppError } from "../errors/app-error.ts";
+import { createAuthAdminClient } from "./admin-client.ts";
+import { createAuthClient } from "./client.ts";
+import { authAdminUserUrl, authTokenUrl, buildAuthConfig, type AuthConfig } from "./config.ts";
+import {
+  AUTH_COOKIE_MAXIMUM_CHUNKS,
+  clearSessionCookies,
+  createAuthCookiePolicy,
+  createCookiePolicy,
+  decodeSessionCookies,
+  encodeSessionCookies,
+  sessionCookieChunkCount,
+  type AuthCookiePolicy,
+  type SessionCookiePayload,
+} from "./cookies.ts";
+import { createInMemoryActorDirectory, createSupabaseActorDirectory, liveRoles } from "./directory.ts";
+import {
+  classifyAuthAnswer,
+  credentialRejectionError,
+  readUpstreamCode,
+  toAuthAppError,
+} from "./failures.ts";
+import { createAuthHttp, type AuthAnswer, type AuthFetch, type AuthHttp } from "./http.ts";
+import {
+  claimsAreCurrent,
+  decodeSessionClaims,
+  millisecondsUntilExpiry,
+  SESSION_CLAIM_CLOCK_SKEW_MS,
+} from "./jwt.ts";
+import {
+  hasAnyRole,
+  hasRole,
+  hasSatisfiedTwoFactor,
+  isTwoFactorEnrolmentRequired,
+  readSession,
+  requireActor,
+  requireAnyRole,
+  requireCompanyId,
+} from "./session.ts";
+import type { ActorRecord, AuthFailure, AuthOutcome, PlatformRole } from "./types.ts";
+
+/**
+ * The authentication gate. Run with `node lib/auth/verify.ts`.
+ *
+ * There is no Supabase project in this environment and there is not going to be one inside a
+ * gate, so every branch below is driven through the injected transport: a scripted answer for
+ * the client and the admin client, a stub `fetch` for the transport itself, and an in memory
+ * directory for the session reader. That is the point of taking those seams in the first place.
+ *
+ * The gate proves the properties a silent regression would break, in the order they matter:
+ *
+ *   1. configuration refuses the four ways a project URL or a key pair can be wrong;
+ *   2. an access token is read into claims, and an expired, truncated or malformed one is not;
+ *   3. a session cookie round trips, chunks without losing a byte, and refuses a gap;
+ *   4. an upstream answer becomes a catalogue code, and a rejected credential reveals nothing;
+ *   5. the transport times out, bounds its body, refuses a redirect and sends no key in a URL;
+ *   6. the directory is one primary key lookup with the service role, and a live role list;
+ *   7. the session reader answers authenticated or unauthenticated, and never a third thing;
+ *   8. the two clients keep their method sets, and the admin client never lists accounts.
+ */
+
+const failures: string[] = [];
+let checkCount = 0;
+
+function expect(condition: boolean, description: string): void {
+  checkCount += 1;
+
+  if (!condition) {
+    failures.push(description);
+  }
+}
+
+function expectEqual(actual: unknown, expected: unknown, description: string): void {
+  checkCount += 1;
+
+  if (actual !== expected) {
+    failures.push(
+      `${description} (expected ${JSON.stringify(expected)}, received ${JSON.stringify(actual)})`,
+    );
+  }
+}
+
+function expectThrows(action: () => unknown, description: string): unknown {
+  checkCount += 1;
+
+  try {
+    const value = action();
+    failures.push(`${description} (nothing was thrown)`);
+
+    return value;
+  } catch (error) {
+    return error;
+  }
+}
+
+function expectAppError(action: () => unknown, code: string, description: string): void {
+  const error = expectThrows(action, description);
+
+  expect(error instanceof AppError, `${description} (the failure must be an AppError)`);
+
+  if (error instanceof AppError) {
+    expectEqual(error.code, code, `${description} (catalogue code)`);
+  }
+}
+
+async function expectRejects(
+  action: () => Promise<unknown>,
+  code: string,
+  description: string,
+): Promise<void> {
+  checkCount += 1;
+
+  try {
+    await action();
+    failures.push(`${description} (nothing was rejected)`);
+  } catch (error) {
+    if (!(error instanceof AppError)) {
+      failures.push(`${description} (the rejection must be an AppError)`);
+      return;
+    }
+
+    expectEqual(error.code, code, `${description} (catalogue code)`);
+  }
+}
+
+const NOW = 1_800_000_000_000;
+const USER_ID = "018f3b1c-1111-7c2a-9d1e-2b3c4d5e6f70";
+const OTHER_USER_ID = "018f3b1c-3333-7c2a-9d1e-2b3c4d5e6f72";
+const SESSION_ID = "018f3b1c-2222-7c2a-9d1e-2b3c4d5e6f71";
+const FIRM_ID = "018f3b1c-4444-7c2a-9d1e-2b3c4d5e6f73";
+
+const environment = {
+  SUPABASE_URL: "https://project-ref.supabase.co",
+  SUPABASE_ANON_KEY: "anon-key-0000000000000000000000000000",
+  SUPABASE_SERVICE_ROLE_KEY: "service-role-key-00000000000000000000",
+  NODE_ENV: "production",
+};
+
+const config: AuthConfig = buildAuthConfig(environment);
+
+function baseClaims(overrides: Readonly<Record<string, unknown>> = {}): Record<string, unknown> {
+  return {
+    sub: USER_ID,
+    exp: Math.floor(NOW / 1000) + 3_600,
+    iat: Math.floor(NOW / 1000) - 60,
+    session_id: SESSION_ID,
+    aal: "aal1",
+    amr: [{ method: "password", timestamp: Math.floor(NOW / 1000) - 60 }],
+    role: "authenticated",
+    email: "owner@example.com",
+    ...overrides,
+  };
+}
+
+function makeAccessToken(claims: Readonly<Record<string, unknown>>): string {
+  const header = Buffer.from(JSON.stringify({ alg: "HS256", typ: "JWT" }), "utf8").toString(
+    "base64url",
+  );
+  const payload = Buffer.from(JSON.stringify(claims), "utf8").toString("base64url");
+
+  return `${header}.${payload}.${Buffer.from("gate-signature", "utf8").toString("base64url")}`;
+}
+
+function okAnswer(
+  status: number,
+  body: unknown,
+  retryAfterSeconds: number | null = null,
+): AuthOutcome<AuthAnswer> {
+  return { ok: true, value: { status, body, retryAfterSeconds } };
+}
+
+function failureAnswer(failure: AuthFailure): AuthOutcome<AuthAnswer> {
+  return { ok: false, failure };
+}
+
+function authFailure(kind: AuthFailure["kind"], status: number | null = null): AuthFailure {
+  return { kind, status, code: null, retryAfterSeconds: null };
+}
+
+interface StubHttp {
+  readonly http: AuthHttp;
+  readonly requests: AuthRequestRecord[];
+}
+
+interface AuthRequestRecord {
+  readonly method: string;
+  readonly url: string;
+  readonly apiKey: string;
+  readonly bearerToken: string | undefined;
+  readonly body: unknown;
+}
+
+function createStubHttp(
+  ...answers: readonly AuthOutcome<AuthAnswer>[]
+): StubHttp {
+  const requests: AuthRequestRecord[] = [];
+  let index = 0;
+
+  return {
+    requests,
+    http: {
+      send(request): Promise<AuthOutcome<AuthAnswer>> {
+        requests.push({
+          method: request.method,
+          url: request.url,
+          apiKey: request.apiKey,
+          bearerToken: request.bearerToken,
+          body: request.body,
+        });
+
+        const answer = answers[index] ?? okAnswer(500, { code: "gate_missing_answer" });
+        index += 1;
+
+        return Promise.resolve(answer);
+      },
+    },
+  };
+}
+
+function firstRequest(requests: readonly AuthRequestRecord[], description: string): AuthRequestRecord | null {
+  const request = requests[0];
+
+  if (request === undefined) {
+    checkCount += 1;
+    failures.push(`${description} (no request was sent)`);
+
+    return null;
+  }
+
+  return request;
+}
+
+/* ------------------------------------------------------------------ 1. config */
+
+function checkConfig(): void {
+  expectEqual(config.projectUrl, "https://project-ref.supabase.co", "the project origin is kept");
+  expectEqual(
+    config.endpoints.token,
+    "https://project-ref.supabase.co/auth/v1/token",
+    "the token endpoint is derived from the origin",
+  );
+  expectEqual(
+    config.endpoints.usersTable,
+    "https://project-ref.supabase.co/rest/v1/users",
+    "the PostgREST users table URL is derived from the origin",
+  );
+  expectEqual(config.secureCookies, true, "production writes Secure cookies");
+  expect(Object.isFrozen(config), "the configuration is frozen");
+  expect(Object.isFrozen(config.endpoints), "the endpoint table is frozen");
+  expectEqual(config.requestTimeoutMs, 10_000, "the timeout is the documented ten seconds");
+  expectEqual(
+    config.maximumResponseBytes,
+    65_536,
+    "the response ceiling is the documented 64 KiB",
+  );
+
+  expectEqual(
+    authTokenUrl(config, "password"),
+    "https://project-ref.supabase.co/auth/v1/token?grant_type=password",
+    "the token URL carries the grant type",
+  );
+  expectEqual(
+    authAdminUserUrl(config, USER_ID),
+    `https://project-ref.supabase.co/auth/v1/admin/users/${USER_ID}`,
+    "the admin user URL is one identifier",
+  );
+
+  expectThrows(
+    () => buildAuthConfig({ ...environment, SUPABASE_URL: "http://project-ref.supabase.co" }),
+    "an http project URL is refused in production",
+  );
+  expectThrows(
+    () => buildAuthConfig({ ...environment, SUPABASE_URL: "https://project-ref.supabase.co/auth" }),
+    "a project URL with a path is refused",
+  );
+  expectThrows(
+    () => buildAuthConfig({ ...environment, SUPABASE_URL: "https://project-ref.supabase.co/?a=1" }),
+    "a project URL with a query is refused",
+  );
+  expectThrows(
+    () => buildAuthConfig({ ...environment, SUPABASE_URL: "https://key:secret@project-ref.supabase.co" }),
+    "a project URL with a credential is refused",
+  );
+  expectThrows(
+    () => buildAuthConfig({ ...environment, SUPABASE_URL: "not-a-url" }),
+    "a project URL that is not absolute is refused",
+  );
+  expectThrows(
+    () =>
+      buildAuthConfig({
+        ...environment,
+        SUPABASE_SERVICE_ROLE_KEY: environment.SUPABASE_ANON_KEY,
+      }),
+    "the two keys must be different",
+  );
+  expectThrows(
+    () =>
+      buildAuthConfig({
+        ...environment,
+        SUPABASE_ANON_KEY: `sb_secret_${"0".repeat(40)}`,
+      }),
+    "a secret key in the anonymous slot is refused",
+  );
+  expectThrows(
+    () =>
+      buildAuthConfig({
+        ...environment,
+        SUPABASE_SERVICE_ROLE_KEY: `sb_publishable_${"0".repeat(40)}`,
+      }),
+    "a publishable key in the service role slot is refused",
+  );
+  expectThrows(
+    () => buildAuthConfig({ ...environment, SUPABASE_ANON_KEY: "short" }),
+    "a key below the minimum length is refused",
+  );
+  expectThrows(
+    () => buildAuthConfig({ ...environment, SUPABASE_ANON_KEY: ` ${environment.SUPABASE_ANON_KEY}` }),
+    "an untrimmed key is refused",
+  );
+
+  const development = buildAuthConfig({
+    ...environment,
+    NODE_ENV: "development",
+    SUPABASE_URL: "http://127.0.0.1:54321",
+  });
+
+  expectEqual(development.secureCookies, false, "development over loopback may skip Secure");
+  expectEqual(
+    buildAuthConfig({ ...environment, NODE_ENV: "test" }).secureCookies,
+    true,
+    "test still requires Secure cookies",
+  );
+  expectEqual(
+    buildAuthConfig({ ...environment, NODE_ENV: "development" }).secureCookies,
+    false,
+    "development does not require a Secure cookie",
+  );
+}
+
+/* ------------------------------------------------------------------ 2. claims */
+
+function checkClaims(): void {
+  const claims = decodeSessionClaims(makeAccessToken(baseClaims()));
+
+  expect(claims !== null, "a well formed access token decodes");
+
+  if (claims === null) {
+    return;
+  }
+
+  expectEqual(claims.subject, USER_ID, "the subject is read");
+  expectEqual(claims.sessionId, SESSION_ID, "the session identifier is read");
+  expectEqual(claims.assuranceLevel, "aal1", "the assurance level is read");
+  expectEqual(claims.email, "owner@example.com", "the email claim is read");
+  expectEqual(claims.methods.length, 1, "the authentication methods are read");
+  expectEqual(claims.methods[0], "password", "the method name is read");
+  expectEqual(claims.expiresAtEpochMs, (Math.floor(NOW / 1000) + 3_600) * 1000, "expiry in ms");
+  expectEqual(
+    millisecondsUntilExpiry(claims, NOW),
+    3_600_000,
+    "the remaining lifetime is computed from the claim",
+  );
+  expect(claimsAreCurrent(claims, NOW), "a fresh token is current");
+  expect(
+    !claimsAreCurrent(claims, NOW + 3_600_000 - SESSION_CLAIM_CLOCK_SKEW_MS / 2),
+    "a token inside the clock skew window is already treated as expired",
+  );
+
+  const secondFactor = decodeSessionClaims(makeAccessToken(baseClaims({ aal: "aal2" })));
+
+  expectEqual(secondFactor?.assuranceLevel, "aal2", "the second factor level is read");
+
+  const withoutOptional = decodeSessionClaims(
+    makeAccessToken({ sub: USER_ID, exp: Math.floor(NOW / 1000) + 600 }),
+  );
+
+  expectEqual(withoutOptional?.sessionId, null, "a token without a session id is accepted");
+  expectEqual(withoutOptional?.assuranceLevel, "aal1", "a token without a level is aal1");
+  expectEqual(withoutOptional?.email, null, "a token without an email has none");
+  expectEqual(withoutOptional?.methods.length, 0, "a token without methods has an empty list");
+
+  const withUnknownClaim = decodeSessionClaims(makeAccessToken(baseClaims({ is_anonymous: false })));
+
+  expect(withUnknownClaim !== null, "an unknown claim does not break a token");
+
+  expectEqual(decodeSessionClaims(""), null, "an empty token is rejected");
+  expectEqual(decodeSessionClaims("one.two"), null, "a two segment token is rejected");
+  expectEqual(decodeSessionClaims(`a.${Buffer.from("not json", "utf8").toString("base64url")}.c`), null, "a payload that is not JSON is rejected");
+  expectEqual(
+    decodeSessionClaims(`a.${Buffer.from(JSON.stringify({ exp: 1 }), "utf8").toString("base64url")}.c`),
+    null,
+    "a token without a subject is rejected",
+  );
+  expectEqual(
+    decodeSessionClaims(
+      makeAccessToken(baseClaims({ sub: "x".repeat(65) })),
+    ),
+    null,
+    "a subject longer than an identifier is rejected",
+  );
+  expectEqual(
+    decodeSessionClaims(
+      makeAccessToken(baseClaims({ aal: "aal3" })),
+    ),
+    null,
+    "an assurance level the platform does not know is rejected",
+  );
+  expectEqual(decodeSessionClaims("a".repeat(5_000)), null, "an oversized token is rejected");
+  expectEqual(
+    decodeSessionClaims(
+      `a.${Buffer.from("{}", "utf8").toString("base64url")}.c`,
+    ),
+    null,
+    "a token without an expiry is rejected",
+  );
+}
+
+/* ------------------------------------------------------------------ 3. cookies */
+
+const developmentConfig: AuthConfig = buildAuthConfig({
+  ...environment,
+  NODE_ENV: "development",
+});
+
+function cookiePolicy(secure = true): AuthCookiePolicy {
+  return createAuthCookiePolicy(secure ? config : developmentConfig, 3_600);
+}
+
+function sessionPayload(
+  overrides: Partial<SessionCookiePayload> = {},
+): SessionCookiePayload {
+  return {
+    accessToken: makeAccessToken(baseClaims()),
+    refreshToken: "refresh-token-000000000000000000",
+    expiresAtEpochMs: NOW + 3_600_000,
+    userId: USER_ID,
+    sessionId: SESSION_ID,
+    ...overrides,
+  };
+}
+
+function bareCookies(cookies: readonly string[]): string {
+  return cookies.map((cookie) => cookie.split(";", 1)[0] ?? "").join("; ");
+}
+
+function checkCookies(): void {
+  const policy = cookiePolicy();
+  const payload = sessionPayload();
+  const cookies = encodeSessionCookies(policy, payload, NOW);
+
+  expectEqual(cookies.length, 1, "a small session fits one cookie");
+
+  const cookie = cookies[0] ?? "";
+
+  expectEqual(policy.name, "__Host-kd_session", "a secure environment prefixes the cookie name");
+  expect(cookie.startsWith(`${policy.name}=`), "the cookie carries the documented name");
+  expect(cookie.includes("HttpOnly"), "the cookie is HttpOnly");
+  expect(cookie.includes("Secure"), "the cookie is Secure outside development");
+  expect(cookie.includes("SameSite=Strict"), "the cookie is SameSite Strict");
+  expect(cookie.includes("Path=/"), "the cookie is scoped to the whole site");
+  expect(cookie.includes("Max-Age=3600"), "the cookie lifetime is the session lifetime");
+  expect(!cookie.includes("Domain="), "the cookie has no Domain attribute");
+
+  const decoded = decodeSessionCookies(policy, cookie);
+
+  expectEqual(decoded?.userId, USER_ID, "a single cookie round trips the user");
+  expectEqual(decoded?.sessionId, SESSION_ID, "a single cookie round trips the session");
+  expectEqual(decoded?.accessToken, payload.accessToken, "a single cookie round trips the token");
+  expectEqual(
+    decoded?.refreshToken,
+    payload.refreshToken,
+    "a single cookie round trips the refresh token",
+  );
+
+  expectEqual(
+    encodeSessionCookies(cookiePolicy(false), payload, NOW)[0]?.includes("Secure"),
+    false,
+    "a development cookie skips the Secure flag",
+  );
+  expectEqual(
+    cookiePolicy(false).name,
+    "kd_session",
+    "a development environment uses the unprefixed name",
+  );
+  expect(
+    !(encodeSessionCookies(cookiePolicy(false), payload, NOW)[0] ?? "").includes("__Host-"),
+    "a development cookie never claims the secure prefix",
+  );
+  expectThrows(
+    () =>
+      createCookiePolicy({
+        name: "__Host-kd_session",
+        secure: false,
+        defaultMaxAgeSeconds: 3_600,
+      }),
+    "a secure prefix without the Secure flag is refused",
+  );
+  expectEqual(
+    encodeSessionCookies(
+      createCookiePolicy({ secure: true, defaultMaxAgeSeconds: 600 }),
+      payload,
+      NOW,
+    )[0]?.includes("Max-Age=600"),
+    true,
+    "the policy lifetime caps the cookie lifetime",
+  );
+  expect(
+    (encodeSessionCookies(policy, sessionPayload({ expiresAtEpochMs: NOW + 60_000 }), NOW)[0] ?? "")
+      .includes("Max-Age=60"),
+    "a session expiring sooner produces a shorter cookie",
+  );
+
+  const largePayload = sessionPayload({
+    accessToken: "t".repeat(4_000),
+    refreshToken: "r".repeat(2_000),
+  });
+  const chunked = encodeSessionCookies(policy, largePayload, NOW);
+
+  expect(chunked.length > 1, "a large session is split into chunks");
+  expect(chunked.length <= AUTH_COOKIE_MAXIMUM_CHUNKS, "the chunk count stays inside the budget");
+  expect(
+    chunked[0]?.startsWith(`${policy.name}.0=`) === true,
+    "the first chunk is numbered zero",
+  );
+  expect(
+    chunked[1]?.startsWith(`${policy.name}.1=`) === true,
+    "the second chunk is numbered one",
+  );
+
+  const joined = bareCookies(chunked);
+  const reassembled = decodeSessionCookies(policy, joined);
+
+  expectEqual(reassembled?.accessToken, largePayload.accessToken, "chunking loses no byte");
+  expect(chunked.length >= 3, "a large token pair needs three chunks");
+  expectEqual(
+    sessionCookieChunkCount(policy, joined),
+    chunked.length,
+    "the chunk count is read from the header",
+  );
+
+  const parts = joined.split("; ");
+  const withGap = [parts[0], parts[parts.length - 1]].filter((part) => part !== undefined).join("; ");
+
+  expectEqual(decodeSessionCookies(policy, withGap), null, "a gap in the chunks is refused");
+
+  expectEqual(
+    decodeSessionCookies(policy, `${joined}; ${policy.name}=${payload.accessToken}`),
+    null,
+    "a header with both a whole cookie and chunks is refused",
+  );
+  expectEqual(
+    decodeSessionCookies(policy, "theme=dark; locale=en; __Host-x=1"),
+    null,
+    "a header without this cookie is not a session",
+  );
+
+  const singleValue = cookie.split(";", 1)[0] ?? "";
+  const tampered = `${singleValue.slice(0, -1)}${singleValue.endsWith("A") ? "B" : "A"}`;
+
+  expectEqual(decodeSessionCookies(policy, tampered), null, "a tampered value is refused");
+  expectEqual(decodeSessionCookies(policy, null), null, "no header is no session");
+  expectEqual(decodeSessionCookies(policy, ""), null, "an empty header is no session");
+  expectEqual(sessionCookieChunkCount(policy, null), 0, "no header means no chunk to clear");
+
+  expectEqual(
+    decodeSessionCookies(policy, `${policy.name}=not-base64-json`),
+    null,
+    "a value that is not our payload is refused",
+  );
+
+  const clear = clearSessionCookies(policy, 2);
+
+  expectEqual(clear.length, 3, "clearing expires the cookie and both chunks");
+  expect(
+    clear.every((value) => value.includes("Max-Age=0")),
+    "a cleared cookie expires at once",
+  );
+  expect(
+    clear.every((value) => value.includes("Path=/") && value.includes("HttpOnly")),
+    "a cleared cookie carries the attributes it was written with",
+  );
+  expect(
+    (clear[0] ?? "").startsWith(`${policy.name}=;`),
+    "the whole cookie is cleared first",
+  );
+
+  expectThrows(
+    () => createCookiePolicy({ secure: true, defaultMaxAgeSeconds: 3_600, name: "bad name" }),
+    "a cookie name that is not cookie safe is refused",
+  );
+  expectThrows(
+    () => createCookiePolicy({ secure: true, defaultMaxAgeSeconds: 0 }),
+    "a cookie policy without a lifetime is refused",
+  );
+  expectThrows(
+    () => encodeSessionCookies(policy, sessionPayload({ accessToken: "x".repeat(5_000) }), NOW),
+    "a payload outside the schema is not written",
+  );
+}
+
+/* ------------------------------------------------------------------ 4. failures */
+
+function checkFailures(): void {
+  expectEqual(classifyAuthAnswer({ status: 200, body: {}, retryAfterSeconds: null }), null, "a success is not a failure");
+  expectEqual(classifyAuthAnswer({ status: 204, body: null, retryAfterSeconds: null }), null, "no content is a success");
+
+  const invalidCredentials = classifyAuthAnswer({
+    status: 400,
+    body: { code: "invalid_credentials", message: "Invalid login credentials" },
+    retryAfterSeconds: null,
+  });
+  const emailNotConfirmed = classifyAuthAnswer({
+    status: 400,
+    body: { code: "email_not_confirmed", msg: "Email not confirmed" },
+    retryAfterSeconds: null,
+  });
+  const unknownUser = classifyAuthAnswer({
+    status: 400,
+    body: { error: "invalid_grant", error_description: "User not found" },
+    retryAfterSeconds: null,
+  });
+
+  expectEqual(invalidCredentials?.kind, "rejected", "a wrong password is a rejection");
+  expectEqual(emailNotConfirmed?.kind, "rejected", "an unconfirmed address is a rejection");
+  expectEqual(unknownUser?.kind, "rejected", "an unknown account is a rejection");
+  expectEqual(
+    toAuthAppError(invalidCredentials ?? authFailure("rejected")).code,
+    "AUTHENTICATION_REQUIRED",
+    "a wrong password answers authentication required",
+  );
+  expectEqual(
+    toAuthAppError(emailNotConfirmed ?? authFailure("rejected")).code,
+    toAuthAppError(invalidCredentials ?? authFailure("rejected")).code,
+    "an unconfirmed address answers exactly like a wrong password",
+  );
+  expectEqual(
+    toAuthAppError(unknownUser ?? authFailure("rejected")).code,
+    toAuthAppError(invalidCredentials ?? authFailure("rejected")).code,
+    "an unknown account answers exactly like a wrong password",
+  );
+  expectEqual(
+    toAuthAppError(invalidCredentials ?? authFailure("rejected"), "registration").code,
+    "VALIDATION_FAILED",
+    "a rejected registration is a validation failure",
+  );
+
+  const rateLimited = classifyAuthAnswer({
+    status: 429,
+    body: { code: "over_request_rate_limit" },
+    retryAfterSeconds: 12,
+  });
+  const rateLimitedWithoutHeader = classifyAuthAnswer({
+    status: 429,
+    body: null,
+    retryAfterSeconds: null,
+  });
+
+  expectEqual(rateLimited?.kind, "rate-limited", "a 429 is a rate limit");
+  expectEqual(rateLimited?.retryAfterSeconds, 12, "the upstream delay is kept");
+  expectEqual(
+    toAuthAppError(rateLimited ?? authFailure("rate-limited")).retryAfterSeconds,
+    12,
+    "the catalogue answer carries the delay",
+  );
+  expectEqual(
+    rateLimitedWithoutHeader?.retryAfterSeconds,
+    60,
+    "a rate limit without a delay gets the documented default",
+  );
+
+  expectEqual(
+    classifyAuthAnswer({ status: 503, body: null, retryAfterSeconds: null })?.kind,
+    "upstream",
+    "a provider failure is an upstream failure",
+  );
+  expectEqual(
+    classifyAuthAnswer({ status: 418, body: null, retryAfterSeconds: null })?.kind,
+    "upstream",
+    "an unexpected status is an upstream failure",
+  );
+  expectEqual(
+    toAuthAppError(authFailure("upstream")).code,
+    "DEPENDENCY_FAILED",
+    "an upstream failure answers dependency failed",
+  );
+  expectEqual(
+    toAuthAppError(authFailure("timeout")).code,
+    "TIMEOUT",
+    "a timeout answers timeout",
+  );
+  expectEqual(
+    toAuthAppError(authFailure("network")).code,
+    "DEPENDENCY_FAILED",
+    "a network failure answers dependency failed",
+  );
+  expectEqual(
+    toAuthAppError(authFailure("malformed-response")).code,
+    "DEPENDENCY_FAILED",
+    "an unreadable answer answers dependency failed",
+  );
+
+  expectEqual(
+    readUpstreamCode({ code: "invalid_credentials" }),
+    "invalid_credentials",
+    "an upstream code is read",
+  );
+  expectEqual(
+    readUpstreamCode({ error: "invalid_grant" }),
+    "invalid_grant",
+    "the legacy error field is read",
+  );
+  expectEqual(
+    readUpstreamCode({ code: "Invalid login credentials for the supplied address" }),
+    null,
+    "a sentence is not accepted as a code",
+  );
+  expectEqual(readUpstreamCode("a string body"), null, "a string body has no code");
+  expectEqual(readUpstreamCode([{ code: "x" }]), null, "an array body has no code");
+
+  const rejection = credentialRejectionError();
+
+  expectEqual(rejection.code, "AUTHENTICATION_REQUIRED", "the sign in rejection is the generic one");
+  expectEqual(rejection.status, 401, "the sign in rejection answers 401");
+  expectEqual(
+    rejection.message,
+    "AUTHENTICATION_REQUIRED",
+    "the rejection carries a code and never a sentence",
+  );
+  expectEqual(
+    credentialRejectionError().message,
+    credentialRejectionError().message,
+    "two sign in rejections are identical",
+  );
+
+  const withCode = toAuthAppError({
+    kind: "rejected",
+    status: 400,
+    code: "invalid_credentials",
+    retryAfterSeconds: null,
+  });
+
+  expect(
+    !JSON.stringify({ code: withCode.code, message: withCode.message }).includes("invalid_credentials"),
+    "no upstream code reaches the failure a caller sees",
+  );
+}
+
+/* ------------------------------------------------------------------ 5. transport */
+
+function jsonResponse(body: unknown, status = 200, headers: Record<string, string> = {}): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "content-type": "application/json", ...headers },
+  });
+}
+
+async function checkTransport(): Promise<void> {
+  const seen: { url: string; init: RequestInit }[] = [];
+  const fetchStub: AuthFetch = (url, init) => {
+    seen.push({ url, init });
+
+    return Promise.resolve(jsonResponse({ ok: true }, 200, { "retry-after": "30" }));
+  };
+  const http = createAuthHttp({ fetch: fetchStub });
+
+  const answer = await http.send({
+    method: "POST",
+    url: config.endpoints.token,
+    apiKey: config.anonymousKey,
+    bearerToken: "access-token",
+    body: { email: "owner@example.com" },
+  });
+
+  expect(answer.ok, "a successful answer is returned");
+
+  const call = seen[0];
+
+  expect(call !== undefined, "the transport performed one request");
+
+  if (call === undefined || !answer.ok) {
+    return;
+  }
+
+  expectEqual(call.init.method, "POST", "the method reaches fetch");
+  expectEqual(call.init.redirect, "error", "a redirect is an error, never a hop");
+  expectEqual(call.init.credentials, "omit", "no process cookie jar reaches the provider");
+  expectEqual(answer.value.status, 200, "the status is returned");
+
+  const headers = new Headers(call.init.headers);
+
+  expectEqual(headers.get("apikey"), config.anonymousKey, "the key travels as the apikey header");
+  expectEqual(headers.get("authorization"), "Bearer access-token", "a bearer token is sent when given");
+  expectEqual(headers.get("content-type"), "application/json", "a body is JSON");
+  expectEqual(headers.get("x-client-info"), "kd-solution-it", "the client identifies the platform");
+  expect(!call.url.includes("anon-key"), "no key is placed in a URL");
+  expectEqual(answer.value.retryAfterSeconds, 30, "the retry-after header is read");
+
+  const emptyBody = await createAuthHttp({
+    fetch: () => Promise.resolve(new Response(null, { status: 204 })),
+  }).send({ method: "POST", url: config.endpoints.logout, apiKey: config.anonymousKey });
+
+  expect(emptyBody.ok && emptyBody.value.body === null, "an answer without a body is null");
+
+  const timeout = await createAuthHttp({
+    fetch: () => Promise.reject(new DOMException("timed out", "TimeoutError")),
+  }).send({ method: "GET", url: config.endpoints.user, apiKey: config.anonymousKey });
+
+  expect(!timeout.ok && timeout.failure.kind === "timeout", "a timeout is a timeout failure");
+
+  const network = await createAuthHttp({
+    fetch: () => Promise.reject(new TypeError("fetch failed")),
+  }).send({ method: "GET", url: config.endpoints.user, apiKey: config.anonymousKey });
+
+  expect(!network.ok && network.failure.kind === "network", "a socket failure is a network failure");
+
+  const controller = new AbortController();
+  const cancelled = await createAuthHttp({
+    fetch: () => {
+      controller.abort();
+
+      return Promise.reject(new DOMException("aborted", "AbortError"));
+    },
+  }).send({
+    method: "GET",
+    url: config.endpoints.user,
+    apiKey: config.anonymousKey,
+    signal: controller.signal,
+  });
+
+  expect(
+    !cancelled.ok && cancelled.failure.kind === "network",
+    "a call the caller cancelled is not reported as a timeout",
+  );
+
+  const malformed = await createAuthHttp({
+    fetch: () => Promise.resolve(new Response("<html>gateway</html>", { status: 200 })),
+  }).send({ method: "GET", url: config.endpoints.user, apiKey: config.anonymousKey });
+
+  expect(
+    !malformed.ok && malformed.failure.kind === "malformed-response",
+    "a body that is not JSON is a malformed answer",
+  );
+
+  const oversizedDeclared = await createAuthHttp({
+    fetch: () =>
+      Promise.resolve(
+        new Response("{}", { status: 200, headers: { "content-length": "70000" } }),
+      ),
+  }).send({ method: "GET", url: config.endpoints.user, apiKey: config.anonymousKey });
+
+  expect(
+    !oversizedDeclared.ok && oversizedDeclared.failure.kind === "malformed-response",
+    "a declared length over the ceiling is refused before reading",
+  );
+
+  const oversizedBody = await createAuthHttp({
+    maximumResponseBytes: 16,
+    fetch: () => Promise.resolve(new Response(JSON.stringify({ value: "x".repeat(64) }))),
+  }).send({ method: "GET", url: config.endpoints.user, apiKey: config.anonymousKey });
+
+  expect(
+    !oversizedBody.ok && oversizedBody.failure.kind === "malformed-response",
+    "a body over the ceiling is refused after reading",
+  );
+
+  const noBody = await createAuthHttp({
+    fetch: (_url, init) => {
+      expect(new Headers(init.headers).get("content-type") === null, "no body means no content type");
+
+      return Promise.resolve(jsonResponse({}));
+    },
+  }).send({ method: "GET", url: config.endpoints.user, apiKey: config.anonymousKey });
+
+  expect(noBody.ok, "a GET without a body is accepted");
+}
+
+/* ------------------------------------------------------------------ 6. directory */
+
+const activeOwner: ActorRecord = {
+  userId: USER_ID,
+  companyId: FIRM_ID,
+  status: "active",
+  roles: ["owner"],
+  emailVerifiedAtEpochMs: NOW - 86_400_000,
+  totpConfirmedAtEpochMs: NOW - 86_400_000,
+  deletedAtEpochMs: null,
+};
+
+async function checkDirectory(): Promise<void> {
+  expectEqual(liveRoles([{ role: "owner" }]).length, 1, "a live grant is kept");
+
+  const filtered = liveRoles([
+    { role: "support" },
+    { role: "owner" },
+    { role: "support" },
+    { role: "ceo" },
+    { role: "not_a_role" },
+  ]);
+
+  expectEqual(filtered.length, 3, "duplicate and unknown roles are dropped");
+  expectEqual(filtered[0], "ceo", "roles are sorted");
+  expectEqual(filtered[1], "owner", "roles are sorted");
+  expectEqual(filtered[2], "support", "roles are sorted");
+
+  const memoryDirectory = createInMemoryActorDirectory([activeOwner]);
+
+  expectEqual((await memoryDirectory.findActor(USER_ID))?.userId, USER_ID, "memory finds an actor");
+  expectEqual(await memoryDirectory.findActor(OTHER_USER_ID), null, "memory misses an unknown actor");
+
+  const stub = createStubHttp(
+    okAnswer(200, [
+      {
+        id: USER_ID,
+        company_id: FIRM_ID,
+        status: "active",
+        email_verified_at: "2026-01-01T00:00:00.000Z",
+        totp_confirmed_at: "2026-01-02T00:00:00.000Z",
+        deleted_at: null,
+        role_assignments: [
+          { role: "owner", revoked_at: null, deleted_at: null },
+          { role: "support", revoked_at: "2026-01-03T00:00:00.000Z", deleted_at: null },
+          { role: "ceo", revoked_at: null, deleted_at: "2026-01-04T00:00:00.000Z" },
+        ],
+      },
+    ]),
+  );
+  const directory = createSupabaseActorDirectory(config, stub.http);
+  const actor = await directory.findActor(USER_ID);
+  const request = firstRequest(stub.requests, "the directory asked the database");
+
+  if (request !== null) {
+    expect(request.url.startsWith(`${config.endpoints.usersTable}?select=`), "the lookup names its columns");
+    expect(request.url.includes(`id=eq.${USER_ID}`), "the lookup filters on the primary key");
+    expect(request.url.includes("limit=1"), "the lookup asks for one row");
+    expect(!request.url.includes("select=*"), "the lookup never selects every column");
+    expect(!request.url.includes("password"), "the lookup never reads a credential");
+    expectEqual(request.apiKey, config.serviceRoleKey, "the lookup uses the service role key");
+    expectEqual(request.bearerToken, config.serviceRoleKey, "the lookup authenticates as service role");
+  }
+
+  expectEqual(actor?.userId, USER_ID, "the directory maps the row");
+  expectEqual(actor?.companyId, FIRM_ID, "the directory maps the company");
+  expectEqual(actor?.roles.length, 1, "only live grants become roles");
+  expectEqual(actor?.roles[0], "owner", "the live grant is the owner role");
+  expectEqual(
+    actor?.totpConfirmedAtEpochMs,
+    Date.parse("2026-01-02T00:00:00.000Z"),
+    "the TOTP instant is mapped",
+  );
+  expectEqual(actor?.deletedAtEpochMs, null, "a live account has no deletion instant");
+
+  const emptyStub = createStubHttp(okAnswer(200, []));
+
+  expectEqual(
+    await createSupabaseActorDirectory(config, emptyStub.http).findActor(USER_ID),
+    null,
+    "no row is no actor",
+  );
+
+  const invalidStub = createStubHttp(okAnswer(200, []));
+
+  expectEqual(
+    await createSupabaseActorDirectory(config, invalidStub.http).findActor("not-a-uuid"),
+    null,
+    "a subject that is not a uuid is not looked up",
+  );
+  expectEqual(invalidStub.requests.length, 0, "a subject that is not a uuid sends no query");
+
+  const duplicatedStub = createStubHttp(
+    okAnswer(200, [
+      {
+        id: USER_ID,
+        company_id: null,
+        status: "active",
+        email_verified_at: null,
+        totp_confirmed_at: null,
+        deleted_at: null,
+        role_assignments: [],
+      },
+      {
+        id: USER_ID,
+        company_id: null,
+        status: "active",
+        email_verified_at: null,
+        totp_confirmed_at: null,
+        deleted_at: null,
+        role_assignments: [],
+      },
+    ]),
+  );
+
+  await expectRejects(
+    () => createSupabaseActorDirectory(config, duplicatedStub.http).findActor(USER_ID),
+    "DEPENDENCY_FAILED",
+    "two rows for one primary key are a platform failure",
+  );
+
+  const brokenStub = createStubHttp(failureAnswer(authFailure("upstream", 503)));
+
+  await expectRejects(
+    () => createSupabaseActorDirectory(config, brokenStub.http).findActor(USER_ID),
+    "DEPENDENCY_FAILED",
+    "a directory outage is not an empty role list",
+  );
+
+  const unauthorisedStub = createStubHttp(okAnswer(401, { message: "no" }));
+
+  await expectRejects(
+    () => createSupabaseActorDirectory(config, unauthorisedStub.http).findActor(USER_ID),
+    "DEPENDENCY_FAILED",
+    "a rejected service key is a deployment failure, not a merchant problem",
+  );
+
+  const malformedStub = createStubHttp(okAnswer(200, [{ id: USER_ID, status: "unknown_status" }]));
+
+  await expectRejects(
+    () => createSupabaseActorDirectory(config, malformedStub.http).findActor(USER_ID),
+    "DEPENDENCY_FAILED",
+    "a status the schema does not allow is a platform failure",
+  );
+
+  const badTimestampStub = createStubHttp(
+    okAnswer(200, [
+      {
+        id: USER_ID,
+        company_id: null,
+        status: "active",
+        email_verified_at: "not-a-date",
+        totp_confirmed_at: null,
+        deleted_at: null,
+        role_assignments: [],
+      },
+    ]),
+  );
+
+  await expectRejects(
+    () => createSupabaseActorDirectory(config, badTimestampStub.http).findActor(USER_ID),
+    "DEPENDENCY_FAILED",
+    "a timestamp that cannot be parsed is a platform failure",
+  );
+}
+
+/* ------------------------------------------------------------------ 7. session */
+
+function sessionCookie(
+  policy: AuthCookiePolicy,
+  claims: Readonly<Record<string, unknown>>,
+  overrides: Partial<SessionCookiePayload> = {},
+): string {
+  const payload = sessionPayload({
+    accessToken: makeAccessToken(claims),
+    expiresAtEpochMs: Number(claims["exp"] ?? 0) * 1000,
+    ...overrides,
+  });
+
+  return bareCookies(encodeSessionCookies(policy, payload, NOW));
+}
+
+async function checkSession(): Promise<void> {
+  const policy = cookiePolicy();
+  const directory = createInMemoryActorDirectory([
+    activeOwner,
+    {
+      userId: OTHER_USER_ID,
+      companyId: null,
+      status: "active",
+      roles: ["support"],
+      emailVerifiedAtEpochMs: NOW,
+      totpConfirmedAtEpochMs: null,
+      deletedAtEpochMs: null,
+    },
+  ]);
+
+  const authenticated = await readSession(sessionCookie(policy, baseClaims()), {
+    directory,
+    cookiePolicy: policy,
+    nowEpochMs: NOW,
+  });
+
+  expectEqual(authenticated.kind, "authenticated", "a valid session authenticates");
+
+  if (authenticated.kind === "authenticated") {
+    expectEqual(authenticated.actor.userId, USER_ID, "the actor is the cookie subject");
+    expectEqual(authenticated.actor.companyId, FIRM_ID, "the actor carries the company");
+    expectEqual(authenticated.actor.sessionId, SESSION_ID, "the actor carries the session");
+    expectEqual(authenticated.actor.roles[0], "owner", "the actor carries the roles");
+    expectEqual(authenticated.actor.emailVerified, true, "a verified account is marked verified");
+    expectEqual(authenticated.actor.twoFactorSatisfied, false, "an aal1 session is one factor short");
+    expect(
+      !authenticated.actor.twoFactorEnrolmentRequired,
+      "an account with a confirmed TOTP needs no enrolment",
+    );
+    expectEqual(hasRole(authenticated.actor, "owner"), true, "the actor holds its role");
+    expectEqual(hasRole(authenticated.actor, "ceo"), false, "the actor does not hold another role");
+    expectEqual(
+      hasAnyRole(authenticated.actor, ["ceo", "owner"]),
+      true,
+      "any of the listed roles is enough",
+    );
+    expectEqual(
+      requireAnyRole(authenticated.actor, ["ceo", "owner"]).userId,
+      USER_ID,
+      "a required role is returned",
+    );
+    expectAppError(
+      () => requireAnyRole(authenticated.actor, ["ceo", "support"]),
+      "PERMISSION_DENIED",
+      "a missing role is a permission failure, not an authentication failure",
+    );
+    expectEqual(
+      requireCompanyId(authenticated.actor),
+      FIRM_ID,
+      "an owner acts for one company",
+    );
+    expectEqual(
+      hasSatisfiedTwoFactor(authenticated.actor),
+      false,
+      "one factor is not enough for a role holder",
+    );
+  }
+
+  const secondFactor = await readSession(
+    sessionCookie(policy, baseClaims({ aal: "aal2" })),
+    { directory, cookiePolicy: policy, nowEpochMs: NOW },
+  );
+
+  if (secondFactor.kind === "authenticated") {
+    expectEqual(secondFactor.actor.twoFactorSatisfied, true, "aal2 satisfies the second factor");
+    expectEqual(hasSatisfiedTwoFactor(secondFactor.actor), true, "aal2 with TOTP is complete");
+  } else {
+    failures.push("an aal2 session must authenticate");
+    checkCount += 1;
+  }
+
+  const unenrolled = await readSession(
+    sessionCookie(policy, baseClaims({ sub: OTHER_USER_ID, session_id: null }), {
+      userId: OTHER_USER_ID,
+      sessionId: null,
+    }),
+    { directory, cookiePolicy: policy, nowEpochMs: NOW },
+  );
+
+  if (unenrolled.kind === "authenticated") {
+    expectEqual(unenrolled.actor.companyId, null, "a platform account has no company");
+    expectEqual(
+      unenrolled.actor.twoFactorEnrolmentRequired,
+      true,
+      "a role holder without a TOTP must enrol",
+    );
+    expectEqual(
+      hasSatisfiedTwoFactor(unenrolled.actor),
+      false,
+      "an unenrolled role holder may not act",
+    );
+    expectAppError(
+      () => requireCompanyId(unenrolled.actor),
+      "PERMISSION_DENIED",
+      "a platform account has no company to act for",
+    );
+  } else {
+    failures.push("a platform account session must authenticate");
+    checkCount += 1;
+  }
+
+  const withoutCookie = await readSession(null, {
+    directory,
+    cookiePolicy: policy,
+    nowEpochMs: NOW,
+  });
+
+  expectEqual(withoutCookie.kind, "unauthenticated", "no cookie is no session");
+  expectEqual(
+    withoutCookie.kind === "unauthenticated" ? withoutCookie.reason : "authenticated",
+    "no-cookie",
+    "no cookie is the documented reason",
+  );
+  expectAppError(
+    () => requireActor(withoutCookie),
+    "AUTHENTICATION_REQUIRED",
+    "a missing session answers authentication required",
+  );
+
+  const malformed = await readSession(`${policy.name}=not-our-payload`, {
+    directory,
+    cookiePolicy: policy,
+    nowEpochMs: NOW,
+  });
+
+  expectEqual(
+    malformed.kind === "unauthenticated" ? malformed.reason : "authenticated",
+    "malformed-cookie",
+    "a broken cookie is a malformed cookie",
+  );
+
+  const badToken = await readSession(
+    bareCookies(
+      encodeSessionCookies(policy, sessionPayload({ accessToken: "not-a-token" }), NOW),
+    ),
+    { directory, cookiePolicy: policy, nowEpochMs: NOW },
+  );
+
+  expectEqual(
+    badToken.kind === "unauthenticated" ? badToken.reason : "authenticated",
+    "malformed-token",
+    "a token that is not a token is a malformed token",
+  );
+
+  const expired = await readSession(
+    sessionCookie(policy, baseClaims({ exp: Math.floor(NOW / 1000) - 600 })),
+    { directory, cookiePolicy: policy, nowEpochMs: NOW },
+  );
+
+  expectEqual(
+    expired.kind === "unauthenticated" ? expired.reason : "authenticated",
+    "expired-token",
+    "an expired token is refused",
+  );
+
+  const substituted = await readSession(
+    sessionCookie(policy, baseClaims(), {
+      accessToken: makeAccessToken(baseClaims({ sub: OTHER_USER_ID })),
+      userId: USER_ID,
+    }),
+    { directory, cookiePolicy: policy, nowEpochMs: NOW },
+  );
+
+  expectEqual(
+    substituted.kind === "unauthenticated" ? substituted.reason : "authenticated",
+    "malformed-cookie",
+    "a cookie naming one user cannot carry the token of another",
+  );
+
+  const foreignSession = await readSession(
+    sessionCookie(policy, baseClaims(), { sessionId: "018f3b1c-5555-7c2a-9d1e-2b3c4d5e6f74" }),
+    { directory, cookiePolicy: policy, nowEpochMs: NOW },
+  );
+
+  expectEqual(
+    foreignSession.kind === "unauthenticated" ? foreignSession.reason : "authenticated",
+    "malformed-cookie",
+    "a cookie naming another session is refused",
+  );
+
+  const unknownAccount = await readSession(
+    sessionCookie(
+      policy,
+      baseClaims({ sub: "018f3b1c-9999-7c2a-9d1e-2b3c4d5e6f75" }),
+      { userId: "018f3b1c-9999-7c2a-9d1e-2b3c4d5e6f75" },
+    ),
+    { directory, cookiePolicy: policy, nowEpochMs: NOW },
+  );
+
+  expectEqual(
+    unknownAccount.kind === "unauthenticated" ? unknownAccount.reason : "authenticated",
+    "unknown-account",
+    "a subject with no platform row has no session",
+  );
+
+  for (const status of ["suspended", "closed"] as const) {
+    const suspendedDirectory = createInMemoryActorDirectory([
+      { ...activeOwner, status },
+    ]);
+    const state = await readSession(sessionCookie(policy, baseClaims()), {
+      directory: suspendedDirectory,
+      cookiePolicy: policy,
+      nowEpochMs: NOW,
+    });
+
+    expectEqual(
+      state.kind === "unauthenticated" ? state.reason : "authenticated",
+      status === "suspended" ? "suspended-account" : "closed-account",
+      `a ${status} account is refused`,
+    );
+    expectAppError(
+      () => requireActor(state),
+      "AUTHENTICATION_REQUIRED",
+      `a ${status} account answers authentication required`,
+    );
+  }
+
+  const deletedDirectory = createInMemoryActorDirectory([
+    { ...activeOwner, deletedAtEpochMs: NOW - 1_000 },
+  ]);
+  const deleted = await readSession(sessionCookie(policy, baseClaims()), {
+    directory: deletedDirectory,
+    cookiePolicy: policy,
+    nowEpochMs: NOW,
+  });
+
+  expectEqual(
+    deleted.kind === "unauthenticated" ? deleted.reason : "authenticated",
+    "deleted-account",
+    "a deleted account is refused",
+  );
+
+  const failingDirectory = {
+    findActor: (): Promise<ActorRecord | null> => Promise.reject(new AppError("TIMEOUT")),
+  };
+
+  await expectRejects(
+    () =>
+      readSession(sessionCookie(policy, baseClaims()), {
+        directory: failingDirectory,
+        cookiePolicy: policy,
+        nowEpochMs: NOW,
+      }),
+    "TIMEOUT",
+    "a directory failure propagates instead of signing the merchant out",
+  );
+
+  expectEqual(
+    isTwoFactorEnrolmentRequired({
+      ...activeOwner,
+      roles: [],
+    }),
+    false,
+    "an account with no role needs no second factor",
+  );
+  expectEqual(
+    isTwoFactorEnrolmentRequired({ ...activeOwner, totpConfirmedAtEpochMs: null }),
+    true,
+    "a role holder without a TOTP needs one",
+  );
+
+  const roles: readonly PlatformRole[] = ["owner", "ceo"];
+
+  expectEqual(roles.length, 2, "the gate's role fixture is two roles");
+}
+
+/* ------------------------------------------------------------------ 8. client */
+
+function sessionBody(): Record<string, unknown> {
+  return {
+    access_token: makeAccessToken(baseClaims()),
+    refresh_token: "refresh-token-000000000000000000",
+    expires_in: 3_600,
+    token_type: "bearer",
+    user: {
+      id: USER_ID,
+      email: "owner@example.com",
+      email_confirmed_at: "2026-01-01T00:00:00.000Z",
+      phone: null,
+      last_sign_in_at: "2026-01-05T00:00:00.000Z",
+      user_metadata: { full_name: "Owner Name" },
+    },
+  };
+}
+
+async function checkClient(): Promise<void> {
+  const signInStub = createStubHttp(okAnswer(200, sessionBody()));
+  const client = createAuthClient(config, signInStub.http);
+  const signedIn = await client.signInWithPassword({
+    email: "owner@example.com",
+    password: "a-long-password",
+  });
+  const signInRequest = firstRequest(signInStub.requests, "the client asked for a token");
+
+  if (signInRequest !== null) {
+    expectEqual(
+      signInRequest.url,
+      `${config.endpoints.token}?grant_type=password`,
+      "the password grant is the token endpoint",
+    );
+    expectEqual(signInRequest.apiKey, config.anonymousKey, "a browser path call uses the anonymous key");
+    expectEqual(signInRequest.bearerToken, undefined, "a sign in carries no bearer token");
+    expectEqual(
+      JSON.stringify(signInRequest.body),
+      JSON.stringify({ email: "owner@example.com", password: "a-long-password" }),
+      "the credentials are the request body",
+    );
+  }
+
+  expect(signedIn.ok, "a successful sign in returns a session");
+
+  if (signedIn.ok) {
+    expectEqual(signedIn.value.user.id, USER_ID, "the session names the user");
+    expectEqual(signedIn.value.user.email, "owner@example.com", "the session carries the address");
+    expectEqual(signedIn.value.user.fullName, "Owner Name", "the session carries the name");
+    expectEqual(
+      signedIn.value.user.emailConfirmedAtEpochMs,
+      Date.parse("2026-01-01T00:00:00.000Z"),
+      "the confirmation instant is mapped",
+    );
+    expectEqual(signedIn.value.refreshToken, "refresh-token-000000000000000000", "the refresh token is kept");
+    expectEqual(signedIn.value.expiresInSeconds, 3_600, "the lifetime is kept");
+    expect(
+      signedIn.value.expiresAtEpochMs > Date.now() + 3_000_000,
+      "the expiry is computed from the lifetime when the provider omits it",
+    );
+  }
+
+  const wrongPassword = await createAuthClient(
+    config,
+    createStubHttp(okAnswer(400, { code: "invalid_credentials", message: "Invalid login" })).http,
+  ).signInWithPassword({ email: "owner@example.com", password: "wrong" });
+  const unknownEmail = await createAuthClient(
+    config,
+    createStubHttp(okAnswer(400, { code: "user_not_found", message: "User not found" })).http,
+  ).signInWithPassword({ email: "stranger@example.com", password: "wrong" });
+
+  expect(!wrongPassword.ok, "a wrong password is not a session");
+  expect(!unknownEmail.ok, "an unknown address is not a session");
+  expectEqual(
+    !wrongPassword.ok ? wrongPassword.failure.kind : "ok",
+    !unknownEmail.ok ? unknownEmail.failure.kind : "different",
+    "a wrong password and an unknown address fail identically",
+  );
+  expectEqual(
+    !wrongPassword.ok ? wrongPassword.failure.code : null,
+    "invalid_credentials",
+    "the upstream reason is kept as a machine code for the log",
+  );
+  expect(
+    !toAuthAppError(!wrongPassword.ok ? wrongPassword.failure : authFailure("rejected"))
+      .message.includes("invalid_credentials"),
+    "the upstream reason never reaches the failure a caller reads",
+  );
+
+  if (!wrongPassword.ok && !unknownEmail.ok) {
+    expectEqual(
+      toAuthAppError(wrongPassword.failure).code,
+      toAuthAppError(unknownEmail.failure).code,
+      "both failures map to one catalogue code",
+    );
+  }
+
+  const rateLimitedSignIn = await createAuthClient(
+    config,
+    createStubHttp(okAnswer(429, { code: "over_request_rate_limit" }, 12)).http,
+  ).signInWithPassword({ email: "owner@example.com", password: "wrong" });
+
+  expect(
+    !rateLimitedSignIn.ok && rateLimitedSignIn.failure.kind === "rate-limited",
+    "a rate limited sign in is reported as a rate limit",
+  );
+
+  const refreshStub = createStubHttp(okAnswer(200, sessionBody()));
+  const refreshed = await createAuthClient(config, refreshStub.http).refreshSession("refresh-token");
+  const refreshRequest = firstRequest(refreshStub.requests, "the client refreshed a session");
+
+  if (refreshRequest !== null) {
+    expectEqual(
+      refreshRequest.url,
+      `${config.endpoints.token}?grant_type=refresh_token`,
+      "the refresh grant is the token endpoint",
+    );
+    expectEqual(
+      JSON.stringify(refreshRequest.body),
+      JSON.stringify({ refresh_token: "refresh-token" }),
+      "the refresh token is the body",
+    );
+  }
+
+  expect(refreshed.ok, "a refresh returns a session");
+
+  const signUpStub = createStubHttp(
+    okAnswer(200, {
+      id: USER_ID,
+      email: "owner@example.com",
+      email_confirmed_at: null,
+      user_metadata: { full_name: "Owner Name" },
+    }),
+  );
+  const signUp = await createAuthClient(config, signUpStub.http).signUpWithPassword({
+    email: "owner@example.com",
+    password: "a-long-password",
+    fullName: "Owner Name",
+    redirectTo: "https://app.example.com/verify",
+  });
+  const signUpRequest = firstRequest(signUpStub.requests, "the client registered an account");
+
+  if (signUpRequest !== null) {
+    expectEqual(
+      signUpRequest.url,
+      `${config.endpoints.signUp}?redirect_to=${encodeURIComponent("https://app.example.com/verify")}`,
+      "the confirmation link returns to the platform",
+    );
+    expect(
+      JSON.stringify(signUpRequest.body).includes('"full_name":"Owner Name"'),
+      "the name is stored as user metadata",
+    );
+    expect(
+      !JSON.stringify(signUpRequest.body).includes("redirect"),
+      "the redirect is never placed in the body",
+    );
+  }
+
+  expect(signUp.ok, "a registration is accepted");
+
+  if (signUp.ok) {
+    expectEqual(signUp.value.userId, USER_ID, "the registration names the platform account id");
+    expectEqual(signUp.value.session, null, "an unconfirmed registration has no session yet");
+  }
+
+  const signUpWithSession = await createAuthClient(
+    config,
+    createStubHttp(
+      okAnswer(200, {
+        ...sessionBody(),
+        user: { id: USER_ID, email: "owner@example.com" },
+      }),
+    ).http,
+  ).signUpWithPassword({
+    email: "owner@example.com",
+    password: "a-long-password",
+    fullName: "Owner Name",
+  });
+
+  expect(
+    signUpWithSession.ok && signUpWithSession.value.session !== null,
+    "a project without confirmation returns a session on sign up",
+  );
+
+  const malformedSignUp = await createAuthClient(
+    config,
+    createStubHttp(okAnswer(200, {})).http,
+  ).signUpWithPassword({
+    email: "owner@example.com",
+    password: "a-long-password",
+    fullName: "Owner Name",
+  });
+
+  expect(!malformedSignUp.ok, "a registration answer without an id is a failure");
+
+  const verifyStub = createStubHttp(okAnswer(200, sessionBody()));
+  const verified = await createAuthClient(config, verifyStub.http).verifyEmailToken({
+    tokenHash: "token-hash-value",
+    type: "signup",
+  });
+  const verifyRequest = firstRequest(verifyStub.requests, "the client verified an email token");
+
+  if (verifyRequest !== null) {
+    expectEqual(verifyRequest.url, config.endpoints.verify, "the verify endpoint is used");
+    expectEqual(
+      JSON.stringify(verifyRequest.body),
+      JSON.stringify({ token_hash: "token-hash-value", type: "signup" }),
+      "the token hash and type are the body",
+    );
+  }
+
+  expect(verified.ok, "a verified token returns a session");
+
+  const resendAccepted = await createAuthClient(
+    config,
+    createStubHttp(okAnswer(422, { code: "email_exists" })).http,
+  ).resendVerificationEmail("stranger@example.com");
+
+  expect(resendAccepted.ok, "a resend never discloses whether the address exists");
+
+  const recoverAccepted = await createAuthClient(
+    config,
+    createStubHttp(okAnswer(400, { code: "user_not_found" })).http,
+  ).requestPasswordReset("stranger@example.com");
+
+  expect(recoverAccepted.ok, "a recovery never discloses whether the address exists");
+
+  const recoverRateLimited = await createAuthClient(
+    config,
+    createStubHttp(okAnswer(429, { code: "over_request_rate_limit" }, 30)).http,
+  ).requestPasswordReset("owner@example.com");
+
+  expect(
+    !recoverRateLimited.ok && recoverRateLimited.failure.kind === "rate-limited",
+    "a rate limit still reaches the caller",
+  );
+
+  const alreadySignedOut = await createAuthClient(
+    config,
+    createStubHttp(okAnswer(401, { code: "session_not_found" })).http,
+  ).signOut("expired-token");
+
+  expect(alreadySignedOut.ok, "signing out an expired session is a successful sign out");
+
+  const signOutStub = createStubHttp(okAnswer(204, null));
+  const signedOut = await createAuthClient(config, signOutStub.http).signOut("access-token");
+  const signOutRequest = firstRequest(signOutStub.requests, "the client ended a session");
+
+  if (signOutRequest !== null) {
+    expectEqual(signOutRequest.url, config.endpoints.logout, "the logout endpoint is used");
+    expectEqual(signOutRequest.bearerToken, "access-token", "the session token names the session");
+    expectEqual(signOutRequest.apiKey, config.anonymousKey, "logout stays on the anonymous key");
+  }
+
+  expect(signedOut.ok, "a sign out succeeds");
+
+  const userStub = createStubHttp(
+    okAnswer(200, {
+      id: USER_ID,
+      email: "owner@example.com",
+      email_confirmed_at: "2026-01-01T00:00:00.000Z",
+      user_metadata: { full_name: "Owner Name" },
+    }),
+  );
+  const user = await createAuthClient(config, userStub.http).getUser("access-token");
+  const userRequest = firstRequest(userStub.requests, "the client read the user of a token");
+
+  if (userRequest !== null) {
+    expectEqual(userRequest.method, "GET", "the user endpoint is read with GET");
+    expectEqual(userRequest.bearerToken, "access-token", "the token is presented as a bearer");
+  }
+
+  expect(user.ok, "a token with a user returns the user");
+  expectEqual(user.ok ? user.value.id : null, USER_ID, "the user is mapped");
+
+  const phoneOnly = await createAuthClient(
+    config,
+    createStubHttp(okAnswer(200, { id: USER_ID, email: null })).http,
+  ).getUser("access-token");
+
+  expect(!phoneOnly.ok, "an account without an email is not a platform account");
+
+  const methodNames = Object.keys(client).sort();
+
+  expectEqual(methodNames.length, 8, "the client exposes eight operations");
+  expect(
+    methodNames.includes("signInWithPassword") &&
+      methodNames.includes("signUpWithPassword") &&
+      methodNames.includes("verifyEmailToken") &&
+      methodNames.includes("resendVerificationEmail") &&
+      methodNames.includes("requestPasswordReset") &&
+      methodNames.includes("refreshSession") &&
+      methodNames.includes("signOut") &&
+      methodNames.includes("getUser"),
+    "the client exposes exactly the documented operations",
+  );
+}
+
+/* ------------------------------------------------------------------ 9. admin client */
+
+async function checkAdminClient(): Promise<void> {
+  const stub = createStubHttp(okAnswer(200, { id: USER_ID, email: "owner@example.com" }));
+  const admin = createAuthAdminClient(config, stub.http);
+  const created = await admin.createUser({
+    email: "owner@example.com",
+    password: "a-long-password",
+    fullName: "Owner Name",
+    userId: USER_ID,
+    emailConfirmed: true,
+  });
+  const createRequest = firstRequest(stub.requests, "the admin client created an account");
+
+  if (createRequest !== null) {
+    const body = createRequest.body as Readonly<Record<string, unknown>>;
+
+    expectEqual(createRequest.method, "POST", "a creation is a POST");
+    expectEqual(createRequest.url, config.endpoints.adminUsers, "the admin endpoint is used");
+    expectEqual(createRequest.apiKey, config.serviceRoleKey, "an admin call uses the service role key");
+    expectEqual(
+      createRequest.bearerToken,
+      config.serviceRoleKey,
+      "an admin call authenticates as the service role",
+    );
+    expectEqual(body["id"], USER_ID, "the account id is chosen by the platform");
+    expectEqual(body["email_confirm"], true, "the bootstrap account is confirmed");
+    expectEqual(
+      JSON.stringify(body["user_metadata"]),
+      JSON.stringify({ full_name: "Owner Name" }),
+      "the name is metadata",
+    );
+    expect(!createRequest.url.includes("anon"), "an admin call never carries a key in the URL");
+  }
+
+  expect(created.ok, "a creation returns the account identifier");
+  expectEqual(created.ok ? created.value.userId : null, USER_ID, "the created account is mapped");
+
+  const updateStub = createStubHttp(okAnswer(200, { id: USER_ID, email: "new@example.com" }));
+  const updated = await createAuthAdminClient(config, updateStub.http).updateUser(USER_ID, {
+    email: "new@example.com",
+  });
+  const updateRequest = firstRequest(updateStub.requests, "the admin client updated an account");
+
+  if (updateRequest !== null) {
+    expectEqual(updateRequest.method, "PUT", "an update is a PUT");
+    expectEqual(updateRequest.url, authAdminUserUrl(config, USER_ID), "the update names one account");
+    expectEqual(
+      JSON.stringify(updateRequest.body),
+      JSON.stringify({ email: "new@example.com" }),
+      "only the changed field is sent",
+    );
+  }
+
+  expect(updated.ok, "an update returns the account");
+
+  const noChange = createAuthAdminClient(config, createStubHttp().http);
+
+  await expectRejects(
+    () => noChange.updateUser(USER_ID, {}),
+    "VALIDATION_FAILED",
+    "an update with no change is refused",
+  );
+  await expectRejects(
+    () => noChange.updateUser("not-a-uuid", { password: "a-long-password" }),
+    "INTERNAL_ERROR",
+    "an update of something that is not an account identifier is refused",
+  );
+
+  const deleteStub = createStubHttp(okAnswer(204, null));
+  const deleted = await createAuthAdminClient(config, deleteStub.http).deleteUser(USER_ID);
+  const deleteRequest = firstRequest(deleteStub.requests, "the admin client deleted an account");
+
+  if (deleteRequest !== null) {
+    expectEqual(deleteRequest.method, "DELETE", "a deletion is a DELETE");
+    expectEqual(deleteRequest.url, authAdminUserUrl(config, USER_ID), "the deletion names one account");
+  }
+
+  expect(deleted.ok, "a deletion succeeds");
+
+  const revokeStub = createStubHttp(okAnswer(204, null));
+  const revoked = await createAuthAdminClient(config, revokeStub.http).revokeUserSessions(USER_ID);
+  const revokeRequest = firstRequest(revokeStub.requests, "the admin client revoked every session");
+
+  if (revokeRequest !== null) {
+    expectEqual(revokeRequest.method, "POST", "a revocation is a POST");
+    expect(
+      revokeRequest.url.endsWith(`/logout?scope=global`),
+      "a revocation ends every session of the account",
+    );
+    expect(
+      revokeRequest.url.startsWith(authAdminUserUrl(config, USER_ID)),
+      "a revocation names one account",
+    );
+  }
+
+  expect(revoked.ok, "a revocation succeeds");
+
+  const getStub = createStubHttp(okAnswer(200, { id: USER_ID, email: "owner@example.com" }));
+  const fetched = await createAuthAdminClient(config, getStub.http).getUser(USER_ID);
+  const getRequest = firstRequest(getStub.requests, "the admin client read one account");
+
+  if (getRequest !== null) {
+    expectEqual(getRequest.method, "GET", "a read is a GET");
+    expectEqual(getRequest.url, authAdminUserUrl(config, USER_ID), "a read names one account");
+  }
+
+  expect(fetched.ok, "a read returns the account");
+
+  const rejectedRead = await createAuthAdminClient(
+    config,
+    createStubHttp(okAnswer(404, { code: "user_not_found" })).http,
+  ).getUser(USER_ID);
+
+  expect(
+    !rejectedRead.ok && rejectedRead.failure.kind === "rejected",
+    "a missing account is reported as a rejection",
+  );
+
+  const adminMethodNames = Object.keys(admin).sort();
+
+  expectEqual(adminMethodNames.length, 5, "the admin client exposes five operations");
+  expect(
+    adminMethodNames.every((name) => name !== "listUsers"),
+    "the admin client can never page through every account",
+  );
+  expect(
+    adminMethodNames.includes("revokeUserSessions") && adminMethodNames.includes("createUser"),
+    "the admin client exposes the documented operations",
+  );
+}
+
+/* ------------------------------------------------------------------ main */
+
+async function main(): Promise<void> {
+  checkConfig();
+  checkClaims();
+  checkCookies();
+  checkFailures();
+  await checkTransport();
+  await checkDirectory();
+  await checkSession();
+  await checkClient();
+  await checkAdminClient();
+
+  if (failures.length > 0) {
+    process.stderr.write(`auth gate failed with ${failures.length} problem(s):\n`);
+
+    for (const failure of failures) {
+      process.stderr.write(`  - ${failure}\n`);
+    }
+
+    process.exitCode = 1;
+
+    return;
+  }
+
+  process.stdout.write(
+    `auth gate passed: ${checkCount} checks, cookie "${createAuthCookiePolicy(config, 3_600).name}", ` +
+      `${AUTH_COOKIE_MAXIMUM_CHUNKS} chunk ceiling\n`,
+  );
+}
+
+await main();
