@@ -35,13 +35,20 @@ import type { AuthFailure, AuthOutcome } from "./types.ts";
 export type AuthFetch = (url: string, init: RequestInit) => Promise<Response>;
 
 export interface AuthRequest {
-  readonly method: "GET" | "POST" | "PUT" | "DELETE";
+  readonly method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
   readonly url: string;
   /** The key presented as the `apikey` header: anonymous for a user call, service role for admin. */
   readonly apiKey: string;
   /** The user's access token, when the call acts as that user. Never the service role key. */
   readonly bearerToken?: string;
   readonly body?: unknown;
+  /**
+   * A form encoded body, for the one endpoint that expects one (Cloudflare Turnstile siteverify).
+   * Mutually exclusive with `body`: a request sends JSON or a form, never both.
+   */
+  readonly form?: Readonly<Record<string, string>>;
+  /** Extra request headers. A reserved header is never overridden by this field. */
+  readonly headers?: Readonly<Record<string, string>>;
   readonly signal?: AbortSignal;
 }
 
@@ -113,22 +120,48 @@ function failureOf(
   return { kind, status, code, retryAfterSeconds: null };
 }
 
+/** Headers a caller may not set: they carry the key, the identity and the body contract. */
+const reservedHeaderNames: ReadonlySet<string> = new Set([
+  "apikey",
+  "authorization",
+  "accept",
+  "content-type",
+  "content-length",
+  "x-client-info",
+]);
+
 function buildHeaders(request: AuthRequest, clientInfo: string): Headers {
-  const headers = new Headers({
-    accept: "application/json",
-    apikey: request.apiKey,
-    "x-client-info": clientInfo,
-  });
+  const headers = new Headers();
+
+  for (const [name, value] of Object.entries(request.headers ?? {})) {
+    if (!reservedHeaderNames.has(name.toLowerCase())) {
+      headers.set(name, value);
+    }
+  }
+
+  headers.set("accept", "application/json");
+  headers.set("apikey", request.apiKey);
+  headers.set("x-client-info", clientInfo);
 
   if (request.bearerToken !== undefined) {
     headers.set("authorization", `Bearer ${request.bearerToken}`);
   }
 
-  if (request.body !== undefined) {
+  if (request.form !== undefined) {
+    headers.set("content-type", "application/x-www-form-urlencoded");
+  } else if (request.body !== undefined) {
     headers.set("content-type", "application/json");
   }
 
   return headers;
+}
+
+function buildBody(request: AuthRequest): string | undefined {
+  if (request.form !== undefined) {
+    return new URLSearchParams(request.form).toString();
+  }
+
+  return request.body === undefined ? undefined : JSON.stringify(request.body);
 }
 
 async function readBoundedText(
@@ -180,6 +213,7 @@ export function createAuthHttp(options: AuthHttpOptions = {}): AuthHttp {
           ? timeoutSignal
           : AbortSignal.any([request.signal, timeoutSignal]);
 
+      const requestBody = buildBody(request);
       let response: Response;
 
       try {
@@ -190,7 +224,7 @@ export function createAuthHttp(options: AuthHttpOptions = {}): AuthHttp {
           redirect: "error",
           // No cookie jar of the process is ever attached to an identity provider call.
           credentials: "omit",
-          ...(request.body === undefined ? {} : { body: JSON.stringify(request.body) }),
+          ...(requestBody === undefined ? {} : { body: requestBody }),
           signal,
         });
       } catch (error) {

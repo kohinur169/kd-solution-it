@@ -2,9 +2,10 @@
 # lib/auth/
 
 Owner: STEP 037 (Supabase Auth client and server helpers with typed session access), extended by
-STEPs 038-055. Later STEPs add the routes, the pages, the device proof key, the rotating token
-and the lock; they do not add a second way to read a session, a second cookie or a second error
-vocabulary.
+STEPs 038-055. STEP 038 added signup, the setting registry, the Turnstile guard, the policy
+catalog, the password verifier, the audit trail and the confirmation link. Later STEPs add the
+sign in page, the device proof key, the rotating token and the lock; they do not add a second way
+to read a session, a second cookie or a second error vocabulary.
 
 | File | Purpose |
 | --- | --- |
@@ -18,6 +19,17 @@ vocabulary.
 | session.ts | `readSession`, `requireActor`, role and company requirements, the 2FA questions |
 | client.ts | Sign up, password sign in, email token, resend, recovery, refresh, sign out, get user |
 | admin-client.ts | Service role create, update, delete, read and revoke sessions of one account |
+| client-address.ts | The request address and agent, refusing anything that is not an address |
+| rest.ts | The serviceless PostgREST client: select, insert, insert returning, update, rpc |
+| secrets.ts | AES-256-GCM sealing of a stored secret, bound to its setting key |
+| settings.ts | `platform_settings`: a JSON value or a secret, never both |
+| turnstile.ts | The Cloudflare Turnstile guard: enabled, secret, siteverify, one verdict |
+| policies.ts | The twelve policy keys, the published catalog and the text hash of a page |
+| password.ts | The scrypt verifier, and the interim password shape STEP 040 replaces |
+| audit.ts | The hash chain and the Ed25519 signature an audit entry is written with |
+| registration.ts | Merchant signup: validate, challenge, provider account, rows, acceptances, audit |
+| email-verification.ts | A followed confirmation link: token, verification instant, audit, cookie |
+| runtime.ts | The one place the real implementations are assembled per process |
 | verify.ts | The gate behind `node lib/auth/verify.ts` |
 
 ## The two values that matter
@@ -76,6 +88,35 @@ the authority. A permission check uses the record, never a claim.
     problem returns `unauthenticated`.
 14. The gate must stay green: `node lib/auth/verify.ts` drives every branch through the injected
     transport. The `check:auth` script line is an integrator request in the STEP 037 handoff.
+15. Signup records acceptances, it does not infer them. `policy_acceptances` gets one row per
+    policy in `POLICY_KEYS`, carrying the published page's `version` and the SHA-256 of its body,
+    and a catalog that is not complete stops the signup with `SERVICE_UNAVAILABLE` rather than
+    writing a partial set. A policy list that is shorter than the catalog is a `VALIDATION_FAILED`
+    detail, never a silent default.
+16. Turnstile is closed by default. `turnstile.enabled` is seeded `false`, and the guard refuses a
+    verification request when the switch is off outside development, so a deployment that forgot the
+    secret fails loudly instead of accepting every token. The secret lives in `platform_settings`
+    sealed with `ENCRYPTION_MASTER_KEY`, never in an environment variable.
+17. A secret is sealed and opened by `secrets.ts` only: AES-256-GCM, a random 12 byte vector, the
+    setting key as associated data, and a failure that is `INTERNAL_ERROR` rather than a partial
+    value. A row whose parts are not a box (a truncated vector, a short tag) is `DEPENDENCY_FAILED`,
+    because a damaged row is a database problem and a wrong key is a deployment problem.
+18. An audit entry is written before the session cookie. `email-verification.ts` records
+    `user.email_verified` first and encodes the cookie second, so a session cannot exist that no
+    entry names.
+19. The chain is not retried. `audit_next_link` and `audit_hash_v1` and the insert guard of `0013`
+    agree on the sequence, so a failed insert means another writer won the link; the caller
+    compensates and rethrows instead of writing a sequence the chain would refuse.
+20. Signup compensates in the reverse order of its writes. A failure after the provider account
+    exists soft deletes the rows it created and deletes that account through the admin client, then
+    rethrows the original error. A signup that answers success with a half written company is worse
+    than a signup that fails.
+21. Registration never discloses whether an address exists. A provider rejection at signup becomes
+    the same `VALIDATION_FAILED` detail as a form problem, and the route answers `201` with the same
+    body whether or not a mail was sent.
+22. A route does not assemble clients. `getAuthRuntime()` builds the real implementations once per
+    process and the gate replaces the object with doubles, which is why the same service is provable
+    without a project, a database or a network.
 
 ## Adding an operation
 

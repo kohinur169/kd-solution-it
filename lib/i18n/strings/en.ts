@@ -75,6 +75,56 @@ const catalog = {
     timeout: "The request took too long to complete. Try again.",
     internal: "Something went wrong on our side. Quote the request id when you contact support.",
   },
+  signup: {
+    eyebrow: "Merchant account",
+    title: "Create your merchant account",
+    description:
+      "One account for your business. We verify your email address before the dashboard opens, and creating the account records your acceptance of the policies that govern it.",
+    fullNameLabel: "Your full name",
+    emailLabel: "Work email",
+    passwordLabel: "Password",
+    passwordHint: "At least twelve characters, and not your email address.",
+    companyNameLabel: "Business name",
+    policiesTitle: "Policies you accept",
+    policiesNotice:
+      "Creating the account records your acceptance of each policy below at the version published today, together with a hash of the text. A later version is a new acceptance.",
+    policiesAccept: "I have read and accept every policy listed above.",
+    turnstileNotice: "This form is protected by Cloudflare Turnstile.",
+    submit: "Create account",
+    submitting: "Creating account",
+    successTitle: "Check your email",
+    successBody:
+      "We sent a confirmation link to {email}. Follow it to verify your address and open your account.",
+    errorTitle: "The account could not be created",
+    unreadableResponse: "The server answered with something this page cannot read. Try again.",
+  },
+  verify: {
+    title: "Email verification",
+    verifiedTitle: "Your email address is verified",
+    verifiedBody:
+      "Your account is ready. This browser now holds the session the platform issued when you followed the link.",
+    invalidTitle: "This link is no longer valid",
+    invalidBody:
+      "A confirmation link works once and expires. Ask for a new one from the sign in page, or create the account again if it was never confirmed.",
+    unavailableTitle: "Verification is temporarily unavailable",
+    unavailableBody:
+      "The platform could not reach the identity provider. Follow the link again in a few minutes.",
+    home: "Go to the home page",
+  },
+  policies: {
+    kyc_kyb: "KYC and KYB Policy",
+    ubo: "UBO Policy",
+    aml_cft: "AML and CFT Policy",
+    sanctions_pep: "Sanctions and PEP Screening Policy",
+    underwriting: "Underwriting and Risk Assessment Policy",
+    merchant_acceptance: "Merchant Acceptance and Prohibited and Restricted Businesses Policy",
+    chargeback: "Chargeback and Dispute Management Policy",
+    refund_settlement: "Refund and Settlement Policy",
+    fraud_risk: "Fraud and Risk Management Policy",
+    data_privacy: "Data Privacy and Security Policy",
+    pci_dss: "PCI-DSS Compliance Policy",
+    automated_decision_review: "Automated Decision Review Policy",
+  },
   errorScreen: {
     title: "Something went wrong",
     description:

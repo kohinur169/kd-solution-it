@@ -1,9 +1,17 @@
 // path: lib/auth/verify.ts
 import { Buffer } from "node:buffer";
 import process from "node:process";
+import { z } from "zod";
 import { AppError } from "../errors/app-error.ts";
 import { createAuthAdminClient } from "./admin-client.ts";
-import { createAuthClient } from "./client.ts";
+import {
+  AUDIT_SIGNING_KEY_ID,
+  createInMemoryAuditTrail,
+  createRestAuditTrail,
+  signAuditHash,
+} from "./audit.ts";
+import { isAddress, readClientAddress, readUserAgent } from "./client-address.ts";
+import { createAuthClient, type AuthClient } from "./client.ts";
 import { authAdminUserUrl, authTokenUrl, buildAuthConfig, type AuthConfig } from "./config.ts";
 import {
   AUTH_COOKIE_MAXIMUM_CHUNKS,
@@ -40,7 +48,41 @@ import {
   requireAnyRole,
   requireCompanyId,
 } from "./session.ts";
-import type { ActorRecord, AuthFailure, AuthOutcome, PlatformRole } from "./types.ts";
+import { completeEmailVerification } from "./email-verification.ts";
+import {
+  assertPasswordAcceptable,
+  hashPassword,
+  verifyPasswordHash,
+} from "./password.ts";
+import {
+  acceptsEveryRequiredPolicy,
+  catalogIsComplete,
+  createInMemoryPolicyCatalog,
+  POLICY_KEYS,
+  policyDocumentSha256,
+  REQUIRED_POLICY_KEYS,
+  type PolicyPage,
+} from "./policies.ts";
+import { companySlug, registerMerchant } from "./registration.ts";
+import type { RestClient } from "./rest.ts";
+import { isSecretBox, openSecret, sealSecret } from "./secrets.ts";
+import {
+  createInMemorySettings,
+  createRestSettings,
+  secretContextFor,
+} from "./settings.ts";
+import {
+  createTurnstileGuard,
+  TURNSTILE_ENABLED_SETTING,
+  TURNSTILE_SECRET_SETTING,
+} from "./turnstile.ts";
+import type {
+  ActorRecord,
+  AuthFailure,
+  AuthOutcome,
+  AuthSession,
+  PlatformRole,
+} from "./types.ts";
 
 /**
  * The authentication gate. Run with `node lib/auth/verify.ts`.
@@ -191,6 +233,8 @@ interface AuthRequestRecord {
   readonly apiKey: string;
   readonly bearerToken: string | undefined;
   readonly body: unknown;
+  readonly form: unknown;
+  readonly headers: unknown;
 }
 
 function createStubHttp(
@@ -209,6 +253,8 @@ function createStubHttp(
           apiKey: request.apiKey,
           bearerToken: request.bearerToken,
           body: request.body,
+          form: request.form,
+          headers: request.headers,
         });
 
         const answer = answers[index] ?? okAnswer(500, { code: "gate_missing_answer" });
@@ -1760,6 +1806,1057 @@ async function checkAdminClient(): Promise<void> {
   );
 }
 
+
+/* ------------------------------------------------------------------ 10. secrets */
+
+const MASTER_KEY = Buffer.alloc(32, 5).toString("base64");
+const OTHER_MASTER_KEY = Buffer.alloc(32, 6).toString("base64");
+const TURNSTILE_CONTEXT = secretContextFor("turnstile.secret_key");
+
+function checkSecrets(): void {
+  const box = sealSecret(MASTER_KEY, "turnstile-secret-value", TURNSTILE_CONTEXT);
+
+  expect(isSecretBox(box), "a sealed secret has the three stored parts");
+  expectEqual(box.iv.length, 16, "the vector is twelve bytes of base64url");
+  expectEqual(box.tag.length, 22, "the tag is sixteen bytes of base64url");
+  expectEqual(
+    openSecret(MASTER_KEY, box, TURNSTILE_CONTEXT),
+    "turnstile-secret-value",
+    "a sealed secret opens with the same key and context",
+  );
+  expectAppError(
+    () => openSecret(OTHER_MASTER_KEY, box, TURNSTILE_CONTEXT),
+    "INTERNAL_ERROR",
+    "a different master key cannot open a secret",
+  );
+  expectAppError(
+    () => openSecret(MASTER_KEY, box, secretContextFor("turnstile.other")),
+    "INTERNAL_ERROR",
+    "a secret copied to another setting cannot open",
+  );
+  expectAppError(
+    () =>
+      openSecret(
+        MASTER_KEY,
+        {
+          ...box,
+          ciphertext: `${box.ciphertext.slice(0, -1)}${box.ciphertext.endsWith("A") ? "B" : "A"}`,
+        },
+        TURNSTILE_CONTEXT,
+      ),
+    "INTERNAL_ERROR",
+    "a changed ciphertext cannot open",
+  );
+  expectAppError(
+    () =>
+      openSecret(
+        MASTER_KEY,
+        { ...box, tag: `${box.tag.startsWith("A") ? "B" : "A"}${box.tag.slice(1)}` },
+        TURNSTILE_CONTEXT,
+      ),
+    "INTERNAL_ERROR",
+    "a changed tag cannot open",
+  );
+  expectAppError(
+    () => openSecret(Buffer.alloc(16, 1).toString("base64"), box, TURNSTILE_CONTEXT),
+    "INTERNAL_ERROR",
+    "a master key of the wrong length is refused",
+  );
+  expect(!isSecretBox({ iv: null, tag: "a", ciphertext: "b" }), "a box without a vector is not a box");
+  expect(!isSecretBox({ iv: "a", tag: "b", ciphertext: "not base64!" }), "a box with a bad part is not a box");
+  expect(
+    sealSecret(MASTER_KEY, "same value", TURNSTILE_CONTEXT).ciphertext !==
+      sealSecret(MASTER_KEY, "same value", TURNSTILE_CONTEXT).ciphertext,
+    "two seals of one value differ because the vector is random",
+  );
+}
+
+/* ------------------------------------------------------------------ 11. settings */
+
+async function checkSettings(): Promise<void> {
+  const memory = createInMemorySettings(
+    { "turnstile.enabled": true, "other.value": 42 },
+    { "turnstile.secret_key": "stored-secret" },
+  );
+
+  expectEqual(
+    await memory.readValue("turnstile.enabled", z.boolean()),
+    true,
+    "a plain setting is read",
+  );
+  expectEqual(await memory.readValue("missing.key", z.boolean()), null, "a missing setting is null");
+  await expectRejects(
+    () => memory.readValue("turnstile.enabled", z.string()),
+    "DEPENDENCY_FAILED",
+    "a setting of the wrong type is refused rather than coerced",
+  );
+  expectEqual(await memory.readSecret("turnstile.secret_key"), "stored-secret", "a secret is read");
+  expectEqual(await memory.readSecret("turnstile.missing"), null, "a missing secret is null");
+
+  const stub = createStubHttp(
+    okAnswer(200, [
+      {
+        setting_key: "turnstile.secret_key",
+        value: null,
+        is_secret: true,
+        secret_iv: "1",
+        secret_tag: "2",
+        secret_ciphertext: "3",
+      },
+    ]),
+  );
+  const restSettings = createRestSettings(config, stub.http, () => MASTER_KEY);
+
+  await expectRejects(
+    () => restSettings.readSecret("turnstile.secret_key"),
+    "DEPENDENCY_FAILED",
+    "a stored secret whose parts are not a box is a platform failure",
+  );
+
+  const request = firstRequest(stub.requests, "the settings reader asked the database");
+
+  if (request !== null) {
+    expect(
+      request.url.includes("setting_key=eq.turnstile.secret_key"),
+      "the settings reader asks for one key",
+    );
+    expect(request.url.includes("deleted_at=is.null"), "the settings reader ignores a removed row");
+    expect(request.url.includes("select=*") === false, "the settings reader names its columns");
+    expectEqual(request.apiKey, config.serviceRoleKey, "the settings reader uses the server key");
+  }
+
+  const sealed = sealSecret(MASTER_KEY, "cloudflare-secret", TURNSTILE_CONTEXT);
+  const secretStub = createStubHttp(
+    okAnswer(200, [
+      {
+        setting_key: "turnstile.secret_key",
+        value: null,
+        is_secret: true,
+        secret_iv: sealed.iv,
+        secret_tag: sealed.tag,
+        secret_ciphertext: sealed.ciphertext,
+      },
+    ]),
+  );
+
+  expectEqual(
+    await createRestSettings(config, secretStub.http, () => MASTER_KEY).readSecret(
+      "turnstile.secret_key",
+    ),
+    "cloudflare-secret",
+    "a stored secret opens with the deployment key",
+  );
+
+  const valueStub = createStubHttp(
+    okAnswer(200, [
+      {
+        setting_key: "turnstile.enabled",
+        value: true,
+        is_secret: false,
+        secret_iv: null,
+        secret_tag: null,
+        secret_ciphertext: null,
+      },
+    ]),
+  );
+
+  expectEqual(
+    await createRestSettings(config, valueStub.http, () => MASTER_KEY).readValue(
+      "turnstile.enabled",
+      z.boolean(),
+    ),
+    true,
+    "a plain setting is read through the database",
+  );
+}
+
+/* ------------------------------------------------------------------ 12. turnstile */
+
+async function checkTurnstile(): Promise<void> {
+  const endpoint = "https://turnstile.gate/siteverify";
+  const enabledSettings = createInMemorySettings(
+    { "turnstile.enabled": true },
+    { "turnstile.secret_key": "cloudflare-secret" },
+  );
+
+  const verifiedStub = createStubHttp(okAnswer(200, { success: true }));
+  const verified = await createTurnstileGuard({
+    settings: enabledSettings,
+    http: verifiedStub.http,
+    isProduction: true,
+    endpoint,
+  }).check({ token: "widget-token", remoteIp: "203.0.113.9" });
+
+  expect(verified.ok && verified.value === "verified", "an accepted challenge is verified");
+
+  const request = firstRequest(verifiedStub.requests, "the guard asked Cloudflare");
+
+  if (request !== null) {
+    expectEqual(request.url, endpoint, "the guard calls siteverify");
+    expectEqual(request.apiKey, "", "siteverify needs no project key");
+    expectEqual(request.bearerToken, undefined, "siteverify needs no bearer");
+    const form = request.form as Readonly<Record<string, string>>;
+    expectEqual(form["secret"], "cloudflare-secret", "the secret travels in the form");
+    expectEqual(form["response"], "widget-token", "the widget token travels in the form");
+    expectEqual(form["remoteip"], "203.0.113.9", "the address travels when it is known");
+    expect(
+      JSON.stringify(request.headers ?? {}).includes("accept"),
+      "the guard asks for JSON",
+    );
+  }
+
+  const rejected = await createTurnstileGuard({
+    settings: enabledSettings,
+    http: createStubHttp(okAnswer(200, { success: false, "error-codes": ["invalid-input-response"] }))
+      .http,
+    isProduction: true,
+    endpoint,
+  }).check({ token: "widget-token", remoteIp: null });
+
+  expect(
+    !rejected.ok && rejected.failure.kind === "rejected" && rejected.failure.code === "invalid-input-response",
+    "a refused challenge is a rejection with the Cloudflare code",
+  );
+
+  const withoutToken = await createTurnstileGuard({
+    settings: enabledSettings,
+    http: createStubHttp().http,
+    isProduction: true,
+    endpoint,
+  }).check({ token: null, remoteIp: null });
+
+  expect(!withoutToken.ok && withoutToken.failure.kind === "rejected", "a missing token is a rejection");
+
+  const withoutSecret = await createTurnstileGuard({
+    settings: createInMemorySettings({ "turnstile.enabled": true }),
+    http: createStubHttp().http,
+    isProduction: true,
+    endpoint,
+  }).check({ token: "widget-token", remoteIp: null });
+
+  expect(
+    !withoutSecret.ok && withoutSecret.failure.kind === "upstream",
+    "an enabled switch without a secret is a deployment failure",
+  );
+
+  const disabledDevelopment = await createTurnstileGuard({
+    settings: createInMemorySettings({ "turnstile.enabled": false }),
+    http: createStubHttp().http,
+    isProduction: false,
+    endpoint,
+  }).check({ token: null, remoteIp: null });
+
+  expect(
+    disabledDevelopment.ok && disabledDevelopment.value === "skipped",
+    "a closed switch in development is skipped",
+  );
+
+  const disabledProduction = await createTurnstileGuard({
+    settings: createInMemorySettings({ "turnstile.enabled": false }),
+    http: createStubHttp().http,
+    isProduction: true,
+    endpoint,
+  }).check({ token: "widget-token", remoteIp: null });
+
+  expect(
+    !disabledProduction.ok && disabledProduction.failure.kind === "upstream",
+    "a closed switch in production refuses instead of skipping",
+  );
+
+  const providerDown = await createTurnstileGuard({
+    settings: enabledSettings,
+    http: createStubHttp(okAnswer(503, { success: false })).http,
+    isProduction: true,
+    endpoint,
+  }).check({ token: "widget-token", remoteIp: null });
+
+  expect(!providerDown.ok && providerDown.failure.kind === "upstream", "a 503 is an upstream failure");
+
+  const malformed = await createTurnstileGuard({
+    settings: enabledSettings,
+    http: createStubHttp(okAnswer(200, { verdict: "yes" })).http,
+    isProduction: true,
+    endpoint,
+  }).check({ token: "widget-token", remoteIp: null });
+
+  expect(
+    !malformed.ok && malformed.failure.kind === "malformed-response",
+    "an answer without a verdict is malformed",
+  );
+
+  expectEqual(TURNSTILE_ENABLED_SETTING, "turnstile.enabled", "the switch key is documented");
+  expectEqual(TURNSTILE_SECRET_SETTING, "turnstile.secret_key", "the secret key is documented");
+}
+
+/* ------------------------------------------------------------------ 13. audit */
+
+const AUDIT_HASH = "b".repeat(64);
+const AUDIT_PREV_HASH = "a".repeat(64);
+
+function checkAudit(): void {
+  const signingKey = Buffer.alloc(32, 9).toString("base64");
+  const signature = signAuditHash(signingKey, AUDIT_HASH);
+
+  expectEqual(signature.length, 86, "an Ed25519 signature is 86 base64url characters");
+  expect(/^[A-Za-z0-9_-]{86}$/u.test(signature), "the signature matches the column check");
+  expectEqual(
+    signAuditHash(signingKey, AUDIT_HASH),
+    signature,
+    "Ed25519 signing is deterministic for one key and one hash",
+  );
+  expect(
+    signAuditHash(signingKey, "c".repeat(64)) !== signature,
+    "a different hash produces a different signature",
+  );
+  expectAppError(
+    () => signAuditHash(signingKey, "not-a-hash"),
+    "INTERNAL_ERROR",
+    "a hash that is not 64 hex characters is refused",
+  );
+  expectAppError(
+    () => signAuditHash(Buffer.alloc(16, 1).toString("base64"), AUDIT_HASH),
+    "INTERNAL_ERROR",
+    "a signing key of the wrong length is refused",
+  );
+
+  const trail = createInMemoryAuditTrail();
+
+  void trail.append({
+    action: "merchant.signed_up",
+    actorUserId: USER_ID,
+    entityType: "company",
+    entityId: FIRM_ID,
+    payload: { policies: [] },
+    companyId: FIRM_ID,
+  });
+
+  expectEqual(trail.entries.length, 1, "the in memory trail keeps the entry");
+  expectEqual(trail.entries[0]?.action, "merchant.signed_up", "the entry keeps its action");
+}
+
+async function checkRestAuditTrail(): Promise<void> {
+  const signingKey = Buffer.alloc(32, 9).toString("base64");
+  const stub = createStubHttp(
+    okAnswer(200, [{ next_sequence: 5, prev_hash: AUDIT_PREV_HASH }]),
+    okAnswer(200, AUDIT_HASH),
+    okAnswer(201, null),
+  );
+  const trail = createRestAuditTrail({
+    config,
+    http: stub.http,
+    signingKey: () => signingKey,
+    now: () => NOW,
+  });
+
+  await trail.append({
+    action: "merchant.signed_up",
+    actorUserId: USER_ID,
+    entityType: "company",
+    entityId: FIRM_ID,
+    payload: { policies: [{ key: "kyc_kyb", version: "2" }] },
+    companyId: FIRM_ID,
+    ipAddress: "203.0.113.9",
+    userAgent: "gate",
+  });
+
+  expectEqual(stub.requests.length, 3, "an audit entry is two functions and one insert");
+
+  const linkCall = stub.requests[0];
+  const hashCall = stub.requests[1];
+  const insertCall = stub.requests[2];
+
+  if (linkCall !== undefined) {
+    expect(linkCall.url.endsWith("/rest/v1/rpc/audit_next_link"), "the chain head is asked first");
+    expectEqual(
+      (linkCall.body as Readonly<Record<string, unknown>>)["p_chain"],
+      FIRM_ID,
+      "the head is asked for the tenant chain",
+    );
+  }
+
+  if (hashCall !== undefined) {
+    const body = hashCall.body as Readonly<Record<string, unknown>>;
+
+    expect(hashCall.url.endsWith("/rest/v1/rpc/audit_hash_v1"), "the canonical hash is computed");
+    expectEqual(body["sequence"], 5, "the hash is computed for the next sequence");
+    expectEqual(body["prev_hash"], AUDIT_PREV_HASH, "the hash links to the head");
+    expectEqual(body["action"], "merchant.signed_up", "the hash covers the action");
+    expectEqual(body["actor_user_id"], USER_ID, "the hash covers the actor");
+  }
+
+  if (insertCall !== undefined) {
+    expectEqual(insertCall.method, "POST", "the row is inserted");
+    expect(insertCall.url.endsWith("/rest/v1/audit_logs"), "the row goes to the audit table");
+
+    const row = (insertCall.body as readonly Readonly<Record<string, unknown>>[])[0];
+
+    if (row === undefined) {
+      failures.push("the audit row must be inserted");
+      checkCount += 1;
+    } else {
+      expectEqual(row["sequence"], 5, "the inserted row carries the sequence");
+      expectEqual(row["prev_hash"], AUDIT_PREV_HASH, "the inserted row links to the head");
+      expectEqual(row["hash"], AUDIT_HASH, "the inserted row carries the canonical hash");
+      expectEqual(row["signing_key_id"], AUDIT_SIGNING_KEY_ID, "the row names the signing key");
+      expectEqual(
+        (row["signature"] as string).length,
+        86,
+        "the row carries the signature over the hash",
+      );
+      expectEqual(row["company_id"], FIRM_ID, "the row is on the tenant chain");
+      expectEqual(row["created_at"], new Date(NOW).toISOString(), "the row carries its instant");
+    }
+  }
+
+  const badAction = createRestAuditTrail({ config, http: createStubHttp().http, signingKey: () => signingKey });
+
+  await expectRejects(
+    () =>
+      badAction.append({
+        action: "Not An Action",
+        actorUserId: null,
+        entityType: null,
+        entityId: null,
+        payload: {},
+        companyId: null,
+      }),
+    "INTERNAL_ERROR",
+    "an action name that is not dotted lower case is refused",
+  );
+  await expectRejects(
+    () =>
+      badAction.append({
+        action: "merchant.signed_up",
+        actorUserId: null,
+        entityType: "company",
+        entityId: null,
+        payload: {},
+        companyId: null,
+      }),
+    "INTERNAL_ERROR",
+    "an entity type without an identifier is refused",
+  );
+  await expectRejects(
+    () =>
+      badAction.append({
+        action: "merchant.signed_up",
+        actorUserId: null,
+        entityType: null,
+        entityId: null,
+        payload: { padding: "x".repeat(9_000) },
+        companyId: null,
+      }),
+    "INTERNAL_ERROR",
+    "a payload over the column ceiling is refused",
+  );
+}
+
+/* ------------------------------------------------------------------ 14. policies */
+
+function policyPages(count: number = POLICY_KEYS.length): readonly PolicyPage[] {
+  return POLICY_KEYS.slice(0, count).map((key, index) => ({
+    key,
+    slug: `policy-${index}`,
+    title: `Policy ${index}`,
+    body: `Policy body ${index}`,
+    version: 2,
+  }));
+}
+
+async function checkPolicies(): Promise<void> {
+  expectEqual(
+    policyDocumentSha256("abc"),
+    "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+    "the document hash is the SHA-256 of the text",
+  );
+  expectEqual(POLICY_KEYS.length, 12, "the platform closes twelve policy keys");
+  expectEqual(REQUIRED_POLICY_KEYS.length, 12, "every policy is required at signup");
+
+  const catalog = createInMemoryPolicyCatalog(policyPages());
+  const published = await catalog.published(REQUIRED_POLICY_KEYS);
+
+  expectEqual(published.length, 12, "a complete catalog answers twelve policies");
+  expectEqual(published[0]?.key, "kyc_kyb", "the catalog keeps the request order");
+  expectEqual(published[0]?.version, "2", "the version is the page row version");
+  expectEqual(
+    published[0]?.documentSha256,
+    policyDocumentSha256("Policy body 0"),
+    "the hash is the hash of the page body",
+  );
+  expect(catalogIsComplete(published), "twelve policies are a complete catalog");
+
+  const partial = await createInMemoryPolicyCatalog(policyPages(11)).published(REQUIRED_POLICY_KEYS);
+
+  expectEqual(partial.length, 11, "an incomplete catalog answers eleven policies");
+  expect(!catalogIsComplete(partial), "an incomplete catalog is not complete");
+
+  expect(
+    acceptsEveryRequiredPolicy(REQUIRED_POLICY_KEYS),
+    "accepting every required policy is enough",
+  );
+  expect(
+    !acceptsEveryRequiredPolicy(REQUIRED_POLICY_KEYS.slice(0, 11)),
+    "a missing policy is not enough",
+  );
+  expect(
+    !acceptsEveryRequiredPolicy([...REQUIRED_POLICY_KEYS, "kyc_kyb"]),
+    "accepting one policy twice is not enough",
+  );
+}
+
+/* ------------------------------------------------------------------ 15. password */
+
+async function checkPassword(): Promise<void> {
+  assertPasswordAcceptable("correct horse battery", "owner@example.com");
+  checkCount += 1;
+
+  expectAppError(
+    () => assertPasswordAcceptable("short-pass1", "owner@example.com"),
+    "VALIDATION_FAILED",
+    "a password below the floor is refused",
+  );
+  expectAppError(
+    () => assertPasswordAcceptable(` ${"a".repeat(20)}`, "owner@example.com"),
+    "VALIDATION_FAILED",
+    "a password with surrounding whitespace is refused",
+  );
+  expectAppError(
+    () => assertPasswordAcceptable("aaaaaaaaaaaa", "owner@example.com"),
+    "VALIDATION_FAILED",
+    "a password of one repeated character is refused",
+  );
+  expectAppError(
+    () => assertPasswordAcceptable("owner-is-my-password", "owner@example.com"),
+    "VALIDATION_FAILED",
+    "a password containing the address is refused",
+  );
+  expectAppError(
+    () => assertPasswordAcceptable(`${"a".repeat(128)}B1`, "owner@example.com"),
+    "VALIDATION_FAILED",
+    "a password above the ceiling is refused",
+  );
+
+  const stored = await hashPassword("correct horse battery");
+
+  expect(stored.startsWith("scrypt$16384$8$1$"), "the stored hash names its parameters");
+  expect(stored.length >= 20 && stored.length <= 255, "the stored hash fits the column");
+  expect(await verifyPasswordHash("correct horse battery", stored), "the right password verifies");
+  expect(!(await verifyPasswordHash("correct horse batterY", stored)), "a wrong password fails");
+  expect(!(await verifyPasswordHash("correct horse battery", "not-a-hash")), "a broken row fails");
+  expect(!(await verifyPasswordHash("correct horse battery", "scrypt$1$8$1$a$b")), "an unknown cost fails");
+  expect((await hashPassword("correct horse battery")) !== stored, "two hashes of one password differ");
+}
+
+/* ------------------------------------------------------------------ 16. registration */
+
+interface RestCall {
+  readonly kind: "select" | "insert" | "insertReturning" | "update" | "rpc";
+  readonly table: string;
+  readonly query: string | null;
+  readonly rows: unknown;
+}
+
+interface StubRest {
+  readonly rest: RestClient;
+  readonly calls: readonly RestCall[];
+}
+
+function createStubRest(options: { readonly failInsertTable?: string } = {}): StubRest {
+  const calls: RestCall[] = [];
+
+  const rest: RestClient = {
+    select<TRow>(table: string, query: string): Promise<readonly TRow[]> {
+      calls.push({ kind: "select", table, query, rows: null });
+
+      return Promise.resolve([]);
+    },
+    insert(table: string, rows: readonly Readonly<Record<string, unknown>>[]): Promise<void> {
+      calls.push({ kind: "insert", table, query: null, rows });
+
+      if (table === options.failInsertTable) {
+        return Promise.reject(new AppError("DEPENDENCY_FAILED"));
+      }
+
+      return Promise.resolve();
+    },
+    insertReturning<TRow>(
+      table: string,
+      rows: readonly Readonly<Record<string, unknown>>[],
+    ): Promise<readonly TRow[]> {
+      calls.push({ kind: "insertReturning", table, query: null, rows });
+
+      if (table === options.failInsertTable) {
+        return Promise.reject(new AppError("DEPENDENCY_FAILED"));
+      }
+
+      return Promise.resolve([{ id: FIRM_ID } as unknown as TRow]);
+    },
+    update(table: string, query: string, values: Readonly<Record<string, unknown>>): Promise<void> {
+      calls.push({ kind: "update", table, query, rows: values });
+
+      return Promise.resolve();
+    },
+    rpc(table: string, body: Readonly<Record<string, unknown>>): Promise<unknown> {
+      calls.push({ kind: "rpc", table, query: null, rows: body });
+
+      return Promise.resolve(null);
+    },
+  };
+
+  return { rest, calls };
+}
+
+const unavailableFailure: AuthFailure = {
+  kind: "upstream",
+  status: 503,
+  code: null,
+  retryAfterSeconds: null,
+};
+
+function stubAuthClient(overrides: Partial<AuthClient> = {}): AuthClient {
+  const unavailable = <TValue>(): Promise<AuthOutcome<TValue>> =>
+    Promise.resolve({ ok: false, failure: unavailableFailure });
+
+  return {
+    signInWithPassword: unavailable,
+    signUpWithPassword: unavailable,
+    verifyEmailToken: unavailable,
+    resendVerificationEmail: unavailable,
+    requestPasswordReset: unavailable,
+    refreshSession: unavailable,
+    signOut: unavailable,
+    getUser: unavailable,
+    ...overrides,
+  };
+}
+
+interface StubAdmin {
+  readonly admin: ReturnType<typeof createAuthAdminClient>;
+  readonly deleted: string[];
+}
+
+function createStubAdmin(): StubAdmin {
+  const deleted: string[] = [];
+
+  return {
+    deleted,
+    admin: {
+      createUser: () => Promise.resolve({ ok: false, failure: unavailableFailure }),
+      updateUser: () => Promise.resolve({ ok: false, failure: unavailableFailure }),
+      deleteUser: (userId: string) => {
+        deleted.push(userId);
+
+        return Promise.resolve({ ok: true, value: undefined });
+      },
+      revokeUserSessions: () => Promise.resolve({ ok: false, failure: unavailableFailure }),
+      getUser: () => Promise.resolve({ ok: false, failure: unavailableFailure }),
+    },
+  };
+}
+
+interface RegistrationFixture {
+  readonly dependencies: Parameters<typeof registerMerchant>[1];
+  readonly rest: StubRest;
+  readonly newAdmin: StubAdmin;
+  readonly audit: ReturnType<typeof createInMemoryAuditTrail>;
+}
+
+function registrationFixture(options: {
+  readonly pages?: readonly PolicyPage[];
+  readonly failInsertTable?: string;
+  readonly turnstileEnabled?: boolean;
+  readonly provider?: AuthOutcome<{ readonly userId: string; readonly session: AuthSession | null }>;
+}): RegistrationFixture {
+  const rest = createStubRest(
+    options.failInsertTable === undefined ? {} : { failInsertTable: options.failInsertTable },
+  );
+  const newAdmin = createStubAdmin();
+  const audit = createInMemoryAuditTrail();
+  const provider: AuthOutcome<{ readonly userId: string; readonly session: AuthSession | null }> =
+    options.provider ?? { ok: true, value: { userId: USER_ID, session: null } };
+
+  return {
+    rest,
+    newAdmin,
+    audit,
+    dependencies: {
+      auth: stubAuthClient({ signUpWithPassword: () => Promise.resolve(provider) }),
+      admin: newAdmin.admin,
+      rest: rest.rest,
+      policies: createInMemoryPolicyCatalog(options.pages ?? policyPages()),
+      turnstile: createTurnstileGuard({
+        settings: createInMemorySettings({
+          "turnstile.enabled": options.turnstileEnabled ?? false,
+        }),
+        http: createStubHttp().http,
+        isProduction: false,
+        endpoint: "https://turnstile.gate/siteverify",
+      }),
+      audit,
+      now: () => NOW,
+    },
+  };
+}
+
+function signupRequest(overrides: Readonly<Record<string, unknown>> = {}): Record<string, unknown> {
+  return {
+    fullName: "Owner Name",
+    email: "owner@example.com",
+    password: "correct horse battery",
+    companyName: "Acme Payments",
+    acceptedPolicies: [...REQUIRED_POLICY_KEYS],
+    turnstileToken: null,
+    ...overrides,
+  };
+}
+
+async function checkRegistration(): Promise<void> {
+  expectEqual(companySlug("Acme Payments"), "acme-payments", "a company name becomes a slug");
+  expectEqual(companySlug("  ***  "), "merchant", "an unusable name still produces a slug");
+
+  const fixture = registrationFixture({});
+  const result = await registerMerchant(
+    { request: signupRequest(), remoteIp: "203.0.113.9", userAgent: "gate" },
+    fixture.dependencies,
+  );
+
+  expectEqual(result.userId, USER_ID, "the platform account keeps the provider identifier");
+  expectEqual(result.companyId, FIRM_ID, "the signup creates a company");
+  expectEqual(result.verificationRequired, true, "an unconfirmed signup awaits the mail link");
+
+  const companyCall = fixture.rest.calls.find((call) => call.kind === "insertReturning");
+  const companyRows = (companyCall?.rows ?? []) as readonly Readonly<Record<string, unknown>>[];
+
+  expectEqual(companyRows[0]?.["slug"], "acme-payments", "the company is created with its slug");
+  expectEqual(companyRows[0]?.["name"], "Acme Payments", "the company keeps its name");
+
+  const userCall = fixture.rest.calls.find(
+    (call) => call.kind === "insert" && call.table === "users",
+  );
+  const userRows = (userCall?.rows ?? []) as readonly Readonly<Record<string, unknown>>[];
+  const userRow = userRows[0];
+
+  if (userRow === undefined) {
+    failures.push("the signup must insert the platform account");
+    checkCount += 1;
+  } else {
+    expectEqual(userRow["id"], USER_ID, "the account id is the provider identifier");
+    expectEqual(userRow["company_id"], FIRM_ID, "the account belongs to the new company");
+    expectEqual(userRow["email"], "owner@example.com", "the account keeps the address");
+    expectEqual(userRow["full_name"], "Owner Name", "the account keeps the name");
+    expectEqual(userRow["status"], "active", "the account starts active");
+    expectEqual(userRow["email_verified_at"], null, "an unconfirmed address has no instant");
+    expect(
+      typeof userRow["password_hash"] === "string" &&
+        userRow["password_hash"].startsWith("scrypt$"),
+      "the account stores a scrypt verifier",
+    );
+  }
+
+  const roleCall = fixture.rest.calls.find(
+    (call) => call.kind === "insert" && call.table === "role_assignments",
+  );
+  const roleRows = (roleCall?.rows ?? []) as readonly Readonly<Record<string, unknown>>[];
+
+  expectEqual(roleRows[0]?.["role"], "owner", "the first person of a company is its owner");
+  expectEqual(roleRows[0]?.["company_id"], FIRM_ID, "the owner grant names the company");
+  expectEqual(roleRows[0]?.["user_id"], USER_ID, "the owner grant names the person");
+
+  const acceptanceCall = fixture.rest.calls.find(
+    (call) => call.kind === "insert" && call.table === "policy_acceptances",
+  );
+  const acceptanceRows = (acceptanceCall?.rows ?? []) as readonly Readonly<
+    Record<string, unknown>
+  >[];
+
+  expectEqual(acceptanceRows.length, 12, "twelve acceptances are recorded");
+  expectEqual(acceptanceRows[0]?.["policy_version"], "2", "the acceptance names the version");
+  expectEqual(
+    acceptanceRows[0]?.["document_sha256"],
+    policyDocumentSha256("Policy body 0"),
+    "the acceptance carries the hash of the text",
+  );
+  expectEqual(acceptanceRows[0]?.["accepted_by"], USER_ID, "the acceptance names the person");
+  expectEqual(acceptanceRows[0]?.["company_id"], FIRM_ID, "the acceptance belongs to the company");
+
+  expectEqual(fixture.audit.entries.length, 1, "the signup writes one audit entry");
+  expectEqual(fixture.audit.entries[0]?.action, "merchant.signed_up", "the entry names the action");
+  expectEqual(fixture.audit.entries[0]?.entityType, "company", "the entry names the company");
+  expectEqual(fixture.audit.entries[0]?.ipAddress, "203.0.113.9", "the entry carries the address");
+
+  await expectRejects(
+    () =>
+      registerMerchant(
+        { request: signupRequest({ extra: "field" }), remoteIp: null, userAgent: null },
+        registrationFixture({}).dependencies,
+      ),
+    "VALIDATION_FAILED",
+    "an unknown field is refused",
+  );
+  await expectRejects(
+    () =>
+      registerMerchant(
+        { request: signupRequest({ password: "short" }), remoteIp: null, userAgent: null },
+        registrationFixture({}).dependencies,
+      ),
+    "VALIDATION_FAILED",
+    "a password below the policy is refused",
+  );
+  await expectRejects(
+    () =>
+      registerMerchant(
+        { request: signupRequest({ acceptedPolicies: ["kyc_kyb"] }), remoteIp: null, userAgent: null },
+        registrationFixture({}).dependencies,
+      ),
+    "VALIDATION_FAILED",
+    "a partial policy acceptance is refused",
+  );
+  await expectRejects(
+    () =>
+      registerMerchant(
+        {
+          request: signupRequest({ acceptedPolicies: [...REQUIRED_POLICY_KEYS, "unknown"] }),
+          remoteIp: null,
+          userAgent: null,
+        },
+        registrationFixture({}).dependencies,
+      ),
+    "VALIDATION_FAILED",
+    "an unknown policy key is refused",
+  );
+  await expectRejects(
+    () =>
+      registerMerchant(
+        { request: signupRequest(), remoteIp: null, userAgent: null },
+        registrationFixture({ pages: policyPages(11) }).dependencies,
+      ),
+    "SERVICE_UNAVAILABLE",
+    "an incomplete policy catalog stops the signup",
+  );
+  await expectRejects(
+    () =>
+      registerMerchant(
+        { request: signupRequest({ turnstileToken: null }), remoteIp: null, userAgent: null },
+        registrationFixture({ turnstileEnabled: true }).dependencies,
+      ),
+    "VALIDATION_FAILED",
+    "an enabled challenge without a token is refused",
+  );
+  await expectRejects(
+    () =>
+      registerMerchant(
+        { request: signupRequest(), remoteIp: null, userAgent: null },
+        registrationFixture({
+          provider: { ok: false, failure: { kind: "rejected", status: 400, code: "user_already_exists", retryAfterSeconds: null } },
+        }).dependencies,
+      ),
+    "VALIDATION_FAILED",
+    "a provider rejection at signup is a generic validation failure",
+  );
+
+  const compensated = registrationFixture({ failInsertTable: "users" });
+
+  await expectRejects(
+    () =>
+      registerMerchant(
+        { request: signupRequest(), remoteIp: null, userAgent: null },
+        compensated.dependencies,
+      ),
+    "DEPENDENCY_FAILED",
+    "a write failure after the provider account is a platform failure",
+  );
+  expectEqual(compensated.newAdmin.deleted.length, 1, "the provider account is removed");
+  expect(
+    compensated.rest.calls.some(
+      (call) => call.kind === "update" && call.table === "companies",
+    ),
+    "the company created by the failed signup is soft deleted",
+  );
+
+  const confirmed = registrationFixture({
+    provider: { ok: true, value: { userId: USER_ID, session: fixtureSession() } },
+  });
+  const confirmedResult = await registerMerchant(
+    { request: signupRequest(), remoteIp: null, userAgent: null },
+    confirmed.dependencies,
+  );
+
+  expectEqual(
+    confirmedResult.verificationRequired,
+    false,
+    "a provider that confirms the address needs no mail",
+  );
+
+  const confirmedUser = (
+    (confirmed.rest.calls.find((call) => call.kind === "insert" && call.table === "users")?.rows ??
+      []) as readonly Readonly<Record<string, unknown>>[]
+  )[0];
+
+  expectEqual(
+    confirmedUser?.["email_verified_at"],
+    new Date(NOW).toISOString(),
+    "a confirmed signup records the verification instant",
+  );
+
+  const storage = await hashPassword("correct horse battery");
+
+  expect(
+    !storage.includes("correct horse battery"),
+    "the stored verifier never contains the password",
+  );
+}
+
+/* ------------------------------------------------------------------ 17. verification */
+
+function fixtureSession(): AuthSession {
+  return {
+    accessToken: makeAccessToken(baseClaims()),
+    refreshToken: "refresh-token-000000000000000000",
+    expiresAtEpochMs: NOW + 3_600_000,
+    expiresInSeconds: 3_600,
+    user: {
+      id: USER_ID,
+      email: "owner@example.com",
+      emailConfirmedAtEpochMs: NOW,
+      phone: null,
+      lastSignInAtEpochMs: NOW,
+      fullName: "Owner Name",
+    },
+  };
+}
+
+async function checkEmailVerification(): Promise<void> {
+  const updates: { table: string; query: string; values: Readonly<Record<string, unknown>> }[] = [];
+  const rest: RestClient = {
+    select<TRow>(): Promise<readonly TRow[]> {
+      return Promise.resolve([
+        { id: USER_ID, company_id: FIRM_ID, email_verified_at: null } as unknown as TRow,
+      ]);
+    },
+    insert: () => Promise.resolve(),
+    insertReturning: () => Promise.resolve([]),
+    update: (table: string, query: string, values: Readonly<Record<string, unknown>>) => {
+      updates.push({ table, query, values });
+
+      return Promise.resolve();
+    },
+    rpc: () => Promise.resolve(null),
+  };
+  const audit = createInMemoryAuditTrail();
+  const dependencies = {
+    auth: stubAuthClient({
+      verifyEmailToken: () => Promise.resolve({ ok: true, value: fixtureSession() }),
+    }),
+    rest,
+    audit,
+    cookiePolicy: cookiePolicy(),
+    now: () => NOW,
+  };
+
+  const result = await completeEmailVerification(
+    { tokenHash: "token-hash-value", type: "signup", remoteIp: "203.0.113.9", userAgent: "gate" },
+    dependencies,
+  );
+
+  expectEqual(result.userId, USER_ID, "the verification answers the person");
+  expectEqual(result.companyId, FIRM_ID, "the verification answers the company");
+  expectEqual(result.cookies.length, 1, "the verification writes one session cookie");
+  expect(
+    (result.cookies[0] ?? "").startsWith("__Host-kd_session="),
+    "the verification cookie is the secure one",
+  );
+  expectEqual(audit.entries.length, 1, "the verification writes one audit entry");
+  expectEqual(audit.entries[0]?.action, "user.email_verified", "the entry names the action");
+  expectEqual(audit.entries[0]?.sessionId, SESSION_ID, "the entry names the session");
+  expectEqual(updates.length, 1, "the verification writes one row");
+  expectEqual(updates[0]?.table, "users", "the verification writes the account row");
+  expect(
+    (updates[0]?.query ?? "").includes(`id=eq.${USER_ID}`),
+    "the verification names the account it updates",
+  );
+  expectEqual(
+    updates[0]?.values["email_verified_at"],
+    new Date(NOW).toISOString(),
+    "the verification records the instant",
+  );
+
+  await expectRejects(
+    () =>
+      completeEmailVerification(
+        { tokenHash: "token-hash-value", type: "email_change", remoteIp: null, userAgent: null },
+        dependencies,
+      ),
+    "VALIDATION_FAILED",
+    "a token type the signup route does not accept is refused",
+  );
+  await expectRejects(
+    () =>
+      completeEmailVerification(
+        { tokenHash: "short", type: "signup", remoteIp: null, userAgent: null },
+        dependencies,
+      ),
+    "VALIDATION_FAILED",
+    "a malformed token is refused before the provider is asked",
+  );
+  await expectRejects(
+    () =>
+      completeEmailVerification(
+        { tokenHash: "token-hash-value", type: "signup", remoteIp: null, userAgent: null },
+        {
+          ...dependencies,
+          auth: stubAuthClient({
+            verifyEmailToken: () =>
+              Promise.resolve({
+                ok: false,
+                failure: { kind: "rejected", status: 403, code: "token_expired", retryAfterSeconds: null },
+              }),
+          }),
+        },
+      ),
+    "VALIDATION_FAILED",
+    "an expired link is a validation failure",
+  );
+  await expectRejects(
+    () =>
+      completeEmailVerification(
+        { tokenHash: "token-hash-value", type: "signup", remoteIp: null, userAgent: null },
+        {
+          ...dependencies,
+          rest: {
+            ...rest,
+            select: <TRow>(): Promise<readonly TRow[]> => Promise.resolve([]),
+          },
+        },
+      ),
+    "AUTHENTICATION_REQUIRED",
+    "a provider identity with no platform row is not an account",
+  );
+}
+
+/* ------------------------------------------------------------------ 18. client address */
+
+function checkClientAddress(): void {
+  expect(isAddress("203.0.113.9"), "an IPv4 address is an address");
+  expect(isAddress("2001:db8::1"), "an IPv6 address is an address");
+  expect(!isAddress("203.0.113.9:443"), "an address with a port is not an address");
+  expect(!isAddress("[2001:db8::1]"), "a bracketed address is not an address");
+  expect(!isAddress("fe80::1%eth0"), "an address with a zone is not an address");
+  expect(!isAddress("not-an-address"), "a word is not an address");
+  expect(!isAddress("999.1.1.1"), "an out of range IPv4 address is not an address");
+
+  const headers = new Headers({
+    "x-forwarded-for": "203.0.113.9, 70.41.3.18",
+    "user-agent": "gate",
+  });
+
+  expectEqual(readClientAddress(headers), "203.0.113.9", "the first forwarded address is used");
+  expectEqual(readUserAgent(headers), "gate", "the user agent is read");
+  expectEqual(readClientAddress(new Headers({ "x-real-ip": "198.51.100.7" })), "198.51.100.7", "a real ip header is used");
+  expectEqual(readClientAddress(new Headers()), null, "a request without headers has no address");
+  expectEqual(readUserAgent(new Headers()), null, "a request without an agent has none");
+  expectEqual(readUserAgent(new Headers({ "user-agent": "x".repeat(600) })), null, "an oversized agent is refused");
+}
+
 /* ------------------------------------------------------------------ main */
 
 async function main(): Promise<void> {
@@ -1772,6 +2869,16 @@ async function main(): Promise<void> {
   await checkSession();
   await checkClient();
   await checkAdminClient();
+  checkSecrets();
+  await checkSettings();
+  await checkTurnstile();
+  checkAudit();
+  await checkRestAuditTrail();
+  await checkPolicies();
+  await checkPassword();
+  await checkRegistration();
+  await checkEmailVerification();
+  checkClientAddress();
 
   if (failures.length > 0) {
     process.stderr.write(`auth gate failed with ${failures.length} problem(s):\n`);
