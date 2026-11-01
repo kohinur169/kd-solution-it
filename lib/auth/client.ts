@@ -53,6 +53,9 @@ const userSchema = z.object({
   confirmed_at: z.string().max(40).nullable().optional(),
   phone: z.string().max(32).nullable().optional(),
   last_sign_in_at: z.string().max(40).nullable().optional(),
+  // The identities of the person. A provider that refuses to say "this address is taken" answers
+  // the existing user with an empty list instead, which is the only duplicate signal it offers.
+  identities: z.array(z.unknown()).max(16).optional(),
   user_metadata: z
     .looseObject({ full_name: z.string().min(1).max(120).optional() })
     .nullable()
@@ -101,14 +104,33 @@ export interface VerifyEmailTokenInput {
 }
 
 /**
+ * What the provider's answer says about the person behind an address.
+ *
+ * The three values exist because the provider has three answers and only one of them is safe to
+ * act on destructively:
+ *
+ *   - `new` - an identity was created for this address. The identifier is ours to clean up;
+ *   - `existing` - the address is already registered, and the provider hid that fact by answering
+ *     the *existing* person with an empty identity list. The identifier belongs to someone else;
+ *   - `unknown` - the provider answered a person but listed no identities at all, which a version
+ *     that does not obfuscate can do. Nothing may be concluded, so nothing may be deleted.
+ *
+ * STEP 048 owns the consequences; this module only reports the fact without inventing one.
+ */
+export type SignUpIdentity = "new" | "existing" | "unknown";
+
+/**
  * The result of a registration.
  *
  * `userId` is the invariant STEP 038 relies on: the platform row in `public.users` is created
  * with this identifier, so a later claim subject is a `public.users.id` with no translation.
+ * `identity` is how much that identifier can be trusted, and it is the field a caller must read
+ * before treating a failed write as something to undo.
  */
 export interface SignUpResult {
   readonly userId: string;
   readonly session: AuthSession | null;
+  readonly identity: SignUpIdentity;
 }
 
 export interface AuthClient {
@@ -286,13 +308,27 @@ export function createAuthClient(
       // returned as is. A project with confirmations enabled answers with only the user, and the
       // merchant signs in after the link is followed.
       const registeredUser = parsed.data.user;
+      // An address the provider already holds is answered with the existing person and an empty
+      // identity list, and never with a session. Read before the session branch below, because
+      // that branch treats a missing session as "check your mail" - which would be a new account
+      // that was never created.
+      const identity: SignUpIdentity =
+        registeredUser === undefined
+          ? "unknown"
+          : parsed.data.access_token !== undefined
+            ? "new"
+            : registeredUser.identities === undefined
+              ? "unknown"
+              : registeredUser.identities.length === 0
+                ? "existing"
+                : "new";
 
       if (
         parsed.data.access_token === undefined ||
         parsed.data.refresh_token === undefined ||
         registeredUser === undefined
       ) {
-        return { ok: true, value: { userId, session: null } };
+        return { ok: true, value: { userId, session: null, identity } };
       }
 
       const session = toSession(
@@ -306,7 +342,7 @@ export function createAuthClient(
         Date.now(),
       );
 
-      return { ok: true, value: { userId, session } };
+      return { ok: true, value: { userId, session, identity } };
     },
 
     verifyEmailToken(input: VerifyEmailTokenInput): Promise<AuthOutcome<AuthSession>> {

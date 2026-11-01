@@ -3,6 +3,7 @@ import { NextResponse } from "next/server";
 import { AppError } from "@/lib/errors/app-error";
 import { withErrorResponse } from "@/lib/errors/respond";
 import { readClientAddress, readUserAgent } from "@/lib/auth/client-address";
+import { TWO_FACTOR_RESET_ACCEPTANCE, type TwoFactorResetAcceptance } from "@/lib/auth/disclosure";
 import { getAuthRuntime } from "@/lib/auth/runtime";
 import { requestTwoFactorReset } from "@/lib/auth/two-factor-reset";
 import { logger } from "@/lib/logger/logger";
@@ -11,10 +12,6 @@ export const dynamic = "force-dynamic";
 
 /** An address and a reason. */
 const maximumBodyBytes = 4_096;
-
-interface ResetResponseBody {
-  readonly status: "accepted";
-}
 
 /**
  * A merchant asks the office to reset the second factor on their account.
@@ -27,7 +24,7 @@ interface ResetResponseBody {
  * reason and the one-live-request index are what keep it from being a lever.
  */
 export const POST = withErrorResponse(
-  async (request: Request): Promise<NextResponse<ResetResponseBody>> => {
+  async (request: Request): Promise<NextResponse<TwoFactorResetAcceptance>> => {
     const declaredLength = request.headers.get("content-length");
 
     if (declaredLength !== null) {
@@ -62,7 +59,7 @@ export const POST = withErrorResponse(
     // place a stranger's data lives.
     logger.info("two factor reset requested", { accepted: result.accepted });
 
-    return NextResponse.json({ status: "accepted" } satisfies ResetResponseBody, {
+    return NextResponse.json(TWO_FACTOR_RESET_ACCEPTANCE, {
       status: 202,
       headers: { "cache-control": "no-store" },
     });

@@ -3,6 +3,7 @@ import { NextResponse } from "next/server";
 import { AppError } from "@/lib/errors/app-error";
 import { withErrorResponse } from "@/lib/errors/respond";
 import { readClientAddress, readUserAgent } from "@/lib/auth/client-address";
+import { SIGNUP_ACCEPTANCE, type SignupAcceptance } from "@/lib/auth/disclosure";
 import { registerMerchant } from "@/lib/auth/registration";
 import { getAuthRuntime } from "@/lib/auth/runtime";
 import { logger } from "@/lib/logger/logger";
@@ -12,9 +13,6 @@ export const dynamic = "force-dynamic";
 /** The largest signup body the route will read. A form of four fields is a few hundred bytes. */
 const maximumBodyBytes = 8_192;
 
-interface SignupResponseBody {
-  readonly status: "verification_required" | "signed_up";
-}
 
 function readDeclaredLength(request: Request): number | null {
   const header = request.headers.get("content-length");
@@ -39,16 +37,23 @@ function readDeclaredLength(request: Request): number | null {
  *
  * Answer shapes:
  *
- *   - `201` with `verification_required` when the provider sent a confirmation mail;
- *   - `201` with `signed_up` when the project confirms addresses automatically;
+ *   - `201` with `{"status":"verification_required"}` for **every** accepted form, whether the
+ *     address was new or already registered. One body, one sentence, one status code: the answer is
+ *     a property of the form and never of the directory (section 22 line 243). The mail that
+ *     arrives, or does not, is the only thing that differs, and only the address holder sees it;
  *   - a `VALIDATION_FAILED` envelope for a form problem, an unaccepted policy or a failed challenge,
  *     with details that name fields and never values;
  *   - a `429`, `502` or `503` when the platform or the provider is the problem.
  *
+ * The old `signed_up` variant is gone with it. A project that confirms addresses automatically
+ * would otherwise answer a new address differently from a registered one, which is the leak in its
+ * purest form; and the platform requires verification anyway (section 22), so the merchant is told
+ * to check their mail either way.
+ *
  * Rate limiting of this endpoint is STEP 055's: the route is written so that the limiter can wrap it
  * without changing the handler.
  */
-export const POST = withErrorResponse(async (request: Request): Promise<NextResponse<SignupResponseBody>> => {
+export const POST = withErrorResponse(async (request: Request): Promise<NextResponse<SignupAcceptance>> => {
   const declaredLength = readDeclaredLength(request);
 
   if (declaredLength !== null && declaredLength > maximumBodyBytes) {
@@ -83,14 +88,21 @@ export const POST = withErrorResponse(async (request: Request): Promise<NextResp
     },
   );
 
-  logger.info("merchant signup accepted", {
-    userId: result.userId,
-    companyId: result.companyId,
-    verificationRequired: result.verificationRequired,
-  });
+  // The log line is where the difference is allowed to exist, and it is narrower than it looks: a
+  // duplicate records that an address was answered generically and not which address it was. The
+  // body below is the same literal for both, so no reader of this function can vary it by accident.
+  if (result.status === "created") {
+    logger.info("merchant signup accepted", {
+      userId: result.userId,
+      companyId: result.companyId,
+      verificationRequired: result.verificationRequired,
+    });
+  } else {
+    logger.info("merchant signup answered without creating an account", { created: false });
+  }
 
   return NextResponse.json(
-    { status: result.verificationRequired ? "verification_required" : "signed_up" },
+    SIGNUP_ACCEPTANCE,
     {
       status: 201,
       headers: {

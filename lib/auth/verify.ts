@@ -1,9 +1,11 @@
 // path: lib/auth/verify.ts
 import { Buffer } from "node:buffer";
+import { readdir } from "node:fs/promises";
 import process from "node:process";
 import { z } from "zod";
 import { AppError } from "../errors/app-error.ts";
 import { ERROR_CODES } from "../errors/codes.ts";
+import { buildErrorEnvelope } from "../errors/respond.ts";
 import { createAuthAdminClient } from "./admin-client.ts";
 import {
   AUDIT_SIGNING_KEY_ID,
@@ -12,6 +14,19 @@ import {
   signAuditHash,
 } from "./audit.ts";
 import { isAddress, readClientAddress, readUserAgent } from "./client-address.ts";
+import {
+  ANONYMOUS_AUTH_SURFACES,
+  ANONYMOUS_REFUSAL,
+  FORBIDDEN_ON_ANONYMOUS_SURFACES,
+  SIGNUP_ACCEPTANCE,
+  SESSION_AUTH_SURFACES,
+  TWO_FACTOR_RESET_ACCEPTANCE,
+  anonymousRejection,
+  anonymousSurfaceCodes,
+  classifiedPaths,
+  isCatalogCode,
+  isDisclosingDetail,
+} from "./disclosure.ts";
 import { getMessage } from "../i18n/messages.ts";
 import type { Logger } from "../logger/logger.ts";
 import {
@@ -75,7 +90,7 @@ import {
   unlockAccountLock,
 } from "./account-unlock.ts";
 import { signInMerchant, signinInputSchema } from "./signin.ts";
-import { createAuthClient, type AuthClient } from "./client.ts";
+import { createAuthClient, type AuthClient, type SignUpIdentity } from "./client.ts";
 import { authAdminUserUrl, authTokenUrl, buildAuthConfig, type AuthConfig } from "./config.ts";
 import {
   AUTH_COOKIE_MAXIMUM_CHUNKS,
@@ -141,7 +156,7 @@ import {
   REQUIRED_POLICY_KEYS,
   type PolicyPage,
 } from "./policies.ts";
-import { companySlug, registerMerchant } from "./registration.ts";
+import { companySlug, registerMerchant, type RegistrationResult } from "./registration.ts";
 import {
   accountLockError,
   assertAccountUnlocked,
@@ -2679,20 +2694,37 @@ interface StubRest {
   readonly calls: readonly RestCall[];
 }
 
-function createStubRest(options: { readonly failInsertTable?: string } = {}): StubRest {
+function createStubRest(
+  options: {
+    readonly failInsertTable?: string;
+    /** Addresses the fake `public.users` table already holds. */
+    readonly registeredEmails?: readonly string[];
+    /** A table whose insert is refused with `CONFLICT`, the way a unique index refuses. */
+    readonly conflictInsertTable?: string;
+  } = {},
+): StubRest {
   const calls: RestCall[] = [];
+  const registeredEmails = options.registeredEmails ?? [];
 
   const rest: RestClient = {
     select<TRow>(table: string, query: string): Promise<readonly TRow[]> {
       calls.push({ kind: "select", table, query, rows: null });
 
-      return Promise.resolve([]);
+      const found =
+        table === "users" &&
+        registeredEmails.some((email) => query.includes(`email=eq.${encodeURIComponent(email)}`));
+
+      return Promise.resolve(found ? ([{ id: USER_ID }] as unknown as readonly TRow[]) : []);
     },
     insert(table: string, rows: readonly Readonly<Record<string, unknown>>[]): Promise<void> {
       calls.push({ kind: "insert", table, query: null, rows });
 
       if (table === options.failInsertTable) {
         return Promise.reject(new AppError("DEPENDENCY_FAILED"));
+      }
+
+      if (table === options.conflictInsertTable) {
+        return Promise.reject(new AppError("CONFLICT"));
       }
 
       return Promise.resolve();
@@ -2779,20 +2811,41 @@ interface RegistrationFixture {
   readonly audit: ReturnType<typeof createInMemoryAuditTrail>;
 }
 
+/**
+ * What a fake provider answers a signup with.
+ *
+ * `identity` defaults to `"new"`: the ordinary answer, in which the provider lists the identity it
+ * just created. A test that wants the obfuscated duplicate says `"existing"`, and the third value
+ * exists so the compensation guard can be asked what it does when the provider says nothing.
+ */
+interface ProviderSignupAnswer {
+  readonly userId: string;
+  readonly session: AuthSession | null;
+  readonly identity?: SignUpIdentity;
+}
+
 function registrationFixture(options: {
   readonly pages?: readonly PolicyPage[];
   readonly failInsertTable?: string;
+  readonly conflictInsertTable?: string;
+  readonly registeredEmails?: readonly string[];
   readonly turnstileEnabled?: boolean;
   readonly breachCheck?: BreachCheck;
-  readonly provider?: AuthOutcome<{ readonly userId: string; readonly session: AuthSession | null }>;
+  readonly provider?: AuthOutcome<ProviderSignupAnswer>;
 }): RegistrationFixture {
-  const rest = createStubRest(
-    options.failInsertTable === undefined ? {} : { failInsertTable: options.failInsertTable },
-  );
+  const rest = createStubRest({
+    ...(options.failInsertTable === undefined ? {} : { failInsertTable: options.failInsertTable }),
+    ...(options.conflictInsertTable === undefined
+      ? {}
+      : { conflictInsertTable: options.conflictInsertTable }),
+    ...(options.registeredEmails === undefined ? {} : { registeredEmails: options.registeredEmails }),
+  });
   const newAdmin = createStubAdmin();
   const audit = createInMemoryAuditTrail();
-  const provider: AuthOutcome<{ readonly userId: string; readonly session: AuthSession | null }> =
-    options.provider ?? { ok: true, value: { userId: USER_ID, session: null } };
+  const provider: AuthOutcome<ProviderSignupAnswer> = options.provider ?? {
+    ok: true,
+    value: { userId: USER_ID, session: null },
+  };
   const breachCheck = options.breachCheck ?? createFixedBreachCheck("clear");
 
   return {
@@ -2800,7 +2853,17 @@ function registrationFixture(options: {
     newAdmin,
     audit,
     dependencies: {
-      auth: stubAuthClient({ signUpWithPassword: () => Promise.resolve(provider) }),
+      auth: stubAuthClient({
+        signUpWithPassword: () =>
+          Promise.resolve(
+            provider.ok
+              ? {
+                  ok: true,
+                  value: { ...provider.value, identity: provider.value.identity ?? "new" },
+                }
+              : provider,
+          ),
+      }),
       admin: newAdmin.admin,
       rest: rest.rest,
       policies: createInMemoryPolicyCatalog(options.pages ?? policyPages()),
@@ -2831,6 +2894,47 @@ function signupRequest(overrides: Readonly<Record<string, unknown>> = {}): Recor
   };
 }
 
+/**
+ * The account a signup created.
+ *
+ * A result is a union because "indistinguishable" carries no identifier, so a check that wants the
+ * identifier has to say which answer it expected. The throw is unreachable while the gate is green
+ * and exists so a regression names itself instead of failing later with a `undefined` comparison.
+ */
+function expectCreated(
+  result: RegistrationResult,
+  description: string,
+): Extract<RegistrationResult, { status: "created" }> {
+  expect(result.status === "created", description);
+
+  if (result.status !== "created") {
+    throw new Error(`${description}: the signup answered indistinguishably`);
+  }
+
+  return result;
+}
+
+/**
+ * The value of a call that must not throw.
+ *
+ * A gate that dies on a stack trace tells the reader less than a line saying which promise was
+ * supposed to answer and what it did instead, and it hides every check after it.
+ */
+async function expectAnswer<TValue>(
+  action: () => Promise<TValue>,
+  description: string,
+): Promise<TValue | null> {
+  checkCount += 1;
+
+  try {
+    return await action();
+  } catch (error) {
+    failures.push(`${description}: it answered ${error instanceof AppError ? error.code : "an unexpected failure"}`);
+
+    return null;
+  }
+}
+
 async function checkRegistration(): Promise<void> {
   expectEqual(companySlug("Acme Payments"), "acme-payments", "a company name becomes a slug");
   expectEqual(companySlug("  ***  "), "merchant", "an unusable name still produces a slug");
@@ -2841,9 +2945,11 @@ async function checkRegistration(): Promise<void> {
     fixture.dependencies,
   );
 
-  expectEqual(result.userId, USER_ID, "the platform account keeps the provider identifier");
-  expectEqual(result.companyId, FIRM_ID, "the signup creates a company");
-  expectEqual(result.verificationRequired, true, "an unconfirmed signup awaits the mail link");
+  const account = expectCreated(result, "a new address creates the account");
+
+  expectEqual(account.userId, USER_ID, "the platform account keeps the provider identifier");
+  expectEqual(account.companyId, FIRM_ID, "the signup creates a company");
+  expectEqual(account.verificationRequired, true, "an unconfirmed signup awaits the mail link");
 
   const companyCall = fixture.rest.calls.find((call) => call.kind === "insertReturning");
   const companyRows = (companyCall?.rows ?? []) as readonly Readonly<Record<string, unknown>>[];
@@ -2968,12 +3074,15 @@ async function checkRegistration(): Promise<void> {
     "VALIDATION_FAILED",
     "an enabled challenge without a token is refused",
   );
+  // A refusal that is *not* about the address still reports itself; one that is, does not. The
+  // second half is `checkDisclosure()`'s, because it is a statement about what a stranger may learn
+  // rather than about how this service unwinds a write.
   await expectRejects(
     () =>
       registerMerchant(
         { request: signupRequest(), remoteIp: null, userAgent: null },
         registrationFixture({
-          provider: { ok: false, failure: { kind: "rejected", status: 400, code: "user_already_exists", retryAfterSeconds: null } },
+          provider: { ok: false, failure: { kind: "rejected", status: 400, code: "signup_disabled", retryAfterSeconds: null } },
         }).dependencies,
       ),
     "VALIDATION_FAILED",
@@ -3007,8 +3116,13 @@ async function checkRegistration(): Promise<void> {
     confirmed.dependencies,
   );
 
+  const confirmedAccount = expectCreated(
+    confirmedResult,
+    "a provider that confirms the address creates the account",
+  );
+
   expectEqual(
-    confirmedResult.verificationRequired,
+    confirmedAccount.verificationRequired,
     false,
     "a provider that confirms the address needs no mail",
   );
@@ -3045,7 +3159,12 @@ async function checkRegistration(): Promise<void> {
     skippedBreach.dependencies,
   );
 
-  expectEqual(skippedResult.userId, USER_ID, "a skipped check still signs the merchant up");
+  const skippedAccount = expectCreated(
+    skippedResult,
+    "a skipped breach check still signs the merchant up",
+  );
+
+  expectEqual(skippedAccount.userId, USER_ID, "a skipped check still signs the merchant up");
   expectEqual(
     skippedBreach.audit.entries[0]?.payload["breach_check"],
     "skipped",
@@ -7182,6 +7301,336 @@ async function checkAccountUnlock(): Promise<void> {
 }
 
 
+/* ------------------------------------------------------- disclosure (048) */
+
+/**
+ * The route files under `app/api/auth`, as the app router serves them.
+ *
+ * Read from disk rather than listed by hand: the property this gate protects is "no anonymous
+ * surface answers about an account", and a surface nobody remembered to classify is exactly the
+ * way that property gets lost. Reading is the only way to notice the route that was added later.
+ */
+async function authRoutePaths(): Promise<readonly string[]> {
+  const root = new URL("../../app/api/auth/", import.meta.url);
+  const entries = await readdir(root, { recursive: true });
+  const paths = entries
+    .map((entry) => entry.replaceAll("\\", "/"))
+    .filter((entry) => entry.endsWith("/route.ts"))
+    .map((entry) => `/api/auth/${entry.slice(0, -"/route.ts".length)}`)
+    .sort();
+
+  return paths;
+}
+
+/** The catalog envelope of a failure, at a fixed request id, so two answers can be compared. */
+function renderedEnvelope(error: AppError): string {
+  return JSON.stringify(buildErrorEnvelope(error, "disclosure-gate-request"));
+}
+
+/**
+ * Section 22 line 243: "Error messages never reveal whether an account exists".
+ *
+ * The gate proves it in three layers.
+ *
+ *   1. **The contract.** Every route under `app/api/auth` is classified, every catalogued code
+ *      exists and none of the four record-carrying codes appears on an anonymous surface.
+ *   2. **The answers.** A wrong password, an address with no account and a locked account without
+ *      its password render the *same* envelope, character for character; the lock answer appears
+ *      only on the far side of a correct password, which section 22 line 238 requires.
+ *   3. **The signup.** Three duplicate paths - the provider's obfuscated person, the provider's
+ *      refusal code and the platform's own `users_email_key` - all answer the acceptance body and
+ *      write nothing, and none of them can delete an account that already existed.
+ */
+async function checkDisclosure(): Promise<void> {
+  // ---- the refusal every anonymous surface shares
+  expectEqual(ANONYMOUS_REFUSAL, "AUTHENTICATION_REQUIRED", "the anonymous refusal is the sign in code");
+  expectEqual(ERROR_CODES[ANONYMOUS_REFUSAL].status, 401, "an anonymous refusal answers 401");
+  expectEqual(ERROR_CODES[ANONYMOUS_REFUSAL].retryable, false, "a refusal is not retryable");
+
+  const first = anonymousRejection();
+  const second = anonymousRejection();
+
+  expect(first !== second, "two refusals are two errors, so a detail cannot travel between routes");
+  expectEqual(first.code, ANONYMOUS_REFUSAL, "the helper builds the shared code");
+  expectEqual(first.details.length, 0, "a refusal carries no detail");
+
+  // ---- the catalogue covers the files that exist
+  const routes = await authRoutePaths();
+  const classified = classifiedPaths();
+
+  expect(routes.length >= 8, "the auth folder still holds its route files");
+  expectEqual(
+    new Set(classified).size,
+    classified.length,
+    "no path is classified twice",
+  );
+
+  for (const route of routes) {
+    expect(
+      classified.includes(route),
+      `the auth route ${route} is classified as anonymous or as session scoped`,
+    );
+  }
+
+  for (const surface of ANONYMOUS_AUTH_SURFACES) {
+    expect(routes.includes(surface.path), `the anonymous surface ${surface.path} is a real route`);
+    expect(surface.codes.length > 0, `the anonymous surface ${surface.path} lists its codes`);
+    expect(
+      surface.note.length > 20,
+      `the anonymous surface ${surface.path} says why its list ends where it does`,
+    );
+
+    for (const code of surface.codes) {
+      expect(isCatalogCode(code), `the code ${code} of ${surface.path} exists in the catalog`);
+      expect(
+        FORBIDDEN_ON_ANONYMOUS_SURFACES.includes(code) === false,
+        `${surface.path} never answers ${code}, which describes a record`,
+      );
+    }
+  }
+
+  for (const surface of SESSION_AUTH_SURFACES) {
+    expect(routes.includes(surface.path), `the session surface ${surface.path} is a real route`);
+  }
+
+  expectEqual(anonymousSurfaceCodes("/api/auth/signup")?.includes("CONFLICT"), false, "signup cannot answer a conflict");
+  expectEqual(anonymousSurfaceCodes("/api/auth/signin")?.includes("ACCOUNT_LOCKED"), true, "sign in may answer the lock, after the password");
+  expectEqual(anonymousSurfaceCodes("/api/auth/does-not-exist"), null, "an unknown path is not an anonymous surface");
+
+  // ---- a detail may describe a form, never an account
+  for (const rule of ["email_exists", "account_not_found", "address_taken", "account_locked", "totp_enrolled", "already_registered"]) {
+    expect(isDisclosingDetail(rule), `the detail rule ${rule} is refused on an anonymous answer`);
+  }
+
+  for (const rule of ["invalid_format", "too_small", "required", "not_accepted", "breached", "invalid_json"]) {
+    expect(isDisclosingDetail(rule) === false, `the detail rule ${rule} describes the form and is allowed`);
+  }
+
+  // ---- one body for every accepted signup
+  expect(Object.isFrozen(SIGNUP_ACCEPTANCE), "the signup acceptance cannot be varied at runtime");
+  expectEqual(SIGNUP_ACCEPTANCE.status, "verification_required", "an accepted signup asks for the mail link");
+  expectEqual(TWO_FACTOR_RESET_ACCEPTANCE.status, "accepted", "a reset request answers one sentence");
+
+  // ---- the signup: the provider already holds the address
+  const anonymousSignup = (): { readonly request: unknown; readonly remoteIp: null; readonly userAgent: null } => ({
+    request: signupRequest(),
+    remoteIp: null,
+    userAgent: null,
+  });
+
+  const bySignal = registrationFixture({
+    provider: { ok: true, value: { userId: USER_ID, session: null, identity: "existing" } },
+  });
+  const signalResult = await expectAnswer(
+    () => registerMerchant(anonymousSignup(), bySignal.dependencies),
+    "a duplicate signup answers instead of throwing",
+  );
+
+  expectEqual(
+    signalResult?.status,
+    "indistinguishable",
+    "a provider that already holds the address accepts and creates nothing",
+  );
+  expectEqual(bySignal.rest.calls.length, 0, "the obfuscated duplicate writes no row");
+  expectEqual(bySignal.newAdmin.deleted.length, 0, "the account that already existed is not deleted");
+  expectEqual(bySignal.audit.entries.length, 0, "no signup is audited for an address that exists");
+
+  // ---- the signup: the provider refuses the address
+  const byCode = registrationFixture({
+    provider: {
+      ok: false,
+      failure: { kind: "rejected", status: 422, code: "user_already_exists", retryAfterSeconds: null },
+    },
+  });
+  const codeResult = await expectAnswer(
+    () => registerMerchant(anonymousSignup(), byCode.dependencies),
+    "a refused address answers instead of throwing",
+  );
+
+  expectEqual(codeResult?.status, "indistinguishable", "a provider that refuses the address accepts and creates nothing");
+  expectEqual(byCode.rest.calls.length, 0, "the refusal writes no row");
+  expectEqual(byCode.newAdmin.deleted.length, 0, "a refused address deletes no account");
+
+  const otherRefusal = registrationFixture({
+    provider: {
+      ok: false,
+      failure: { kind: "rejected", status: 422, code: "weak_password", retryAfterSeconds: null },
+    },
+  });
+  const refusalError = await captureRejection(
+    () => registerMerchant(anonymousSignup(), otherRefusal.dependencies),
+    "a refusal that is not about the address is still reported",
+  );
+
+  expectEqual(refusalError.code, "VALIDATION_FAILED", "an unrelated refusal keeps its own answer");
+  expectEqual(refusalError.details.length, 0, "the unrelated refusal tells the form nothing either");
+
+  // ---- the signup: the platform already holds the address
+  const held = registrationFixture({ registeredEmails: ["owner@example.com"] });
+  const heldResult = await expectAnswer(
+    () => registerMerchant(anonymousSignup(), held.dependencies),
+    "an address the platform holds answers instead of throwing",
+  );
+
+  expectEqual(heldResult?.status, "indistinguishable", "an address this platform holds accepts and creates nothing");
+  expectEqual(
+    held.rest.calls.filter((call) => call.kind === "insert" || call.kind === "insertReturning").length,
+    0,
+    "no company and no person are written for an address that exists",
+  );
+  expectEqual(held.newAdmin.deleted.length, 0, "the provider account of the existing person is not deleted");
+  expectEqual(
+    held.rest.calls.filter((call) => call.kind === "select").length,
+    1,
+    "the question is one index lookup",
+  );
+
+  // ---- the signup: two requests raced and one lost
+  const raced = registrationFixture({ conflictInsertTable: "users" });
+  const racedResult = await expectAnswer(
+    () => registerMerchant(anonymousSignup(), raced.dependencies),
+    "a lost race answers instead of throwing",
+  );
+
+  expectEqual(racedResult?.status, "indistinguishable", "a lost race answers like a duplicate");
+  expectEqual(raced.newAdmin.deleted.length, 1, "the provider user this request created is cleaned up");
+  expectEqual(raced.newAdmin.deleted[0], USER_ID, "the cleanup names the identifier the provider minted");
+  expectEqual(
+    raced.rest.calls.some((call) => call.kind === "update" && call.table === "users"),
+    false,
+    "no other party's account is soft closed by the compensation",
+  );
+  expect(
+    raced.rest.calls.some((call) => call.kind === "update" && call.table === "companies"),
+    "the company this attempt created is undone",
+  );
+
+  // ---- a real failure still compensates, and still reports itself
+  const broken = registrationFixture({ failInsertTable: "role_assignments" });
+  const brokenError = await captureRejection(
+    () => registerMerchant(anonymousSignup(), broken.dependencies),
+    "a failure after the person exists is reported",
+  );
+
+  const unproven = registrationFixture({
+    failInsertTable: "role_assignments",
+    provider: { ok: true, value: { userId: USER_ID, session: null, identity: "unknown" } },
+  });
+  const unprovenError = await captureRejection(
+    () => registerMerchant(anonymousSignup(), unproven.dependencies),
+    "a failure after an unprovable provider answer is reported",
+  );
+
+  expectEqual(unprovenError.code, "DEPENDENCY_FAILED", "the unprovable answer is still an outage");
+  expectEqual(
+    unproven.newAdmin.deleted.length,
+    0,
+    "a provider account the platform cannot prove it created is never deleted",
+  );
+  expect(
+    unproven.rest.calls.some((call) => call.kind === "update" && call.table === "users"),
+    "the person the platform recorded is still soft closed",
+  );
+
+  expectEqual(brokenError.code, "DEPENDENCY_FAILED", "an outage is still an outage");
+  expectEqual(broken.newAdmin.deleted.length, 1, "the provider account this platform recorded is deleted");
+  expectEqual(broken.newAdmin.deleted[0], USER_ID, "the compensation names the account it created");
+  expect(
+    broken.rest.calls.some((call) => call.kind === "update" && call.table === "users"),
+    "the recorded person is soft closed",
+  );
+
+  // ---- the sign in: one envelope for every reason
+  const canonical = renderedEnvelope(anonymousRejection());
+
+  const unknownAccount = signinFixture({ user: null });
+  const unknownError = await captureRejection(
+    () =>
+      signInMerchant(
+        { request: signinRequest(), remoteIp: "203.0.113.9", userAgent: "gate" },
+        unknownAccount.dependencies,
+      ),
+    "an address with no account is refused",
+  );
+
+  expectEqual(unknownError.code, "AUTHENTICATION_REQUIRED", "an unknown address answers the shared code");
+  expectEqual(unknownError.details.length, 0, "an unknown address names no field");
+  expectEqual(renderedEnvelope(unknownError), canonical, "an unknown address renders the canonical refusal");
+
+  const wrongPasswordFixture = signinFixture({ signIn: rejectedSignIn });
+  const wrongPassword = await captureRejection(
+    () =>
+      signInMerchant(
+        { request: signinRequest(), remoteIp: "203.0.113.9", userAgent: "gate" },
+        wrongPasswordFixture.dependencies,
+      ),
+    "a wrong password is refused",
+  );
+
+  expectEqual(wrongPassword.code, "AUTHENTICATION_REQUIRED", "a wrong password answers the shared code");
+  expectEqual(renderedEnvelope(wrongPassword), canonical, "a wrong password renders exactly what an unknown address renders");
+
+  const unconfirmed = signinFixture({
+    user: {
+      id: USER_ID,
+      company_id: FIRM_ID,
+      status: "active",
+      email_verified_at: null,
+      deleted_at: null,
+      totp_confirmed_at: null,
+    },
+  });
+  const unconfirmedError = await captureRejection(
+    () =>
+      signInMerchant(
+        { request: signinRequest(), remoteIp: "203.0.113.9", userAgent: "gate" },
+        unconfirmed.dependencies,
+      ),
+    "an unconfirmed address is refused",
+  );
+
+  expectEqual(renderedEnvelope(unconfirmedError), canonical, "an unconfirmed mail renders the same refusal again");
+
+  // ---- the lock is invisible without the password
+  const lockedTable = createLockTable();
+
+  lockedTable.insert([
+    {
+      company_id: FIRM_ID,
+      user_id: USER_ID,
+      triggered_by: "password",
+      locked_at: new Date(NOW - 600_000).toISOString(),
+      expires_at: new Date(NOW + 6_600_000).toISOString(),
+    },
+  ]);
+
+  const lockedOwner = signinFixture({ locks: lockedTable });
+  const lockedError = await captureRejection(
+    () =>
+      signInMerchant(
+        { request: signinRequest(), remoteIp: "203.0.113.9", userAgent: "gate" },
+        lockedOwner.dependencies,
+      ),
+    "a correct password on a locked account is refused",
+  );
+
+  expectEqual(lockedError.code, "ACCOUNT_LOCKED", "a proven password learns the lock");
+  expect(renderedEnvelope(lockedError) !== canonical, "the lock answer is a different answer, as section 22 allows");
+
+  const lockedStranger = signinFixture({ locks: lockedTable, signIn: rejectedSignIn });
+  const lockedStrangerError = await captureRejection(
+    () =>
+      signInMerchant(
+        { request: signinRequest(), remoteIp: "203.0.113.9", userAgent: "gate" },
+        lockedStranger.dependencies,
+      ),
+    "a wrong password on a locked account is refused",
+  );
+
+  expectEqual(lockedStrangerError.code, "AUTHENTICATION_REQUIRED", "a stranger never learns the lock");
+  expectEqual(renderedEnvelope(lockedStrangerError), canonical, "a locked account without its password renders the canonical refusal");
+}
+
 async function main(): Promise<void> {
   checkConfig();
   checkClaims();
@@ -7215,6 +7664,7 @@ async function main(): Promise<void> {
   await checkLoginLock();
   await checkLockAlert();
   await checkAccountUnlock();
+  await checkDisclosure();
 
   if (failures.length > 0) {
     process.stderr.write(`auth gate failed with ${failures.length} problem(s):\n`);

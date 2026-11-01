@@ -306,6 +306,33 @@ the authority. A permission check uses the record, never a claim.
     queue as the lock alert of STEP 046. It is queued last and caught: a platform with no sender, an
     account with no address and a queue that refuses the row are logged answers, and an unlock never
     fails because its confirmation could not be queued.
+59. One sentence for every anonymous refusal. `lib/auth/disclosure.ts` names the refusal
+    (`AUTHENTICATION_REQUIRED`, 401, no details) and `anonymousRejection()` builds a fresh instance
+    of it, so a wrong password, an address the platform has no row for, an unconfirmed mail and a
+    followed link that has expired all render the same envelope. A surface that answers one of them
+    differently - a `409`, a "no such account", a field named `email` with the rule `not_found` - has
+    turned the sign in form into an account directory.
+60. The catalogue is the contract, and the gate reads the folder. `ANONYMOUS_AUTH_SURFACES` lists
+    every stranger-facing route with the codes it may answer; `SESSION_AUTH_SURFACES` lists the rest
+    so "not classified" is distinguishable from "forgotten". `checkDisclosure()` compares both lists
+    against the files under `app/api/auth`, refuses a code the catalog does not know and refuses
+    `CONFLICT`, `IDEMPOTENCY_CONFLICT`, `PERMISSION_DENIED`, `RESOURCE_NOT_FOUND` and
+    `UNSUPPORTED_MEDIA_TYPE` on an anonymous surface, because each of those five describes a record.
+61. A fact about an account is only the account holder's. `ACCOUNT_LOCKED` and the second factor
+    challenge are real answers and stay: section 22 line 238 requires a locked account with the
+    right password to be told so. What section 22 line 243 forbids is a stranger learning it, so the
+    lock answer is computed only after the password has been proven, and the same locked account
+    with a wrong password renders the canonical refusal. `verify.ts` compares the rendered envelopes
+    rather than the codes, so a detail added later fails the gate.
+62. Signup accepts every address the same way, and creates nothing for one that exists. The provider
+    hides a duplicate by answering the existing person with an empty identity list (in
+    `SignUpResult.identity` that is `existing`, and the identifier in it is somebody else's); a
+    project with confirmations off answers a refusal code instead. Both, plus the platform's own
+    `users_email_key`, end in `{ status: "indistinguishable" }` and `201`
+    `{"status":"verification_required"}` with no company, no person and no audit entry. The
+    compensation learned two guards on the way: it never soft closes a `users` row this request did
+    not insert, and it never deletes a provider account the provider did not say it created, so a
+    duplicate cannot close, delete or otherwise disturb the account it collided with.
 
 ## Adding an operation
 
@@ -314,5 +341,7 @@ the authority. A permission check uses the record, never a claim.
 2. Return `AuthOutcome`, never a raw body and never an upstream message.
 3. If the operation is anonymous and touches an email address, ask whether its answer could
    disclose whether an account exists. If it could, treat a rejection as accepted, the way
-   `resendVerificationEmail` and `requestPasswordReset` do.
+   `resendVerificationEmail` and `requestPasswordReset` do, and add the path to
+   `ANONYMOUS_AUTH_SURFACES` in `disclosure.ts` with the codes it may answer. `checkDisclosure()`
+   fails on an unclassified route, so this is a step, not a suggestion.
 4. Add a check to `verify.ts` that proves the endpoint, the key and the failure mapping.

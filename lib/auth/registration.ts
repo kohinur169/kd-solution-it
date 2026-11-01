@@ -45,12 +45,28 @@ import type { AuthFailure } from "./types.ts";
  * what the caller sees. A signup that half happened and reported success would be the one outcome
  * this design must never allow.
  *
- * ## What a duplicate address looks like
+ * ## What a duplicate address looks like, and what it must not look like
  *
- * The provider may answer an address that already exists with an obfuscated user instead of an
- * error, and the unique index on `public.users.email` is the backstop. Either way the merchant gets
- * `VALIDATION_FAILED` with no detail that says whether the address exists, which is the same rule
- * the sign in of STEP 039 keeps.
+ * Nothing. Section 22 line 243 asks that no answer says whether an account exists, and a duplicate
+ * signup is the one place where the obvious answer - a conflict, "already registered" - is both a
+ * leak and, in the order this file used to run, a catastrophe: the provider answers an existing
+ * address with the *existing* person and an empty identity list, which reads exactly like a new
+ * account with a pending confirmation. A registration that believed it would insert a company,
+ * collide with `users_email_key`, and then compensate by soft closing and provider-deleting the
+ * account of the merchant who was already registered.
+ *
+ * So a duplicate is recognised three times over, cheapest first, and every one of them answers the
+ * same acceptance body a brand new address gets:
+ *
+ *   1. the provider says the address is in use (`user_already_exists`) - nothing was created;
+ *   2. the provider hands back a person with no identity and no session (`existingAddress`) -
+ *      nothing was created;
+ *   3. the provider created a person, but `users_email_key` already holds that address - the
+ *      person is the platform's existing account under another identifier, and `compensate()`
+ *      will not touch a provider user whose identifier this platform never recorded.
+ *
+ * `RegistrationResult` is a union rather than a boolean for the same reason: a caller cannot read
+ * a `companyId` off an answer that created nothing, because there is none to read.
  */
 
 /** The form the signup route accepts. Unknown fields are refused rather than ignored. */
@@ -85,11 +101,27 @@ export interface RegistrationInput {
   readonly userAgent: string | null;
 }
 
-export interface RegistrationResult {
-  readonly userId: string;
-  readonly companyId: string;
-  /** True when the provider sent a verification mail and no session exists yet. */
-  readonly verificationRequired: boolean;
+/**
+ * The two answers a signup can have.
+ *
+ * `created` is the account that now exists. `indistinguishable` is every path that must not say
+ * what it found - an address already registered, a provider that refused it, a race that lost the
+ * unique index - and it carries no identifier at all, so a route cannot accidentally log or return
+ * one and undo the point of the union.
+ */
+export type RegistrationResult =
+  | {
+      readonly status: "created";
+      readonly userId: string;
+      readonly companyId: string;
+      /** True when the provider sent a verification mail and no session exists yet. */
+      readonly verificationRequired: boolean;
+    }
+  | { readonly status: "indistinguishable" };
+
+/** The one answer a duplicate, a refusal and a lost race share. */
+function indistinguishable(): RegistrationResult {
+  return { status: "indistinguishable" };
 }
 
 export interface RegistrationDependencies {
@@ -259,27 +291,73 @@ export async function registerMerchant(
   });
 
   if (!provider.ok) {
+    // "This address is taken" is not a failure the merchant may see: it is an acceptance that
+    // happens to create nothing. Every other refusal - a weak password the local policy missed, an
+    // upstream outage - keeps its own answer, because hiding those would hide real breakage.
+    if (isAddressInUse(provider.failure)) {
+      return indistinguishable();
+    }
+
     throw providerError(provider.failure);
+  }
+
+  if (provider.value.identity === "existing") {
+    return indistinguishable();
   }
 
   const userId = provider.value.userId;
   const verificationRequired = provider.value.session === null;
+  // Deleting a provider account is only safe when the provider said it created one for us. An
+  // answer that lists no identity at all cannot be told apart from the obfuscated duplicate, and
+  // the identifier in it may belong to a merchant who registered months ago.
+  const providerUserIsOurs = provider.value.identity === "new";
+
+  // The provider created a person. Whether the platform already holds that address decides the
+  // rest, and the question is asked before a company exists so the answer costs one index lookup
+  // instead of a company that would have to be undone.
+  if (await emailIsRegistered(dependencies.rest, request.email)) {
+    return indistinguishable();
+  }
+
   let companyId: string | null = null;
+  let userRowWritten = false;
 
   try {
     companyId = await insertCompany(dependencies.rest, request.companyName);
 
-    await dependencies.rest.insert("users", [
-      {
-        id: userId,
-        company_id: companyId,
-        email: request.email,
-        full_name: request.fullName,
-        password_hash: passwordHash,
-        email_verified_at: verificationRequired ? null : instantIso,
-        status: "active",
-      },
-    ]);
+    try {
+      await dependencies.rest.insert("users", [
+        {
+          id: userId,
+          company_id: companyId,
+          email: request.email,
+          full_name: request.fullName,
+          password_hash: passwordHash,
+          email_verified_at: verificationRequired ? null : instantIso,
+          status: "active",
+        },
+      ]);
+      userRowWritten = true;
+    } catch (error) {
+      // Anything but a conflict is an outage: the outer handler compensates and reports it.
+      if (!isConflictError(error)) {
+        throw error;
+      }
+
+      // `users_email_key` (or the primary key) refused the row: the address the provider just
+      // created is one this platform already holds under another identifier. Nothing of ours was
+      // written, and the provider user cannot be proven ours, so the compensation touches only the
+      // company, and the answer says nothing about what happened.
+      await compensate(dependencies, {
+        userId,
+        companyId,
+        instantIso,
+        userRowWritten: false,
+        providerUserIsOurs,
+      });
+
+      return indistinguishable();
+    }
 
     await dependencies.rest.insert("role_assignments", [
       {
@@ -319,12 +397,18 @@ export async function registerMerchant(
       userAgent: input.userAgent,
     });
   } catch (error) {
-    await compensate(dependencies, { userId, companyId, instantIso });
+    await compensate(dependencies, {
+      userId,
+      companyId,
+      instantIso,
+      userRowWritten,
+      providerUserIsOurs,
+    });
 
     throw error instanceof AppError ? error : new AppError("INTERNAL_ERROR");
   }
 
-  return { userId, companyId, verificationRequired };
+  return { status: "created", userId, companyId, verificationRequired };
 }
 
 async function insertCompany(rest: RestClient, name: string): Promise<string> {
@@ -357,16 +441,73 @@ function randomSuffix(): string {
     .padStart(4, "0");
 }
 
+const emailRowSchema = z.object({ id: z.string().min(1).max(64) });
+
 /**
- * Undo a signup that failed after the provider account existed.
+ * Whether the platform already holds this address, soft deleted rows included.
  *
- * The provider user goes first, because that is the only row another system holds; then the rows of
- * this platform are soft deleted, newest first. Every step is attempted even if an earlier one
- * fails, and nothing here throws: the caller is already reporting the failure that caused this.
+ * `users_email_key` is a full unique index, not a partial one, so a closed account keeps its
+ * address reserved. Asking the question the index asks keeps the answer consistent with the
+ * database instead of being a second opinion that disagrees with it in the one case that matters.
+ */
+async function emailIsRegistered(rest: RestClient, email: string): Promise<boolean> {
+  const rows = await rest.select(
+    "users",
+    `select=id&email=eq.${encodeURIComponent(email)}&limit=1`,
+    emailRowSchema,
+  );
+
+  return rows.length > 0;
+}
+
+/**
+ * The upstream codes that mean "this address already has an identity".
+ *
+ * The provider is asked to confirm the address by mail, so it answers a duplicate with an
+ * obfuscated person rather than an error; a project with confirmations switched off gets the error.
+ * Both paths end in the same acceptance, and the list is the documented vocabulary rather than a
+ * guess at the sentence, which the client never keeps anyway.
+ */
+const ADDRESS_IN_USE_CODES: readonly string[] = ["user_already_exists", "email_exists"];
+
+function isAddressInUse(failure: AuthFailure): boolean {
+  return (
+    failure.kind === "rejected" &&
+    failure.code !== null &&
+    ADDRESS_IN_USE_CODES.includes(failure.code.toLowerCase())
+  );
+}
+
+/**
+ * Undo a signup that failed after the provider answered.
+ *
+ * The rows of this platform are soft deleted, newest first. Every step is attempted even if an
+ * earlier one fails, and nothing here throws: the caller is already reporting the failure that
+ * caused this.
+ *
+ * ## The guard
+ *
+ * Two flags decide what may be undone, and both are facts this file established rather than
+ * assumptions about a database it cannot see:
+ *
+ *   - `userRowWritten` - the platform claimed the person. Until that row exists the identifier is
+ *     not the platform's, so another party's row is never soft closed. When the insert was refused
+ *     by `users_email_key`, the identifier belongs to a merchant who registered earlier.
+ *   - `providerUserIsOurs` - the provider said it created an identity for this request. When the
+ *     answer lists no identity at all, it cannot be told apart from the obfuscated duplicate that
+ *     carries the existing merchant's identifier, and deleting that account to tidy up a duplicate
+ *     is the one mistake this file must not make. The cost of being wrong here is an unused,
+ *     unconfirmed provider identity; the cost of the alternative is a customer's account.
  */
 async function compensate(
   dependencies: RegistrationDependencies,
-  state: { readonly userId: string; readonly companyId: string | null; readonly instantIso: string },
+  state: {
+    readonly userId: string;
+    readonly companyId: string | null;
+    readonly instantIso: string;
+    readonly userRowWritten: boolean;
+    readonly providerUserIsOurs: boolean;
+  },
 ): Promise<void> {
   const companyId = state.companyId;
 
@@ -381,12 +522,16 @@ async function compensate(
         deleted_at: state.instantIso,
       }),
     );
-    await attempt(() =>
-      dependencies.rest.update("users", `id=eq.${state.userId}`, {
-        deleted_at: state.instantIso,
-        status: "closed",
-      }),
-    );
+
+    if (state.userRowWritten) {
+      await attempt(() =>
+        dependencies.rest.update("users", `id=eq.${state.userId}`, {
+          deleted_at: state.instantIso,
+          status: "closed",
+        }),
+      );
+    }
+
     await attempt(() =>
       dependencies.rest.update("companies", `id=eq.${companyId}`, {
         deleted_at: state.instantIso,
@@ -394,7 +539,9 @@ async function compensate(
     );
   }
 
-  await attempt(() => dependencies.admin.deleteUser(state.userId));
+  if (state.providerUserIsOurs) {
+    await attempt(() => dependencies.admin.deleteUser(state.userId));
+  }
 }
 
 async function attempt(action: () => Promise<unknown>): Promise<void> {
