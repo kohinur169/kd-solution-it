@@ -389,6 +389,53 @@ const catalog = {
     submitting: "Ending the session",
     home: "Go to the home page",
   },
+  office: {
+    /** Eyebrow of every office screen: the platform side of the product. */
+    eyebrow: "Platform office",
+    workspaceTitle: "Office workspace",
+    workspaceDescription:
+      "Every office screen starts here. The roles this account holds decide which of them open, and nothing outside that list is offered.",
+    rolesHeading: "Roles you hold",
+    dutiesHeading: "What this role may do",
+    sectionsHeading: "Where you can go",
+    navLabel: "Office navigation",
+    approvalChain:
+      "A large action moves through three people: the one who requests it, then the chief executive, then the super administrator.",
+    sectionWorkspace: "Workspace and roles",
+    sectionWorkspaceDescription:
+      "The roles this account holds, what each of them may do, and the office screens they open.",
+    sectionSessions: "Account sessions",
+    sectionSessionsDescription:
+      "Read the live sessions of one account and end any that should not be there.",
+    sectionTwoFactorResets: "Two factor reset queue",
+    sectionTwoFactorResetsDescription:
+      "Work the requests of merchants who lost the authenticator app and the backup codes with it.",
+    roleSuperAdmin: "Super administrator",
+    roleCeo: "Chief executive",
+    roleComplianceKyc: "Compliance and KYC",
+    roleFinanceOps: "Finance operations",
+    roleSupport: "Support",
+    roleBlogger: "Content and blog",
+    charterSuperAdmin:
+      "Full control of the platform: its name, logo, contact details and every general setting, and the permissions delegated to each office role.",
+    charterCeo:
+      "Approvals and the final KYC decision, the confirmation of a large super administrator action, and the country and pricing decisions taken with the super administrator.",
+    charterComplianceKyc:
+      "KYC review, underwriting criteria, manual payment review, dispute documents, and sanctions and PEP screening.",
+    charterFinanceOps:
+      "Reconciliation mismatches, failed payouts, settlement release, and the matching of each processor bill.",
+    charterSupport:
+      "Support tickets and merchant help. No gateway key, no payment data and no KYC decision.",
+    charterBlogger:
+      "Blog posts and public content only. No merchant, payment or KYC data.",
+    accessDeniedTitle: "This account has no office access",
+    accessDeniedBody:
+      "An office screen needs an office role. Sign in with the account that holds one, or use the merchant area of your own account.",
+    unavailableTitle: "The office could not be opened",
+    unavailableBody:
+      "The account behind this request could not be read just now, so nothing was shown. Try again in a moment.",
+    homeLink: "Go to the home page",
+  },
   email: {
     lockAlert: {
       /** Subject of the section 23 alert of section 22: the owner is told their account locked. */
