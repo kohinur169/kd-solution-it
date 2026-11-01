@@ -65,6 +65,42 @@ function readErrorMessage(payload: unknown): string | null {
 const fieldClassName =
   "mt-1 w-full rounded-lg border border-border bg-background px-3 py-2 text-sm text-foreground outline-none focus-visible:ring-2 focus-visible:ring-primary";
 
+const codeFieldClassName =
+  "mt-1 w-full rounded-lg border border-border bg-background px-3 py-2 font-mono text-lg tracking-[0.3em] text-foreground outline-none focus-visible:ring-2 focus-visible:ring-primary";
+
+/**
+ * Read the challenge out of a sign in answer.
+ *
+ * A `two_factor_required` answer is the only shape this function accepts, and it accepts nothing
+ * from it that it cannot check: a handle that is not a bounded string, or an expiry that is not a
+ * number, is treated as an unreadable answer rather than shown. The expiry only decides when the
+ * screen stops pretending a challenge is still live, so the server remains the authority.
+ */
+function readSecondFactor(payload: unknown): { token: string; expiresAtEpochMs: number } | null {
+  if (typeof payload !== "object" || payload === null) {
+    return null;
+  }
+
+  const candidate = payload as {
+    readonly status?: unknown;
+    readonly challengeToken?: unknown;
+    readonly expiresAtEpochMs?: unknown;
+  };
+
+  if (
+    candidate.status !== "two_factor_required" ||
+    typeof candidate.challengeToken !== "string" ||
+    candidate.challengeToken.length === 0 ||
+    candidate.challengeToken.length > 128 ||
+    typeof candidate.expiresAtEpochMs !== "number" ||
+    !Number.isFinite(candidate.expiresAtEpochMs)
+  ) {
+    return null;
+  }
+
+  return { token: candidate.challengeToken, expiresAtEpochMs: candidate.expiresAtEpochMs };
+}
+
 export function SigninForm({ siteKey, afterSigninPath }: SigninFormProperties): ReactNode {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -73,6 +109,19 @@ export function SigninForm({ siteKey, afterSigninPath }: SigninFormProperties): 
   const [scriptReady, setScriptReady] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
+  /**
+   * The handle of a challenge whose password was accepted, or null.
+   *
+   * When it is set this component shows the code step and no longer shows the password form: the
+   * password has already been used, and offering it again would invite a second challenge while the
+   * first is still waiting.
+   */
+  const [challenge, setChallenge] = useState<{ token: string; expiresAtEpochMs: number } | null>(
+    null,
+  );
+  const [code, setCode] = useState("");
+  const [verifying, setVerifying] = useState(false);
+  const [expired, setExpired] = useState(false);
   const container = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -106,6 +155,25 @@ export function SigninForm({ siteKey, afterSigninPath }: SigninFormProperties): 
     }
   }, [scriptReady, siteKey, widgetId]);
 
+  // The expiry is a timer, not a comparison during render: a component that reads the clock while
+  // rendering is not pure, and a challenge that lapses while the tab sits open has to be able to say
+  // so without a reload. The server is still the authority - this only changes the sentence.
+  useEffect(() => {
+    if (challenge === null) {
+      return undefined;
+    }
+
+    const remaining = Math.max(0, challenge.expiresAtEpochMs - Date.now());
+
+    const timer = window.setTimeout(() => {
+      setExpired(true);
+    }, Math.min(remaining, 2_147_483_647));
+
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [challenge]);
+
   function resetChallenge(): void {
     setTurnstileToken(null);
 
@@ -136,6 +204,19 @@ export function SigninForm({ siteKey, afterSigninPath }: SigninFormProperties): 
         return;
       }
 
+      const payload: unknown = await response.json().catch(() => null);
+      const secondFactor = readSecondFactor(payload);
+
+      if (secondFactor !== null) {
+        // No cookie was written: this answer names a challenge, and the code step is next.
+        setChallenge(secondFactor);
+        setExpired(false);
+        setSubmitting(false);
+        resetChallenge();
+
+        return;
+      }
+
       // A full navigation, so the cookie written by this response is the one the next request
       // carries; a client side transition could render a page from the previous identity.
       window.location.assign(afterSigninPath);
@@ -143,6 +224,107 @@ export function SigninForm({ siteKey, afterSigninPath }: SigninFormProperties): 
       setMessage(getMessage("signin.unreadableResponse"));
       setSubmitting(false);
     }
+  }
+
+  async function verify(event: FormEvent<HTMLFormElement>): Promise<void> {
+    event.preventDefault();
+
+    if (challenge === null) {
+      return;
+    }
+
+    setMessage(null);
+    setVerifying(true);
+
+    try {
+      const response = await fetch("/api/auth/2fa/verify", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ challengeToken: challenge.token, code }),
+      });
+
+      if (!response.ok) {
+        const payload: unknown = await response.json().catch(() => null);
+
+        setMessage(
+          response.status === 401
+            ? getMessage("signin.secondFactorRejected")
+            : (readErrorMessage(payload) ?? getMessage("signin.unreadableResponse")),
+        );
+        setCode("");
+        setVerifying(false);
+
+        return;
+      }
+
+      window.location.assign(afterSigninPath);
+    } catch {
+      setMessage(getMessage("signin.unreadableResponse"));
+      setVerifying(false);
+    }
+  }
+
+  if (challenge !== null) {
+    return (
+      <form
+        className="mt-6 grid gap-4"
+        noValidate
+        onSubmit={(event) => {
+          void verify(event);
+        }}
+      >
+        <h2 className="text-lg font-semibold tracking-tight">{getMessage("signin.secondFactorTitle")}</h2>
+        <p className="text-sm text-muted-foreground">{getMessage("signin.secondFactorBody")}</p>
+
+        <label className="block text-sm font-medium">
+          {getMessage("signin.secondFactorCodeLabel")}
+          <input
+            className={codeFieldClassName}
+            name="code"
+            type="text"
+            autoComplete="one-time-code"
+            inputMode="text"
+            maxLength={11}
+            required
+            value={code}
+            onChange={(event) => {
+              setCode(event.target.value.trim().slice(0, 11));
+            }}
+          />
+        </label>
+
+        <p aria-live="polite" className="text-sm text-destructive" role="alert">
+          {message ?? ""}
+        </p>
+
+        <button
+          className="rounded-lg bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground disabled:opacity-60"
+          type="submit"
+          disabled={verifying || code.length < 6}
+        >
+          {verifying ? getMessage("signin.secondFactorSubmitting") : getMessage("signin.secondFactorSubmit")}
+        </button>
+
+        {expired ? (
+          <p className="text-sm text-muted-foreground" role="status">
+            {getMessage("signin.secondFactorExpired")}
+          </p>
+        ) : null}
+
+        <button
+          className="justify-self-start text-sm font-semibold text-primary underline-offset-4 hover:underline"
+          type="button"
+          onClick={(): void => {
+            setChallenge(null);
+            setCode("");
+            setMessage(null);
+            setPassword("");
+          }}
+        >
+          {getMessage("signin.secondFactorRestart")}
+        </button>
+      </form>
+    );
   }
 
   return (

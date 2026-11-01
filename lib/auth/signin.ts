@@ -15,6 +15,7 @@ import type { LoginAttemptRecorder } from "./login-attempts.ts";
 import type { RestClient } from "./rest.ts";
 import type { TurnstileGuard } from "./turnstile.ts";
 import type { AuthFailure } from "./types.ts";
+import { issueTwoFactorChallenge } from "./two-factor-login.ts";
 
 /**
  * Sign in with a password, a challenge and nothing else.
@@ -66,7 +67,17 @@ export interface SigninInput {
   readonly userAgent: string | null;
 }
 
-export interface SigninResult {
+/**
+ * The two answers a correct password can produce.
+ *
+ * `signed_in` is a session: the account has no confirmed second factor, or the caller already went
+ * through the code step. `two_factor_required` is not a session and carries no cookie - it names a
+ * challenge the browser presents to `/api/auth/2fa/verify` together with a code. Section 22 makes
+ * the distinction necessary: an account holding a role must not be signed in by a password alone,
+ * so the password step has to be able to stop half way.
+ */
+export interface SignedInResult {
+  readonly outcome: "signed_in";
   readonly userId: string;
   readonly companyId: string | null;
   /** True when the account has no live device proof key, so STEP 049 must enrol this browser. */
@@ -75,6 +86,19 @@ export interface SigninResult {
   readonly cookies: readonly string[];
 }
 
+export interface TwoFactorRequiredResult {
+  readonly outcome: "two_factor_required";
+  readonly userId: string;
+  readonly companyId: string | null;
+  readonly deviceProofRequired: boolean;
+  readonly device: DeviceContext;
+  /** The handle the browser presents with the code. Not a session, and useless without one. */
+  readonly challengeToken: string;
+  readonly expiresAtEpochMs: number;
+}
+
+export type SigninResult = SignedInResult | TwoFactorRequiredResult;
+
 export interface SigninDependencies {
   readonly auth: AuthClient;
   readonly rest: RestClient;
@@ -82,6 +106,8 @@ export interface SigninDependencies {
   readonly attempts: LoginAttemptRecorder;
   readonly audit: AuditTrail;
   readonly cookiePolicy: AuthCookiePolicy;
+  /** The key that seals a pending session while the code is asked for. */
+  readonly masterKey: () => string;
   readonly now?: () => number;
 }
 
@@ -91,6 +117,7 @@ const userRowSchema = z.object({
   status: z.string().min(1).max(16),
   email_verified_at: z.string().nullable(),
   deleted_at: z.string().nullable(),
+  totp_confirmed_at: z.string().nullable(),
 });
 
 const deviceKeyRowSchema = z.object({ id: z.string().min(1).max(64) });
@@ -203,7 +230,7 @@ export async function signInMerchant(
 
   const rows = await dependencies.rest.select(
     "users",
-    `select=id,company_id,status,email_verified_at,deleted_at&id=eq.${encodeURIComponent(claims.subject)}&limit=1`,
+    `select=id,company_id,status,email_verified_at,deleted_at,totp_confirmed_at&id=eq.${encodeURIComponent(claims.subject)}&limit=1`,
     userRowSchema,
   );
   const user = rows[0];
@@ -240,6 +267,62 @@ export async function signInMerchant(
     userAgent: input.userAgent,
   });
 
+  // The password is right and the account is open. If the account has confirmed a second factor,
+  // this is where the session stops: the provider's pair is sealed into a challenge, the browser
+  // receives a handle instead of a cookie, and `user.signed_in` is written only after the code.
+  if (account.totp_confirmed_at !== null) {
+    const challenge = await issueTwoFactorChallenge(
+      {
+        userId: account.id,
+        companyId: account.company_id,
+        session: {
+          accessToken: session.accessToken,
+          refreshToken: session.refreshToken,
+          expiresAtEpochMs: session.expiresAtEpochMs,
+          sessionId: claims.sessionId,
+        },
+        device,
+        remoteIp: input.remoteIp,
+        userAgent: input.userAgent,
+      },
+      {
+        rest: dependencies.rest,
+        audit: dependencies.audit,
+        attempts: dependencies.attempts,
+        cookiePolicy: dependencies.cookiePolicy,
+        masterKey: dependencies.masterKey,
+        ...(dependencies.now === undefined ? {} : { now: dependencies.now }),
+      },
+    );
+
+    await dependencies.audit.append({
+      action: "user.two_factor_challenged",
+      actorUserId: account.id,
+      entityType: "user",
+      entityId: account.id,
+      companyId: account.company_id,
+      sessionId: claims.sessionId,
+      payload: {
+        device: device.label,
+        challenge_expires_at: new Date(challenge.expiresAtEpochMs).toISOString(),
+        assurance_level: claims.assuranceLevel,
+        attempt_recorded: recorded,
+      },
+      ipAddress: input.remoteIp,
+      userAgent: input.userAgent,
+    });
+
+    return {
+      outcome: "two_factor_required",
+      userId: account.id,
+      companyId: account.company_id,
+      deviceProofRequired,
+      device,
+      challengeToken: challenge.token,
+      expiresAtEpochMs: challenge.expiresAtEpochMs,
+    };
+  }
+
   await dependencies.audit.append({
     action: "user.signed_in",
     actorUserId: account.id,
@@ -266,6 +349,7 @@ export async function signInMerchant(
   };
 
   return {
+    outcome: "signed_in",
     userId: account.id,
     companyId: account.company_id,
     deviceProofRequired,

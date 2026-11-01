@@ -39,6 +39,15 @@ import {
   startTotpEnrolment,
   twoFactorContext,
 } from "./two-factor.ts";
+import {
+  challengeContext,
+  completeTwoFactorChallenge,
+  hashChallengeToken,
+  isSameChallengeToken,
+  issueTwoFactorChallenge,
+  TWO_FACTOR_CHALLENGE_TTL_MS,
+  TWO_FACTOR_MAXIMUM_ATTEMPTS,
+} from "./two-factor-login.ts";
 import { signInMerchant, signinInputSchema } from "./signin.ts";
 import { createAuthClient, type AuthClient } from "./client.ts";
 import { authAdminUserUrl, authTokenUrl, buildAuthConfig, type AuthConfig } from "./config.ts";
@@ -107,7 +116,7 @@ import {
 } from "./policies.ts";
 import { companySlug, registerMerchant } from "./registration.ts";
 import type { RestClient } from "./rest.ts";
-import { isSecretBox, openSecret, sealSecret, unpackSecretBox } from "./secrets.ts";
+import { isSecretBox, openSecret, packSecretBox, sealSecret, unpackSecretBox } from "./secrets.ts";
 import {
   createInMemorySettings,
   createRestSettings,
@@ -3320,6 +3329,7 @@ function signinFixture(options: SigninRestOptions & {
           status: "active",
           email_verified_at: new Date(NOW).toISOString(),
           deleted_at: null,
+          totp_confirmed_at: null,
         }
       : options.user;
   const proofKeys = options.proofKeys ?? 0;
@@ -3372,6 +3382,7 @@ function signinFixture(options: SigninRestOptions & {
       attempts,
       audit,
       cookiePolicy: cookiePolicy(),
+      masterKey: () => MASTER_KEY,
       now: () => NOW,
     },
   };
@@ -3392,6 +3403,15 @@ async function checkSignin(): Promise<void> {
     { request: signinRequest(), remoteIp: "203.0.113.9", userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/126.0.0.0 Safari/537.36" },
     fixture.dependencies,
   );
+
+  expectEqual(result.outcome, "signed_in", "an account with no second factor is signed in");
+
+  if (result.outcome !== "signed_in") {
+    failures.push("an account with no second factor must produce a session");
+    checkCount += 1;
+
+    return;
+  }
 
   expectEqual(result.userId, USER_ID, "a correct password answers the account");
   expectEqual(result.companyId, FIRM_ID, "the answer names the company");
@@ -4020,6 +4040,558 @@ async function checkTwoFactor(): Promise<void> {
   expectEqual(twoFactorContext(USER_ID), `users.totp:${USER_ID}`, "the associated data names the account");
 }
 
+/* ------------------------------------- STEP 042: the second factor at sign in */
+
+interface ChallengeState {
+  challenge:
+    | {
+        id: string;
+        user_id: string;
+        company_id: string | null;
+        secret_ciphertext: string;
+        attempt_count: number;
+        expires_at: string;
+        consumed_at: string | null;
+      }
+    | null;
+  user: {
+    id: string;
+    company_id: string | null;
+    status: string;
+    email_verified_at: string | null;
+    deleted_at: string | null;
+    totp_secret_ciphertext: string | null;
+    totp_confirmed_at: string | null;
+    backup_code_hashes: readonly string[];
+  };
+}
+
+/**
+ * A REST double for the challenge table and the account beside it.
+ *
+ * The gate has no database, and a second factor that is only proved against a mock of the service
+ * proves nothing about the order the service works in. This double therefore keeps the state a
+ * database would keep - the sealed challenge row, its attempt counter, the consumed instant and the
+ * account's backup code verifiers - and the checks below read it back after every call.
+ */
+function twoFactorLoginFixture(options: {
+  readonly totpConfirmed?: boolean;
+  readonly secret?: string;
+  readonly backupCodeHashes?: readonly string[];
+} = {}): {
+  readonly state: ChallengeState;
+  readonly updates: { table: string; query: string; values: Readonly<Record<string, unknown>> }[];
+  readonly attempts: ReturnType<typeof createInMemoryLoginAttemptRecorder>;
+  readonly audit: ReturnType<typeof createInMemoryAuditTrail>;
+  readonly dependencies: Parameters<typeof completeTwoFactorChallenge>[1];
+} {
+  const secret = options.secret ?? generateTotpSecret();
+  const state: ChallengeState = {
+    challenge: null,
+    user: {
+      id: USER_ID,
+      company_id: FIRM_ID,
+      status: "active",
+      email_verified_at: new Date(NOW).toISOString(),
+      deleted_at: null,
+      totp_secret_ciphertext:
+        options.totpConfirmed === false
+          ? null
+          : packSecretBox(sealSecret(MASTER_KEY, secret, twoFactorContext(USER_ID))),
+      totp_confirmed_at:
+        options.totpConfirmed === false ? null : new Date(NOW - 86_400_000).toISOString(),
+      backup_code_hashes: options.backupCodeHashes ?? [],
+    },
+  };
+  const updates: { table: string; query: string; values: Readonly<Record<string, unknown>> }[] = [];
+
+  const rest: RestClient = {
+    select<TRow>(table: string, query: string): Promise<readonly TRow[]> {
+      if (table === "auth_challenges") {
+        const wanted = /token_hash=eq\.([0-9a-f]{64})/u.exec(query)?.[1] ?? "";
+        const row = state.challenge;
+
+        return Promise.resolve(
+          row !== null && row.id === wanted ? ([{ ...row }] as unknown as readonly TRow[]) : [],
+        );
+      }
+
+      if (table === "users") {
+        return Promise.resolve([{ ...state.user }] as unknown as readonly TRow[]);
+      }
+
+      return Promise.resolve([]);
+    },
+    insert(table: string, rows: readonly Readonly<Record<string, unknown>>[]): Promise<void> {
+      if (table !== "auth_challenges") {
+        return Promise.resolve();
+      }
+
+      const row = rows[0] ?? {};
+
+      state.challenge = {
+        id: String(row["token_hash"] ?? ""),
+        user_id: String(row["user_id"] ?? ""),
+        company_id: (row["company_id"] as string | null | undefined) ?? null,
+        secret_ciphertext: String(row["secret_ciphertext"] ?? ""),
+        attempt_count: 0,
+        expires_at: String(row["expires_at"] ?? ""),
+        consumed_at: null,
+      };
+
+      return Promise.resolve();
+    },
+    insertReturning: <TRow>(): Promise<readonly TRow[]> => Promise.resolve([]),
+    update(
+      table: string,
+      query: string,
+      values: Readonly<Record<string, unknown>>,
+    ): Promise<void> {
+      updates.push({ table, query, values });
+
+      if (table === "auth_challenges" && state.challenge !== null) {
+        if ("attempt_count" in values) {
+          state.challenge.attempt_count = Number(values["attempt_count"]);
+        }
+
+        if ("consumed_at" in values) {
+          state.challenge.consumed_at = values["consumed_at"] as string | null;
+        }
+      }
+
+      if (table === "users" && "backup_code_hashes" in values) {
+        state.user.backup_code_hashes = values["backup_code_hashes"] as readonly string[];
+      }
+
+      return Promise.resolve();
+    },
+    rpc: (): Promise<unknown> => Promise.resolve(null),
+  };
+  const attempts = createInMemoryLoginAttemptRecorder();
+  const audit = createInMemoryAuditTrail();
+
+  return {
+    state,
+    updates,
+    attempts,
+    audit,
+    dependencies: {
+      rest,
+      audit,
+      attempts,
+      cookiePolicy: cookiePolicy(),
+      masterKey: () => MASTER_KEY,
+      now: () => NOW,
+    },
+  };
+}
+
+async function checkTwoFactorLogin(): Promise<void> {
+  const handle = "handle-" + "x".repeat(30);
+  const hashed = hashChallengeToken(handle);
+
+  expect(/^[0-9a-f]{64}$/u.test(hashed), "a handle hashes to sixty four hexadecimal characters");
+  expectEqual(hashChallengeToken("other-handle-value"), hashChallengeToken("other-handle-value"), "the same handle hashes the same way");
+  expect(hashChallengeToken("other-handle-value") !== hashed, "two handles do not share a hash");
+  expect(isSameChallengeToken("abc", "abc"), "the comparison accepts equal values");
+  expect(!isSameChallengeToken("abc", "abd"), "the comparison refuses different values");
+  expectEqual(challengeContext(hashed), `auth.challenge:${hashed}`, "the associated data names the challenge");
+
+  // ---- a correct code produces the session, and only then
+  const fixture = twoFactorLoginFixture();
+
+  const issued = await issueTwoFactorChallenge(
+    {
+      userId: USER_ID,
+      companyId: FIRM_ID,
+      session: {
+        accessToken: makeAccessToken(baseClaims()),
+        refreshToken: "refresh-token-000000000000000000",
+        expiresAtEpochMs: NOW + 3_600_000,
+        sessionId: SESSION_ID,
+      },
+      device: readDeviceContext("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/126.0.0.0"),
+      remoteIp: "203.0.113.9",
+      userAgent: "gate",
+    },
+    fixture.dependencies,
+  );
+
+  expectEqual(typeof issued.token, "string", "the challenge answers a handle");
+  expectEqual(issued.expiresAtEpochMs, NOW + TWO_FACTOR_CHALLENGE_TTL_MS, "the challenge lives ten minutes");
+  expect(fixture.state.challenge !== null, "the challenge is stored");
+  expectEqual(
+    fixture.state.challenge?.id,
+    hashChallengeToken(issued.token),
+    "the stored row is keyed by the hash of the handle, never the handle",
+  );
+  expect(
+    !JSON.stringify(fixture.state.challenge).includes(issued.token),
+    "the handle itself is not stored anywhere in the row",
+  );
+  expect(
+    !JSON.stringify(fixture.state.challenge).includes("refresh-token-000000000000000000"),
+    "the provider pair is sealed, not stored in clear",
+  );
+
+  const reopened = openEnrolledSecret(
+    fixture.state.user.totp_secret_ciphertext ?? "",
+    USER_ID,
+    MASTER_KEY,
+  );
+  const key = base32Decode(reopened) ?? new Uint8Array();
+  const goodCode = totpCodeForStep(key, totpStep(NOW));
+
+  const unknownHandle = await captureRejection(
+    () =>
+      completeTwoFactorChallenge(
+        { challengeToken: `unknown-${"y".repeat(30)}`, code: goodCode, remoteIp: null, userAgent: null },
+        fixture.dependencies,
+      ),
+    "an unknown handle is refused",
+  );
+
+  expectEqual(unknownHandle.code, "AUTHENTICATION_REQUIRED", "an unknown handle answers the generic refusal");
+
+  const wrongCode = await captureRejection(
+    () =>
+      completeTwoFactorChallenge(
+        { challengeToken: issued.token, code: "000000", remoteIp: "203.0.113.9", userAgent: "gate" },
+        fixture.dependencies,
+      ),
+    "a wrong code is refused",
+  );
+
+  expectEqual(wrongCode.code, "AUTHENTICATION_REQUIRED", "a wrong code answers the generic refusal");
+  expectEqual(fixture.state.challenge?.attempt_count, 1, "a wrong code counts one attempt");
+  expectEqual(fixture.state.challenge?.consumed_at, null, "a wrong code does not consume the challenge");
+  expectEqual(fixture.attempts.attempts.length, 1, "a wrong code records one attempt row");
+  expectEqual(fixture.attempts.attempts[0]?.factor, "totp", "the attempt row names the totp factor");
+  expectEqual(fixture.attempts.attempts[0]?.outcome, "failed", "the attempt row is a failure");
+  expectEqual(fixture.audit.entries.length, 0, "a wrong code writes no audit entry");
+
+  const completed = await completeTwoFactorChallenge(
+    { challengeToken: issued.token, code: goodCode, remoteIp: "203.0.113.9", userAgent: "gate" },
+    fixture.dependencies,
+  );
+
+  expectEqual(completed.userId, USER_ID, "the accepted code answers the account");
+  expectEqual(completed.method, "totp", "the accepted code names the method");
+  expectEqual(completed.cookies.length, 1, "the accepted code writes one session cookie");
+  expectEqual(fixture.state.challenge?.consumed_at, new Date(NOW).toISOString(), "the challenge is consumed");
+  expectEqual(fixture.audit.entries.length, 1, "the accepted code writes one audit entry");
+  expectEqual(fixture.audit.entries[0]?.action, "user.signed_in", "the entry names the sign in");
+  expectEqual(fixture.audit.entries[0]?.payload["assurance_level"], "aal2", "the sign in records the stronger assurance");
+  expectEqual(fixture.audit.entries[0]?.payload["method"], "totp", "the sign in records the method");
+  expectEqual(fixture.attempts.attempts.length, 2, "the accepted code records its attempt");
+  expectEqual(fixture.attempts.attempts[1]?.outcome, "succeeded", "the accepted attempt is a success");
+
+  const policy = cookiePolicy();
+  const sessionState = await readSession(completed.cookies[0] ?? "", {
+    directory: createInMemoryActorDirectory([
+      {
+        userId: USER_ID,
+        companyId: FIRM_ID,
+        roles: ["owner"],
+        status: "active",
+        emailVerifiedAtEpochMs: NOW - 86_400_000,
+        deletedAtEpochMs: null,
+        twoFactorConfirmedAtEpochMs: NOW - 86_400_000,
+      } as never,
+    ]),
+    cookiePolicy: policy,
+    nowEpochMs: NOW,
+  });
+
+  expectEqual(sessionState.kind, "authenticated", "the cookie minted by the code is a session");
+  expect(
+    sessionState.kind === "authenticated" && sessionState.actor.twoFactorSatisfied,
+    "the session says the second factor was satisfied",
+  );
+  expectEqual(
+    decodeSessionCookies(policy, completed.cookies[0] ?? "")?.assuranceLevel,
+    "aal2",
+    "the payload carries the assurance this platform established",
+  );
+
+  const replay = await captureRejection(
+    () =>
+      completeTwoFactorChallenge(
+        { challengeToken: issued.token, code: goodCode, remoteIp: null, userAgent: null },
+        fixture.dependencies,
+      ),
+    "a consumed challenge is refused",
+  );
+
+  expectEqual(replay.code, "AUTHENTICATION_REQUIRED", "a consumed challenge answers the generic refusal");
+
+  // ---- five rejected codes retire the challenge
+  const limited = twoFactorLoginFixture();
+  const limitedIssued = await issueTwoFactorChallenge(
+    {
+      userId: USER_ID,
+      companyId: FIRM_ID,
+      session: {
+        accessToken: makeAccessToken(baseClaims()),
+        refreshToken: "refresh-token-000000000000000000",
+        expiresAtEpochMs: NOW + 3_600_000,
+        sessionId: SESSION_ID,
+      },
+      device: readDeviceContext(null),
+      remoteIp: null,
+      userAgent: null,
+    },
+    limited.dependencies,
+  );
+
+  for (let attempt = 0; attempt < TWO_FACTOR_MAXIMUM_ATTEMPTS; attempt += 1) {
+    const refused = await captureRejection(
+      () =>
+        completeTwoFactorChallenge(
+          { challengeToken: limitedIssued.token, code: "111111", remoteIp: "203.0.113.9", userAgent: "gate" },
+          limited.dependencies,
+        ),
+      "a rejected code is refused",
+    );
+
+    expectEqual(refused.code, "AUTHENTICATION_REQUIRED", "every rejected code answers the same refusal");
+  }
+
+  expectEqual(limited.state.challenge?.attempt_count, TWO_FACTOR_MAXIMUM_ATTEMPTS, "the counter reaches the ceiling");
+  expect(limited.state.challenge?.consumed_at !== null, "the challenge retires when the ceiling is reached");
+
+  const afterCeiling = await captureRejection(
+    () =>
+      completeTwoFactorChallenge(
+        { challengeToken: limitedIssued.token, code: goodCode, remoteIp: null, userAgent: null },
+        limited.dependencies,
+      ),
+    "a retired challenge is refused even with the right code",
+  );
+
+  expectEqual(afterCeiling.code, "AUTHENTICATION_REQUIRED", "a retired challenge cannot be completed");
+
+  // ---- an expired challenge, and an account that is no longer signable
+  const expired = twoFactorLoginFixture();
+  const expiredIssued = await issueTwoFactorChallenge(
+    {
+      userId: USER_ID,
+      companyId: FIRM_ID,
+      session: {
+        accessToken: makeAccessToken(baseClaims()),
+        refreshToken: "refresh-token-000000000000000000",
+        expiresAtEpochMs: NOW + 3_600_000,
+        sessionId: SESSION_ID,
+      },
+      device: readDeviceContext(null),
+      remoteIp: null,
+      userAgent: null,
+    },
+    { ...expired.dependencies, now: () => NOW - TWO_FACTOR_CHALLENGE_TTL_MS - 1_000 },
+  );
+
+  expectEqual(
+    expiredIssued.expiresAtEpochMs,
+    NOW - 1_000,
+    "a challenge issued in the past has already expired",
+  );
+
+  const refusedExpired = await captureRejection(
+    () =>
+      completeTwoFactorChallenge(
+        { challengeToken: expiredIssued.token, code: goodCode, remoteIp: null, userAgent: null },
+        expired.dependencies,
+      ),
+    "an expired challenge is refused",
+  );
+
+  expectEqual(refusedExpired.code, "AUTHENTICATION_REQUIRED", "an expired challenge answers the generic refusal");
+
+  const closed = twoFactorLoginFixture();
+  const closedIssued = await issueTwoFactorChallenge(
+    {
+      userId: USER_ID,
+      companyId: FIRM_ID,
+      session: {
+        accessToken: makeAccessToken(baseClaims()),
+        refreshToken: "refresh-token-000000000000000000",
+        expiresAtEpochMs: NOW + 3_600_000,
+        sessionId: SESSION_ID,
+      },
+      device: readDeviceContext(null),
+      remoteIp: null,
+      userAgent: null,
+    },
+    closed.dependencies,
+  );
+
+  closed.state.user.status = "suspended";
+
+  await expectRejects(
+    () =>
+      completeTwoFactorChallenge(
+        { challengeToken: closedIssued.token, code: goodCode, remoteIp: null, userAgent: null },
+        closed.dependencies,
+      ),
+    "AUTHENTICATION_REQUIRED",
+    "an account suspended between the password and the code cannot complete",
+  );
+
+  const unenrolled = twoFactorLoginFixture({ totpConfirmed: false });
+  const unenrolledIssued = await issueTwoFactorChallenge(
+    {
+      userId: USER_ID,
+      companyId: FIRM_ID,
+      session: {
+        accessToken: makeAccessToken(baseClaims()),
+        refreshToken: "refresh-token-000000000000000000",
+        expiresAtEpochMs: NOW + 3_600_000,
+        sessionId: SESSION_ID,
+      },
+      device: readDeviceContext(null),
+      remoteIp: null,
+      userAgent: null,
+    },
+    unenrolled.dependencies,
+  );
+
+  await expectRejects(
+    () =>
+      completeTwoFactorChallenge(
+        { challengeToken: unenrolledIssued.token, code: goodCode, remoteIp: null, userAgent: null },
+        unenrolled.dependencies,
+      ),
+    "AUTHENTICATION_REQUIRED",
+    "a challenge whose account lost its second factor cannot complete",
+  );
+
+  await expectRejects(
+    () =>
+      completeTwoFactorChallenge(
+        { challengeToken: "short", code: goodCode, remoteIp: null, userAgent: null },
+        fixture.dependencies,
+      ),
+    "AUTHENTICATION_REQUIRED",
+    "a malformed handle is refused before any query",
+  );
+
+  // ---- a backup code is one sign in
+  const backupPlain = "abcde-fghjk";
+  const otherPlain = "mnpqr-stuvw";
+  const hashes = [
+    await hashPassword(normalizeBackupCode(backupPlain)),
+    await hashPassword(normalizeBackupCode(otherPlain)),
+  ];
+  const backup = twoFactorLoginFixture({ backupCodeHashes: hashes });
+  const backupIssued = await issueTwoFactorChallenge(
+    {
+      userId: USER_ID,
+      companyId: FIRM_ID,
+      session: {
+        accessToken: makeAccessToken(baseClaims()),
+        refreshToken: "refresh-token-000000000000000000",
+        expiresAtEpochMs: NOW + 3_600_000,
+        sessionId: SESSION_ID,
+      },
+      device: readDeviceContext(null),
+      remoteIp: "203.0.113.9",
+      userAgent: "gate",
+    },
+    backup.dependencies,
+  );
+
+  const withBackup = await completeTwoFactorChallenge(
+    { challengeToken: backupIssued.token, code: "ABCDE FGHJK", remoteIp: "203.0.113.9", userAgent: "gate" },
+    backup.dependencies,
+  );
+
+  expectEqual(withBackup.method, "backup_code", "a backup code is accepted at the second factor");
+  expectEqual(withBackup.cookies.length, 1, "a backup code writes a session cookie");
+  expectEqual(backup.state.user.backup_code_hashes.length, 1, "using a backup code leaves the others");
+  expectEqual(
+    backup.state.user.backup_code_hashes[0],
+    hashes[1],
+    "the verifier of the used code is the one removed",
+  );
+  expectEqual(backup.audit.entries.length, 2, "a backup code writes two audit entries");
+  expectEqual(backup.audit.entries[0]?.action, "user.backup_code_used", "the first entry names the code use");
+  expectEqual(backup.audit.entries[0]?.payload["remaining"], 1, "the entry counts the codes left");
+  expectEqual(backup.audit.entries[1]?.action, "user.signed_in", "the second entry names the sign in");
+  expectEqual(backup.audit.entries[1]?.payload["method"], "backup_code", "the sign in records the backup code");
+
+  const secondBackup = twoFactorLoginFixture({ backupCodeHashes: [hashes[0] as string] });
+  const secondIssued = await issueTwoFactorChallenge(
+    {
+      userId: USER_ID,
+      companyId: FIRM_ID,
+      session: {
+        accessToken: makeAccessToken(baseClaims()),
+        refreshToken: "refresh-token-000000000000000000",
+        expiresAtEpochMs: NOW + 3_600_000,
+        sessionId: SESSION_ID,
+      },
+      device: readDeviceContext(null),
+      remoteIp: null,
+      userAgent: null,
+    },
+    secondBackup.dependencies,
+  );
+
+  await expectRejects(
+    () =>
+      completeTwoFactorChallenge(
+        { challengeToken: secondIssued.token, code: otherPlain, remoteIp: null, userAgent: null },
+        secondBackup.dependencies,
+      ),
+    "AUTHENTICATION_REQUIRED",
+    "a backup code that was already used is refused",
+  );
+  expectEqual(secondBackup.state.challenge?.attempt_count, 1, "a used backup code counts an attempt");
+  expectEqual(secondBackup.audit.entries.length, 0, "a used backup code writes no audit entry");
+
+  // ---- the password step stops when the account has a second factor
+  const challenged = signinFixture({
+    user: {
+      id: USER_ID,
+      company_id: FIRM_ID,
+      status: "active",
+      email_verified_at: new Date(NOW).toISOString(),
+      deleted_at: null,
+      totp_confirmed_at: new Date(NOW - 86_400_000).toISOString(),
+    },
+  });
+  const challengedResult = await signInMerchant(
+    {
+      request: signinRequest(),
+      remoteIp: "203.0.113.9",
+      userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/126.0.0.0",
+    },
+    challenged.dependencies,
+  );
+
+  expectEqual(challengedResult.outcome, "two_factor_required", "a password alone does not sign an enrolled account in");
+
+  if (challengedResult.outcome === "two_factor_required") {
+    expect(
+      !("cookies" in challengedResult),
+      "the challenge result has no cookie field at all",
+    );
+    expect(challengedResult.challengeToken.length > 20, "the challenge answers a handle");
+  }
+
+  expectEqual(challenged.inserts.length, 1, "the challenge writes one row");
+  expectEqual(challenged.inserts[0]?.table, "auth_challenges", "the row is a challenge");
+  expectEqual(challenged.audit.entries.length, 1, "the password step writes one audit entry");
+  expectEqual(challenged.audit.entries[0]?.action, "user.two_factor_challenged", "the entry names the challenge");
+  expect(
+    challenged.audit.entries.every((entry) => entry.action !== "user.signed_in"),
+    "the password step never audits a sign in it did not complete",
+  );
+  expectEqual(challenged.attempts.attempts.length, 1, "the password step records its own attempt");
+  expectEqual(challenged.attempts.attempts[0]?.outcome, "succeeded", "the password attempt is a success");
+  expectEqual(challenged.attempts.attempts[0]?.factor, "password", "the attempt names the password factor");
+}
+
 /* ------------------------------------------------------------------ main */
 
 async function main(): Promise<void> {
@@ -4049,6 +4621,7 @@ async function main(): Promise<void> {
   checkTotp();
   checkQr();
   await checkTwoFactor();
+  await checkTwoFactorLogin();
 
   if (failures.length > 0) {
     process.stderr.write(`auth gate failed with ${failures.length} problem(s):\n`);

@@ -12,10 +12,20 @@ export const dynamic = "force-dynamic";
 /** A sign in body is three short fields. */
 const maximumBodyBytes = 4_096;
 
-interface SigninResponseBody {
+interface SignedInResponseBody {
   readonly status: "signed_in";
   readonly deviceProofRequired: boolean;
 }
+
+interface TwoFactorResponseBody {
+  readonly status: "two_factor_required";
+  readonly deviceProofRequired: boolean;
+  /** The handle of the challenge, presented with the code. Not a session. */
+  readonly challengeToken: string;
+  readonly expiresAtEpochMs: number;
+}
+
+type SigninResponseBody = SignedInResponseBody | TwoFactorResponseBody;
 
 function readDeclaredLength(request: Request): number | null {
   const header = request.headers.get("content-length");
@@ -69,19 +79,30 @@ export const POST = withErrorResponse(async (request: Request): Promise<NextResp
       attempts: runtime.attempts,
       audit: runtime.audit,
       cookiePolicy: runtime.cookiePolicy,
+      masterKey: runtime.masterKey,
     },
   );
 
-  logger.info("merchant signed in", {
-    userId: result.userId,
-    device: result.device.label,
-    deviceProofRequired: result.deviceProofRequired,
-  });
+  logger.info(
+    result.outcome === "signed_in" ? "merchant signed in" : "merchant challenged for the second factor",
+    {
+      userId: result.userId,
+      device: result.device.label,
+      deviceProofRequired: result.deviceProofRequired,
+    },
+  );
 
-  const responseBody: SigninResponseBody = {
-    status: "signed_in",
-    deviceProofRequired: result.deviceProofRequired,
-  };
+  // A challenge is not a session: the answer says what to do next and writes no cookie. The
+  // `set-cookie` loop below sees an empty list, which is exactly the property this STEP needs.
+  const responseBody: SigninResponseBody =
+    result.outcome === "signed_in"
+      ? { status: "signed_in", deviceProofRequired: result.deviceProofRequired }
+      : {
+          status: "two_factor_required",
+          deviceProofRequired: result.deviceProofRequired,
+          challengeToken: result.challengeToken,
+          expiresAtEpochMs: result.expiresAtEpochMs,
+        };
   const response = NextResponse.json(
     responseBody,
     {
@@ -94,8 +115,10 @@ export const POST = withErrorResponse(async (request: Request): Promise<NextResp
     },
   );
 
-  for (const cookie of result.cookies) {
-    response.headers.append("set-cookie", cookie);
+  if (result.outcome === "signed_in") {
+    for (const cookie of result.cookies) {
+      response.headers.append("set-cookie", cookie);
+    }
   }
 
   return response;

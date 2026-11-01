@@ -236,11 +236,11 @@ export function normalizeBackupCode(code: string): string {
 /**
  * True when a typed value has the shape of a backup code, so a hash is never computed for junk.
  *
- * The separator is optional because a person reading a code off a screen often types it without
- * one; the length is not, because the hash comparison is against a ten character code and a value
- * of another length can only waste a scrypt run.
+ * The separator is optional, and so is the space a person substitutes for it, because a code is read
+ * off a screen and typed by hand; the length is not, because the hash comparison is against a ten
+ * character code and a value of another length can only waste a scrypt run.
  */
 export function isBackupCodeShaped(code: string): boolean {
-  return /^[a-z0-9]{5}-?[a-z0-9]{5}$/u.test(code.trim().toLowerCase()) &&
+  return /^[a-z0-9]{5}[- ]?[a-z0-9]{5}$/u.test(code.trim().toLowerCase()) &&
     normalizeBackupCode(code).length === backupCodeLength * 2;
 }

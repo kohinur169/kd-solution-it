@@ -79,6 +79,15 @@ const payloadSchema = z.object({
   expiresAtEpochMs: z.number().int().positive(),
   userId: z.string().min(1).max(identifierMaximumLength),
   sessionId: z.string().min(1).max(identifierMaximumLength).nullable(),
+  /**
+   * The assurance this platform established for the session.
+   *
+   * The provider's token says what the provider saw, which is a password. The second factor of
+   * section 22 is this platform's own, checked against `users.totp_confirmed_at`, so only this
+   * platform can raise the level - and it says so in the payload it signs. A cookie minted at the
+   * password step carries `aal1`; the one minted after a code is accepted carries `aal2`.
+   */
+  assuranceLevel: z.enum(["aal1", "aal2"]).optional(),
 });
 
 /**

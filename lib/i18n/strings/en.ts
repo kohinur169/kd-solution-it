@@ -118,6 +118,17 @@ const catalog = {
     noAccount: "No account yet?",
     createAccount: "Create one",
     unreadableResponse: "The server answered with something this page cannot read. Try again.",
+    secondFactorTitle: "Enter the code for this account",
+    secondFactorBody:
+      "The password was accepted and no session has been issued yet. Enter the six digit code from your authenticator app, or one of the backup codes you saved when two factor authentication was turned on.",
+    secondFactorCodeLabel: "Authenticator code or backup code",
+    secondFactorSubmit: "Verify and sign in",
+    secondFactorSubmitting: "Verifying",
+    secondFactorRejected:
+      "That code was not accepted. Wait for the next one in the app, or use a backup code.",
+    secondFactorExpired:
+      "This sign in took too long to complete. Enter the password again to start a new one.",
+    secondFactorRestart: "Start again",
   },
   verify: {
     title: "Email verification",

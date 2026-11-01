@@ -155,7 +155,18 @@ export async function readSession(
     return unauthenticated(rejection);
   }
 
-  return { kind: "authenticated", actor: toRequestActor(claims, record) };
+  // The payload this platform signed is at least as trustworthy as the claims inside the provider's
+  // token, and it is the only place a second factor this platform verified can be recorded. The
+  // higher of the two wins: a provider that already answered `aal2` is never lowered by a payload
+  // written before the code was asked for.
+  const claimedLevel = claims.assuranceLevel === "aal2" || payload.assuranceLevel === "aal2"
+    ? "aal2"
+    : "aal1";
+
+  return {
+    kind: "authenticated",
+    actor: toRequestActor({ ...claims, assuranceLevel: claimedLevel }, record),
+  };
 }
 
 /** The sentence-free rejection every caller of this module throws. */

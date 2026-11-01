@@ -173,6 +173,24 @@ the authority. A permission check uses the record, never a claim.
     from numbers; no string of markup is ever injected, and `fill-symbol`/`fill-symbol-background`
     keep the symbol dark on light in both themes.
 
+33. A password does not sign an enrolled account in. `signInMerchant` answers `signed_in` or
+    `two_factor_required`, and the second shape carries no cookie and no `cookies` field at all:
+    `user.signed_in` is written only after the code, because before it nothing has signed in. The
+    provider's pair is sealed into one `auth_challenges` row and the browser holds a handle.
+34. A challenge is a handle, a hash and a sealed pair. `two-factor-login.ts` stores the SHA-256 of
+    32 random bytes, never the handle; the pair is AES-256-GCM under the master key with the
+    challenge in the associated data; the lifetime is ten minutes and a success consumes the row, so
+    one password entry produces one session.
+35. Every refusal at the second factor is the same sentence. An unknown handle, an expired
+    challenge, a consumed one, a wrong code and a spent backup code all answer
+    `AUTHENTICATION_REQUIRED`, and each rejection is a `login_attempts` row with `factor = 'totp'`
+    for the lock of STEP 045. Five rejections retire the challenge, so a stolen password has five
+    guesses at a million.
+36. Assurance is decided by the payload this platform signed. The provider's token says a password
+    was checked; only this platform knows that a code was, so `completeTwoFactorChallenge` mints a
+    cookie carrying `assuranceLevel: "aal2"` and `readSession` takes the higher of the payload and
+    the claim. A backup code counts as a satisfied second factor, and spending it is audited.
+
 ## Adding an operation
 
 1. Add the method to the `AuthClient` or `AdminAuthClient` interface and its implementation,
