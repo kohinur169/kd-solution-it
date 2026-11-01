@@ -49,7 +49,8 @@ verification and its failed-attempt path), `lib/auth/account-unlock.ts` and the 
 
 ## Sub-step 2 - Owned paths
 
-New: `migrations/0091_sessions_reauthenticated_at.sql` (+ rollback), `lib/auth/step-up.ts`,
+New: `migrations/0091_sessions_reauthenticated_at.sql` (+ rollback; one constraint, no column),
+`lib/auth/step-up.ts`,
 `app/api/auth/session/reauth/route.ts`, `app/(auth)/reauth/page.tsx` and its client form, this
 document and the handoff.
 
@@ -61,13 +62,15 @@ Modified: `lib/auth/session-rotation.ts` (the column, and the rotation copying i
 
 ## Sub-step 3 - Database: `0091_sessions_reauthenticated_at.sql`
 
-One nullable column on `public.sessions`, plus three checks that make the stamp mean something:
-it can never predate the row's `issued_at`, never reach past the row's `expires_at`, and never reach
-past the family's `absolute_expires_at`. Existing rows are unaffected (the column is null for them,
-which reads as "never reauthenticated in this session"). The rollback drops the column.
+`0010` already wrote `reauthenticated_at` and its lower bound (`sessions_reauthenticated_check`), so
+this STEP adds no column: it adds the **upper** bound that was missing, so a proof can never be
+recorded after the row it belongs to has ended. The family ceiling needs no third check, because
+`0089` already keeps `expires_at` inside `absolute_expires_at`.
 
-Proof: PGlite, forward, checks, rollback, forward again, with negative controls on each of the three
-constraints.
+Proof: PGlite, replaying the real `0010` table and the real `0089` ceiling, forward, checks, rollback,
+forward again, and two controls - the file that added the column cannot apply at all, and without the
+new check a late proof is accepted. That double-add was the defect found and corrected before
+STEP 054; `migrations/verify.ts` gained `checkNoRevisions` so no later STEP can repeat it.
 
 ## Sub-step 4 - Core service `lib/auth/step-up.ts`
 

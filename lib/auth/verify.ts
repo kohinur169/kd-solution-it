@@ -11321,11 +11321,23 @@ async function checkStepUp(): Promise<void> {
     new URL("../../migrations/0091_sessions_reauthenticated_at.sql", import.meta.url),
     "utf8",
   );
+  const sessionsMigration = await readFile(
+    new URL("../../migrations/0010_sessions.sql", import.meta.url),
+    "utf8",
+  );
 
+  // The two bounds live in two files, on purpose: `0010` wrote the column and its lower bound, and
+  // `0091` adds only the upper one. A migration that re-adds the column cannot apply at all, which
+  // is the mistake `checkNoRevisions` in the migrations gate now refuses.
   expect(
-    migration.includes("sessions_reauthenticated_after_issue_check") &&
-      migration.includes("sessions_reauthenticated_within_row_check"),
-    "and the database bounds the instant from both sides",
+    sessionsMigration.includes("reauthenticated_at timestamptz") &&
+      sessionsMigration.includes("sessions_reauthenticated_check"),
+    "0010 owns the column and the lower bound",
+  );
+  expect(
+    migration.includes("sessions_reauthenticated_within_row_check") &&
+      !migration.includes("add column reauthenticated_at"),
+    "0091 adds the upper bound and never the column",
   );
 }
 

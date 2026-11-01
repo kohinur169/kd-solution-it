@@ -19,7 +19,13 @@ import { fileURLToPath } from "node:url";
  *      version, and the id default is the shared UUID v7 function;
  *   6. security: every created table enables row level security and carries its default-deny
  *      policy in the same file, refusing reads and writes alike;
- *   7. rollback: a down file drops exactly the tables its forward file creates.
+ *   7. rollback: a down file drops exactly the tables its forward file creates;
+ *   8. no revision: a table is created once, and no file adds a column the table already has. This
+ *      is the shape a duplicate looks like - a `create table` that repeats an earlier one, or an
+ *      `alter table ... add column` for a column some earlier file already wrote - and it only
+ *      fails when the SQL is applied, which is the one thing this static gate cannot do. STEP 053
+ *      shipped exactly that mistake (`0091` added `sessions.reauthenticated_at`, which `0010`
+ *      already had) and this check is why it cannot happen again.
  *
  * The gate is static, so it runs anywhere a Node.js process runs. Whether the SQL actually
  * applies is proven by running it against PostgreSQL; that transcript belongs to the handoff file
@@ -203,6 +209,57 @@ function checkForwardFile(file: MigrationFile): void {
   }
 }
 
+/**
+ * Refuse a table created twice, and a column added to a table that already has it.
+ *
+ * The two are the same defect from a reader's side: a migration that reads as an addition and is
+ * really a duplicate, so the chain applies on the machine that wrote it - where the SQL was never
+ * run - and fails on the first real database. The scan is in file order, so "already has it" means
+ * everything written before this file.
+ */
+function checkNoRevisions(forward: readonly MigrationFile[]): void {
+  const columnsByTable = new Map<string, string>();
+  const createdBy = new Map<string, string>();
+  const addColumnPattern =
+    /alter\s+table\s+(?:if\s+exists\s+)?public\.([a-z][a-z0-9_]*)\s+add\s+column\s+(?:if\s+not\s+exists\s+)?([a-z][a-z0-9_]*)/giu;
+
+  for (const file of forward) {
+    for (const table of file.tables) {
+      const already = createdBy.get(table.name);
+
+      expect(
+        already === undefined,
+        `${file.name}: table ${table.name} is already created by ${already ?? "an earlier file"}`,
+      );
+
+      if (already === undefined) {
+        createdBy.set(table.name, file.name);
+      }
+
+      columnsByTable.set(table.name, table.columns.join(" "));
+    }
+  }
+
+  for (const file of forward) {
+    addColumnPattern.lastIndex = 0;
+    let match = addColumnPattern.exec(file.content);
+
+    while (match !== null) {
+      const table = match[1] ?? "";
+      const column = match[2] ?? "";
+      const known = columnsByTable.get(table) ?? "";
+
+      expect(
+        !known.split(" ").includes(column),
+        `${file.name}: column ${table}.${column} already exists, so this file must not add it`,
+      );
+
+      columnsByTable.set(table, `${known} ${column}`.trim());
+      match = addColumnPattern.exec(file.content);
+    }
+  }
+}
+
 function checkDownFile(file: MigrationFile, forward: MigrationFile): void {
   const statements = statementsOf(file.content);
 
@@ -253,6 +310,8 @@ async function main(): Promise<void> {
       checkDownFile(rollback, file);
     }
   }
+
+  checkNoRevisions(forward);
 
   for (const rollback of down.values()) {
     expect(

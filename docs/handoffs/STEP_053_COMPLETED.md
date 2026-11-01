@@ -33,26 +33,42 @@ the guard as one function and one column rather than as a rule inside the unlock
 
 ## Database - `0091_sessions_reauthenticated_at.sql`
 
-One nullable column on `public.sessions` and two checks:
+`0010_sessions.sql` already carried the column this STEP needs - `reauthenticated_at`, together with
+`sessions_reauthenticated_check`, which refuses an instant that predates `issued_at`. What it did not
+bound is the other end. `0091` is that bound and nothing else:
 
-| object | meaning |
-| --- | --- |
-| `sessions.reauthenticated_at` | when this session last proved the second factor again; null until it does, which is the honest state of every row written before this file |
-| `sessions_reauthenticated_after_issue_check` | a proof cannot predate `issued_at` |
-| `sessions_reauthenticated_within_row_check` | a proof cannot reach past the row's `expires_at` |
+| object | where | meaning |
+| --- | --- | --- |
+| `sessions.reauthenticated_at` | `0010` | when this session last proved the second factor again; null until it does |
+| `sessions_reauthenticated_check` | `0010` | a proof cannot predate `issued_at` |
+| `sessions_reauthenticated_within_row_check` | `0091` | a proof cannot reach past the row's `expires_at` |
 
 The family's `absolute_expires_at` needs no third check: `0089` already refuses a row whose
 `expires_at` is past it, so a proof inside the row is inside the ceiling by construction. That is
-written into the migration rather than left as an apparent omission, and the PGlite proof states the
+written into the migration rather than left as an apparent omission, and the proof states the
 boundary case explicitly.
 
-The column is additive and nullable, so deploying this file invalidates no session. The rollback
-drops the two checks and the column, and keeps every row: what is lost is the record of which
-sessions had proved themselves again, which the audit chain already holds.
+Additive: no column, no row and no existing constraint is touched, so deploying this file
+invalidates no session. The rollback drops the one check and keeps the column, the lower bound and
+every row.
 
-Proof: PGlite 0.5.14 - forward, 19 checks, rollback, forward again, plus four negative controls (no
-lower bound, no row ceiling, a required instant that would invalidate every existing row, a column
-that is not an instant), each of which makes the harness fail.
+Proof: PGlite 0.5.14 against the **real** `0010` table definition and the **real** `0089` ceiling,
+not a hand written stand-in - forward, 17 checks, rollback, forward again, plus two controls: the
+version of this file that first shipped (which added the column `0010` already had) cannot apply at
+all, and without the new check a proof past the row's end is accepted.
+
+### Correction, made before STEP 054
+
+The first version of `0091` added `reauthenticated_at` as a new column. It never ran anywhere - the
+migrations gate is static and the proof of that STEP used a hand written `sessions` table - so the
+duplicate surfaced only when STEP 054 re-read `0010`. It is corrected here rather than in a later
+migration, because a migration that cannot apply on a real database cannot be repaired by one that
+runs after it. Two things changed with it:
+
+- the PGlite proof now replays the real `0010` and `0089` files instead of a stand-in;
+- `migrations/verify.ts` gained `checkNoRevisions`, which refuses a `create table` for a table an
+  earlier file created and an `add column` for a column that already exists - the two shapes this
+  defect took. It found no other duplicate in the 91 migrations.
 
 ## Service - `lib/auth/step-up.ts`
 
@@ -119,13 +135,13 @@ put a credential through the network again to learn less. A backup code is accep
 | --- | --- |
 | `npx tsc --noEmit` | clean |
 | `npm run lint` | clean |
-| `node lib/auth/verify.ts` | **1890 checks** (1808 before this STEP); `checkStepUp()` adds 74 |
+| `node lib/auth/verify.ts` | **1891 checks** (1808 before this STEP); `checkStepUp()` adds 74, the 0091 correction one more |
 | `node lib/i18n/verify.ts` | 244 messages, 10 placeholders, 1 locale |
-| `npm run check:migrations` | 2637 checks, 91 migrations, 74 tables |
+| `npm run check:migrations` | 2714 checks, 91 migrations, 74 tables (after the correction) |
 | `npm run check:structure` | 16 directories, 13 root files, 147 source files |
 | `npm run check:shell` | 209 checks, 45 files |
 | `npm run verify` | exit 0 |
-| PGlite proof of `0091` | forward/back/forward, 19 checks, 4 negative controls |
+| PGlite proof of `0091` | real `0010` schema, forward/back/forward, 17 checks, 2 controls |
 
 Mutation controls, each applied to the working tree, run, and restored: window widened, window edge
 made inclusive, guard never refusing, wrong code not counted, instant not written, rotation dropping

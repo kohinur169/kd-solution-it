@@ -431,12 +431,13 @@ the authority. A permission check uses the record, never a claim.
     `requireTrustedDevice` turns the report into the refusal at the three endpoints that hand out a
     way in: ten fresh backup codes, an approved reset and an unlock.
 80. Freshness is two instants on the session, not a flag in a cookie. `sessions.mfa_verified_at`
-    (`0010`) records when the second factor was satisfied at sign in and `sessions.reauthenticated_at`
-    (`0091`, STEP 053) when it was proved again inside the session. `readStepUpState` takes the later
-    of the two and the proof counts for `STEP_UP_WINDOW_MS` (ten minutes), so a merchant who signed in
-    a minute ago is not asked for the same code twice while a session left open all afternoon cannot
-    unlock an account. Both instants are carried onto the actor by `readBoundSession`, which is the
-    only place that reads the row, so the guard itself does no I/O and the gate can hold its edges.
+    (`0010`) records when the second factor was satisfied at sign in, and `sessions.reauthenticated_at`
+    - the column `0010` already carried and STEP 053 fills, bounded above by `0091` - records when it
+    was proved again inside the session. `readStepUpState` takes the later of the two and the proof
+    counts for `STEP_UP_WINDOW_MS` (ten minutes), so a merchant who signed in a minute ago is not
+    asked for the same code twice while a session left open all afternoon cannot unlock an account.
+    Both instants are carried onto the actor by `readBoundSession`, which is the only place that
+    reads the row, so the guard itself does no I/O and the gate can hold its edges.
 81. The step-up proof is the second factor, not the password again. The session already proved the
     password; the authenticator code is the part a stolen password and a stolen cookie both cannot
     supply, and it is verified against the sealed secret in `users`. A backup code is accepted for
@@ -452,8 +453,9 @@ the authority. A permission check uses the record, never a claim.
 83. A rotation carries the proof. `rotate` copies `mfa_verified_at` and `reauthenticated_at` into the
     child row, so replacing a token fifteen minutes after a step-up cannot undo the step-up itself -
     the freshness belongs to the login, not to one rotation of it. The lock of section 22 is asked
-    before the code, so a locked account cannot be used to test one, and `0091` bounds the instant
-    from both sides: after `issued_at`, before `expires_at`.
+    before the code, so a locked account cannot be used to test one. The instant is bounded from both
+    sides, in two files: `0010` refuses one that predates `issued_at`, `0091` one that reaches past
+    `expires_at`, and the family ceiling of `0089` follows from the row's own.
 
 ## Adding an operation
 
