@@ -2,10 +2,10 @@
 # lib/security/
 
 Owner: STEP 056 (input sanitiser for text, rich text and URLs), STEP 057 (the double submit token),
-STEP 058 (the destination rule), STEP 059 (the Content Security Policy) and STEP 060 (the security
-headers). Later STEPs call these functions; they do not write a second escape, a second URL check, a
-second allowlist, a second CSRF token, a second DNS check, a second policy header or a second header
-table.
+STEP 058 (the destination rule), STEP 059 (the Content Security Policy), STEP 060 (the security headers)
+and STEP 061 (the upload validator). Later STEPs call these functions; they do not write a second
+escape, a second URL check, a second allowlist, a second CSRF token, a second DNS check, a second policy
+header, a second header table or a second file type check.
 
 | File | Purpose |
 | --- | --- |
@@ -18,6 +18,7 @@ table.
 | ssrf.ts | The destination rule: the allowlist, the resolver, and the three checks a URL must pass |
 | csp.ts | The Content Security Policy: the nonce, the fifteen directives, and what each allowance is for |
 | headers.ts | The security headers of every response, in two scopes: a document and a static file |
+| upload.ts | What a file must be before it is stored: purpose, size, magic bytes, and the quarantine verdict |
 | verify.ts | The gate behind `npm run check:security`, and the attack corpus it runs |
 
 ## The four rules
@@ -149,6 +150,35 @@ response was a 500. Serving it is what found it, and the fix is the rule this fi
 `/_next/static/` and `/_next/image` are build output, because those are the paths the framework itself
 serves as files. Everything else is a document, and pays one nonce for the guarantee that a page can
 never be rendered without a policy.
+
+## What a file must be
+
+`upload.ts` answers three questions, in this order, and the second one is the only one that is evidence:
+
+1. **How big is it?** A limit per purpose, every one of them at or under the 50 MB row check of migration
+   `0057`. A size is a claim the client makes, so the caller passes the number it counted, not the one
+   the request declared.
+2. **What is it, really?** The first 32 bytes are compared with the signatures of the four types this
+   platform accepts - `%PDF-`, `FF D8 FF`, the eight byte PNG signature, and `RIFF` plus `WEBP` at
+   offset eight. The `Content-Type` header a browser sends is a claim: a POST can say `image/png` and
+   send HTML, and a handler that stores the claim and serves it back is a stored XSS with a download
+   button.
+3. **Do the claim and the evidence agree?** They must, and when they do not the answer is **quarantine**,
+   not refusal: the object becomes a row with a hash, `magic_byte_verified = false` and a reason an
+   operator reads, because "this merchant sent a file that lied about its type" is evidence a refusal
+   throws away. A refusal is reserved for what never deserved a row: an empty file, a size over the
+   purpose limit, a missing or unacceptable type.
+
+Two types are refused on purpose. **`image/svg+xml`** because an SVG is a document that can carry
+`<script>`, an external reference or a font, and this repository has no SVG sanitiser - the rich text
+allowlist of `html.ts` is a different job. **ZIP containers** (`application/zip`, the OOXML formats)
+because a container needs an extractor with its own bomb, traversal and macro rules, and none of the five
+purposes of section 21 needs one.
+
+The module reads bytes a route already has. It does not encrypt (section 21 puts AES-256-GCM before the
+upload, owned by the storage STEPs 100-105), it does not store, and it does not sign a URL. The rule it
+leaves for whoever serves a stored file: **send `content-disposition: attachment` and keep `nosniff`** -
+a browser rendering a quarantined PDF inline is the one thing a magic byte check cannot prevent alone.
 
 ## Ceilings
 

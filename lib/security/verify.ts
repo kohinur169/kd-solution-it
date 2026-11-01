@@ -38,6 +38,24 @@ import {
   type CspDirective,
 } from "./csp.ts";
 import {
+  detectContentType,
+  requireValidUpload,
+  sha256Hex,
+  sniffHead,
+  UPLOAD_DATABASE_MAXIMUM_BYTES,
+  UPLOAD_FIELD,
+  UPLOAD_MAXIMUM_REASON_LENGTH,
+  UPLOAD_PURPOSES,
+  UPLOAD_POLICIES,
+  UPLOAD_QUARANTINE_REASONS,
+  UPLOAD_RULE,
+  UPLOAD_SNIFF_BYTES,
+  uploadRejection,
+  validateUpload,
+  type UploadPurpose,
+  type UploadRejectionReason,
+} from "./upload.ts";
+import {
   headersFor,
   isSecurityHeaderName,
   SECURITY_HEADERS,
@@ -1016,6 +1034,271 @@ async function checkSecurityHeaderWiring(): Promise<void> {
   expectEqual(scanned.join(","), "lib/security/headers.ts", "no module writes a security header by hand");
 }
 
+/* ------------------------------------------------------------------ 9. the upload validator */
+
+/** A minimal file of each accepted type, built from its signature so the corpus needs no fixture. */
+function uploadSamples(): Readonly<Record<string, Uint8Array>> {
+  const text = new TextEncoder();
+
+  return {
+    "application/pdf": new Uint8Array([...text.encode("%PDF-1.7\n"), 0x25, 0x25, 0x45, 0x4f, 0x46]),
+    "image/jpeg": new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46]),
+    "image/png": new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d]),
+    "image/webp": new Uint8Array([0x52, 0x49, 0x46, 0x46, 0x24, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50]),
+  };
+}
+
+/**
+ * The upload validator of STEP 061.
+ *
+ * Two halves, and the second one is the one that cannot be faked: the signature corpus proves what a
+ * type is, and the *disagreement* corpus proves what happens when the client's claim and the bytes are
+ * different facts - which is the entire attack this validator exists for. The last section reads
+ * `migrations/0057_files.sql` and asserts that the limits and purpose names here are the ones the
+ * database already enforces, because a validator that is stricter than its row is a surprise and one
+ * that is looser is a failed insert in production.
+ */
+function checkUploadValidator(): void {
+  const samples = uploadSamples();
+
+  expectEqual(UPLOAD_PURPOSES.length, 5, "the platform accepts five upload purposes");
+  expectEqual(new Set(UPLOAD_PURPOSES).size, UPLOAD_PURPOSES.length, "and no purpose is listed twice");
+  expectEqual(UPLOAD_PURPOSES.join(","), Object.keys(UPLOAD_POLICIES).join(","), "every purpose has a policy and no policy has no purpose");
+  expect(Object.isFrozen(UPLOAD_POLICIES), "the policy table is frozen");
+
+  for (const purpose of UPLOAD_PURPOSES) {
+    const policy = UPLOAD_POLICIES[purpose];
+
+    expectEqual(policy.purpose, purpose, `${purpose} names itself`);
+    expect(policy.allowedTypes.length > 0, `${purpose} accepts at least one type`);
+    expect(
+      policy.allowedTypes.every((type) => /^[a-z]+\/[A-Za-z0-9.+-]+$/u.test(type)),
+      `${purpose} accepts types the files_content_type_check of 0057 would accept`,
+    );
+    expect(
+      policy.allowedTypes.every((type) => detectContentType(samples[type] ?? new Uint8Array()) === type),
+      `${purpose} accepts only types this module can prove from the bytes`,
+    );
+    expectEqual(
+      policy.allowedTypes.includes("image/svg+xml"),
+      false,
+      `${purpose} refuses an SVG, which is a document that can carry script`,
+    );
+    expect(policy.maximumBytes > 0, `${purpose} has a size limit`);
+    expect(
+      policy.maximumBytes <= UPLOAD_DATABASE_MAXIMUM_BYTES,
+      `${purpose} never exceeds the 0057 row check`,
+    );
+    expect(Object.isFrozen(policy.allowedTypes), `${purpose} cannot have a type added at runtime`);
+  }
+
+  expectEqual(UPLOAD_POLICIES.kyc_document.maximumBytes, UPLOAD_DATABASE_MAXIMUM_BYTES, "a KYC scan may be as large as the row allows");
+  expect(
+    UPLOAD_POLICIES.company_logo.maximumBytes < UPLOAD_POLICIES.kyc_document.maximumBytes,
+    "and a logo is smaller than a scan, because it is an icon rather than a document",
+  );
+  expect(
+    UPLOAD_POLICIES.invoice_pdf.allowedTypes.join(",") === "application/pdf",
+    "the invoice purpose accepts a PDF and nothing else, because the platform writes it",
+  );
+
+  // ---- the signatures
+  for (const [type, sample] of Object.entries(samples)) {
+    expectEqual(detectContentType(sample), type, `${type} is recognised from its own signature`);
+    expectEqual(detectContentType(sniffHead(sample)), type, `and from the first ${UPLOAD_SNIFF_BYTES} bytes, which is all a route reads`);
+  }
+
+  expectEqual(detectContentType(new TextEncoder().encode("%PDF1.7")), null, "a bare %PDF is not a PDF header");
+  expectEqual(detectContentType(new Uint8Array([0x25, 0x50, 0x44])), null, "a truncated signature proves nothing");
+  expectEqual(detectContentType(new Uint8Array([0x00, 0xff, 0xd8, 0xff])), null, "a signature at the wrong offset is not a signature");
+  expectEqual(
+    detectContentType(new Uint8Array([0x52, 0x49, 0x46, 0x46, 0x24, 0x00, 0x00, 0x00, 0x41, 0x56, 0x49, 0x20])),
+    null,
+    "a RIFF container that is not WebP is refused",
+  );
+  expectEqual(detectContentType(new Uint8Array()), null, "no bytes, no type");
+  expectEqual(detectContentType(new TextEncoder().encode("<html><body>hi")), null, "markup is not a file type this platform accepts");
+
+  // ---- the decisions
+  const png = samples["image/png"] ?? new Uint8Array();
+  const pdf = samples["application/pdf"] ?? new Uint8Array();
+  const html = new TextEncoder().encode("<script>alert(1)</script>");
+
+  const verified = validateUpload(
+    { fileName: "scan.png", declaredType: "image/png", byteSize: png.length, head: png },
+    "kyc_document",
+  );
+
+  expect(verified.ok && verified.verdict.decision === "verified", "a PNG declared as a PNG is verified");
+  expectEqual(verified.ok && verified.verdict.quarantineReason, null, "and carries no quarantine reason");
+  expectEqual(verified.ok && verified.verdict.contentType, "image/png", "and records the type the bytes proved");
+
+  const declaredLoud = validateUpload(
+    { fileName: "SCAN.PNG", declaredType: "  IMAGE/PNG  ", byteSize: png.length, head: png },
+    "kyc_document",
+  );
+
+  expect(declaredLoud.ok && declaredLoud.verdict.decision === "verified", "a declared type is compared in one case");
+  expectEqual(declaredLoud.ok && declaredLoud.verdict.fileName, "SCAN.PNG", "and a name keeps its case, because it is display only");
+
+  const traversal = validateUpload(
+    { fileName: "../../etc/passwd.png", declaredType: "image/png", byteSize: png.length, head: png },
+    "company_logo",
+  );
+
+  expectEqual(traversal.ok && traversal.verdict.fileName.includes("/"), false, "a traversal in a name cannot survive the sanitiser");
+  expectEqual(traversal.ok && traversal.verdict.fileName.includes(".."), false, "and neither may a parent segment");
+
+  const mismatch = validateUpload(
+    { fileName: "statement.png", declaredType: "application/pdf", byteSize: png.length, head: png },
+    "kyc_document",
+  );
+
+  expect(mismatch.ok && mismatch.verdict.decision === "quarantined", "a PNG declared as a PDF is quarantined");
+  expectEqual(
+    mismatch.ok && mismatch.verdict.quarantineReason,
+    UPLOAD_QUARANTINE_REASONS.typeMismatch,
+    "because the claim and the bytes disagree",
+  );
+  expectEqual(mismatch.ok && mismatch.verdict.contentType, "image/png", "and the record keeps what the bytes are, not what was claimed");
+
+  const active = validateUpload(
+    { fileName: "invoice.pdf", declaredType: "application/pdf", byteSize: html.length, head: html },
+    "invoice_pdf",
+  );
+
+  expect(active.ok && active.verdict.decision === "quarantined", "markup in place of a document is quarantined");
+  expectEqual(
+    active.ok && active.verdict.quarantineReason,
+    UPLOAD_QUARANTINE_REASONS.activeContent,
+    "with the reason that names what it is",
+  );
+
+  const unknown = validateUpload(
+    { fileName: "note.pdf", declaredType: "application/pdf", byteSize: 12, head: new Uint8Array([0x1f, 0x8b, 0x08, 0x00]) },
+    "invoice_pdf",
+  );
+
+  expect(unknown.ok && unknown.verdict.decision === "quarantined", "an unrecognised signature is quarantined rather than refused");
+  expectEqual(
+    unknown.ok && unknown.verdict.quarantineReason,
+    UPLOAD_QUARANTINE_REASONS.unknownSignature,
+    "with the reason a person reads in the file record",
+  );
+
+  const refused: readonly (readonly [string, UploadCandidateLike, UploadPurpose, UploadRejectionReason])[] = [
+    ["an empty declared type", { fileName: "a.png", declaredType: "   ", byteSize: 10, head: png }, "company_logo", "type_missing"],
+    ["an empty file", { fileName: "a.png", declaredType: "image/png", byteSize: 0, head: png }, "company_logo", "empty_file"],
+    ["a file one byte over the logo limit", { fileName: "a.png", declaredType: "image/png", byteSize: UPLOAD_POLICIES.company_logo.maximumBytes + 1, head: png }, "company_logo", "too_large"],
+    ["an SVG", { fileName: "logo.svg", declaredType: "image/svg+xml", byteSize: 200, head: png }, "company_logo", "type_not_allowed"],
+    ["a PNG where only a PDF is allowed", { fileName: "i.png", declaredType: "image/png", byteSize: png.length, head: png }, "invoice_pdf", "type_not_allowed"],
+    ["a zip archive", { fileName: "a.zip", declaredType: "application/zip", byteSize: 10, head: png }, "support_attachment", "type_not_allowed"],
+    ["an HTML file", { fileName: "a.html", declaredType: "text/html", byteSize: html.length, head: html }, "support_attachment", "type_not_allowed"],
+  ];
+
+  for (const [label, candidate, purpose, reason] of refused) {
+    const decision = validateUpload(candidate, purpose);
+
+    expectEqual(decision.ok, false, `${label} is refused rather than quarantined`);
+
+    if (!decision.ok) {
+      expectEqual(decision.reason, reason, `and answers ${reason}`);
+    }
+  }
+
+  const atTheLimit = validateUpload(
+    { fileName: "logo.png", declaredType: "image/png", byteSize: UPLOAD_POLICIES.company_logo.maximumBytes, head: png },
+    "company_logo",
+  );
+
+  expect(atTheLimit.ok && atTheLimit.verdict.decision === "verified", "a file exactly at the limit is accepted");
+  expectEqual(atTheLimit.ok && atTheLimit.verdict.byteSize, UPLOAD_POLICIES.company_logo.maximumBytes, "and its size is recorded as counted");
+
+  const longHead = validateUpload(
+    { fileName: "scan.png", declaredType: "image/png", byteSize: 4_096, head: new Uint8Array([...png, ...new Uint8Array(2_048)]) },
+    "kyc_document",
+  );
+
+  expect(longHead.ok && longHead.verdict.decision === "verified", "a signature at the start is enough however long the file is");
+  expectEqual(longHead.ok && longHead.verdict.byteSize, 4_096, "and the counted size is what the record keeps");
+
+  // ---- the hash the record stores
+  const digest = sha256Hex(new TextEncoder().encode("abc"));
+
+  expectEqual(digest, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "the hash is the SHA-256 of the plaintext");
+  expect(/^[0-9a-f]{64}$/u.test(digest), "in the lower case hex files_hash_check accepts");
+  expectEqual(sha256Hex(pdf), sha256Hex(pdf), "and it is deterministic");
+  expect(sha256Hex(pdf) !== sha256Hex(png), "two files do not share a digest");
+
+  // ---- the reasons, as the database will store them
+  for (const [name, reason] of Object.entries(UPLOAD_QUARANTINE_REASONS)) {
+    expect(reason.length > 0 && reason.length <= UPLOAD_MAXIMUM_REASON_LENGTH, `${name} fits files_quarantine_reason_check`);
+    expectEqual(reason, reason.trim(), `${name} is trimmed, because the row check demands it`);
+  }
+
+  expect(Object.isFrozen(UPLOAD_QUARANTINE_REASONS), "the reason list is frozen");
+
+  // ---- the refusal factory and the throwing wrapper
+  const factory = uploadRejection("too_large");
+
+  expectEqual(factory.code, "VALIDATION_FAILED", "the refusal factory answers the validation code");
+  expectEqual(
+    (factory.cause as { reason?: string } | undefined)?.reason,
+    "too_large",
+    "and keeps the broken limit as evidence for the log",
+  );
+
+  const refusal = expectThrows(
+    () => requireValidUpload({ fileName: "a.svg", declaredType: "image/svg+xml", byteSize: 10, head: png }, "company_logo"),
+    "a route that calls the wrapper gets an application error",
+  );
+
+  expectEqual(refusal?.code, "VALIDATION_FAILED", "with the validation code");
+  expectEqual(refusal?.details[0]?.field, UPLOAD_FIELD, "naming the file field");
+  expectEqual(refusal?.details[0]?.rule, UPLOAD_RULE, "and the one upload rule");
+  expectEqual(
+    (refusal?.cause as { reason?: string } | undefined)?.reason,
+    "type_not_allowed",
+    "with the reason kept for the log and never serialised into the response",
+  );
+
+  const accepted = requireValidUpload(
+    { fileName: "scan.pdf", declaredType: "application/pdf", byteSize: pdf.length, head: pdf },
+    "kyc_document",
+  );
+
+  expectEqual(accepted.decision, "verified", "and an accepted upload comes back as a verdict the route can store");
+}
+
+interface UploadCandidateLike {
+  readonly fileName: string;
+  readonly declaredType: string;
+  readonly byteSize: number;
+  readonly head: Uint8Array;
+}
+
+/** The tree, and the migration this module has to agree with. */
+async function checkUploadWiring(): Promise<void> {
+  const uploadSource = await readFile(new URL("./upload.ts", import.meta.url), "utf8");
+  const migration = await readFile(new URL("../../migrations/0057_files.sql", import.meta.url), "utf8");
+
+  expect(uploadSource.includes('from "node:crypto"'), "the digest comes from the platform's hash");
+  expect(uploadSource.includes('from "./text.ts"'), "the file name is cleaned by the sanitiser of STEP 056 rather than a second rule");
+  expectEqual(uploadSource.includes("node:fs"), false, "the validator never touches a path: it is given bytes");
+  expectEqual(uploadSource.includes("fetch("), false, "and it makes no request");
+
+  for (const purpose of UPLOAD_PURPOSES) {
+    expect(migration.includes(`'${purpose}'`), `migration 0057 knows the purpose ${purpose}`);
+  }
+
+  expect(migration.includes("byte_size between 1 and 52428800"), "0057 states the row size check this module mirrors");
+  expectEqual(UPLOAD_DATABASE_MAXIMUM_BYTES, 52_428_800, "and the constant is the same number");
+  expect(migration.includes("content_type ~ '^[a-z]+/[A-Za-z0-9.+-]+$'"), "0057 states the content type shape");
+  expect(migration.includes("char_length(quarantined_reason) between 1 and 280"), "and the reason length");
+  expectEqual(UPLOAD_MAXIMUM_REASON_LENGTH, 280, "which is the constant here");
+  expect(migration.includes("magic_byte_verified"), "the verdict this module produces is a column the row already has");
+}
+
 async function checkTree(): Promise<void> {
   const securityRoot = new URL("./", import.meta.url);
   const securityFiles = (await readdir(securityRoot)).filter((name) => name.endsWith(".ts"));
@@ -1086,8 +1369,10 @@ async function main(): Promise<void> {
   await checkOutboundAddresses(outbound);
   checkCsp();
   checkSecurityHeaders();
+  checkUploadValidator();
   await checkCspWiring();
   await checkSecurityHeaderWiring();
+  await checkUploadWiring();
   await checkTree();
 
   if (failures.length > 0) {
