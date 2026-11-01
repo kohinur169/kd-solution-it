@@ -4,7 +4,7 @@
 Owner: STEP 012-036 and every later STEP that adds a table.
 
 Append-only numbered SQL migrations applied with the Supabase CLI against the project of the
-current environment. STEP 012 to STEP 035 created the first seventy four files; `npm run
+current environment. STEP 012 to STEP 036 created the first seventy nine files; `npm run
 check:migrations` keeps them honest.
 
 Each row names the objects its file creates. The index count is the number of indexes the
@@ -86,6 +86,11 @@ table has once the file has run, the primary key included, so it is what `\d` pr
 | 0072_actor_roles.sql | `public.current_actor_roles()` and `public.current_actor_has_role(text)`: the live roles of the person asking, read as the owner so a role policy cannot recurse, and false for a revoked, future or suspended assignment; it creates no table |
 | 0073_office_and_secret_policies.sql | The 33 policies of the five office tables, the four per-person tables and the four credential and connection tables: `super_admin` full control, the person's own session, device key, attempt, lock, assignment, permission and dismissal, the announcement audience rule, and the merchant's own credentials pinned to a live insert and a revoked update, plus three `<table>_tenant_idx` indexes; it creates no table |
 | 0074_platform_and_audit_policies.sql | The 36 policies of the platform book, the configuration, the content and the machinery, each by the role that works it, the merchant's own entitlement and send log, and the two selects that make `audit_logs` readable while it stays append-only, plus the `plan_entitlements` index; it creates no table |
+| 0075_audit_chain_functions.sql | `public.audit_canonical_json(jsonb)`, `public.audit_hash_v1(..)`, `public.audit_log_row_hash(public.audit_logs)`, `public.audit_genesis_hash()`, `public.audit_next_link(uuid)`, `public.audit_verify_chain(uuid, bigint, bigint)` and `public.audit_merkle_root(uuid, bigint, bigint)`: the one executable form of the canonical v1 hash of `0013`, a verification that walks a chain and reports its first break, and the RFC 6962 Merkle root of a range; it creates no table |
+| 0076_reference_countries.sql | The `countries` reference table of section 3: the alpha-2, alpha-3 and numeric codes, the name, the permanent sanction flag with its note and the platform enable switch, the guard that freezes the identity and refuses every delete, three indexes, five policies and 250 seeded ISO 3166-1 rows, four of them embargoed and disabled |
+| 0077_reference_mcc_codes.sql | The `mcc_codes` reference table of section 5: 981 published four digit codes with the risk tier the compliance team sets and the active flag that retires a code, the guard that freezes the code and the title and refuses every delete, three indexes and five policies |
+| 0078_policy_pages_seed.sql | The twelve policy pages of section 3 as `cms_pages` drafts, one row per policy key, each with its slug, its body and its SEO pair, for the bootstrap of `0079` to publish; it creates no table |
+| 0079_super_admin_bootstrap.sql | `public.audit_platform_chain()` and `public.bootstrap_super_admin(..)`: the once-only first run that creates the first super_admin, grants the role with `granted_by` null, publishes the twelve policy pages and writes one signed audit row on the platform chain after checking the caller's hash against the canonical one; it creates no table |
 
 Every file is paired with `<name>.down.sql`, which undoes exactly what its forward file created and
 nothing else.
@@ -378,7 +383,33 @@ nothing else.
     FEATURE_LIST section 2 gives it, a person reads its own session, device key, attempt, lock,
     assignment, permission and dismissal, and `audit_logs` grants no write to anybody: the deny
     policy and `audit_logs_append_only` are what answer a change.
-54. Numbering is contiguous from 0001. A migration is never renumbered after it has been applied
+54. The audit chain is computed here and signed outside. `0075` is the only implementation of the
+    canonical v1 string of `0013`: `audit_canonical_json` sorts keys bytewise and writes no
+    whitespace, `audit_hash_v1` renders the nine fields with an empty segment for a null one and
+    the instant as ISO 8601 UTC with six fractional digits, and `audit_log_row_hash` recomputes a
+    stored row from its own columns. A writer asks `audit_next_link` for the sequence and the head
+    hash, asks `audit_hash_v1` for the hash, signs those 32 bytes with the `AUDIT_SIGNING_KEY` in
+    the service, and writes the row; no migration may implement the string a second time, and no
+    function here signs, because Ed25519 is not in the PostgreSQL core and rule 9 forbids an
+    extension.
+55. A reference list is seeded, frozen and never deleted. `countries` and `mcc_codes` carry
+    `company_id is null`, their codes and names are written once by the migration that creates
+    them, a guard trigger refuses every change to the identity and every delete or soft delete,
+    and the columns the office may change are the country switch, the risk tier and the active
+    flag. A change to the list itself is a new migration, which is the review such a change needs,
+    and a sanctioned country is disabled in the seed, refused by a check constraint when it is
+    enabled and frozen by the guard. The seed rows themselves are written by the migration owner
+    before any account exists, so there is no actor to name and no audit row of their own: the
+    platform chain begins with the bootstrap of `0079`.
+56. The bootstrap is a database action, runs once and is signed before it writes. `0079` is the
+    only way the first account exists, so it may not be an endpoint: execute is revoked from
+    `public` and the caller supplies the account id, the instant, the payload, the hash and the
+    signature it obtained by asking `audit_next_link` and `audit_hash_v1` first. The function
+    recomputes the hash from the same inputs and refuses the run when it differs, when a live
+    `super_admin` already exists, or when the twelve policy pages are not all present, so one call
+    either writes the account, the grant, the published pages and the audit row together or writes
+    nothing at all.
+57. Numbering is contiguous from 0001. A migration is never renumbered after it has been applied
     anywhere.
 
 ## Commands

@@ -503,6 +503,21 @@ handoff file.
   archived, `company_transactions` is corrected by a reversing entry rather than deleted,
   `processor_bills` stores a generated variance over the matched amount, and `compliance_items`
   moves its expiry and its last alert forward only.
+- STEP 036 opens the database by making three things executable. `public.audit_hash_v1()` is the
+  one implementation of the canonical v1 string `0013` documents, with `audit_canonical_json()`
+  writing keys in byte order and no whitespace, `audit_next_link()` returning the sequence and head
+  a writer must extend, `audit_verify_chain()` walking a chain and naming the first break, and
+  `audit_merkle_root()` returning the RFC 6962 root of a range; the Ed25519 signature stays in the
+  service, because the SHA-256 arithmetic is what the database can prove and the signature is what
+  the key holder can. `public.countries` seeds 250 ISO 3166-1 rows, four embargoed countries
+  disabled and frozen, with one switch that `super_admin` and `ceo` may flip and a guard that
+  refuses every other change and every delete. `public.mcc_codes` seeds the 981 published merchant
+  category codes as text, with a risk tier that starts unassigned for the compliance team to set and
+  a retired code kept rather than removed. The twelve policy pages of section 3 arrive as CMS
+  drafts, and `public.bootstrap_super_admin()` is the once-only first run: it creates the first
+  `super_admin`, grants the role with `granted_by` null, publishes those twelve pages, and writes
+  one signed audit row after checking the caller's hash against the canonical one, so the first
+  account exists without an endpoint that could create one.
 - STEP 035 gives the office its rows and closes the layer. `public.current_actor_roles()` and
   `current_actor_has_role()` read the seven roles from `role_assignments` as the table owner, and
   69 policies place them: `super_admin` full control, `finance_ops` the platform book,
