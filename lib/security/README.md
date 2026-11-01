@@ -2,10 +2,10 @@
 # lib/security/
 
 Owner: STEP 056 (input sanitiser for text, rich text and URLs), STEP 057 (the double submit token),
-STEP 058 (the destination rule), STEP 059 (the Content Security Policy), STEP 060 (the security headers)
-and STEP 061 (the upload validator). Later STEPs call these functions; they do not write a second
-escape, a second URL check, a second allowlist, a second CSRF token, a second DNS check, a second policy
-header, a second header table or a second file type check.
+STEP 058 (the destination rule), STEP 059 (the Content Security Policy), STEP 060 (the security headers),
+STEP 061 (the upload validator) and STEP 062 (the rate limiter). Later STEPs call these functions; they do
+not write a second escape, a second URL check, a second allowlist, a second CSRF token, a second DNS
+check, a second policy header, a second header table, a second file type check or a second counter.
 
 | File | Purpose |
 | --- | --- |
@@ -19,6 +19,7 @@ header, a second header table or a second file type check.
 | csp.ts | The Content Security Policy: the nonce, the fifteen directives, and what each allowance is for |
 | headers.ts | The security headers of every response, in two scopes: a document and a static file |
 | upload.ts | What a file must be before it is stored: purpose, size, magic bytes, and the quarantine verdict |
+| rate-limit.ts | How often one address, one account and one route may ask: three buckets, one counter, one decision |
 | verify.ts | The gate behind `npm run check:security`, and the attack corpus it runs |
 
 ## The four rules
@@ -150,6 +151,35 @@ response was a 500. Serving it is what found it, and the fix is the rule this fi
 `/_next/static/` and `/_next/image` are build output, because those are the paths the framework itself
 serves as files. Everything else is a document, and pays one nonce for the guarantee that a page can
 never be rendered without a policy.
+
+## How often a request may ask
+
+`rate-limit.ts` counts every request of the platform in three buckets and refuses when any of them is
+full. The buckets exist because each of the others is blind to a real attack: an address bucket cannot
+see one account spread over a thousand addresses, an account bucket cannot see one machine walking every
+route, and neither notices a single endpoint being hammered. So an address is counted across its class,
+the account across its class, and the address again on the one route.
+
+The limit is per class rather than per route: `public_api`, `webhook`, `office_read`, `office_write`,
+`export` and `authenticated`, with the route limit always the smallest of the three so the bucket that
+trips first on a hammered endpoint is the one that names that endpoint. An export is the tightest class
+in the platform, because a scan of a tenant's rows is not a page render.
+
+There is no second counter. `public.rate_limit_windows` from `0092` stores one row per `(scope, key
+hash)`, and `public.consume_rate_limit` moves it in one statement, so a bucket is a scope
+(`ip_office_write`, `user_public_api`, `route_export`) and a key that is the hex SHA-256 of its subject.
+The authentication limiter of STEP 045 writes the same table through the same function; the gate asserts
+that exactly one migration defines that function, so the two limiters can never disagree about how many
+requests an address has made.
+
+Two properties are worth keeping when this module is wired into a route. It never reads a request, so the
+trust rule for an address - which hop of `x-forwarded-for` is real - stays in `lib/auth/client-address.ts`
+and cannot be re-decided here; the caller passes what that reader returned. And a failure to count is a
+refusal (`SERVICE_UNAVAILABLE`), never a pass: "the counter was down, so the request went through" is the
+one behaviour that turns an outage into permission.
+
+The two liveness probes (`/api/health`, `/api/jobs/health`) are exempt by exact path, because a probe
+answered with `429` reports the platform as down - and the monitor would be right.
 
 ## What a file must be
 

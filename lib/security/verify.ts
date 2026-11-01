@@ -62,6 +62,35 @@ import {
   SECURITY_HEADER_NAMES,
   type ResolvedHeader,
 } from "./headers.ts";
+import {
+  canonicalRateLimitAddress,
+  consumeRateLimitBuckets,
+  enforceRouteRateLimit,
+  isRateLimitExemptRoute,
+  isRateLimitReadMethod,
+  normalizeRateLimitRoute,
+  rateLimitAuditEntry,
+  rateLimitBucketsFor,
+  rateLimitClassForRoute,
+  rateLimitHeaders,
+  rateLimitScopeFor,
+  RATE_LIMIT_AUDIT_ACTION,
+  RATE_LIMIT_BUCKET_DIMENSIONS,
+  RATE_LIMIT_CLASSES,
+  RATE_LIMIT_CLASS_POLICIES,
+  RATE_LIMIT_COUNTER_FUNCTION,
+  RATE_LIMIT_EXEMPT_ROUTES,
+  RATE_LIMIT_KEY_HASH_PATTERN,
+  RATE_LIMIT_MAXIMUM_SCOPE_LENGTH,
+  RATE_LIMIT_MAXIMUM_WINDOW_SECONDS,
+  RATE_LIMIT_MINIMUM_WINDOW_SECONDS,
+  RATE_LIMIT_RULE,
+  RATE_LIMIT_SCOPE_PATTERN,
+  type RateLimitAuditEntry,
+  type RateLimitAuditTrail,
+  type RateLimitCounterClient,
+  type RateLimitDependencies,
+} from "./rate-limit.ts";
 
 /**
  * The gate behind the input sanitiser.
@@ -1299,6 +1328,786 @@ async function checkUploadWiring(): Promise<void> {
   expect(migration.includes("magic_byte_verified"), "the verdict this module produces is a column the row already has");
 }
 
+/** ---- Rate limiting: three buckets, one counter, one decision. */
+
+interface RecordedCounterCall {
+  readonly functionName: string;
+  readonly arguments: Readonly<Record<string, unknown>>;
+}
+
+interface FakeCounterOptions {
+  /** A scope that refuses with the given delay, whatever the counter holds. */
+  readonly refuse?: (scope: string) => number | null;
+  /** A scope whose allowed answer carries this remaining count. */
+  readonly remaining?: (scope: string) => number | null;
+}
+
+interface FakeCounter {
+  readonly client: RateLimitCounterClient;
+  readonly calls: RecordedCounterCall[];
+}
+
+/**
+ * A counter that behaves like `public.consume_rate_limit` in memory: one fixed window per
+ * `(scope, key)`, rewritten when the window lapses, refusing only once the limit is reached.
+ *
+ * The gate drives the real module against it, so the limit boundary is exercised as the database
+ * implements it rather than asserted from a constant.
+ */
+function createFakeCounter(options: FakeCounterOptions = {}): FakeCounter {
+  const rows = new Map<string, { start: number; hits: number; refused: boolean }>();
+  const calls: RecordedCounterCall[] = [];
+  const client: RateLimitCounterClient = {
+    rpc(functionName, arguments_) {
+      calls.push({ functionName, arguments: arguments_ });
+
+      const scope = String(arguments_["p_scope"]);
+      const keyHash = String(arguments_["p_key_hash"]);
+      const limit = Number(arguments_["p_limit"]);
+      const windowSeconds = Number(arguments_["p_window_seconds"]);
+      const nowSeconds = Math.floor(Date.parse(String(arguments_["p_now"])) / 1_000);
+      const windowStart = Math.floor(nowSeconds / windowSeconds) * windowSeconds;
+      const retryAfter = Math.max(1, windowStart + windowSeconds - nowSeconds);
+      const refused = options.refuse?.(scope) ?? null;
+
+      if (refused !== null) {
+        return Promise.resolve([
+          { allowed: false, remaining: 0, retry_after_seconds: refused, first_refusal: true },
+        ]);
+      }
+
+      const remaining = options.remaining?.(scope) ?? null;
+
+      if (remaining !== null) {
+        return Promise.resolve([
+          { allowed: true, remaining, retry_after_seconds: 0, first_refusal: false },
+        ]);
+      }
+
+      const id = `${scope}|${keyHash}`;
+      const row = rows.get(id);
+
+      if (row === undefined || row.start < windowStart) {
+        rows.set(id, { start: windowStart, hits: 1, refused: false });
+
+        return Promise.resolve([
+          { allowed: true, remaining: Math.max(0, limit - 1), retry_after_seconds: 0, first_refusal: false },
+        ]);
+      }
+
+      if (row.hits < limit) {
+        row.hits += 1;
+
+        return Promise.resolve([
+          { allowed: true, remaining: Math.max(0, limit - row.hits), retry_after_seconds: 0, first_refusal: false },
+        ]);
+      }
+
+      const first = !row.refused;
+
+      row.refused = true;
+
+      return Promise.resolve([
+        { allowed: false, remaining: 0, retry_after_seconds: retryAfter, first_refusal: first },
+      ]);
+    },
+  };
+
+  return { client, calls };
+}
+
+async function expectThrowsAsync(
+  action: () => Promise<unknown>,
+  description: string,
+): Promise<AppError | null> {
+  checks += 1;
+
+  try {
+    await action();
+  } catch (error) {
+    if (error instanceof AppError) {
+      return error;
+    }
+
+    failures.push(`${description} (the rejection must be an AppError)`);
+
+    return null;
+  }
+
+  failures.push(`${description} (nothing was rejected)`);
+
+  return null;
+}
+
+const rateLimitTestUser = "018f2b8a-1111-4c2d-9c3e-0123456789ab";
+const rateLimitSecondUser = "018f2b8a-2222-4c2d-9c3e-0123456789ab";
+const rateLimitFixedNow = Date.parse("2026-11-01T10:00:30.000Z");
+const rateLimitAddress = "203.0.113.9";
+
+function rateLimitDependencies(
+  counter: FakeCounter,
+  audit?: RateLimitAuditTrail,
+): RateLimitDependencies {
+  return {
+    rest: counter.client,
+    ...(audit === undefined ? {} : { audit }),
+    now: () => rateLimitFixedNow,
+  };
+}
+
+function checkRateLimitTable(): void {
+  expectEqual(RATE_LIMIT_CLASSES.length, 6, "the platform counts six classes of endpoint");
+  expectEqual(new Set(RATE_LIMIT_CLASSES).size, RATE_LIMIT_CLASSES.length, "and no class is listed twice");
+  expectEqual(
+    RATE_LIMIT_CLASSES.join(","),
+    Object.keys(RATE_LIMIT_CLASS_POLICIES).join(","),
+    "every class has a policy and no policy has no class",
+  );
+  expect(Object.isFrozen(RATE_LIMIT_CLASS_POLICIES), "the policy table is frozen");
+  expectEqual(RATE_LIMIT_BUCKET_DIMENSIONS.join(","), "ip,user,route", "a request is counted in three buckets");
+
+  for (const limitClass of RATE_LIMIT_CLASSES) {
+    const policy = RATE_LIMIT_CLASS_POLICIES[limitClass];
+
+    expect(RATE_LIMIT_SCOPE_PATTERN.test(limitClass), `${limitClass} is a name the counter table can store`);
+    expect(Object.isFrozen(policy), `the ${limitClass} policy cannot be edited at runtime`);
+    expect(Object.isFrozen(policy.ip), `and neither can its ip bucket`);
+    expect(Object.isFrozen(policy.route), `nor its route bucket`);
+
+    if (policy.user === null) {
+      continue;
+    }
+
+    expect(Object.isFrozen(policy.user), `the ${limitClass} user bucket cannot be edited either`);
+  }
+
+  for (const limitClass of RATE_LIMIT_CLASSES) {
+    const policy = RATE_LIMIT_CLASS_POLICIES[limitClass];
+
+    for (const bucket of [policy.ip, policy.route, policy.user]) {
+      if (bucket === null) {
+        continue;
+      }
+
+      expect(Number.isInteger(bucket.limit) && bucket.limit >= 1, `${limitClass} has a positive integer limit`);
+      expect(bucket.limit <= 100_000, `${limitClass} does not allow an unbounded burst`);
+      expect(
+        Number.isInteger(bucket.windowSeconds) &&
+          bucket.windowSeconds >= RATE_LIMIT_MINIMUM_WINDOW_SECONDS &&
+          bucket.windowSeconds <= RATE_LIMIT_MAXIMUM_WINDOW_SECONDS,
+        `${limitClass} uses a window the rate_limit_windows check accepts`,
+      );
+    }
+
+    expect(policy.route.limit < policy.ip.limit, `${limitClass} limits one route more tightly than the whole class`);
+  }
+
+  expect(
+    RATE_LIMIT_CLASS_POLICIES.office_write.route.limit < RATE_LIMIT_CLASS_POLICIES.office_read.route.limit,
+    "a write is rarer than a read, so its route limit is lower",
+  );
+  expect(
+    RATE_LIMIT_CLASS_POLICIES.office_write.ip.limit < RATE_LIMIT_CLASS_POLICIES.office_read.ip.limit,
+    "and its address limit is lower too",
+  );
+  expectEqual(
+    RATE_LIMIT_CLASS_POLICIES.webhook.user,
+    null,
+    "a provider webhook arrives before an account is known, so it has no user bucket",
+  );
+  expect(
+    RATE_LIMIT_CLASSES.filter((limitClass) => RATE_LIMIT_CLASS_POLICIES[limitClass].user !== null).length === 5,
+    "every other class counts the account as well as the address",
+  );
+  expect(
+    RATE_LIMIT_CLASS_POLICIES.webhook.ip.limit > RATE_LIMIT_CLASS_POLICIES.authenticated.ip.limit,
+    "a provider sends bursts, so the webhook address limit is the loosest",
+  );
+  expect(
+    RATE_LIMIT_CLASSES.every(
+      (limitClass) => RATE_LIMIT_CLASS_POLICIES[limitClass].route.limit >= RATE_LIMIT_CLASS_POLICIES.export.route.limit,
+    ),
+    "an export is the tightest route in the platform",
+  );
+  expectEqual(RATE_LIMIT_CLASS_POLICIES.export.route.windowSeconds, 300, "and it counts five minutes at a time");
+
+  // The scope of every bucket is a name `rate_limit_windows_scope_check` accepts, and it is unique.
+  const scopes: string[] = [];
+
+  for (const dimension of RATE_LIMIT_BUCKET_DIMENSIONS) {
+    for (const limitClass of RATE_LIMIT_CLASSES) {
+      const scope = rateLimitScopeFor(dimension, limitClass);
+
+      expect(RATE_LIMIT_SCOPE_PATTERN.test(scope), `${scope} matches the scope check of 0092`);
+      expect(scope.length <= RATE_LIMIT_MAXIMUM_SCOPE_LENGTH, `${scope} fits the column`);
+      expect(scope.startsWith(`${dimension}_`), `${scope} names its own bucket`);
+      expect(scope.length <= RATE_LIMIT_MAXIMUM_SCOPE_LENGTH, `${scope} is inside the longest scope the table stores`);
+      scopes.push(scope);
+    }
+  }
+
+  expectEqual(scopes.length, 18, "three buckets on six classes are eighteen counters");
+  expectEqual(new Set(scopes).size, scopes.length, "and no two buckets share a scope");
+  expect(
+    RATE_LIMIT_EXEMPT_ROUTES.length === 2 &&
+      RATE_LIMIT_EXEMPT_ROUTES.every((route) => route.startsWith("/api/") && route.endsWith("health")),
+    "the only routes never counted are the two liveness probes",
+  );
+  expectEqual(new Set(RATE_LIMIT_EXEMPT_ROUTES).size, RATE_LIMIT_EXEMPT_ROUTES.length, "and neither is listed twice");
+}
+
+function checkRateLimitAddresses(): void {
+  expectEqual(canonicalRateLimitAddress("1.2.3.4"), "1.2.3.4", "an address has one spelling");
+  expectEqual(canonicalRateLimitAddress(" 1.2.3.4 "), "1.2.3.4", "surrounding space is not part of it");
+  expectEqual(
+    canonicalRateLimitAddress("2001:DB8::1"),
+    canonicalRateLimitAddress("2001:0db8:0000:0000:0000:0000:0000:0001"),
+    "two spellings of one IPv6 address are one spelling here",
+  );
+  expectEqual(canonicalRateLimitAddress("2001:DB8::1"), "2001:db8::1", "the spelling is lower case and compressed");
+  expectEqual(canonicalRateLimitAddress("::ffff:1.2.3.4"), "::ffff:102:304", "the IPv4 mapped form is canonicalised too");
+  expectEqual(canonicalRateLimitAddress(""), null, "an empty value is not an address");
+  expectEqual(canonicalRateLimitAddress("not-an-address"), null, "a host name is not an address");
+  expectEqual(canonicalRateLimitAddress("1.2.3.4:8080"), null, "an address with a port is not an address");
+  expectEqual(canonicalRateLimitAddress("fe80::1%eth0"), null, "nor is an address with a zone index");
+  expectEqual(canonicalRateLimitAddress("1.2.3.4, 5.6.7.8"), null, "nor is a forwarding header");
+  expectEqual(canonicalRateLimitAddress("01.2.3.4"), null, "nor is a padded octet, which net.isIP refuses");
+}
+
+function checkRateLimitRoutes(): void {
+  expectEqual(normalizeRateLimitRoute("/api/office/sessions/"), "/api/office/sessions", "a trailing slash is not part of a route");
+  expectEqual(normalizeRateLimitRoute("//api//office//"), "/api/office", "and neither is a doubled slash");
+  expectEqual(normalizeRateLimitRoute("/api/public/pay?amount=1#top"), "/api/public/pay", "a query string and a fragment are not either");
+  expectEqual(normalizeRateLimitRoute(""), "/", "an empty route is the root");
+  expectEqual(normalizeRateLimitRoute("api/public/pay"), "/api/public/pay", "a route without its leading slash is repaired");
+  expectEqual(normalizeRateLimitRoute("/"), "/", "and the root stays the root");
+
+  expectEqual(rateLimitClassForRoute("/api/public/payments", "POST"), "public_api", "the merchant public API is its own class");
+  expectEqual(rateLimitClassForRoute("/api/public", "GET"), "public_api", "and so is its root");
+  expectEqual(rateLimitClassForRoute("/api/publicity", "GET"), "authenticated", "a path that merely starts the same way is not it");
+  expectEqual(rateLimitClassForRoute("/api/webhooks/stripe", "POST"), "webhook", "a provider webhook is its own class");
+  expectEqual(rateLimitClassForRoute("/api/webhooksomething", "POST"), "authenticated", "and a look alike is not");
+  expectEqual(rateLimitClassForRoute("/api/office/sessions", "GET"), "office_read", "a GET under the office is a read");
+  expectEqual(rateLimitClassForRoute("/api/office/sessions", "POST"), "office_write", "and a POST is a write");
+  expectEqual(rateLimitClassForRoute("/api/office/sessions", "patch"), "office_write", "whatever case the method arrives in");
+  expectEqual(rateLimitClassForRoute("/api/office/sessions", "HEAD"), "office_read", "a HEAD only reads");
+  expectEqual(rateLimitClassForRoute("/api/office/reports/export", "GET"), "export", "an export under the office is still an export");
+  expectEqual(rateLimitClassForRoute("/api/exports/ledger", "GET"), "export", "as is anything under the export prefix");
+  expectEqual(rateLimitClassForRoute("/api/reports/export", "POST"), "export", "and anything that ends in the export word");
+  expectEqual(rateLimitClassForRoute("/api/invoices", "POST"), "authenticated", "every other API route is the authenticated class");
+  expectEqual(rateLimitClassForRoute("/dashboard", "GET"), null, "a page is not counted here");
+  expectEqual(rateLimitClassForRoute("/", "GET"), null, "and neither is the root page");
+  expectEqual(isRateLimitReadMethod("GET"), true, "GET reads");
+  expectEqual(isRateLimitReadMethod("DELETE"), false, "DELETE writes");
+
+  for (const exempt of RATE_LIMIT_EXEMPT_ROUTES) {
+    expectEqual(isRateLimitExemptRoute(exempt), true, `${exempt} is a liveness probe`);
+    expectEqual(rateLimitClassForRoute(exempt, "GET"), null, `${exempt} has no class`);
+    expectEqual(rateLimitClassForRoute(`${exempt}?probe=1`, "GET"), null, `${exempt} stays exempt with a query string`);
+    expectEqual(isRateLimitExemptRoute(`${exempt}/deep`), false, `${exempt} exempts exactly itself and nothing under it`);
+  }
+}
+
+function checkRateLimitBuckets(): void {
+  const office = rateLimitBucketsFor({
+    route: "/api/office/sessions/revoke",
+    method: "POST",
+    clientAddress: rateLimitAddress,
+    userId: rateLimitTestUser,
+  });
+
+  expect(office !== null, "an office write is counted");
+
+  if (office === null) {
+    return;
+  }
+
+  expectEqual(office.map((bucket) => bucket.dimension).join(","), "ip,user,route", "in all three buckets");
+  expectEqual(office[0]?.scope, "ip_office_write", "the address bucket names its class");
+  expectEqual(office[1]?.scope, "user_office_write", "the account bucket names its class");
+  expectEqual(office[2]?.scope, "route_office_write", "and the route bucket names its class");
+  expectEqual(office[0]?.limit, RATE_LIMIT_CLASS_POLICIES.office_write.ip.limit, "the address bucket carries the policy limit");
+  expectEqual(office[1]?.limit, RATE_LIMIT_CLASS_POLICIES.office_write.user?.limit, "the account bucket too");
+  expectEqual(office[2]?.limit, RATE_LIMIT_CLASS_POLICIES.office_write.route.limit, "and the route bucket");
+  expect(office.every((bucket) => RATE_LIMIT_KEY_HASH_PATTERN.test(bucket.keyHash)), "every key is a hex SHA-256");
+  expectEqual(new Set(office.map((bucket) => bucket.keyHash)).size, 3, "and the three keys are namespaced apart");
+
+  const hook = rateLimitBucketsFor({
+    route: "/api/webhooks/stripe",
+    method: "POST",
+    clientAddress: rateLimitAddress,
+    userId: rateLimitTestUser,
+  });
+
+  expectEqual(hook?.map((bucket) => bucket.dimension).join(","), "ip,route", "a webhook is counted by address and route only");
+
+  const again = rateLimitBucketsFor({
+    route: "/api/office/sessions/revoke",
+    method: "POST",
+    clientAddress: rateLimitAddress,
+    userId: rateLimitTestUser,
+  });
+
+  expectEqual(
+    again?.map((bucket) => bucket.keyHash).join(","),
+    office.map((bucket) => bucket.keyHash).join(","),
+    "the same request produces the same keys",
+  );
+
+  const otherRoute = rateLimitBucketsFor({
+    route: "/api/office/2fa-reset-requests",
+    method: "POST",
+    clientAddress: rateLimitAddress,
+    userId: rateLimitTestUser,
+  });
+
+  expectEqual(otherRoute?.[0]?.keyHash, office[0]?.keyHash, "the address bucket is shared across the class");
+  expect(otherRoute?.[2]?.keyHash !== office[2]?.keyHash, "the route bucket is not shared across the class");
+
+  const otherUser = rateLimitBucketsFor({
+    route: "/api/office/sessions/revoke",
+    method: "POST",
+    clientAddress: rateLimitAddress,
+    userId: rateLimitSecondUser,
+  });
+
+  expectEqual(otherUser?.[1]?.keyHash === office[1]?.keyHash, false, "a second account has its own bucket");
+
+  const sixthForm = rateLimitBucketsFor({
+    route: "/api/public/pay",
+    method: "POST",
+    clientAddress: "2001:0db8:0000:0000:0000:0000:0000:0001",
+    userId: rateLimitTestUser,
+  });
+  const sixthFormAgain = rateLimitBucketsFor({
+    route: "/api/public/pay",
+    method: "POST",
+    clientAddress: "2001:DB8::1",
+    userId: rateLimitTestUser,
+  });
+
+  expectEqual(sixthForm?.[0]?.keyHash, sixthFormAgain?.[0]?.keyHash, "one IPv6 address in two spellings is one bucket");
+  expectEqual(sixthForm?.[2]?.keyHash, sixthFormAgain?.[2]?.keyHash, "on the route bucket as well");
+
+  expectThrows(
+    () => rateLimitBucketsFor({ route: "/api/office/sessions", method: "GET", clientAddress: rateLimitAddress }),
+    "a class with a user bucket refuses a request with no account",
+  );
+  expectThrows(
+    () =>
+      rateLimitBucketsFor({
+        route: "/api/office/sessions",
+        method: "GET",
+        clientAddress: rateLimitAddress,
+        userId: "not-a-uuid",
+      }),
+    "and refuses an account id that is not one",
+  );
+
+  const noAddress = expectThrows(
+    () => rateLimitBucketsFor({ route: "/api/office/sessions", method: "GET", clientAddress: null, userId: rateLimitTestUser }),
+    "a request with no address cannot be counted",
+  );
+  expectEqual(noAddress?.code, "SERVICE_UNAVAILABLE", "and is refused rather than let through");
+
+  const badAddress = expectThrows(
+    () =>
+      rateLimitBucketsFor({
+        route: "/api/office/sessions",
+        method: "GET",
+        clientAddress: "1.2.3.4:8080",
+        userId: rateLimitTestUser,
+      }),
+    "a value that is not an address cannot be counted either",
+  );
+  expectEqual(badAddress?.code, "SERVICE_UNAVAILABLE", "with the same code");
+
+  expectEqual(
+    rateLimitBucketsFor({
+      route: "/api/health",
+      method: "GET",
+      clientAddress: rateLimitAddress,
+      userId: rateLimitTestUser,
+    }),
+    null,
+    "a liveness probe has no bucket",
+  );
+  expectEqual(
+    rateLimitBucketsFor({ route: "/invoices", method: "GET", clientAddress: rateLimitAddress }),
+    null,
+    "and a page has none either",
+  );
+}
+
+async function checkRateLimitDecision(): Promise<void> {
+  const counter = createFakeCounter();
+  const request = {
+    route: "/api/office/sessions/revoke",
+    method: "POST",
+    clientAddress: rateLimitAddress,
+    userId: rateLimitTestUser,
+  } as const;
+
+  const first = await consumeRateLimitBuckets(request, rateLimitDependencies(counter));
+
+  expectEqual(first.allowed, true, "a first request is allowed");
+  expectEqual(first.exempt, false, "and is not exempt");
+  expectEqual(first.class, "office_write", "the class is the route's class");
+  expectEqual(first.limit, 30, "the limit reported is the tightest bucket's");
+  expectEqual(first.remaining, 29, "and so is the remaining count");
+  expectEqual(first.retryAfterSeconds, 0, "an allowed request asks for no wait");
+  expectEqual(first.refusedBuckets.length, 0, "and names no refusing bucket");
+  expectEqual(counter.calls.length, 3, "the request was counted three times");
+  expectEqual(counter.calls[0]?.functionName, RATE_LIMIT_COUNTER_FUNCTION, "through the counter function of 0092");
+  expectEqual(counter.calls[0]?.arguments["p_scope"], "ip_office_write", "with the address scope");
+  expectEqual(counter.calls[0]?.arguments["p_limit"], 60, "the policy limit");
+  expectEqual(counter.calls[0]?.arguments["p_window_seconds"], 60, "the policy window");
+  expectEqual(counter.calls[0]?.arguments["p_now"], "2026-11-01T10:00:30.000Z", "and the clock the caller supplied");
+  expect(
+    counter.calls.every((call) => RATE_LIMIT_KEY_HASH_PATTERN.test(String(call.arguments["p_key_hash"]))),
+    "every key sent to the counter is a hex SHA-256",
+  );
+
+  let last = first;
+
+  for (let index = 2; index <= 30; index += 1) {
+    last = await consumeRateLimitBuckets(request, rateLimitDependencies(counter));
+  }
+
+  expectEqual(last.allowed, true, "the request that reaches the limit is allowed");
+  expectEqual(last.remaining, 0, "and has no room left");
+
+  const refused = await consumeRateLimitBuckets(request, rateLimitDependencies(counter));
+
+  expectEqual(refused.allowed, false, "the next request is refused");
+  expectEqual(refused.retryAfterSeconds, 30, "for the rest of the window");
+  expectEqual(refused.refusedBuckets.join(","), "route", "the tightest bucket is the one that refused");
+  expectEqual(refused.firstRefusalBuckets.join(","), "route", "and it is the first refusal of its window");
+  expectEqual(refused.class, "office_write", "the class survives a refusal");
+
+  const entries: RateLimitAuditEntry[] = [];
+  const audit: RateLimitAuditTrail = {
+    append(entry) {
+      entries.push(entry);
+
+      return Promise.resolve();
+    },
+  };
+  const enforcing = createFakeCounter();
+  const auditRequest = { ...request, route: "/api/office/2fa-reset-requests" } as const;
+
+  for (let index = 1; index <= 30; index += 1) {
+    await enforceRouteRateLimit(auditRequest, rateLimitDependencies(enforcing, audit));
+  }
+
+  expectEqual(entries.length, 0, "a request inside the limit writes no audit entry");
+
+  const error = await expectThrowsAsync(
+    () => enforceRouteRateLimit(auditRequest, rateLimitDependencies(enforcing, audit)),
+    "a request past the limit is refused",
+  );
+
+  expectEqual(error?.code, "RATE_LIMITED", "with the code the catalog already carries");
+  expectEqual(error?.status, 429, "which is a 429");
+  expectEqual(error?.retryAfterSeconds, 30, "and carries the delay in retry-after");
+  expectEqual(entries.length, 1, "the refusal is audited once");
+
+  await expectThrowsAsync(
+    () => enforceRouteRateLimit(auditRequest, rateLimitDependencies(enforcing, audit)),
+    "and the next refusal is refused again",
+  );
+
+  expectEqual(entries.length, 1, "but the audit chain is not a copy of the attack");
+
+  const pathCounter = createFakeCounter({ refuse: (scope) => (scope === "route_webhook" ? 15 : null) });
+  const pathRefusal = await consumeRateLimitBuckets(
+    { route: "/api/webhooks/stripe", method: "POST", clientAddress: rateLimitAddress },
+    rateLimitDependencies(pathCounter),
+  );
+
+  expectEqual(pathRefusal.allowed, false, "one full bucket refuses the request");
+  expectEqual(pathRefusal.refusedBuckets.join(","), "route", "and only that bucket names itself");
+  expectEqual(pathRefusal.retryAfterSeconds, 15, "the wait is the refusing bucket's");
+  expectEqual(
+    pathCounter.calls.map((call) => String(call.arguments["p_scope"])).sort().join(","),
+    "ip_webhook,route_webhook",
+    "the other buckets were counted even though one refused",
+  );
+
+  const delayCounter = createFakeCounter({
+    refuse: (scope) => (scope === "user_office_write" ? 12 : scope === "route_office_write" ? 40 : null),
+  });
+  const delay = await consumeRateLimitBuckets(request, rateLimitDependencies(delayCounter));
+
+  expectEqual(delay.refusedBuckets.join(","), "user,route", "two refusing buckets are both named");
+  expectEqual(delay.retryAfterSeconds, 40, "and the wait is the longest of them, not the first");
+
+  const remainingCounter = createFakeCounter({
+    remaining: (scope) =>
+      scope === "ip_office_write" ? 5 : scope === "user_office_write" ? 2 : scope === "route_office_write" ? 7 : null,
+  });
+  const tightest = await consumeRateLimitBuckets(request, rateLimitDependencies(remainingCounter));
+
+  expectEqual(tightest.allowed, true, "a request inside every limit is allowed");
+  expectEqual(tightest.remaining, 2, "and reports the bucket that runs out first");
+
+  const exemptCounter = createFakeCounter();
+  const exempt = await consumeRateLimitBuckets(
+    { route: "/api/health", method: "GET", clientAddress: rateLimitAddress, userId: rateLimitTestUser },
+    rateLimitDependencies(exemptCounter),
+  );
+
+  expectEqual(exempt.exempt, true, "a liveness probe is exempt");
+  expectEqual(exempt.allowed, true, "and allowed");
+  expectEqual(exempt.buckets.length, 0, "without a counter");
+  expectEqual(exemptCounter.calls.length, 0, "and without a query");
+  expectEqual(exempt.limit, 0, "the reported limit is zero because nothing was counted");
+
+  const notAnAddress = await expectThrowsAsync(
+    () =>
+      enforceRouteRateLimit(
+        { route: "/api/office/sessions", method: "GET", clientAddress: null, userId: rateLimitTestUser },
+        rateLimitDependencies(createFakeCounter()),
+      ),
+    "a request that cannot be counted is refused",
+  );
+
+  expectEqual(notAnAddress?.code, "SERVICE_UNAVAILABLE", "with the code of an uncountable request");
+
+  const badAnswers: readonly unknown[] = [
+    null,
+    [],
+    [{}],
+    [{ allowed: "yes", remaining: 1, retry_after_seconds: 0, first_refusal: false }],
+    [{ allowed: true, remaining: 1_000, retry_after_seconds: 0, first_refusal: false }],
+    [{ allowed: true, remaining: 1, retry_after_seconds: 5, first_refusal: false }],
+    [{ allowed: true, remaining: 1, retry_after_seconds: 0, first_refusal: true }],
+    [{ allowed: false, remaining: 0, retry_after_seconds: 0, first_refusal: true }],
+    [{ allowed: false, remaining: 0, retry_after_seconds: 90_000, first_refusal: true }],
+    [{ allowed: false, remaining: -1, retry_after_seconds: 5, first_refusal: true }],
+  ];
+
+  for (const answer of badAnswers) {
+    const broken = await expectThrowsAsync(
+      () =>
+        consumeRateLimitBuckets(request, {
+          rest: { rpc: () => Promise.resolve(answer) },
+          now: () => rateLimitFixedNow,
+        }),
+      `a counter answer of ${JSON.stringify(answer)} is a dependency failure`,
+    );
+
+    expectEqual(broken?.code, "DEPENDENCY_FAILED", "and never read as an allowance");
+  }
+
+  const unavailable = await expectThrowsAsync(
+    () =>
+      consumeRateLimitBuckets(request, {
+        rest: { rpc: () => Promise.reject(new AppError("DEPENDENCY_FAILED")) },
+        now: () => rateLimitFixedNow,
+      }),
+    "a counter that cannot answer refuses the request",
+  );
+
+  expectEqual(unavailable?.code, "DEPENDENCY_FAILED", "with the dependency code rather than a free pass");
+}
+
+function checkRateLimitReports(): void {
+  const outcome = {
+    route: "/api/office/sessions/revoke",
+    method: "POST",
+    class: "office_write" as const,
+    exempt: false,
+    allowed: false,
+    limit: 30,
+    remaining: 0,
+    retryAfterSeconds: 30,
+    buckets: [
+      {
+        dimension: "ip" as const,
+        scope: "ip_office_write",
+        keyHash: "a".repeat(64),
+        limit: 60,
+        windowSeconds: 60,
+        allowed: true,
+        remaining: 0,
+        retryAfterSeconds: 0,
+        firstRefusal: false,
+      },
+      {
+        dimension: "route" as const,
+        scope: "route_office_write",
+        keyHash: "b".repeat(64),
+        limit: 30,
+        windowSeconds: 60,
+        allowed: false,
+        remaining: 0,
+        retryAfterSeconds: 30,
+        firstRefusal: true,
+      },
+    ],
+    refusedBuckets: ["route" as const],
+    firstRefusalBuckets: ["route" as const],
+  };
+  const entry = rateLimitAuditEntry(outcome, {
+    ipAddress: rateLimitAddress,
+    userAgent: "probe/1.0",
+    userId: rateLimitTestUser,
+    companyId: null,
+  });
+
+  expect(entry !== null, "a first refusal produces an audit entry");
+
+  if (entry !== null) {
+    expectEqual(entry.action, RATE_LIMIT_AUDIT_ACTION, "with the action this module owns");
+    expect(/^[a-z][a-z0-9]*([.][a-z0-9_]+)+$/u.test(entry.action), "which is a dotted action name");
+    expect(entry.action.length <= 64, "inside the length the audit table accepts");
+    expect(/^[a-z][a-z0-9_]*$/u.test(String(entry.entityType)), "and a lower snake entity type");
+    expectEqual(entry.actorUserId, rateLimitTestUser, "it names the account");
+    expectEqual(entry.ipAddress, rateLimitAddress, "and the address");
+    expectEqual(entry.payload["route"], outcome.route, "the payload names the route");
+    expectEqual(entry.payload["class"], "office_write", "and the class");
+    expectEqual(entry.payload["rule"], RATE_LIMIT_RULE, "and the rule a screen can name");
+    expectEqual(entry.payload["retry_after_seconds"], 30, "and the wait");
+    expectEqual(String(entry.payload["buckets"]), "route", "and the bucket that refused");
+    expectEqual(String(entry.payload["scopes"]), "route_office_write", "with the scope it is stored under");
+    expect(
+      (entry.payload["key_hashes"] as readonly string[]).every((hash) => RATE_LIMIT_KEY_HASH_PATTERN.test(hash)),
+      "the payload carries key hashes, never the address as a key",
+    );
+    expect(new TextEncoder().encode(JSON.stringify(entry.payload)).length <= 8_192, "the payload fits the audit column");
+  }
+
+  expectEqual(
+    rateLimitAuditEntry({ ...outcome, allowed: true, firstRefusalBuckets: [], refusedBuckets: [] }, { ipAddress: rateLimitAddress }),
+    null,
+    "an allowed request writes nothing",
+  );
+  expectEqual(
+    rateLimitAuditEntry(
+      { ...outcome, allowed: false, firstRefusalBuckets: [], buckets: [], refusedBuckets: ["route"] },
+      { ipAddress: rateLimitAddress },
+    ),
+    null,
+    "and a refusal that is not the first of its window writes nothing either",
+  );
+
+  const headers = rateLimitHeaders(outcome, rateLimitFixedNow);
+
+  expectEqual(Object.keys(headers).sort().join(","), "ratelimit-limit,ratelimit-remaining,ratelimit-reset", "the rate limit headers are exactly these three");
+  expectEqual(headers["ratelimit-limit"], "30", "the limit is the tightest bucket's");
+  expectEqual(headers["ratelimit-remaining"], "0", "so is the remaining count");
+  expectEqual(headers["ratelimit-reset"], "30", "and the reset is the seconds left in the window");
+  expect(
+    Object.keys(headers).every((name) => !SECURITY_HEADER_NAMES.includes(name)),
+    "none of them is a security header of STEP 060",
+  );
+  expect(
+    Object.values(headers).every((value) => /^[0-9]+$/u.test(value)),
+    "and every value is a number a client can read",
+  );
+
+  for (const instant of ["2026-11-01T10:00:07.000Z", "2026-11-01T10:00:59.000Z", "2026-11-01T10:04:01.000Z"]) {
+    const at = Date.parse(instant);
+    const reset = Number(rateLimitHeaders(outcome, at)["ratelimit-reset"]);
+
+    expectEqual(reset, 60 - (Math.floor(at / 1_000) % 60), `the reset at ${instant} is the seconds left in the window`);
+    expect(reset >= 1 && reset <= 60, `and it never leaves the window at ${instant}`);
+  }
+  expectEqual(
+    Object.keys(rateLimitHeaders({ ...outcome, exempt: true, buckets: [] }, rateLimitFixedNow)).length,
+    0,
+    "an exempt route writes no headers",
+  );
+}
+
+async function checkRateLimitWiring(): Promise<void> {
+  const source = await readFile(new URL("./rate-limit.ts", import.meta.url), "utf8");
+  const migration = await readFile(new URL("../../migrations/0092_rate_limit_windows.sql", import.meta.url), "utf8");
+  const authSource = await readFile(new URL("../auth/rate-limit.ts", import.meta.url), "utf8");
+  const catalogue = await readFile(new URL("../i18n/strings/en.ts", import.meta.url), "utf8");
+
+  expect(source.includes(`"${RATE_LIMIT_COUNTER_FUNCTION}"`), "the module calls the counter function by its name");
+  expect(authSource.includes(RATE_LIMIT_COUNTER_FUNCTION), "which is the same function the auth limiter calls");
+  expectEqual(source.includes("insert into"), false, "and it never writes the counter itself");
+  expectEqual(source.includes("update public.rate_limit_windows"), false, "or moves the row directly");
+  expectEqual(source.includes("create table"), false, "no second table is created here");
+  expectEqual(source.includes("from \"../auth"), false, "the module imports nothing from the auth tree, so there is no cycle");
+  expectEqual(source.includes("x-forwarded-for"), false, "and it never reads a forwarding header");
+  expectEqual(source.includes("x-real-ip"), false, "or the real ip header");
+  expectEqual(source.includes("headers.get"), false, "because the trust rule of one address stays in one file");
+  expect(source.includes("from \"node:net\""), "an address is recognised by the platform, not by a pattern here");
+  expect(source.includes("from \"node:crypto\""), "the key is a SHA-256 from the platform's hash");
+
+  expect(migration.includes("create table public.rate_limit_windows"), "0092 owns the counter table");
+  expect(migration.includes("create function public.consume_rate_limit"), "and the one statement that moves it");
+  expect(migration.includes(RATE_LIMIT_SCOPE_PATTERN.source), "the migration states the scope pattern this module generates");
+  expect(migration.includes(RATE_LIMIT_KEY_HASH_PATTERN.source), "and the key shape");
+  expect(
+    migration.includes(`between ${RATE_LIMIT_MINIMUM_WINDOW_SECONDS} and ${RATE_LIMIT_MAXIMUM_WINDOW_SECONDS}`),
+    "and the window bounds",
+  );
+  expect(migration.includes("constraint rate_limit_windows_scope_key_unique unique (scope, key_hash)"), "one row per bucket per subject");
+  expect(migration.includes("first_refusal"), "the answer carries the flag the audit depends on");
+  expect(RATE_LIMIT_SCOPE_PATTERN.source === "^[a-z][a-z0-9_]{1,39}$", "and the pattern is exactly the one written in the migration");
+  expectEqual(RATE_LIMIT_MAXIMUM_SCOPE_LENGTH, 40, "forty characters is the longest scope the column stores");
+  expectEqual(Object.keys(RATE_LIMIT_CLASS_POLICIES).length, 6, "the policy table matches the class count the gate asserts");
+
+  const migrations = await readdir(new URL("../../migrations/", import.meta.url));
+  let counterDefinitions = 0;
+
+  for (const name of migrations.filter((entry) => entry.endsWith(".sql") && !entry.endsWith(".down.sql"))) {
+    const text = await readFile(new URL(`../../migrations/${name}`, import.meta.url), "utf8");
+
+    if (text.includes("create function public.consume_rate_limit")) {
+      counterDefinitions += 1;
+    }
+  }
+
+  expectEqual(counterDefinitions, 1, "exactly one migration defines the counter, so there is no second counter to work under");
+
+  expect(catalogue.includes("rateLimited:"), "the refusal has a sentence in the catalog");
+  expect(catalogue.includes("rateLimit: {"), "and the screens have their own wording for the wait");
+
+  const appRoot = new URL("../../", import.meta.url);
+  const apiEntries = (await readdir(appRoot, { recursive: true }))
+    .map((entry) => entry.replaceAll("\\", "/"))
+    .filter((entry) => entry.startsWith("app/api/") && entry.endsWith("/route.ts"));
+  const apiRoutes = apiEntries.map((entry) => `/${entry.slice("app/".length, -"/route.ts".length)}`);
+
+  expect(apiRoutes.length > 0, "the repository has API routes to classify");
+
+  let unclassified = 0;
+
+  for (const route of apiRoutes) {
+    const limitClass = rateLimitClassForRoute(route, "POST");
+    const exempt = isRateLimitExemptRoute(route);
+
+    if (limitClass === null && !exempt) {
+      unclassified += 1;
+    }
+  }
+
+  expectEqual(unclassified, 0, "every route in app/api is counted by a class or is a liveness probe");
+  expectEqual(
+    apiRoutes.filter((route) => isRateLimitExemptRoute(route)).sort().join(","),
+    [...RATE_LIMIT_EXEMPT_ROUTES].sort().join(","),
+    "and the probes in the tree are exactly the exempt list",
+  );
+  expect(
+    apiRoutes
+      .filter((route) => route.startsWith("/api/office/"))
+      .every((route) => rateLimitClassForRoute(route, "GET") === "office_read"),
+    "every office route would be counted as a read on a GET",
+  );
+  expect(
+    apiRoutes
+      .filter((route) => route.startsWith("/api/office/"))
+      .every((route) => rateLimitClassForRoute(route, "POST") === "office_write"),
+    "and as a write on a POST",
+  );
+}
+
 async function checkTree(): Promise<void> {
   const securityRoot = new URL("./", import.meta.url);
   const securityFiles = (await readdir(securityRoot)).filter((name) => name.endsWith(".ts"));
@@ -1370,9 +2179,16 @@ async function main(): Promise<void> {
   checkCsp();
   checkSecurityHeaders();
   checkUploadValidator();
+  checkRateLimitTable();
+  checkRateLimitAddresses();
+  checkRateLimitRoutes();
+  checkRateLimitBuckets();
+  checkRateLimitReports();
   await checkCspWiring();
   await checkSecurityHeaderWiring();
   await checkUploadWiring();
+  await checkRateLimitDecision();
+  await checkRateLimitWiring();
   await checkTree();
 
   if (failures.length > 0) {
