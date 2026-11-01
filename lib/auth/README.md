@@ -3,9 +3,10 @@
 
 Owner: STEP 037 (Supabase Auth client and server helpers with typed session access), extended by
 STEPs 038-055. STEP 038 added signup, the setting registry, the Turnstile guard, the policy
-catalog, the password verifier, the audit trail and the confirmation link. Later STEPs add the
-sign in page, the device proof key, the rotating token and the lock; they do not add a second way
-to read a session, a second cookie or a second error vocabulary.
+catalog, the password verifier, the audit trail and the confirmation link; STEP 039 added sign in,
+the attempt record and the device label. Later STEPs add the device proof key, the rotating token
+and the lock; they do not add a second way to read a session, a second cookie or a second error
+vocabulary.
 
 | File | Purpose |
 | --- | --- |
@@ -29,6 +30,9 @@ to read a session, a second cookie or a second error vocabulary.
 | audit.ts | The hash chain and the Ed25519 signature an audit entry is written with |
 | registration.ts | Merchant signup: validate, challenge, provider account, rows, acceptances, audit |
 | email-verification.ts | A followed confirmation link: token, verification instant, audit, cookie |
+| device-context.ts | The device label of an agent, and the hash of an address nobody owns |
+| login-attempts.ts | One attempt row in `public.login_attempts`, the record STEP 045 counts |
+| signin.ts | Password sign in: challenge, exchange, account check, attempt, audit, cookie |
 | runtime.ts | The one place the real implementations are assembled per process |
 | verify.ts | The gate behind `node lib/auth/verify.ts` |
 
@@ -117,6 +121,19 @@ the authority. A permission check uses the record, never a claim.
 22. A route does not assemble clients. `getAuthRuntime()` builds the real implementations once per
     process and the gate replaces the object with doubles, which is why the same service is provable
     without a project, a database or a network.
+23. Sign in answers one failure. A wrong password, an unknown address, an unconfirmed address, a
+    closed account and a missing platform row all throw `credentialRejectionError()`, which is the
+    only constructor of `AUTHENTICATION_REQUIRED` in this module, and the difference is recorded in
+    `login_attempts` where only the platform can read it.
+24. An attempt is a row before it is a decision. Every sign in writes `public.login_attempts` with
+    the factor and the outcome, so STEP 045's lock survives a restart because it counts rows and
+    not a number in memory. A refused attempt is recorded too, and a record that fails never changes
+    the answer to the merchant.
+25. The device is recorded, the proof key is not invented. `device-context.ts` derives a bounded
+    label from a user agent, and the sign in reports `deviceProofRequired` from the live
+    `device_proof_keys` rows. The key pair itself is STEP 049's browser work and the `sessions` row
+    that binds it is STEP 051's, because `0009` needs a client public key and `0010` needs the key
+    before a session can exist. A fabricated key would be a device the platform cannot verify.
 
 ## Adding an operation
 

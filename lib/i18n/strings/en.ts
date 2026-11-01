@@ -98,6 +98,20 @@ const catalog = {
     errorTitle: "The account could not be created",
     unreadableResponse: "The server answered with something this page cannot read. Try again.",
   },
+  signin: {
+    eyebrow: "Merchant account",
+    title: "Sign in",
+    description:
+      "Use the work email and password of your merchant account. Every refusal on this page is the same sentence, because this page never says whether an address has an account.",
+    emailLabel: "Work email",
+    passwordLabel: "Password",
+    turnstileNotice: "This form is protected by Cloudflare Turnstile.",
+    submit: "Sign in",
+    submitting: "Signing in",
+    noAccount: "No account yet?",
+    createAccount: "Create one",
+    unreadableResponse: "The server answered with something this page cannot read. Try again.",
+  },
   verify: {
     title: "Email verification",
     verifiedTitle: "Your email address is verified",

@@ -11,6 +11,12 @@ import {
   signAuditHash,
 } from "./audit.ts";
 import { isAddress, readClientAddress, readUserAgent } from "./client-address.ts";
+import { emailHash, readDeviceContext } from "./device-context.ts";
+import {
+  createInMemoryLoginAttemptRecorder,
+  createRestLoginAttemptRecorder,
+} from "./login-attempts.ts";
+import { signInMerchant, signinInputSchema } from "./signin.ts";
 import { createAuthClient, type AuthClient } from "./client.ts";
 import { authAdminUserUrl, authTokenUrl, buildAuthConfig, type AuthConfig } from "./config.ts";
 import {
@@ -166,6 +172,29 @@ async function expectRejects(
 
     expectEqual(error.code, code, `${description} (catalogue code)`);
   }
+}
+
+async function captureRejection(
+  action: () => Promise<unknown>,
+  description: string,
+): Promise<AppError> {
+  checkCount += 1;
+
+  try {
+    await action();
+  } catch (error) {
+    if (error instanceof AppError) {
+      return error;
+    }
+
+    failures.push(`${description} (the rejection must be an AppError)`);
+
+    return new AppError("INTERNAL_ERROR");
+  }
+
+  failures.push(`${description} (nothing was rejected)`);
+
+  return new AppError("INTERNAL_ERROR");
 }
 
 const NOW = 1_800_000_000_000;
@@ -1840,7 +1869,8 @@ function checkSecrets(): void {
         MASTER_KEY,
         {
           ...box,
-          ciphertext: `${box.ciphertext.slice(0, -1)}${box.ciphertext.endsWith("A") ? "B" : "A"}`,
+          // The first character, because the last one carries bits a base64 decoder discards.
+          ciphertext: `${box.ciphertext.startsWith("A") ? "B" : "A"}${box.ciphertext.slice(1)}`,
         },
         TURNSTILE_CONTEXT,
       ),
@@ -2857,6 +2887,455 @@ function checkClientAddress(): void {
   expectEqual(readUserAgent(new Headers({ "user-agent": "x".repeat(600) })), null, "an oversized agent is refused");
 }
 
+
+/* ------------------------------------------------------------------ 19. device context */
+
+function checkDeviceContext(): void {
+  const chromeOnMac = readDeviceContext(
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+  );
+
+  expectEqual(chromeOnMac.browser, "Chrome", "Chrome is named before Safari, which it claims");
+  expectEqual(chromeOnMac.platform, "macOS", "a Macintosh agent is macOS");
+  expectEqual(chromeOnMac.label, "Chrome on macOS", "the label is one readable sentence fragment");
+
+  const edge = readDeviceContext(
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0",
+  );
+
+  expectEqual(edge.browser, "Edge", "Edge is named before the Chrome it also claims");
+  expectEqual(edge.platform, "Windows", "a Windows agent is Windows");
+
+  const opera = readDeviceContext("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 OPR/91.0 Safari/537.36");
+
+  expectEqual(opera.browser, "Opera", "Opera is named before Chrome");
+  expectEqual(opera.platform, "Linux", "an X11 agent is Linux");
+
+  const chromeOnPhone = readDeviceContext(
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/126.0 Mobile/15E148 Safari/604.1",
+  );
+
+  expectEqual(chromeOnPhone.browser, "Chrome", "Chrome on iOS is named from CriOS");
+  expectEqual(chromeOnPhone.platform, "iOS", "an iPhone agent is iOS");
+
+  const unknown = readDeviceContext("curl/8.7.1");
+
+  expectEqual(unknown.label, "an unknown browser on an unknown platform", "an unnamed agent stays unnamed");
+  expect(readDeviceContext(null).label.length > 0, "a request without an agent still has a label");
+  expect(
+    readDeviceContext(`Mozilla/5.0 ${"x".repeat(400)} Chrome/126`).label.length <= 80,
+    "a label never exceeds the device column ceiling",
+  );
+
+  const hash = emailHash("Owner@Example.com");
+
+  expectEqual(hash.length, 64, "an address hash is 64 characters");
+  expect(/^[a-f0-9]{64}$/u.test(hash), "an address hash matches the column check");
+  expectEqual(hash, emailHash(" owner@example.com "), "the hash ignores case and surrounding space");
+  expect(hash !== emailHash("other@example.com"), "two addresses have two hashes");
+}
+
+/* ------------------------------------------------------------------ 20. login attempts */
+
+async function checkLoginAttempts(): Promise<void> {
+  const recorded: { table: string; rows: readonly Readonly<Record<string, unknown>>[] }[] = [];
+  const rest: RestClient = {
+    select: <TRow>(): Promise<readonly TRow[]> => Promise.resolve([]),
+    insert(table: string, rows: readonly Readonly<Record<string, unknown>>[]): Promise<void> {
+      recorded.push({ table, rows });
+
+      return Promise.resolve();
+    },
+    insertReturning: <TRow>(): Promise<readonly TRow[]> => Promise.resolve([]),
+    update: (): Promise<void> => Promise.resolve(),
+    rpc: (): Promise<unknown> => Promise.resolve(null),
+  };
+  const recorder = createRestLoginAttemptRecorder(rest);
+
+  const stored = await recorder.record({
+    factor: "password",
+    outcome: "failed",
+    userId: null,
+    companyId: null,
+    emailHash: emailHash("owner@example.com"),
+    ipAddress: "203.0.113.9",
+    userAgent: "gate",
+  });
+
+  expect(stored, "an attempt with an address is written");
+
+  const row = recorded[0]?.rows[0];
+
+  expectEqual(recorded[0]?.table, "login_attempts", "the attempt goes to the attempt table");
+  expectEqual(row?.["outcome"], "failed", "the row records the outcome");
+  expectEqual(row?.["factor"], "password", "the row records the factor");
+  expectEqual(row?.["user_id"], null, "an unknown account has no user id");
+  expectEqual(row?.["company_id"], null, "an unknown account has no company");
+  expect((row?.["email_hash"] as string).length === 64, "an unknown account is counted by address hash");
+  expectEqual(row?.["ip_address"], "203.0.113.9", "the row records the address");
+  expectEqual(row?.["user_agent"], "gate", "the row records the agent");
+
+  const skipped = await recorder.record({
+    factor: "password",
+    outcome: "failed",
+    userId: null,
+    companyId: null,
+    emailHash: emailHash("owner@example.com"),
+    ipAddress: null,
+    userAgent: null,
+  });
+
+  expect(!skipped, "an attempt without an address cannot be recorded");
+  expectEqual(recorded.length, 1, "an attempt without an address writes nothing");
+
+  await recorder.record({
+    factor: "password",
+    outcome: "succeeded",
+    userId: USER_ID,
+    companyId: FIRM_ID,
+    emailHash: emailHash("owner@example.com"),
+    ipAddress: "203.0.113.9",
+    userAgent: "gate",
+  });
+
+  const known = recorded[1]?.rows[0];
+
+  expectEqual(known?.["user_id"], USER_ID, "a known account is counted by user id");
+  expectEqual(known?.["email_hash"], null, "a known account stores no address hash");
+  expectEqual(known?.["company_id"], FIRM_ID, "a known account carries its tenant");
+
+  const memory = createInMemoryLoginAttemptRecorder();
+
+  await memory.record({
+    factor: "password",
+    outcome: "succeeded",
+    userId: USER_ID,
+    companyId: FIRM_ID,
+    emailHash: null,
+    ipAddress: "203.0.113.9",
+    userAgent: "gate",
+  });
+
+  expectEqual(memory.attempts.length, 1, "the in memory recorder keeps the attempt");
+}
+
+/* ------------------------------------------------------------------ 21. sign in */
+
+interface SigninRestOptions {
+  readonly user?: Readonly<Record<string, unknown>> | null;
+  readonly proofKeys?: number;
+  readonly claims?: Readonly<Record<string, unknown>>;
+}
+
+interface SigninFixture {
+  readonly dependencies: Parameters<typeof signInMerchant>[1];
+  readonly attempts: ReturnType<typeof createInMemoryLoginAttemptRecorder>;
+  readonly audit: ReturnType<typeof createInMemoryAuditTrail>;
+  readonly inserts: { table: string; rows: readonly Readonly<Record<string, unknown>>[] }[];
+}
+
+function signinFixture(options: SigninRestOptions & {
+  readonly signIn?: AuthOutcome<AuthSession>;
+  readonly turnstileEnabled?: boolean;
+} = {}): SigninFixture {
+  const inserts: { table: string; rows: readonly Readonly<Record<string, unknown>>[] }[] = [];
+  const user =
+    options.user === undefined
+      ? {
+          id: USER_ID,
+          company_id: FIRM_ID,
+          status: "active",
+          email_verified_at: new Date(NOW).toISOString(),
+          deleted_at: null,
+        }
+      : options.user;
+  const proofKeys = options.proofKeys ?? 0;
+  const session: AuthSession = {
+    ...fixtureSession(),
+    accessToken: makeAccessToken(baseClaims(options.claims ?? {})),
+  };
+
+  const rest: RestClient = {
+    select<TRow>(table: string): Promise<readonly TRow[]> {
+      if (table === "users") {
+        return Promise.resolve(user === null ? [] : ([{ ...user }] as unknown as readonly TRow[]));
+      }
+
+      if (table === "device_proof_keys") {
+        return Promise.resolve(
+          Array.from({ length: proofKeys }, (_unused, index) => ({
+            id: `device-${index}`,
+          })) as unknown as readonly TRow[],
+        );
+      }
+
+      return Promise.resolve([]);
+    },
+    insert(table: string, rows: readonly Readonly<Record<string, unknown>>[]): Promise<void> {
+      inserts.push({ table, rows });
+
+      return Promise.resolve();
+    },
+    insertReturning: <TRow>(): Promise<readonly TRow[]> => Promise.resolve([]),
+    update: (): Promise<void> => Promise.resolve(),
+    rpc: (): Promise<unknown> => Promise.resolve(null),
+  };
+  const attempts = createInMemoryLoginAttemptRecorder();
+  const audit = createInMemoryAuditTrail();
+
+  return {
+    inserts,
+    attempts,
+    audit,
+    dependencies: {
+      auth: stubAuthClient({ signInWithPassword: () => Promise.resolve(options.signIn ?? { ok: true, value: session }) }),
+      rest,
+      turnstile: createTurnstileGuard({
+        settings: createInMemorySettings({ "turnstile.enabled": options.turnstileEnabled ?? false }),
+        http: createStubHttp().http,
+        isProduction: false,
+        endpoint: "https://turnstile.gate/siteverify",
+      }),
+      attempts,
+      audit,
+      cookiePolicy: cookiePolicy(),
+      now: () => NOW,
+    },
+  };
+}
+
+function signinRequest(overrides: Readonly<Record<string, unknown>> = {}): Record<string, unknown> {
+  return {
+    email: "owner@example.com",
+    password: "correct horse battery",
+    turnstileToken: null,
+    ...overrides,
+  };
+}
+
+async function checkSignin(): Promise<void> {
+  const fixture = signinFixture();
+  const result = await signInMerchant(
+    { request: signinRequest(), remoteIp: "203.0.113.9", userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/126.0.0.0 Safari/537.36" },
+    fixture.dependencies,
+  );
+
+  expectEqual(result.userId, USER_ID, "a correct password answers the account");
+  expectEqual(result.companyId, FIRM_ID, "the answer names the company");
+  expectEqual(result.deviceProofRequired, true, "an account with no proof key must enrol this browser");
+  expectEqual(result.device.label, "Chrome on macOS", "the answer names the device");
+  expectEqual(result.cookies.length, 1, "one session cookie is written");
+  expect(
+    (result.cookies[0] ?? "").startsWith("__Host-kd_session="),
+    "the sign in cookie is the secure name",
+  );
+  expect(
+    (result.cookies[0] ?? "").toLowerCase().includes("httponly"),
+    "the sign in cookie is HttpOnly",
+  );
+  expectEqual(fixture.attempts.attempts.length, 1, "the sign in records one attempt");
+  expectEqual(fixture.attempts.attempts[0]?.outcome, "succeeded", "the attempt is a success");
+  expectEqual(fixture.attempts.attempts[0]?.userId, USER_ID, "the attempt names the account");
+  expectEqual(fixture.audit.entries.length, 1, "the sign in writes one audit entry");
+  expectEqual(fixture.audit.entries[0]?.action, "user.signed_in", "the entry names the action");
+  expectEqual(fixture.audit.entries[0]?.payload["device"], "Chrome on macOS", "the entry names the device");
+  expectEqual(
+    fixture.audit.entries[0]?.payload["device_proof_present"],
+    false,
+    "the entry records that no proof key exists yet",
+  );
+
+  const enrolled = signinFixture({ proofKeys: 1 });
+  const enrolledResult = await signInMerchant(
+    { request: signinRequest(), remoteIp: "203.0.113.9", userAgent: "gate" },
+    enrolled.dependencies,
+  );
+
+  expectEqual(enrolledResult.deviceProofRequired, false, "an enrolled device needs no new key");
+
+  const claimsMismatch = await captureRejection(
+    () =>
+      signInMerchant(
+        { request: signinRequest(), remoteIp: null, userAgent: null },
+        signinFixture({
+          signIn: {
+            ok: true,
+            value: {
+              ...fixtureSession(),
+              accessToken: makeAccessToken(baseClaims({ sub: "11111111-1111-4111-8111-111111111111" })),
+            },
+          },
+        }).dependencies,
+      ),
+    "a token whose subject is not the account it names is a provider fault",
+  );
+
+  expectEqual(claimsMismatch.code, "DEPENDENCY_FAILED", "a provider fault is a platform failure");
+  expectEqual(
+    claimsMismatch.details.length,
+    0,
+    "a provider fault carries no detail about the account",
+  );
+
+  const rejectedProvider = (outcome: AuthOutcome<AuthSession>, label: string, code: string): Promise<void> =>
+    expectRejects(
+      () =>
+        signInMerchant(
+          { request: signinRequest(), remoteIp: "203.0.113.9", userAgent: "gate" },
+          signinFixture({ signIn: outcome }).dependencies,
+        ),
+      code,
+      label,
+    );
+
+  await rejectedProvider(
+    { ok: false, failure: { kind: "rejected", status: 400, code: "invalid_credentials", retryAfterSeconds: null } },
+    "a wrong password is the generic rejection",
+    "AUTHENTICATION_REQUIRED",
+  );
+  await rejectedProvider(
+    { ok: false, failure: { kind: "rejected", status: 400, code: "email_not_confirmed", retryAfterSeconds: null } },
+    "an unconfirmed address is the generic rejection",
+    "AUTHENTICATION_REQUIRED",
+  );
+  await rejectedProvider(
+    { ok: false, failure: { kind: "timeout", status: null, code: null, retryAfterSeconds: null } },
+    "a provider timeout is not a credential answer",
+    "TIMEOUT",
+  );
+  await rejectedProvider(
+    { ok: false, failure: { kind: "upstream", status: 503, code: null, retryAfterSeconds: null } },
+    "a provider outage is not a credential answer",
+    "DEPENDENCY_FAILED",
+  );
+  await rejectedProvider(
+    { ok: false, failure: { kind: "rate-limited", status: 429, code: null, retryAfterSeconds: 30 } },
+    "a provider rate limit keeps its delay",
+    "RATE_LIMITED",
+  );
+
+  const unknownAddress = signinFixture({
+    user: null,
+    signIn: { ok: true, value: fixtureSession() },
+  });
+  const unknownError = await captureRejection(
+    () =>
+      signInMerchant(
+        { request: signinRequest({ email: "stranger@example.com" }), remoteIp: "203.0.113.9", userAgent: "gate" },
+        unknownAddress.dependencies,
+      ),
+    "a provider account with no platform row is the generic rejection",
+  );
+
+  expectEqual(unknownError.code, "AUTHENTICATION_REQUIRED", "the refusal is the generic code");
+  expectEqual(unknownError.status, 401, "the generic rejection is a 401");
+  expectEqual(unknownAddress.attempts.attempts.length, 1, "the refusal is recorded");
+  expectEqual(unknownAddress.attempts.attempts[0]?.outcome, "failed", "the refusal is a failure");
+  expectEqual(
+    unknownAddress.attempts.attempts[0]?.emailHash,
+    emailHash("stranger@example.com"),
+    "an unknown account is counted by address hash",
+  );
+  expect(unknownAddress.audit.entries.length === 0, "a refusal writes no audit entry");
+
+  for (const [label, user] of [
+    [
+      "an unconfirmed address is refused",
+      { id: USER_ID, company_id: FIRM_ID, status: "active", email_verified_at: null, deleted_at: null },
+    ],
+    [
+      "a suspended account is refused",
+      {
+        id: USER_ID,
+        company_id: FIRM_ID,
+        status: "suspended",
+        email_verified_at: new Date(NOW).toISOString(),
+        deleted_at: null,
+      },
+    ],
+    [
+      "a soft deleted account is refused",
+      {
+        id: USER_ID,
+        company_id: FIRM_ID,
+        status: "active",
+        email_verified_at: new Date(NOW).toISOString(),
+        deleted_at: new Date(NOW).toISOString(),
+      },
+    ],
+  ] as const) {
+    const refusal = signinFixture({ user });
+
+    const error = await captureRejection(
+      () =>
+        signInMerchant(
+          { request: signinRequest(), remoteIp: "203.0.113.9", userAgent: "gate" },
+          refusal.dependencies,
+        ),
+      label,
+    );
+
+    expectEqual(error.code, "AUTHENTICATION_REQUIRED", `${label} (catalogue code)`);
+    expectEqual(error.status, unknownError.status, "every account refusal shares one status");
+    expectEqual(
+      error.details.length,
+      unknownError.details.length,
+      "every account refusal carries one detail set",
+    );
+    expectEqual(refusal.attempts.attempts.length, 1, "the account refusal is recorded");
+    expectEqual(refusal.attempts.attempts[0]?.userId, USER_ID, "the refusal names the account");
+    expectEqual(
+      refusal.attempts.attempts[0]?.emailHash,
+      null,
+      "a known account is never counted by address hash",
+    );
+  }
+
+  const malformed = await captureRejection(
+    () =>
+      signInMerchant(
+        { request: { email: "owner@example.com" }, remoteIp: null, userAgent: null },
+        signinFixture().dependencies,
+      ),
+    "a form without a password is the generic rejection",
+  );
+
+  expectEqual(malformed.code, unknownError.code, "a malformed form is not distinguishable");
+  expectEqual(malformed.status, unknownError.status, "a malformed form shares the same status");
+
+  await expectRejects(
+    () =>
+      signInMerchant(
+        { request: signinRequest({ extra: "field" }), remoteIp: null, userAgent: null },
+        signinFixture().dependencies,
+      ),
+    "AUTHENTICATION_REQUIRED",
+    "an unknown field is the generic rejection",
+  );
+
+  const challenged = signinFixture({ turnstileEnabled: true });
+  const challengeError = await captureRejection(
+    () =>
+      signInMerchant(
+        { request: signinRequest(), remoteIp: "203.0.113.9", userAgent: "gate" },
+        challenged.dependencies,
+      ),
+    "a missing challenge token is a form failure",
+  );
+
+  expectEqual(challengeError.code, "VALIDATION_FAILED", "the challenge refusal is a form failure");
+  expectEqual(
+    challengeError.details?.[0]?.field,
+    "turnstileToken",
+    "the challenge failure names the widget field",
+  );
+  expectEqual(challenged.attempts.attempts[0]?.outcome, "challenged", "the challenge refusal is recorded");
+
+  const parsed = signinInputSchema.safeParse({ email: "Owner@Example.com", password: "x" });
+
+  expect(parsed.success && parsed.data.email === "owner@example.com", "the form lowercases the address");
+}
+
 /* ------------------------------------------------------------------ main */
 
 async function main(): Promise<void> {
@@ -2879,6 +3358,9 @@ async function main(): Promise<void> {
   await checkRegistration();
   await checkEmailVerification();
   checkClientAddress();
+  checkDeviceContext();
+  await checkLoginAttempts();
+  await checkSignin();
 
   if (failures.length > 0) {
     process.stderr.write(`auth gate failed with ${failures.length} problem(s):\n`);

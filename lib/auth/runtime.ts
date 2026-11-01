@@ -6,6 +6,10 @@ import { createRestAuditTrail, type AuditTrail } from "./audit.ts";
 import { createAuthClient, type AuthClient } from "./client.ts";
 import { createAuthCookiePolicy, type AuthCookiePolicy } from "./cookies.ts";
 import { getAuthConfig, type AuthConfig } from "./config.ts";
+import {
+  createRestLoginAttemptRecorder,
+  type LoginAttemptRecorder,
+} from "./login-attempts.ts";
 import { createAuthHttpForConfig, type AuthHttp } from "./http.ts";
 import { createRestPolicyCatalog, type PolicyCatalog } from "./policies.ts";
 import { createRestClient, type RestClient } from "./rest.ts";
@@ -44,6 +48,7 @@ export interface AuthRuntime {
   readonly turnstile: TurnstileGuard;
   readonly policies: PolicyCatalog;
   readonly audit: AuditTrail;
+  readonly attempts: LoginAttemptRecorder;
   readonly cookiePolicy: AuthCookiePolicy;
 }
 
@@ -77,6 +82,7 @@ export function getAuthRuntime(): AuthRuntime {
       http,
       signingKey: () => serverEnv().AUDIT_SIGNING_KEY,
     }),
+    attempts: createRestLoginAttemptRecorder(createRestClient(config, http)),
     cookiePolicy: createAuthCookiePolicy(config, AUTH_SESSION_MAX_AGE_SECONDS),
   };
 
