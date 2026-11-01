@@ -127,6 +127,7 @@ export type ProofRejectionReason =
   | "method-mismatch"
   | "stale-timestamp"
   | "unknown-device"
+  | "session-device-mismatch"
   | "signature"
   | "replayed";
 
@@ -286,6 +287,13 @@ async function verify(
 
   if (algorithm === null) {
     throw new ProofRefusal("unknown-device");
+  }
+
+  // The session names the device it was issued for (STEP 051), so a signature from another device of
+  // the same account is not evidence about this session. Refusing here is what makes
+  // `sessions.device_proof_key_id` a binding rather than a comment.
+  if (input.actor.deviceProofKeyId !== null && input.actor.deviceProofKeyId !== device.id) {
+    throw new ProofRefusal("session-device-mismatch");
   }
 
   const verified = await verifyProofMessage({

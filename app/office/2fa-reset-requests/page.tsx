@@ -12,6 +12,7 @@ import {
   type TwoFactorResetRequestView,
 } from "@/lib/auth/two-factor-reset";
 import { getMessage } from "@/lib/i18n/messages";
+import { SessionKeeper } from "@/components/auth/session-keeper";
 import { OfficeResetQueue } from "./office-reset-queue";
 
 export const metadata: Metadata = {
@@ -48,6 +49,8 @@ async function readQueueState(): Promise<QueueState> {
     const actor = await readRequestActor(cookieHeader, {
       directory: runtime.directory,
       cookiePolicy: runtime.cookiePolicy,
+      sessions: runtime.sessions,
+      audit: runtime.audit,
     });
     const requests = await listTwoFactorResetRequests(
       { actor, roles: TWO_FACTOR_RESET_OFFICE_ROLES, limit: 100 },
@@ -82,6 +85,8 @@ export default async function OfficeResetRequestsPage(): Promise<ReactNode> {
 
   return (
     <main className="min-h-dvh bg-background px-4 py-8 text-foreground sm:px-6 lg:px-8">
+      {/* Section 22's rotating token: the page asks for a rotation, and the server decides. */}
+      <SessionKeeper />
       <div className="mx-auto w-full max-w-4xl">
         <p className="text-xs font-semibold uppercase tracking-widest text-muted-foreground">
           {getMessage("officeReset.eyebrow")}

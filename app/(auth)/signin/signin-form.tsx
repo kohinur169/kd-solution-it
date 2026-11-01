@@ -3,7 +3,11 @@
 
 import Script from "next/script";
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
-import { enrolDeviceProofKey } from "@/lib/auth/device-proof-store";
+import {
+  bindSession,
+  enrolDeviceProofKey,
+  readStoredDeviceProofKey,
+} from "@/lib/auth/device-proof-store";
 import { formatMessage, getMessage } from "@/lib/i18n/messages";
 
 /**
@@ -115,21 +119,35 @@ function readDeviceProofRequired(payload: unknown): boolean {
 }
 
 /**
- * Register this browser's proof key when the answer asked for one.
+ * Give this browser a proof key and bind the session the sign in just created to it.
  *
- * Every failure is swallowed on purpose: the sign in has already succeeded, and the only durable
- * consequence of a missing key is that the next sign in asks again.
+ * Two halves, in this order, and the order is the point. The enrolment of STEP 049 registers the
+ * public half of a key this browser generates; the binding of STEP 051 then asks the server to write
+ * the first row of `public.sessions` naming that device and to hand back a rotating token in the
+ * cookie. A session that is never bound is refused by every page that matters, so a browser that
+ * cannot do both is told, rather than sent to a page that would answer the same way.
+ *
+ * The enrolment is skipped when the server said the account already has a key on this browser: a
+ * second key would be a second device. It is never skipped for the *binding*, because a sign in
+ * always creates a fresh session.
  */
-async function enrolDeviceProofKeyWhenRequired(payload: unknown): Promise<void> {
-  if (!readDeviceProofRequired(payload)) {
-    return;
+async function establishSession(payload: unknown): Promise<boolean> {
+  const stored = await readStoredDeviceProofKey().catch(() => null);
+
+  // Enrol when the server asked for a key, and also when this browser has none: an account whose
+  // other browser holds the only key is never told to enrol here, and a session cannot bind without
+  // a key of its own.
+  if (readDeviceProofRequired(payload) || stored === null) {
+    const enrolled = await enrolDeviceProofKey().catch(() => null);
+
+    if (enrolled === null || !enrolled.ok) {
+      return false;
+    }
   }
 
-  try {
-    await enrolDeviceProofKey();
-  } catch {
-    // Nothing to say and nothing to undo: the session is the server's, not the key's.
-  }
+  const bound = await bindSession().catch(() => null);
+
+  return bound !== null && bound.ok;
 }
 
 /**
@@ -288,7 +306,15 @@ export function SigninForm({ siteKey, afterSigninPath }: SigninFormProperties): 
         return;
       }
 
-      await enrolDeviceProofKeyWhenRequired(payload);
+      if (!(await establishSession(payload))) {
+        // The cookie exists but names no device, and every page that reads one would refuse it.
+        // Saying so here is the only honest option: navigating would bounce the merchant back to
+        // this form with nothing to read.
+        setMessage(getMessage("device.bindingFailed"));
+        setSubmitting(false);
+
+        return;
+      }
 
       // A full navigation, so the cookie written by this response is the one the next request
       // carries; a client side transition could render a page from the previous identity.
@@ -334,7 +360,12 @@ export function SigninForm({ siteKey, afterSigninPath }: SigninFormProperties): 
 
       const payload: unknown = await response.json().catch(() => null);
 
-      await enrolDeviceProofKeyWhenRequired(payload);
+      if (!(await establishSession(payload))) {
+        setMessage(getMessage("device.bindingFailed"));
+        setVerifying(false);
+
+        return;
+      }
 
       window.location.assign(afterSigninPath);
     } catch {

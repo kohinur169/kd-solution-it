@@ -67,9 +67,14 @@ export const POST = withErrorResponse(
     }
 
     const runtime = getAuthRuntime();
+    // One of exactly two routes that may run before the cookie is bound: enrolling a device key is
+    // what makes binding possible, so refusing an unbound session here would deadlock a new browser.
     const actor = await readRequestActor(request.headers.get("cookie"), {
       directory: runtime.directory,
       cookiePolicy: runtime.cookiePolicy,
+      sessions: runtime.sessions,
+      audit: runtime.audit,
+      allowUnbound: true,
     });
 
     const result = await enrolDeviceProofKey(

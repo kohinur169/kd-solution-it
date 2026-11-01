@@ -1,5 +1,6 @@
 // path: lib/auth/types.ts
 import { deepFreeze } from "../utils/freeze.ts";
+import type { SessionCookiePayload } from "./cookies.ts";
 
 /**
  * Every value that crosses the authentication boundary.
@@ -142,6 +143,16 @@ export interface RequestActor {
   readonly twoFactorSatisfied: boolean;
   /** True when section 22 requires this actor to enrol TOTP before it may act. */
   readonly twoFactorEnrolmentRequired: boolean;
+  /**
+   * The device the platform session is bound to, or null before the session is bound.
+   *
+   * `public.sessions.device_proof_key_id` is the row's own binding, enforced by the composite
+   * foreign key of `0010`. STEP 051 carries it onto the actor so a proof can be checked against the
+   * device this session was issued for, and STEP 054 can end every session of one device.
+   */
+  readonly deviceProofKeyId: string | null;
+  /** The family this session belongs to, so one revocation can end the whole login. */
+  readonly sessionFamilyId: string | null;
 }
 
 /**
@@ -160,11 +171,39 @@ export type SessionRejectionReason =
   | "unknown-account"
   | "suspended-account"
   | "closed-account"
-  | "deleted-account";
+  | "deleted-account"
+  /** The cookie is valid but names no platform session: it predates binding (STEP 051). */
+  | "unbound-session"
+  /** The token names no row, or a row of another account. */
+  | "unknown-session"
+  /** The row's own expiry, or its family's ceiling, has passed. */
+  | "expired-session"
+  /** The row was ended for a reason other than rotation: signed out, revoked, a changed password. */
+  | "revoked-session"
+  /** A spent token was presented after the grace window, and its family has been revoked. */
+  | "replayed-session";
 
-/** The one question a route asks. Two cases, so a handler cannot forget the rejection. */
+/**
+ * The one question a route asks. Two cases, so a handler cannot forget the rejection.
+ *
+ * An authenticated state also carries the platform session token the cookie held, or null when the
+ * cookie predates binding. Only the reader of STEP 051 uses it; a handler keeps using the actor.
+ */
 export type SessionState =
-  | { readonly kind: "authenticated"; readonly actor: RequestActor }
+  | {
+      readonly kind: "authenticated";
+      readonly actor: RequestActor;
+      readonly sessionToken: string | null;
+      /**
+       * The verified payload itself.
+       *
+       * The rotation of STEP 051 rewrites one field of it - the session token - and has to carry
+       * the provider's pair forward byte for byte. Handing the payload back here keeps that pair
+       * inside the modules that already handle it rather than making a route decode a cookie a
+       * second time.
+       */
+      readonly payload: SessionCookiePayload;
+    }
   | { readonly kind: "unauthenticated"; readonly reason: SessionRejectionReason };
 
 /**

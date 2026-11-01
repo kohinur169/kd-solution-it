@@ -377,6 +377,30 @@ the authority. A permission check uses the record, never a claim.
     with the routes that import `verifySensitiveRequest`: a listed endpoint whose file does not
     call it, and a route that calls it without being listed, both fail. Adding an endpoint is
     therefore a change in one file, proved by a check, not by memory.
+71. A cookie is a reference, not a bearer token. After STEP 051 the payload carries a 32 byte
+    random `sessionToken`, the server stores only its SHA-256 in `public.sessions.token_hash`, and
+    every authenticated request resolves it to exactly one row. The signature proves the platform
+    wrote the cookie; the row proves the session is still the session the platform last issued, so
+    revoking one (054) and ending a family after a theft both take effect on the next request.
+72. A session is bound to the device it was issued for. `0010` makes `device_proof_key_id` required
+    and its composite foreign key keeps the device on the same account;
+    `POST /api/auth/session/rotate` writes that row after the enrolment of STEP 049, and
+    `verifySensitiveRequest` refuses a proof whose device row is not the one the session names
+    (`session-device-mismatch`). A sibling key of the same account is therefore not evidence about
+    this session.
+73. Rotation is a compare and swap, and the grace window is why it is safe. The parent is revoked
+    as `ROTATED` by an update that only matches `revoked_at is null`, the row is read back to learn
+    whether this call won, and only the winner inserts a child that copies `family_id` and
+    `absolute_expires_at`. A spend token presented again inside `SESSION_ROTATION_GRACE_MS` is
+    honoured without issuing anything - the request was already in flight when the answer rewrote
+    the cookie - and the same token after it is a replay: the row becomes `REPLAY_DETECTED`, every
+    live row of the family becomes `FAMILY_REVOKED`, and `session.replay_detected` plus
+    `session.family_revoked` record it. Neither entry ever quotes a token.
+74. A rotation chain has a ceiling. `0089` added `absolute_expires_at`, written when a family starts
+    and copied by every rotation, with a check that refuses a row whose own expiry reaches past it.
+    `openSession` and `rotateSession` compute each expiry as the earlier of the rotation window and
+    the ceiling, so a browser that keeps a stolen cookie rotating cannot extend a login for ever.
+    A rotation past the ceiling is refused as `expired`, not silently renewed.
 
 ## Adding an operation
 

@@ -80,6 +80,19 @@ const payloadSchema = z.object({
   userId: z.string().min(1).max(identifierMaximumLength),
   sessionId: z.string().min(1).max(identifierMaximumLength).nullable(),
   /**
+   * The rotating session token of STEP 051, or null when the cookie predates binding.
+   *
+   * The signature protects this value like every other field, and the server stores only its
+   * SHA-256 in `public.sessions.token_hash`, so a stolen database yields no usable cookie. The
+   * field is optional because a cookie is minted at sign in - before a browser on a new device has
+   * a proof key to bind the session to - and the first rotation adds it.
+   */
+  sessionToken: z
+    .string()
+    .regex(/^[A-Za-z0-9_-]{43}$/u)
+    .nullable()
+    .optional(),
+  /**
    * The assurance this platform established for the session.
    *
    * The provider's token says what the provider saw, which is a password. The second factor of

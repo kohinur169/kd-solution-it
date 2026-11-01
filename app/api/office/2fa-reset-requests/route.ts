@@ -40,6 +40,8 @@ export const GET = withErrorResponse(
     const actor = await readRequestActor(request.headers.get("cookie"), {
       directory: runtime.directory,
       cookiePolicy: runtime.cookiePolicy,
+      sessions: runtime.sessions,
+      audit: runtime.audit,
     });
 
     const requests = await listTwoFactorResetRequests(

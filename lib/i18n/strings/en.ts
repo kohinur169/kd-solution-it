@@ -209,6 +209,8 @@ const catalog = {
   device: {
     proofRequired:
       "This browser has not registered its device key yet. Sign in again on this browser, then repeat this action.",
+    bindingFailed:
+      "This browser could not finish setting up its device key, so the session cannot continue. Reload the page and sign in again.",
   },
   resetRequest: {
     eyebrow: "Account recovery",

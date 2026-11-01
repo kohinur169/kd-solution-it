@@ -22,6 +22,7 @@ import { createRestPolicyCatalog, type PolicyCatalog } from "./policies.ts";
 import { createSupabaseActorDirectory, type ActorDirectory } from "./directory.ts";
 import { createRestClient, type RestClient } from "./rest.ts";
 import { createRestSettings, type PlatformSettings } from "./settings.ts";
+import { createRestSessionTokenStore, type SessionTokenStore } from "./session-rotation.ts";
 import { createTurnstileGuard, type TurnstileGuard } from "./turnstile.ts";
 
 /**
@@ -61,6 +62,13 @@ export interface AuthRuntime {
   readonly cookiePolicy: AuthCookiePolicy;
   /** Reads an actor for a cookie: the session of STEP 039 and of every authenticated route. */
   readonly directory: ActorDirectory;
+  /**
+   * The rows of `public.sessions`: the rotating token of STEP 051.
+   *
+   * A route passes this to `readRequestActor`, which resolves the cookie's token to one row and
+   * refuses anything a revocation, an expiry or a replay has ended.
+   */
+  readonly sessions: SessionTokenStore;
   /** Tells a company owner that their account just locked, through the email queue of section 23. */
   readonly lockAlerts: LockAlertNotifier;
   /**
@@ -122,6 +130,7 @@ export function getAuthRuntime(): AuthRuntime {
       serverEnv().ENCRYPTION_MASTER_KEY,
     ),
     directory: createSupabaseActorDirectory(config, http),
+    sessions: createRestSessionTokenStore(rest),
     lockAlerts: createLockAlertNotifier({ rest, audit, logger }),
     masterKey: () => serverEnv().ENCRYPTION_MASTER_KEY,
   };

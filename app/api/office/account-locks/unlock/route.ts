@@ -58,6 +58,8 @@ export const POST = withErrorResponse(
     const actor = await readRequestActor(request.headers.get("cookie"), {
       directory: runtime.directory,
       cookiePolicy: runtime.cookiePolicy,
+      sessions: runtime.sessions,
+      audit: runtime.audit,
     });
 
     // Section 22 names account unlocks among the actions a cookie alone may not perform.

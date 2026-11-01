@@ -36,6 +36,24 @@ import {
   type ProofKeyAlgorithm,
 } from "./proof-key.ts";
 import {
+  createRawSessionToken,
+  hashSessionToken,
+  isSessionToken,
+  issueSessionToken,
+  resolveSessionToken,
+  revokeDeviceSessions,
+  revokeSession,
+  SESSION_ABSOLUTE_WINDOW_MS,
+  SESSION_ROTATION_GRACE_MS,
+  SESSION_ROTATION_INTERVAL_MS,
+  SESSION_ROTATION_WINDOW_MS,
+  SESSION_TOKEN_PATTERN,
+  type NewSessionRow,
+  type SessionRow,
+  type SessionTokenStore,
+} from "./session-rotation.ts";
+import { readBoundSession, readRequestActor } from "./request-actor.ts";
+import {
   isSensitivePath,
   SENSITIVE_ENDPOINTS,
   verifySensitiveRequest,
@@ -5409,6 +5427,8 @@ function resetActor(options: { readonly roles?: readonly PlatformRole[] } = {}):
     emailVerified: true,
     twoFactorSatisfied: true,
     twoFactorEnrolmentRequired: false,
+    deviceProofKeyId: null,
+    sessionFamilyId: null,
   };
 }
 
@@ -6840,6 +6860,8 @@ function officeActor(options: {
     emailVerified: true,
     twoFactorSatisfied: options.twoFactorSatisfied ?? true,
     twoFactorEnrolmentRequired: false,
+    deviceProofKeyId: null,
+    sessionFamilyId: null,
   };
 }
 
@@ -8435,6 +8457,8 @@ async function checkRequestProof(): Promise<void> {
     emailVerified: true,
     twoFactorSatisfied: true,
     twoFactorEnrolmentRequired: false,
+    deviceProofKeyId: "device-050",
+    sessionFamilyId: "family-050",
   };
   const path = "/api/office/account-locks/unlock";
   const body = '{"lockId":"018f3b1c-6666-7c2a-9d1e-2b3c4d5e6f75","note":"called the owner"}';
@@ -8609,11 +8633,40 @@ async function checkRequestProof(): Promise<void> {
     privateKey: pair.privateKey,
   });
   const trusted = await verifySensitiveRequest(
-    { request: trustedCall.request, bodyText: body, actor },
+    {
+      request: trustedCall.request,
+      bodyText: body,
+      actor: { ...actor, deviceProofKeyId: "device-trusted" },
+    },
     dependencies,
   );
 
   expectEqual(trusted.trusted, true, "a confirmed device is reported as trusted");
+
+  // ---- the session's own binding (STEP 051)
+  world.seedDevice({
+    id: "device-sibling",
+    user_id: USER_ID,
+    public_key: pair.publicKeyBase64Url,
+  });
+
+  const siblingCall = await signedCall({
+    path,
+    body,
+    deviceKeyId: "device-sibling",
+    privateKey: pair.privateKey,
+  });
+  const sibling = await captureRejection(
+    () => verifySensitiveRequest({ request: siblingCall.request, bodyText: body, actor }, dependencies),
+    "a sibling device of the same account cannot sign for this session",
+  );
+
+  expectEqual(sibling.code, "AUTHENTICATION_REQUIRED", "the sibling refusal is the shared one");
+  expectEqual(
+    audit.entries.at(-1)?.payload["reason"],
+    "session-device-mismatch",
+    "the entry names the session binding",
+  );
 
   // ---- the message a request actually signs
   const tamperedCases: readonly (readonly [string, Partial<SignCallOptions>, string])[] = [
@@ -8785,6 +8838,935 @@ async function checkRequestProof(): Promise<void> {
   expectEqual(browserCall.request.headers.get(REQUEST_PROOF_HEADERS.nonce), "BBBBBBBBBBBBBBBBBBBBBB", "the nonce travels in its own header");
 }
 
+/**
+ * An in-memory `public.sessions`.
+ *
+ * The two constraints the rotation decides on are here in full, because a double that accepted
+ * everything would prove nothing: a token hash is unique, and one row can have at most one child
+ * (`sessions_rotation_key`). The two hooks exist to reach a race that a single threaded gate cannot
+ * otherwise produce: `ignoreNextUpdate` loses a compare and swap, and nothing else does.
+ */
+interface SessionTableRow {
+  id: string;
+  user_id: string;
+  company_id: string | null;
+  device_proof_key_id: string;
+  token_hash: string;
+  family_id: string;
+  rotated_from_session_id: string | null;
+  issued_at: number;
+  expires_at: number;
+  absolute_expires_at: number;
+  revoked_at: number | null;
+  revocation_reason: string | null;
+  replay_detected_at: number | null;
+  mfa_verified_at: number | null;
+  deleted_at: number | null;
+}
+
+interface SessionTable extends SessionTokenStore {
+  readonly rows: SessionTableRow[];
+  ignoreNextUpdate: boolean;
+  familyCount(): number;
+}
+
+function createSessionTable(): SessionTable {
+  const rows: SessionTableRow[] = [];
+  let sequence = 0;
+
+  function nextId(): string {
+    sequence += 1;
+
+    return `session-${String(sequence).padStart(4, "0")}`;
+  }
+
+  function matches(row: SessionTableRow, query: string): boolean {
+    for (const clause of query.split("&")) {
+      const [field, value] = clause.split("=");
+
+      if (field === undefined || value === undefined) {
+        continue;
+      }
+
+      if (field === "revoked_at") {
+        if (value === "is.null" && row.revoked_at !== null) {
+          return false;
+        }
+      }
+
+      if (field === "revocation_reason") {
+        const expected = value.replace("eq.", "");
+
+        if (row.revocation_reason !== expected) {
+          return false;
+        }
+      }
+    }
+
+    return true;
+  }
+
+  function visible(row: SessionTableRow): boolean {
+    return row.deleted_at === null;
+  }
+
+  function toRow(row: SessionTableRow): SessionRow {
+    return {
+      id: row.id,
+      userId: row.user_id,
+      companyId: row.company_id,
+      deviceProofKeyId: row.device_proof_key_id,
+      familyId: row.family_id,
+      rotatedFromSessionId: row.rotated_from_session_id,
+      issuedAtEpochMs: row.issued_at,
+      expiresAtEpochMs: row.expires_at,
+      absoluteExpiresAtEpochMs: row.absolute_expires_at,
+      revokedAtEpochMs: row.revoked_at,
+      revocationReason: row.revocation_reason,
+      replayDetectedAtEpochMs: row.replay_detected_at,
+      mfaVerifiedAtEpochMs: row.mfa_verified_at,
+    };
+  }
+
+  const table: SessionTable = {
+    rows,
+    ignoreNextUpdate: false,
+    familyCount(): number {
+      return new Set(rows.map((row) => row.family_id)).size;
+    },
+
+    findByHash(tokenHash: string): Promise<SessionRow | null> {
+      const found = rows.find((row) => row.token_hash === tokenHash && visible(row));
+
+      return Promise.resolve(found === undefined ? null : toRow(found));
+    },
+
+    findLiveInFamily(familyId: string): Promise<SessionRow | null> {
+      const found = rows.find(
+        (row) => row.family_id === familyId && row.revoked_at === null && visible(row),
+      );
+
+      return Promise.resolve(found === undefined ? null : toRow(found));
+    },
+
+    insert(row: NewSessionRow): Promise<SessionRow> {
+      if (rows.some((existing) => existing.token_hash === row.tokenHash)) {
+        throw new AppError("CONFLICT");
+      }
+
+      if (
+        row.rotatedFromSessionId !== undefined &&
+        row.rotatedFromSessionId !== null &&
+        rows.some((existing) => existing.rotated_from_session_id === row.rotatedFromSessionId)
+      ) {
+        throw new AppError("CONFLICT");
+      }
+
+      const created: SessionTableRow = {
+        id: nextId(),
+        user_id: row.userId,
+        company_id: row.companyId,
+        device_proof_key_id: row.deviceProofKeyId,
+        token_hash: row.tokenHash,
+        family_id: row.familyId ?? `family-${String(sequence).padStart(4, "0")}`,
+        rotated_from_session_id: row.rotatedFromSessionId ?? null,
+        issued_at: row.issuedAtEpochMs,
+        expires_at: row.expiresAtEpochMs,
+        absolute_expires_at: row.absoluteExpiresAtEpochMs,
+        revoked_at: null,
+        revocation_reason: null,
+        replay_detected_at: null,
+        mfa_verified_at: row.mfaVerifiedAtEpochMs,
+        deleted_at: null,
+      };
+      rows.push(created);
+
+      return Promise.resolve(toRow(created));
+    },
+
+    update(sessionId: string, query: string, values: Readonly<Record<string, unknown>>): Promise<void> {
+      if (table.ignoreNextUpdate) {
+        table.ignoreNextUpdate = false;
+
+        return Promise.resolve();
+      }
+
+      for (const row of rows) {
+        if (row.id !== sessionId || !visible(row) || !matches(row, query)) {
+          continue;
+        }
+
+        if (typeof values["revoked_at"] === "string") {
+          row.revoked_at = Date.parse(values["revoked_at"]);
+        }
+
+        if (typeof values["revocation_reason"] === "string") {
+          row.revocation_reason = values["revocation_reason"];
+        }
+
+        if (typeof values["replay_detected_at"] === "string") {
+          row.replay_detected_at = Date.parse(values["replay_detected_at"]);
+        }
+      }
+
+      return Promise.resolve();
+    },
+
+    revokeFamily(familyId: string, values: Readonly<Record<string, unknown>>): Promise<number> {
+      const live = rows.filter((row) => row.family_id === familyId && row.revoked_at === null);
+
+      for (const row of live) {
+        row.revoked_at = Date.parse(String(values["revoked_at"]));
+        row.revocation_reason = String(values["revocation_reason"]);
+      }
+
+      return Promise.resolve(live.length);
+    },
+
+    revokeDevice(
+      deviceProofKeyId: string,
+      values: Readonly<Record<string, unknown>>,
+    ): Promise<number> {
+      const live = rows.filter(
+        (row) => row.device_proof_key_id === deviceProofKeyId && row.revoked_at === null,
+      );
+
+      for (const row of live) {
+        row.revoked_at = Date.parse(String(values["revoked_at"]));
+        row.revocation_reason = String(values["revocation_reason"]);
+      }
+
+      return Promise.resolve(live.length);
+    },
+  };
+
+  return table;
+}
+
+async function checkSessionRotation(): Promise<void> {
+  // ---- the token itself
+  const minted = createRawSessionToken();
+
+  expectEqual(minted.length, 43, "a session token is 43 base64url characters");
+  expect(SESSION_TOKEN_PATTERN.test(minted), "a minted token matches the pattern 0010 accepts");
+  expect(createRawSessionToken() !== minted, "two tokens are never the same");
+  expectEqual(hashSessionToken(minted).length, 43, "the hash is 43 characters too");
+  expect(hashSessionToken(minted) !== minted, "the hash is not the token");
+  expectEqual(hashSessionToken(minted), hashSessionToken(minted), "the hash is deterministic");
+  expect(hashSessionToken(`${minted.slice(0, 42)}A`) !== hashSessionToken(minted), "a changed token hashes differently");
+  expect(isSessionToken(minted), "a minted token is a session token");
+  expect(!isSessionToken("short"), "a short string is not a session token");
+  expect(!isSessionToken(`${minted}=`), "a padded string is not a session token");
+  expect(!isSessionToken(`${minted}A`), "a 44 character string is not a session token");
+  expect(!isSessionToken(42), "a number is not a session token");
+
+  // ---- the first binding
+  const table = createSessionTable();
+  const audit = createInMemoryAuditTrail();
+  const dependencies = { sessions: table, audit, now: () => NOW };
+
+  const bound = await issueSessionToken(
+    {
+      presentedToken: null,
+      userId: USER_ID,
+      companyId: FIRM_ID,
+      deviceProofKeyId: "device-051",
+      assuranceLevel: "aal2",
+      ipAddress: "203.0.113.9",
+      userAgent: chromeAgent,
+      claimSessionId: SESSION_ID,
+    },
+    dependencies,
+  );
+
+  expectEqual(bound.kind, "bound", "a cookie without a session token starts a family");
+  expectEqual(table.rows.length, 1, "binding writes one row");
+  expectEqual(table.rows[0]?.user_id, USER_ID, "the row belongs to the account");
+  expectEqual(table.rows[0]?.device_proof_key_id, "device-051", "the row is bound to the device");
+  expectEqual(table.rows[0]?.token_hash, hashSessionToken((bound as { token: string }).token), "the row holds the hash, never the token");
+  expect(table.rows[0]?.token_hash !== (bound as { token: string }).token, "the row does not hold the token");
+  expectEqual(table.rows[0]?.issued_at, NOW, "the row starts now");
+  expectEqual(table.rows[0]?.expires_at, NOW + SESSION_ROTATION_WINDOW_MS, "one rotation lives one window");
+  expectEqual(table.rows[0]?.absolute_expires_at, NOW + SESSION_ABSOLUTE_WINDOW_MS, "the family gets a ceiling");
+  expectEqual(table.rows[0]?.mfa_verified_at, NOW, "an aal2 cookie records when the second factor was proven");
+  expectEqual(audit.entries.at(-1)?.action, "session.bound", "binding is audited");
+  expectEqual(audit.entries.at(-1)?.payload["device_proof_key_id"], "device-051", "the entry names the device");
+  expect(
+    JSON.stringify(audit.entries.at(-1)?.payload).includes((bound as { token: string }).token) === false,
+    "the audit entry never quotes the token",
+  );
+
+  const firstToken = (bound as { token: string }).token;
+  const live = await resolveSessionToken({ token: firstToken, userId: USER_ID }, dependencies);
+
+  expectEqual(live.kind, "live", "a fresh token resolves to its row");
+
+  if (live.kind === "live") {
+    expectEqual(live.row.deviceProofKeyId, "device-051", "the resolved row carries the device");
+    expectEqual(live.row.companyId, FIRM_ID, "the resolved row carries the tenant");
+  }
+
+  // ---- an aal1 binding records no second factor
+  const aal1Table = createSessionTable();
+  const aal1 = await issueSessionToken(
+    {
+      presentedToken: null,
+      userId: USER_ID,
+      companyId: FIRM_ID,
+      deviceProofKeyId: "device-051",
+      assuranceLevel: "aal1",
+      ipAddress: null,
+      userAgent: null,
+      claimSessionId: null,
+    },
+    { sessions: aal1Table, audit: createInMemoryAuditTrail(), now: () => NOW },
+  );
+
+  expectEqual(aal1Table.rows[0]?.mfa_verified_at, null, "an aal1 binding records no second factor");
+  expectEqual(aal1.kind, "bound", "the aal1 binding still binds");
+
+  // ---- the second binding is a second family
+  const secondFamily = await issueSessionToken(
+    {
+      presentedToken: null,
+      userId: USER_ID,
+      companyId: FIRM_ID,
+      deviceProofKeyId: "device-051",
+      assuranceLevel: "aal1",
+      ipAddress: null,
+      userAgent: null,
+      claimSessionId: null,
+    },
+    dependencies,
+  );
+
+  expectEqual(table.familyCount(), 2, "a second binding starts a second family");
+  expect(
+    (secondFamily as { familyId: string }).familyId !== (bound as { familyId: string }).familyId,
+    "the two families are distinct",
+  );
+
+  // ---- what a token can resolve to
+  const unknown = await resolveSessionToken({ token: createRawSessionToken(), userId: USER_ID }, dependencies);
+
+  expectEqual(unknown.kind, "unknown", "a token no row carries resolves to nothing");
+
+  const neighbour = await resolveSessionToken({ token: firstToken, userId: OTHER_USER_ID }, dependencies);
+
+  expectEqual(neighbour.kind, "unknown", "a token of one account does not authenticate another");
+
+  const malformed = await resolveSessionToken({ token: "not-a-token", userId: USER_ID }, dependencies);
+
+  expectEqual(malformed.kind, "unknown", "a string that is not a token is refused before any query");
+
+  // ---- the interval: a young session is answered, not rotated
+  const young = await issueSessionToken(
+    {
+      presentedToken: firstToken,
+      userId: USER_ID,
+      companyId: FIRM_ID,
+      deviceProofKeyId: "device-051",
+      assuranceLevel: "aal2",
+      ipAddress: null,
+      userAgent: null,
+      claimSessionId: null,
+    },
+    dependencies,
+  );
+
+  expectEqual(young.kind, "current", "a session younger than the interval is not rotated");
+  expectEqual(table.rows.length, 2, "and nothing is written");
+
+  // ---- the rotation
+  const later = NOW + SESSION_ROTATION_INTERVAL_MS;
+  const rotationDependencies = { sessions: table, audit, now: () => later };
+  const rotated = await issueSessionToken(
+    {
+      presentedToken: firstToken,
+      userId: USER_ID,
+      companyId: FIRM_ID,
+      deviceProofKeyId: "device-051",
+      assuranceLevel: "aal2",
+      ipAddress: "203.0.113.9",
+      userAgent: chromeAgent,
+      claimSessionId: null,
+    },
+    rotationDependencies,
+  );
+
+  expectEqual(rotated.kind, "rotated", "a session past the interval rotates");
+  expectEqual(table.rows.length, 3, "a rotation writes one child");
+  expectEqual(table.rows[0]?.revocation_reason, "ROTATED", "the replaced row is revoked as a rotation");
+  expectEqual(table.rows[0]?.revoked_at, later, "the revocation is stamped with the rotation instant");
+
+  const child = table.rows[2];
+
+  expectEqual(child?.rotated_from_session_id, "session-0001", "the child names its parent");
+  expectEqual(child?.family_id, "family-0001", "the child copies the family");
+  expectEqual(child?.absolute_expires_at, NOW + SESSION_ABSOLUTE_WINDOW_MS, "the child copies the ceiling");
+  expectEqual(child?.expires_at, later + SESSION_ROTATION_WINDOW_MS, "the child gets a fresh window");
+  expectEqual(child?.mfa_verified_at, NOW, "the child keeps the instant the second factor was proven");
+  expectEqual(audit.entries.at(-1)?.action, "session.rotated", "the rotation is audited");
+  expectEqual(audit.entries.at(-1)?.payload["previous_session_id"], "session-0001", "the entry names the parent");
+
+  const rotatedToken = (rotated as { token: string }).token;
+
+  expect(rotatedToken !== firstToken, "a rotation mints a new token");
+  expectEqual(
+    (await resolveSessionToken({ token: rotatedToken, userId: USER_ID }, rotationDependencies)).kind,
+    "live",
+    "the new token is the live one",
+  );
+
+  // ---- the grace window
+  const insideGrace = await resolveSessionToken(
+    { token: firstToken, userId: USER_ID },
+    { sessions: table, audit, now: () => later + SESSION_ROTATION_GRACE_MS },
+  );
+
+  expectEqual(insideGrace.kind, "grace", "a spent token is honoured inside the grace window");
+
+  const afterGrace = await resolveSessionToken(
+    { token: firstToken, userId: USER_ID },
+    { sessions: table, audit, now: () => later + SESSION_ROTATION_GRACE_MS + 1 },
+  );
+
+  expectEqual(afterGrace.kind, "replayed", "the same token past the grace window is a replay");
+  expectEqual(table.rows[0]?.revocation_reason, "REPLAY_DETECTED", "the replayed row is marked as a replay");
+  expectEqual(table.rows[0]?.replay_detected_at, later + SESSION_ROTATION_GRACE_MS + 1, "the replay instant is recorded");
+  expectEqual(child?.revocation_reason, "FAMILY_REVOKED", "the whole family is revoked");
+  expectEqual(
+    audit.entries.filter((entry) => entry.action === "session.family_revoked").length,
+    1,
+    "the family revocation is audited once",
+  );
+  expectEqual(
+    audit.entries.at(-1)?.payload["revoked_sessions"],
+    1,
+    "the entry counts the live rows it ended",
+  );
+
+  const endedHead = await resolveSessionToken(
+    { token: rotatedToken, userId: USER_ID },
+    { sessions: table, audit, now: () => later + SESSION_ROTATION_GRACE_MS + 2 },
+  );
+
+  expectEqual(endedHead.kind, "revoked", "the rest of a revoked family stops working");
+
+  // ---- a replay presented to the issuing service is the same answer
+  const replayAttempt = await issueSessionToken(
+    {
+      presentedToken: firstToken,
+      userId: USER_ID,
+      companyId: FIRM_ID,
+      deviceProofKeyId: "device-051",
+      assuranceLevel: "aal2",
+      ipAddress: null,
+      userAgent: null,
+      claimSessionId: null,
+    },
+    { sessions: table, audit, now: () => later + SESSION_ROTATION_GRACE_MS + 3 },
+  );
+
+  expectEqual(replayAttempt.kind, "refused", "a replay cannot be rotated into a new session");
+
+  // ---- expiry, on both clocks
+  const expiryTable = createSessionTable();
+  const expiring = await issueSessionToken(
+    {
+      presentedToken: null,
+      userId: USER_ID,
+      companyId: null,
+      deviceProofKeyId: "device-051",
+      assuranceLevel: "aal1",
+      ipAddress: null,
+      userAgent: null,
+      claimSessionId: null,
+    },
+    { sessions: expiryTable, audit: createInMemoryAuditTrail(), now: () => NOW },
+  );
+  const expiringToken = (expiring as { token: string }).token;
+
+  expectEqual(
+    (await resolveSessionToken({ token: expiringToken, userId: USER_ID }, {
+      sessions: expiryTable,
+      audit: createInMemoryAuditTrail(),
+      now: () => NOW + SESSION_ROTATION_WINDOW_MS,
+    })).kind,
+    "expired",
+    "a row resolves as expired at its own expiry",
+  );
+
+  const ceilingTable = createSessionTable();
+  const ceiling = await issueSessionToken(
+    {
+      presentedToken: null,
+      userId: USER_ID,
+      companyId: null,
+      deviceProofKeyId: "device-051",
+      assuranceLevel: "aal1",
+      ipAddress: null,
+      userAgent: null,
+      claimSessionId: null,
+    },
+    { sessions: ceilingTable, audit: createInMemoryAuditTrail(), now: () => NOW },
+  );
+
+  const ceilingRow = ceilingTable.rows[0];
+
+  if (ceilingRow === undefined) {
+    throw new Error("the ceiling check needs the row it just wrote");
+  }
+
+  ceilingRow.expires_at = NOW + SESSION_ABSOLUTE_WINDOW_MS + 1;
+
+  expectEqual(
+    (await resolveSessionToken({ token: (ceiling as { token: string }).token, userId: USER_ID }, {
+      sessions: ceilingTable,
+      audit: createInMemoryAuditTrail(),
+      now: () => NOW + SESSION_ABSOLUTE_WINDOW_MS,
+    })).kind,
+    "expired",
+    "the family's ceiling ends a session even if its own expiry is later",
+  );
+
+  // ---- a rotation cannot reach past the ceiling
+  const ceilingRotationTable = createSessionTable();
+  const shortFamily = await issueSessionToken(
+    {
+      presentedToken: null,
+      userId: USER_ID,
+      companyId: null,
+      deviceProofKeyId: "device-051",
+      assuranceLevel: "aal1",
+      ipAddress: null,
+      userAgent: null,
+      claimSessionId: null,
+    },
+    {
+      sessions: ceilingRotationTable,
+      audit: createInMemoryAuditTrail(),
+      now: () => NOW,
+      absoluteWindowMs: 20 * 60_000,
+    },
+  );
+
+  const atCeiling = await issueSessionToken(
+    {
+      presentedToken: (shortFamily as { token: string }).token,
+      userId: USER_ID,
+      companyId: null,
+      deviceProofKeyId: "device-051",
+      assuranceLevel: "aal1",
+      ipAddress: null,
+      userAgent: null,
+      claimSessionId: null,
+    },
+    {
+      sessions: ceilingRotationTable,
+      audit: createInMemoryAuditTrail(),
+      now: () => NOW + SESSION_ROTATION_INTERVAL_MS,
+      absoluteWindowMs: 20 * 60_000,
+    },
+  );
+
+  expectEqual(atCeiling.kind, "rotated", "a short family still rotates inside its ceiling");
+  expectEqual(
+    ceilingRotationTable.rows[1]?.expires_at,
+    NOW + 20 * 60_000,
+    "the rotation stops at the ceiling instead of extending it",
+  );
+  expectEqual(
+    ceilingRotationTable.rows[1]?.absolute_expires_at,
+    NOW + 20 * 60_000,
+    "the child copies the ceiling it cannot pass",
+  );
+
+  const ceilingToken = (atCeiling as { token: string }).token;
+  const pastCeiling = await issueSessionToken(
+    {
+      presentedToken: ceilingToken,
+      userId: USER_ID,
+      companyId: null,
+      deviceProofKeyId: "device-051",
+      assuranceLevel: "aal1",
+      ipAddress: null,
+      userAgent: null,
+      claimSessionId: null,
+    },
+    {
+      sessions: ceilingRotationTable,
+      audit: createInMemoryAuditTrail(),
+      now: () => NOW + 20 * 60_000,
+      absoluteWindowMs: 20 * 60_000,
+    },
+  );
+
+  expectEqual(pastCeiling.kind, "refused", "a token whose family reached its ceiling is refused");
+  expectEqual(
+    (pastCeiling as { reason: string }).reason,
+    "expired",
+    "the refusal is the expiry its ceiling produced",
+  );
+
+  // ---- the device binding of a session
+  const mismatchTable = createSessionTable();
+  const mismatch = await issueSessionToken(
+    {
+      presentedToken: null,
+      userId: USER_ID,
+      companyId: null,
+      deviceProofKeyId: "device-051",
+      assuranceLevel: "aal1",
+      ipAddress: null,
+      userAgent: null,
+      claimSessionId: null,
+    },
+    { sessions: mismatchTable, audit: createInMemoryAuditTrail(), now: () => NOW },
+  );
+  const mismatchOutcome = await issueSessionToken(
+    {
+      presentedToken: (mismatch as { token: string }).token,
+      userId: USER_ID,
+      companyId: null,
+      deviceProofKeyId: "device-sibling",
+      assuranceLevel: "aal1",
+      ipAddress: null,
+      userAgent: null,
+      claimSessionId: null,
+    },
+    {
+      sessions: mismatchTable,
+      audit: createInMemoryAuditTrail(),
+      now: () => NOW + SESSION_ROTATION_INTERVAL_MS,
+    },
+  );
+
+  expectEqual(mismatchOutcome.kind, "refused", "a session cannot move to another device");
+  expectEqual(
+    (mismatchOutcome as { reason: string }).reason,
+    "device-mismatch",
+    "the refusal names the device mismatch",
+  );
+  expectEqual(mismatchTable.rows.length, 1, "and writes nothing");
+
+  // ---- a rotation that lost its compare and swap
+  const raceTable = createSessionTable();
+  const raced = await issueSessionToken(
+    {
+      presentedToken: null,
+      userId: USER_ID,
+      companyId: null,
+      deviceProofKeyId: "device-051",
+      assuranceLevel: "aal1",
+      ipAddress: null,
+      userAgent: null,
+      claimSessionId: null,
+    },
+    { sessions: raceTable, audit: createInMemoryAuditTrail(), now: () => NOW },
+  );
+
+  raceTable.ignoreNextUpdate = true;
+
+  const lost = await issueSessionToken(
+    {
+      presentedToken: (raced as { token: string }).token,
+      userId: USER_ID,
+      companyId: null,
+      deviceProofKeyId: "device-051",
+      assuranceLevel: "aal1",
+      ipAddress: null,
+      userAgent: null,
+      claimSessionId: null,
+    },
+    {
+      sessions: raceTable,
+      audit: createInMemoryAuditTrail(),
+      now: () => NOW + SESSION_ROTATION_INTERVAL_MS,
+    },
+  );
+
+  expectEqual(lost.kind, "current", "a rotation that lost the swap answers the live session");
+  expectEqual(raceTable.rows.length, 1, "and writes nothing");
+  expectEqual(raceTable.rows[0]?.revoked_at, null, "the row is still the live row");
+
+  // ---- a rotation whose child already exists
+  const forkTable = createSessionTable();
+  const forked = await issueSessionToken(
+    {
+      presentedToken: null,
+      userId: USER_ID,
+      companyId: null,
+      deviceProofKeyId: "device-051",
+      assuranceLevel: "aal1",
+      ipAddress: null,
+      userAgent: null,
+      claimSessionId: null,
+    },
+    { sessions: forkTable, audit: createInMemoryAuditTrail(), now: () => NOW },
+  );
+
+  await forkTable.insert({
+    userId: USER_ID,
+    companyId: null,
+    deviceProofKeyId: "device-051",
+    tokenHash: hashSessionToken(createRawSessionToken()),
+    issuedAtEpochMs: NOW + SESSION_ROTATION_INTERVAL_MS,
+    expiresAtEpochMs: NOW + SESSION_ROTATION_WINDOW_MS,
+    absoluteExpiresAtEpochMs: NOW + SESSION_ABSOLUTE_WINDOW_MS,
+    mfaVerifiedAtEpochMs: null,
+    ipAddress: null,
+    userAgent: null,
+    familyId: (forked as { familyId: string }).familyId,
+    rotatedFromSessionId: "session-0001",
+  });
+
+  const forkOutcome = await issueSessionToken(
+    {
+      presentedToken: (forked as { token: string }).token,
+      userId: USER_ID,
+      companyId: null,
+      deviceProofKeyId: "device-051",
+      assuranceLevel: "aal1",
+      ipAddress: null,
+      userAgent: null,
+      claimSessionId: null,
+    },
+    {
+      sessions: forkTable,
+      audit: createInMemoryAuditTrail(),
+      now: () => NOW + SESSION_ROTATION_INTERVAL_MS,
+    },
+  );
+
+  expectEqual(forkOutcome.kind, "current", "a fork answers the child that already exists");
+  expectEqual(forkTable.rows.length, 2, "a fork writes no third row");
+
+  // ---- ending a session, and ending one device's sessions
+  const revokeTable = createSessionTable();
+  const revokedSession = await issueSessionToken(
+    {
+      presentedToken: null,
+      userId: USER_ID,
+      companyId: null,
+      deviceProofKeyId: "device-051",
+      assuranceLevel: "aal1",
+      ipAddress: null,
+      userAgent: null,
+      claimSessionId: null,
+    },
+    { sessions: revokeTable, audit: createInMemoryAuditTrail(), now: () => NOW },
+  );
+  const revokeAudit = createInMemoryAuditTrail();
+
+  await revokeSession(
+    {
+      sessionId: (revokedSession as { sessionId: string }).sessionId,
+      userId: USER_ID,
+      companyId: null,
+      reason: "SIGNED_OUT",
+      ipAddress: null,
+      userAgent: null,
+    },
+    { sessions: revokeTable, audit: revokeAudit, now: () => NOW },
+  );
+
+  expectEqual(revokeTable.rows[0]?.revocation_reason, "SIGNED_OUT", "a sign out ends the row");
+  expectEqual(revokeAudit.entries.at(-1)?.action, "session.revoked", "the sign out is audited");
+  expectEqual(
+    (await resolveSessionToken({ token: (revokedSession as { token: string }).token, userId: USER_ID }, {
+      sessions: revokeTable,
+      audit: revokeAudit,
+      now: () => NOW,
+    })).kind,
+    "revoked",
+    "an ended session resolves as revoked",
+  );
+
+  const deviceTable = createSessionTable();
+  const deviceAudit = createInMemoryAuditTrail();
+  await issueSessionToken(
+    {
+      presentedToken: null,
+      userId: USER_ID,
+      companyId: null,
+      deviceProofKeyId: "device-051",
+      assuranceLevel: "aal1",
+      ipAddress: null,
+      userAgent: null,
+      claimSessionId: null,
+    },
+    { sessions: deviceTable, audit: deviceAudit, now: () => NOW },
+  );
+
+  const deviceRevoked = await revokeDeviceSessions(
+    { deviceProofKeyId: "device-051", userId: USER_ID, companyId: null },
+    { sessions: deviceTable, audit: deviceAudit, now: () => NOW },
+  );
+
+  expectEqual(deviceRevoked, 1, "dropping a device ends its session");
+  expectEqual(deviceTable.rows[0]?.revocation_reason, "DEVICE_REVOKED", "with the device reason");
+  expectEqual(deviceAudit.entries.at(-1)?.action, "session.device_revoked", "and the act is audited");
+
+  // ---- the reader every route uses
+  const policy = cookiePolicy();
+  const directory = createInMemoryActorDirectory([activeOwner]);
+  const readerTable = createSessionTable();
+  const readerAudit = createInMemoryAuditTrail();
+  const readerOptions = {
+    directory,
+    cookiePolicy: policy,
+    sessions: readerTable,
+    audit: readerAudit,
+    nowEpochMs: NOW,
+  };
+
+  const unboundCookie = sessionCookie(policy, baseClaims());
+
+  await expectRejects(
+    () => readRequestActor(unboundCookie, readerOptions),
+    "AUTHENTICATION_REQUIRED",
+    "a cookie that names no session is refused",
+  );
+
+  const unbound = await readBoundSession(unboundCookie, { ...readerOptions, allowUnbound: true });
+
+  expectEqual(unbound.bound, false, "an unbound cookie is reported as unbound");
+  expectEqual(unbound.sessionToken, null, "and carries no token");
+  expectEqual(unbound.actor.sessionId, SESSION_ID, "an unbound actor keeps the provider's session id");
+  expectEqual(unbound.actor.deviceProofKeyId, null, "an unbound actor names no device");
+
+  const readerBinding = await issueSessionToken(
+    {
+      presentedToken: null,
+      userId: USER_ID,
+      companyId: FIRM_ID,
+      deviceProofKeyId: "device-051",
+      assuranceLevel: "aal1",
+      ipAddress: null,
+      userAgent: null,
+      claimSessionId: null,
+    },
+    { sessions: readerTable, audit: readerAudit, now: () => NOW },
+  );
+  const boundCookie = sessionCookie(policy, baseClaims(), {
+    sessionToken: (readerBinding as { token: string }).token,
+  });
+
+  const readerActor = await readRequestActor(boundCookie, readerOptions);
+
+  expectEqual(readerActor.sessionId, "session-0001", "a bound actor carries the platform session id");
+  expectEqual(readerActor.deviceProofKeyId, "device-051", "a bound actor carries its device");
+  expectEqual(readerActor.sessionFamilyId, "family-0001", "a bound actor carries its family");
+
+  const boundSession = await readBoundSession(boundCookie, readerOptions);
+
+  expectEqual(boundSession.bound, true, "a bound cookie is reported as bound");
+  expectEqual(
+    boundSession.payload.accessToken.length > 0,
+    true,
+    "the reader hands back the payload it verified",
+  );
+
+  const neighbourBinding = await issueSessionToken(
+    {
+      presentedToken: null,
+      userId: OTHER_USER_ID,
+      companyId: null,
+      deviceProofKeyId: "device-neighbour",
+      assuranceLevel: "aal1",
+      ipAddress: null,
+      userAgent: null,
+      claimSessionId: null,
+    },
+    { sessions: readerTable, audit: readerAudit, now: () => NOW },
+  );
+  const neighbourCookie = sessionCookie(policy, baseClaims(), {
+    sessionToken: (neighbourBinding as { token: string }).token,
+  });
+
+  await expectRejects(
+    () => readRequestActor(neighbourCookie, readerOptions),
+    "AUTHENTICATION_REQUIRED",
+    "a token of another account does not authenticate this one",
+  );
+
+  const mismatchedCookie = sessionCookie(policy, { ...baseClaims(), sub: OTHER_USER_ID });
+
+  await expectRejects(
+    () => readRequestActor(mismatchedCookie, readerOptions),
+    "AUTHENTICATION_REQUIRED",
+    "a cookie whose subject disagrees with its payload is refused",
+  );
+
+  // A revoked row is refused, and `allowUnbound` does not rescue it.
+  await revokeSession(
+    {
+      sessionId: (readerBinding as { sessionId: string }).sessionId,
+      userId: USER_ID,
+      companyId: FIRM_ID,
+      reason: "ADMIN_REVOKED",
+      ipAddress: null,
+      userAgent: null,
+    },
+    { sessions: readerTable, audit: readerAudit, now: () => NOW },
+  );
+
+  await expectRejects(
+    () => readRequestActor(boundCookie, { ...readerOptions, allowUnbound: true }),
+    "AUTHENTICATION_REQUIRED",
+    "a revoked session is refused even where an unbound cookie is allowed",
+  );
+
+  // ---- the exception, on disk
+  const root = new URL("../../app/", import.meta.url);
+  const entries = await readdir(root, { recursive: true });
+  const sources = await Promise.all(
+    entries
+      .map((entry) => entry.replaceAll("\\", "/"))
+      .filter((entry) => entry.endsWith(".tsx") || entry.endsWith(".ts"))
+      .map(async (entry) => ({
+        path: `/${entry}`,
+        source: await readFile(new URL(entry, root), "utf8"),
+      })),
+  );
+  const unboundCallers = sources
+    .filter((file) => file.source.includes("allowUnbound"))
+    .map((file) => file.path)
+    .sort();
+
+  expectEqual(
+    unboundCallers.length,
+    2,
+    "exactly two files may let a cookie run before it is bound",
+  );
+  expect(
+    unboundCallers.includes("/api/auth/session/rotate/route.ts"),
+    "the rotation that binds is one of them",
+  );
+  expect(
+    unboundCallers.includes("/api/auth/devices/route.ts"),
+    "the enrolment that makes a key exist is the other",
+  );
+
+  const rotateRoute = sources.find((file) => file.path === "/api/auth/session/rotate/route.ts");
+
+  expect(
+    rotateRoute !== undefined && rotateRoute.source.includes("issueSessionToken"),
+    "the rotation route issues the token it answers with",
+  );
+  expect(
+    rotateRoute !== undefined && rotateRoute.source.includes("readBoundSession"),
+    "the rotation route reads the session it extends",
+  );
+
+  const keepers = sources.filter(
+    (file) => file.path.endsWith(".tsx") && file.source.includes("<SessionKeeper"),
+  );
+
+  expectEqual(keepers.length, 2, "both signed-in pages keep their session rotating");
+}
+
 async function main(): Promise<void> {
   checkConfig();
   checkClaims();
@@ -8821,6 +9803,7 @@ async function main(): Promise<void> {
   await checkDisclosure();
   await checkDeviceProofKey();
   await checkRequestProof();
+  await checkSessionRotation();
 
   if (failures.length > 0) {
     process.stderr.write(`auth gate failed with ${failures.length} problem(s):\n`);

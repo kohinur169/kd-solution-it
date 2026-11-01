@@ -57,7 +57,9 @@ export type DeviceProofFailureReason =
   | "storage"
   | "network"
   | "refused"
-  | "unreadable";
+  | "unreadable"
+  /** The browser has no stored key, so there is nothing to bind the session to. */
+  | "missing-key";
 
 export type DeviceProofOutcome =
   | { readonly ok: true; readonly fingerprint: string; readonly trusted: boolean }
@@ -211,6 +213,83 @@ export async function deviceProofHeaders(
     // same way as no key at all, and the next sign in regenerates the pair.
     return null;
   }
+}
+
+/** Where a browser binds its session to the device it just enrolled. */
+const rotationPath = "/api/auth/session/rotate";
+
+/** What a bind or a rotation produced, as far as this module cares. */
+export type SessionBindingOutcome =
+  | { readonly ok: true; readonly status: "bound" | "rotated" | "current" }
+  | { readonly ok: false; readonly reason: DeviceProofFailureReason };
+
+/**
+ * Bind this browser's session to its device key, or rotate the session token.
+ *
+ * The sign in writes a cookie that names no device, because a browser on a new device has no proof
+ * key until the enrolment above has run. This call is the one that ends that state: the server
+ * writes the first row of `public.sessions`, bound to this device, and hands back a rotating token
+ * in the same cookie. Every later request resolves that token to a row, which is what makes
+ * revoking a session and detecting a replayed one mean anything.
+ *
+ * A rotation is also what this call does when the session is due - fifteen minutes after the last
+ * one - so the same endpoint serves the sign in and the silent keeper on a signed-in page.
+ *
+ * Nothing here throws. A browser without WebCrypto, a storage that refused and an endpoint that is
+ * down are one `{ ok: false }`, and the caller decides whether that is worth a sentence.
+ */
+export async function bindSession(): Promise<SessionBindingOutcome> {
+  let key: StoredProofKey | null;
+
+  try {
+    key = await readStoredDeviceProofKey();
+  } catch {
+    return { ok: false, reason: "storage" };
+  }
+
+  if (key === null) {
+    return { ok: false, reason: "missing-key" };
+  }
+
+  let response: Response;
+
+  try {
+    response = await fetch(rotationPath, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ deviceId: key.deviceId }),
+      credentials: "same-origin",
+      cache: "no-store",
+    });
+  } catch {
+    return { ok: false, reason: "network" };
+  }
+
+  const text = await response.text().catch(() => "");
+
+  if (!response.ok) {
+    return { ok: false, reason: "refused" };
+  }
+
+  if (text.length > maximumAnswerBytes) {
+    return { ok: false, reason: "unreadable" };
+  }
+
+  let answer: unknown;
+
+  try {
+    answer = JSON.parse(text) as unknown;
+  } catch {
+    return { ok: false, reason: "unreadable" };
+  }
+
+  const status = (answer as { readonly status?: unknown } | null)?.status;
+
+  if (status !== "bound" && status !== "rotated" && status !== "current") {
+    return { ok: false, reason: "unreadable" };
+  }
+
+  return { ok: true, status };
 }
 
 /** Forget this browser's key. The platform's row is untouched: revoking a device is STEP 054's. */

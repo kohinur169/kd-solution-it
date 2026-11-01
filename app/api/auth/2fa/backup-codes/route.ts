@@ -48,6 +48,8 @@ export const POST = withErrorResponse(
     const actor = await readRequestActor(request.headers.get("cookie"), {
       directory: runtime.directory,
       cookiePolicy: runtime.cookiePolicy,
+      sessions: runtime.sessions,
+      audit: runtime.audit,
     });
 
     // Before the parser sees a byte: a tampered body fails the proof, not a schema.

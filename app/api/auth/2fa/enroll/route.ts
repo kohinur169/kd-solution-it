@@ -46,6 +46,8 @@ export const POST = withErrorResponse(
     const actor = await readRequestActor(request.headers.get("cookie"), {
       directory: runtime.directory,
       cookiePolicy: runtime.cookiePolicy,
+      sessions: runtime.sessions,
+      audit: runtime.audit,
     });
 
     const result = await startTotpEnrolment(

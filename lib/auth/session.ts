@@ -90,6 +90,10 @@ export function toRequestActor(claims: SessionClaims, record: ActorRecord): Requ
     emailVerified: record.emailVerifiedAtEpochMs !== null,
     twoFactorSatisfied: claims.assuranceLevel === "aal2",
     twoFactorEnrolmentRequired: isTwoFactorEnrolmentRequired(record),
+    // The cookie reader knows nothing about `public.sessions`; STEP 051's bound reader fills these
+    // two in once the payload's token resolves to a live row.
+    deviceProofKeyId: null,
+    sessionFamilyId: null,
   };
 }
 
@@ -166,6 +170,8 @@ export async function readSession(
   return {
     kind: "authenticated",
     actor: toRequestActor({ ...claims, assuranceLevel: claimedLevel }, record),
+    sessionToken: payload.sessionToken ?? null,
+    payload,
   };
 }
 

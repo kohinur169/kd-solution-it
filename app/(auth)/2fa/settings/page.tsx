@@ -8,6 +8,7 @@ import { readTwoFactorStatus, type TwoFactorStatus } from "@/lib/auth/backup-cod
 import { readRequestActor } from "@/lib/auth/request-actor";
 import { getAuthRuntime } from "@/lib/auth/runtime";
 import { getMessage } from "@/lib/i18n/messages";
+import { SessionKeeper } from "@/components/auth/session-keeper";
 import { BackupCodesForm } from "./backup-codes-form";
 
 export const metadata: Metadata = {
@@ -45,6 +46,8 @@ async function readSettingsState(): Promise<SettingsState> {
     const actor = await readRequestActor(cookieHeader, {
       directory: runtime.directory,
       cookiePolicy: runtime.cookiePolicy,
+      sessions: runtime.sessions,
+      audit: runtime.audit,
     });
     const status = await readTwoFactorStatus(
       { userId: actor.userId },
@@ -74,6 +77,8 @@ export default async function TwoFactorSettingsPage(): Promise<ReactNode> {
 
   return (
     <main className="flex min-h-dvh items-center justify-center bg-background px-4 py-8 text-foreground sm:px-6">
+      {/* Section 22's rotating token: the page asks for a rotation, and the server decides. */}
+      <SessionKeeper />
       <section className="w-full max-w-xl rounded-card border border-border bg-surface p-6 shadow-card sm:p-8">
         <p className="text-xs font-semibold uppercase tracking-widest text-muted-foreground">
           {getMessage("twoFactor.eyebrow")}
