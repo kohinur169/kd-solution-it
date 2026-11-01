@@ -240,7 +240,12 @@ import {
   REQUIRED_POLICY_KEYS,
   type PolicyPage,
 } from "./policies.ts";
-import { companySlug, registerMerchant, type RegistrationResult } from "./registration.ts";
+import {
+  companySlug,
+  registerMerchant,
+  signupInputSchema,
+  type RegistrationResult,
+} from "./registration.ts";
 import {
   accountLockError,
   assertAccountUnlocked,
@@ -12384,6 +12389,71 @@ async function checkRateLimit(): Promise<void> {
   expect(rollback.includes("drop table if exists public.rate_limit_windows;"), "and then the table");
 }
 
+/**
+ * STEP 056: the three places that take a person's words run them through the sanitiser.
+ *
+ * A library nobody calls is a library that does not protect anything, so this check reads the call
+ * sites as well as the behaviour: the counts prove the schema still has its `.transform`, and the
+ * parse proves the transform is the sanitiser rather than an identity function. The corpus of attack
+ * strings lives in `lib/security/verify.ts`, which is one module's proof; what belongs here is the
+ * claim that *this* platform's inputs go through it.
+ */
+async function checkSanitizerWiring(): Promise<void> {
+  const registrationSource = await readFile(new URL("./registration.ts", import.meta.url), "utf8");
+  const resetSource = await readFile(new URL("./two-factor-reset.ts", import.meta.url), "utf8");
+  const unlockSource = await readFile(new URL("./account-unlock.ts", import.meta.url), "utf8");
+
+  expectEqual(
+    registrationSource.split("sanitizeSingleLineText(").length - 1,
+    2,
+    "the signup name and company name are sanitised",
+  );
+  expectEqual(
+    registrationSource.split(".transform(").length - 1 >= 2,
+    true,
+    "and the sanitiser runs inside the schema, so no path can skip it",
+  );
+  expectEqual(
+    resetSource.split("sanitizeMultilineText(").length - 1,
+    2,
+    "the reset request reason and the decision note are sanitised",
+  );
+  expectEqual(
+    resetSource.split("sanitizeSingleLineText(").length - 1,
+    1,
+    "and the document reference the officer records",
+  );
+  expectEqual(
+    unlockSource.split("sanitizeMultilineText(").length - 1,
+    1,
+    "the unlock note is sanitised",
+  );
+
+  const clean = signupInputSchema.parse({
+    fullName: "A\u0000li\u202ece",
+    email: "owner@example.com",
+    password: "CorrectHorse9!",
+    companyName: "  K.D.\u200b Trading  ",
+    acceptedPolicies: ["kyc_kyb"],
+    turnstileToken: null,
+  });
+
+  expectEqual(clean.fullName, "Alice", "a name is stripped of the null byte and the override before it is used");
+  expectEqual(clean.companyName, "K.D. Trading", "and so is a company name, which keeps its punctuation");
+  expectEqual(
+    signupInputSchema.parse({
+      fullName: "ordinary name",
+      email: "owner@example.com",
+      password: "CorrectHorse9!",
+      companyName: "Ordinary Company",
+      acceptedPolicies: ["kyc_kyb"],
+      turnstileToken: null,
+    }).fullName,
+    "ordinary name",
+    "while ordinary text passes through unchanged",
+  );
+}
+
 async function main(): Promise<void> {
   checkConfig();
   checkClaims();
@@ -12425,6 +12495,7 @@ async function main(): Promise<void> {
   await checkStepUp();
   await checkSessionList();
   await checkRateLimit();
+  await checkSanitizerWiring();
 
   if (failures.length > 0) {
     process.stderr.write(`auth gate failed with ${failures.length} problem(s):\n`);

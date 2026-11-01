@@ -1,6 +1,7 @@
 // path: lib/auth/two-factor-reset.ts
 import { z } from "zod";
 import { AppError } from "../errors/app-error.ts";
+import { sanitizeMultilineText, sanitizeSingleLineText } from "../security/text.ts";
 import type { AuditTrail } from "./audit.ts";
 import type { RestClient } from "./rest.ts";
 import { requireAnyRole } from "./session.ts";
@@ -62,7 +63,12 @@ export interface ResetDependencies {
 export const resetRequestInputSchema = z
   .object({
     email: z.string().trim().toLowerCase().min(3).max(254),
-    reason: z.string().trim().min(10).max(1_000),
+    reason: z
+      .string()
+      .trim()
+      .min(10)
+      .max(1_000)
+      .transform((value) => sanitizeMultilineText(value, 1_000)),
   })
   .strict();
 
@@ -255,8 +261,18 @@ export async function listTwoFactorResetRequests(
   }));
 }
 
-const documentReferenceSchema = z.string().trim().min(1).max(200);
-const noteSchema = z.string().trim().min(1).max(1_000);
+const documentReferenceSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(200)
+  .transform((value) => sanitizeSingleLineText(value, 200));
+const noteSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(1_000)
+  .transform((value) => sanitizeMultilineText(value, 1_000));
 
 async function readRequest(
   dependencies: ResetDependencies,

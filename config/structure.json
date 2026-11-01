@@ -65,6 +65,11 @@
       "purpose": "Foundation libraries: environment schema, configuration, i18n, logging, security, storage, payments, tax, email and API clients."
     },
     {
+      "path": "lib/security",
+      "owner": "STEP 056 (input sanitiser for text, rich text and URLs)",
+      "purpose": "The one place that decides what a safe text, a safe URL and a safe rich text are: Unicode normalisation, character removal, the SSRF host rules, the URL and path decisions and the rich text allowlist."
+    },
+    {
       "path": "migrations",
       "owner": "STEP 012-036 and every STEP that adds a table",
       "purpose": "Append-only numbered SQL migrations, each paired with a rollback file and never edited after commit."

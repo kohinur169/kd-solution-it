@@ -1,6 +1,7 @@
 // path: lib/auth/account-unlock.ts
 import { z } from "zod";
 import { AppError } from "../errors/app-error.ts";
+import { sanitizeMultilineText } from "../security/text.ts";
 import { getMessage } from "../i18n/messages.ts";
 import type { Logger } from "../logger/logger.ts";
 import type { AuditTrail } from "./audit.ts";
@@ -102,7 +103,12 @@ export interface AccountUnlockResult {
 
 const identifierSchema = z.string().uuid();
 
-const noteSchema = z.string().trim().min(1).max(ACCOUNT_UNLOCK_NOTE_MAX_LENGTH);
+const noteSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(ACCOUNT_UNLOCK_NOTE_MAX_LENGTH)
+  .transform((value) => sanitizeMultilineText(value, ACCOUNT_UNLOCK_NOTE_MAX_LENGTH));
 
 const lockRowSchema = z.object({
   id: z.string().min(1).max(64),

@@ -1,5 +1,6 @@
 // path: lib/auth/registration.ts
 import { z } from "zod";
+import { sanitizeSingleLineText } from "../security/text.ts";
 import { AppError } from "../errors/app-error.ts";
 import type { AdminAuthClient } from "./admin-client.ts";
 import type { AuditTrail } from "./audit.ts";
@@ -72,7 +73,12 @@ import type { AuthFailure } from "./types.ts";
 /** The form the signup route accepts. Unknown fields are refused rather than ignored. */
 export const signupInputSchema = z
   .object({
-    fullName: z.string().trim().min(1).max(120),
+    fullName: z
+      .string()
+      .trim()
+      .min(1)
+      .max(120)
+      .transform((value) => sanitizeSingleLineText(value, 120)),
     email: z
       .string()
       .trim()
@@ -81,7 +87,12 @@ export const signupInputSchema = z
       .max(254)
       .regex(/^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$/u),
     password: z.string().min(1).max(128),
-    companyName: z.string().trim().min(1).max(120),
+    companyName: z
+      .string()
+      .trim()
+      .min(1)
+      .max(120)
+      .transform((value) => sanitizeSingleLineText(value, 120)),
     acceptedPolicies: z.array(z.string().min(1).max(32)).min(1).max(12),
     // A form that renders no widget sends nothing; the guard decides what a deployment allows,
     // so an absent token is the same as an empty one and never a shape error of the form.
