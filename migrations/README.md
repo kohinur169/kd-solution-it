@@ -4,7 +4,7 @@
 Owner: STEP 012-036 and every later STEP that adds a table.
 
 Append-only numbered SQL migrations applied with the Supabase CLI against the project of the
-current environment. STEP 012 to STEP 033 created the first seventy files; `npm run
+current environment. STEP 012 to STEP 034 created the first seventy one files; `npm run
 check:migrations` keeps them honest.
 
 Each row names the objects its file creates. The index count is the number of indexes the
@@ -82,6 +82,7 @@ table has once the file has run, the primary key included, so it is what `\d` pr
 | 0068_compliance_items.sql | The `compliance_items` row per certificate or filing with its issue and expiry dates, its alert window, the renewal instant an archive keeps, the guard that moves both forward, its three indexes and the policy |
 | 0069_actor_session.sql | The three helpers the tenant policies read: `uuid_or_null`, which spells a canonical uuid or returns null and never raises, `current_actor_id`, which reads the `app.user_id` setting and then the `sub` claim of the JWT, and the `security definer` `current_actor_company_id`, which maps an active and undeleted person to a company; it creates no table |
 | 0070_tenant_policies_batch_one.sql | The 22 `<table>_tenant_isolation` policies of batch one, permissive, for all commands and addressed to `public`, beside the deny they do not replace, plus the two `company_id` indexes the last two tables needed; it creates no table |
+| 0071_payment_ledger_policies.sql | The 17 policies of batch two: `<table>_tenant_select` on the thirteen money and ledger tables, `<table>_tenant_insert` on `refunds`, `payout_bank_accounts` and `bank_change_requests` with the opening state and the requester pinned, and `<table>_tenant_update` on `disputes` inside the open envelope, plus the ten `<table>_tenant_idx` indexes a bare `company_id` predicate can use; it creates no table |
 
 Every file is paired with `<name>.down.sql`, which undoes exactly what its forward file created and
 nothing else.
@@ -357,7 +358,16 @@ nothing else.
     requires an `active` row with no `deleted_at`, and is the only `security definer` of the
     pair, so the policy on `users` cannot ask itself the question from inside its own predicate.
     No `auth` schema, extension or role is created for any of it.
-51. Numbering is contiguous from 0001. A migration is never renumbered after it has been applied
+51. A money row is read by its merchant and written by the service. A payment, settlement, hold,
+    reserve, payout, ledger account, ledger entry, subscription and subscription charge grant
+    `select` only, because the row is written by a webhook, a job or an office decision that
+    reaches the table as its owner. The three rows a merchant opens - a requested refund, a
+    pending payout bank account and a requested bank change - may be inserted, and each
+    `with check` pins the opening state and the actor as requester, so the same session cannot
+    insert the approved, verified or cooling state; the dispute response is the one update, and
+    its `using` and `with check` both stay inside the open envelope, so a merchant cannot submit
+    a dispute or resolve one. No money table grants a delete.
+52. Numbering is contiguous from 0001. A migration is never renumbered after it has been applied
     anywhere.
 
 ## Commands

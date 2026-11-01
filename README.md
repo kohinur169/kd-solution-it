@@ -503,6 +503,14 @@ handoff file.
   archived, `company_transactions` is corrected by a reversing entry rather than deleted,
   `processor_bills` stores a generated variance over the matched amount, and `compliance_items`
   moves its expiry and its last alert forward only.
+- STEP 034 gives the money tables the same treatment, but by command rather than `for all`. The
+  thirteen money and ledger tables grant `select` to their merchant, `refunds`,
+  `payout_bank_accounts` and `bank_change_requests` grant an insert pinned to the opening state
+  and to the actor as requester, and `disputes` grants one update inside the open envelope, so a
+  browser session cannot approve a refund, verify a bank account or resolve a dispute; the other
+  nine are written by the service, which reaches them as the owner. Ten `<table>_tenant_idx`
+  indexes give the `company_id` predicate an index it can use, because the existing ones are
+  partial and keyed on a status.
 - STEP 033 answers who is asking the database. `public.current_actor_id()` reads the `app.user_id`
   setting of a server connection and then the `sub` claim of a Supabase JWT, both through
   `public.uuid_or_null()`, so a malformed claim is no actor rather than an error, and
