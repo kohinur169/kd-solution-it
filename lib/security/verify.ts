@@ -1,5 +1,5 @@
 // path: lib/security/verify.ts
-import { randomBytes } from "node:crypto";
+import { createHmac, hkdfSync, randomBytes } from "node:crypto";
 import { readFile, readdir } from "node:fs/promises";
 import process from "node:process";
 import { AppError } from "../errors/app-error.ts";
@@ -88,6 +88,31 @@ import {
   ENCRYPTION_SECRET_PREFIX,
   ENCRYPTION_TAG_BYTES,
 } from "./encryption.ts";
+import {
+  isPortalTokenCapability,
+  isPortalTokenKind,
+  mintPortalToken,
+  openPortalToken,
+  portalTokenDigest,
+  PORTAL_TOKEN_CAPABILITIES,
+  PORTAL_TOKEN_CAPABILITIES_BY_KIND,
+  PORTAL_TOKEN_CLOCK_SKEW_SECONDS,
+  PORTAL_TOKEN_DIGEST_PREFIX,
+  PORTAL_TOKEN_ID_BYTES,
+  PORTAL_TOKEN_KEY_BYTES,
+  PORTAL_TOKEN_KINDS,
+  PORTAL_TOKEN_MAXIMUM_KEYS,
+  PORTAL_TOKEN_MAXIMUM_LIFETIME_SECONDS,
+  PORTAL_TOKEN_MAXIMUM_PAYLOAD_BYTES,
+  PORTAL_TOKEN_MINIMUM_LIFETIME_SECONDS,
+  PORTAL_TOKEN_PREFIX,
+  PORTAL_TOKEN_PROBLEMS,
+  PORTAL_TOKEN_SIGNATURE_BYTES,
+  PORTAL_TOKEN_SIGNING_INFO,
+  PORTAL_TOKEN_VERSION,
+  type PortalTokenOpenOptions,
+  type PortalTokenRequest,
+} from "./portal-token.ts";
 import {
   auditEntryProblem,
   auditPayloadBytes,
@@ -3364,6 +3389,647 @@ async function checkEncryptionWiring(): Promise<void> {
   );
 }
 
+/** ---- Portal tokens: one signed link, an expiry, and a revocation lookup. */
+
+const portalMasterKey = randomBytes(PORTAL_TOKEN_KEY_BYTES).toString("base64");
+const portalRetiredKey = randomBytes(PORTAL_TOKEN_KEY_BYTES).toString("base64");
+const portalForeignKey = randomBytes(PORTAL_TOKEN_KEY_BYTES).toString("base64");
+const portalKeys = { primary: portalMasterKey } as const;
+const portalCompanyId = "018f2b8a-0000-4000-8000-0000000000c1";
+const portalInvoiceId = "018f2b8a-0000-4000-8000-000000000011";
+const portalEstimateId = "018f2b8a-0000-4000-8000-000000000012";
+const portalNow = 1_800_000_000;
+const portalBase64Alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+/** The key the gate derives for itself, so the module's derivation is compared with one written twice. */
+function portalSigningKey(master: string): Buffer {
+  return Buffer.from(
+    hkdfSync("sha256", Buffer.from(master, "base64"), Buffer.alloc(0), PORTAL_TOKEN_SIGNING_INFO, PORTAL_TOKEN_KEY_BYTES),
+  );
+}
+
+/** A payload this platform's writer would never produce, signed with a real key. */
+function forgedPortalToken(payload: string, master: string = portalMasterKey, header: string = "kdpt1"): string {
+  const payloadPart = Buffer.from(payload, "utf8").toString("base64url");
+  const key = portalSigningKey(master);
+
+  try {
+    const signature = createHmac("sha256", key).update(`${header}.${payloadPart}`, "utf8").digest("base64url");
+
+    return `${header}.${payloadPart}.${signature}`;
+  } finally {
+    key.fill(0);
+  }
+}
+
+/** A claim the writer would produce, as text, so one field can be changed at a time. */
+function portalPayload(overrides: Record<string, unknown> = {}): string {
+  return JSON.stringify({
+    version: PORTAL_TOKEN_VERSION,
+    kind: "invoice",
+    companyId: portalCompanyId,
+    resourceId: portalInvoiceId,
+    capability: "pay",
+    tokenId: "AAAAAAAAAAAAAAAAAAAAAA",
+    issuedAt: portalNow,
+    expiresAt: portalNow + 3_600,
+    ...overrides,
+  });
+}
+
+function portalMint(overrides: Partial<PortalTokenRequest> = {}, tokenId?: string): string {
+  return mintPortalToken(
+    {
+      kind: "invoice",
+      companyId: portalCompanyId,
+      resourceId: portalInvoiceId,
+      capability: "pay",
+      lifetimeSeconds: 3_600,
+      ...overrides,
+    },
+    tokenId === undefined ? { keys: portalKeys, now: portalNow } : { keys: portalKeys, now: portalNow, tokenId },
+  );
+}
+
+/**
+ * The minter with a request the compiler would refuse, because the refusals have to be exercised.
+ *
+ * A route validates a merchant's choice with Zod first, so these values can only arrive here - and
+ * the service has to say no to them rather than trust its caller.
+ */
+function portalMintUnchecked(overrides: Record<string, unknown>): string {
+  return mintPortalToken(
+    {
+      kind: "invoice",
+      companyId: portalCompanyId,
+      resourceId: portalInvoiceId,
+      capability: "pay",
+      lifetimeSeconds: 3_600,
+      ...overrides,
+    } as PortalTokenRequest,
+    { keys: portalKeys, now: portalNow },
+  );
+}
+
+function portalReason(error: AppError | null): string {
+  return encryptionReason(error);
+}
+
+/** Why a link did not open, with every refusal described once. */
+function portalOpenFailure(token: string, description: string, options: Partial<PortalTokenOpenOptions> = {}): string {
+  return portalReason(
+    expectThrows(() => openPortalToken(token, { keys: portalKeys, now: portalNow, ...options }), description),
+  );
+}
+
+/** Another spelling of one base64url part, when its last character has spare bits. */
+function secondSpelling(part: string): string | null {
+  const bytes = Buffer.from(part, "base64url");
+  const head = part.slice(0, -1);
+
+  for (const character of portalBase64Alphabet) {
+    const candidate = `${head}${character}`;
+
+    if (candidate !== part && Buffer.from(candidate, "base64url").equals(bytes)) {
+      return candidate;
+    }
+  }
+
+  return null;
+}
+
+function checkPortalTokenKeys(): void {
+  expectEqual(PORTAL_TOKEN_KEY_BYTES, 32, "a signing key is thirty-two bytes, like every key this platform derives");
+  expectEqual(PORTAL_TOKEN_SIGNATURE_BYTES, 32, "the signature is HMAC-SHA-256, so thirty-two");
+  expectEqual(PORTAL_TOKEN_ID_BYTES, 16, "a link id is sixteen random bytes");
+  expectEqual(PORTAL_TOKEN_PREFIX, "kdpt", "a link announces itself with its own prefix");
+  expectEqual(PORTAL_TOKEN_VERSION, 1, "at version one");
+  expectEqual(PORTAL_TOKEN_SIGNING_INFO, "kd-portal-token:v1", "and derives its key under its own HKDF info string");
+  expectEqual(PORTAL_TOKEN_DIGEST_PREFIX, "kdpd1", "a stored digest is not a link");
+  expectEqual(PORTAL_TOKEN_MAXIMUM_PAYLOAD_BYTES, 512, "a payload is bounded before it is parsed, and that bounds the link");
+  expectEqual(PORTAL_TOKEN_MINIMUM_LIFETIME_SECONDS, 300, "the shortest link lives five minutes");
+  expectEqual(PORTAL_TOKEN_MAXIMUM_LIFETIME_SECONDS, 2_592_000, "the longest lives thirty days");
+  expectEqual(PORTAL_TOKEN_MAXIMUM_LIFETIME_SECONDS / 86_400, 30, "which is thirty days, stated once");
+  expectEqual(PORTAL_TOKEN_CLOCK_SKEW_SECONDS, 60, "one minute of clock skew is tolerated, no more");
+  expectEqual(PORTAL_TOKEN_MAXIMUM_KEYS, 4, "a rotation may leave three retired keys behind");
+  expectEqual(PORTAL_TOKEN_KINDS.join(","), "invoice,estimate,payment_link", "three kinds of link exist");
+  expectEqual(PORTAL_TOKEN_CAPABILITIES.join(","), "view,pay,sign", "and three capabilities");
+  expectEqual(PORTAL_TOKEN_CAPABILITIES_BY_KIND.invoice.join(","), "view,pay", "an invoice is read and paid");
+  expectEqual(PORTAL_TOKEN_CAPABILITIES_BY_KIND.estimate.join(","), "view,sign", "an estimate is read and signed");
+  expectEqual(PORTAL_TOKEN_CAPABILITIES_BY_KIND.payment_link.join(","), "view,pay", "a payment link is read and paid");
+  expect(Object.isFrozen(PORTAL_TOKEN_KINDS), "the kinds cannot be extended at runtime");
+  expect(Object.isFrozen(PORTAL_TOKEN_CAPABILITIES), "nor the capabilities");
+  expect(Object.isFrozen(PORTAL_TOKEN_CAPABILITIES_BY_KIND.invoice), "nor the table that pairs them");
+  expect(Object.isFrozen(PORTAL_TOKEN_PROBLEMS), "nor the list of refusals");
+  expectEqual(PORTAL_TOKEN_PROBLEMS.length, 12, "there are twelve refusals");
+  expectEqual(new Set(PORTAL_TOKEN_PROBLEMS).size, 12, "and no two of them are the same word");
+  expect(isPortalTokenKind("invoice"), "an invoice is a kind");
+  expect(isPortalTokenKind("estimate"), "and so is an estimate");
+  expectEqual(isPortalTokenKind("receipt"), false, "a receipt is not");
+  expectEqual(isPortalTokenKind(7), false, "and neither is a number");
+  expect(isPortalTokenCapability("sign"), "a signature is a capability");
+  expectEqual(isPortalTokenCapability("delete"), false, "deleting is not");
+
+  const derived = portalSigningKey(portalMasterKey);
+  const retired = portalSigningKey(portalRetiredKey);
+
+  expectEqual(derived.byteLength, 32, "the signing key derived from the master key is thirty-two bytes");
+  expectEqual(derived.equals(retired), false, "two master keys derive two signing keys");
+  expectEqual(derived.equals(portalSigningKey(portalMasterKey)), true, "and one master key derives one, every time");
+  expectEqual(derived.equals(Buffer.from(portalMasterKey, "base64")), false, "the master key itself never signs");
+
+  derived.fill(0);
+  retired.fill(0);
+}
+
+function checkPortalTokenMint(): void {
+  const token = portalMint();
+  const parts = token.split(".");
+
+  expectEqual(parts.length, 3, "a link is a header, a payload and a signature");
+  expectEqual(parts[0], "kdpt1", "the header names the format and the version");
+  expect(
+    token.length <= 5 + 1 + Math.ceil(PORTAL_TOKEN_MAXIMUM_PAYLOAD_BYTES / 3) * 4 + 1 + 43,
+    "a link is a header, a bounded payload and a signature, and nothing else",
+  );
+  expectEqual(portalMint() === token, false, "two links for one invoice are two links, because the id is random");
+
+  const claim = openPortalToken(portalMint({}, `${"B".repeat(21)}Q`), { keys: portalKeys, now: portalNow });
+
+  expectEqual(claim.tokenId, `${"B".repeat(21)}Q`, "a caller that writes the row first chooses the link id");
+  expectEqual(claim.version, PORTAL_TOKEN_VERSION, "the claim carries its version");
+  expectEqual(claim.kind, "invoice", "the kind it was minted for");
+  expectEqual(claim.companyId, portalCompanyId, "the company it belongs to");
+  expectEqual(claim.resourceId, portalInvoiceId, "the resource it opens");
+  expectEqual(claim.capability, "pay", "and what the holder may do");
+  expectEqual(claim.issuedAt, portalNow, "the instant it was issued");
+  expectEqual(claim.expiresAt, portalNow + 3_600, "and the instant it expires");
+  expectEqual(Object.keys(claim).length, 8, "a claim has exactly these eight fields");
+  expectEqual(portalTokenDigest(token).startsWith("kdpd1."), true, "a digest says which kind of value it is");
+
+  for (const [kind, capability] of [
+    ["invoice", "view"],
+    ["invoice", "pay"],
+    ["estimate", "sign"],
+    ["estimate", "view"],
+    ["payment_link", "pay"],
+    ["payment_link", "view"],
+  ] as const) {
+    const minted = portalMint({ kind, capability, resourceId: kind === "estimate" ? portalEstimateId : portalInvoiceId });
+
+    expectEqual(openPortalToken(minted, { keys: portalKeys, now: portalNow }).capability, capability, `${kind} may carry ${capability}`);
+  }
+
+  const minimum = portalMint({ lifetimeSeconds: PORTAL_TOKEN_MINIMUM_LIFETIME_SECONDS });
+  const maximum = portalMint({ lifetimeSeconds: PORTAL_TOKEN_MAXIMUM_LIFETIME_SECONDS });
+
+  expectEqual(
+    openPortalToken(minimum, { keys: portalKeys, now: portalNow }).expiresAt,
+    portalNow + PORTAL_TOKEN_MINIMUM_LIFETIME_SECONDS,
+    "the shortest lifetime that is allowed is allowed",
+  );
+  expectEqual(
+    openPortalToken(maximum, { keys: portalKeys, now: portalNow + PORTAL_TOKEN_MAXIMUM_LIFETIME_SECONDS - 1 }).expiresAt,
+    portalNow + PORTAL_TOKEN_MAXIMUM_LIFETIME_SECONDS,
+    "and the longest survives until its last second",
+  );
+
+  for (const lifetimeSeconds of [0, -1, 299, 2_592_001, 3_600.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+    expectEqual(
+      portalReason(
+        expectThrows(
+          () => portalMint({ lifetimeSeconds }),
+          `${JSON.stringify(lifetimeSeconds)} is not a lifetime this platform mints`,
+        ),
+      ),
+      "request_invalid",
+      `and ${JSON.stringify(lifetimeSeconds)} is a request failure, not a link`,
+    );
+  }
+
+  for (const [overrides, description] of [
+    [{ kind: "receipt" }, "an unknown kind"],
+    [{ capability: "delete" }, "an unknown capability"],
+    [{ kind: "invoice", capability: "sign" }, "an invoice that may be signed"],
+    [{ kind: "estimate", capability: "pay", resourceId: portalEstimateId }, "an estimate that may be paid"],
+    [{ companyId: "not-a-uuid" }, "a company id that is not a uuid"],
+    [{ resourceId: "" }, "an empty resource id"],
+    [{ companyId: portalCompanyId.toUpperCase() }, "an upper case uuid"],
+  ] as readonly (readonly [Record<string, unknown>, string])[]) {
+    expectEqual(
+      portalReason(expectThrows(() => portalMintUnchecked(overrides), `${description} is refused when a link is minted`)),
+      "request_invalid",
+      `and ${description} is a request failure`,
+    );
+  }
+
+  for (const tokenId of ["A".repeat(21), "A".repeat(23), "AAAAAAAAAAAAAAAAAAAAAB", "not a link id at all!"]) {
+    expectEqual(
+      portalReason(expectThrows(() => portalMint({}, tokenId), `${JSON.stringify(tokenId)} is not a link id`)),
+      "request_invalid",
+      `and ${JSON.stringify(tokenId)} cannot be minted into a link`,
+    );
+  }
+
+  expectEqual(
+    portalReason(
+      expectThrows(
+        () => mintPortalToken(
+          { kind: "invoice", companyId: portalCompanyId, resourceId: portalInvoiceId, capability: "pay", lifetimeSeconds: 3_600 },
+          { keys: { primary: randomBytes(31).toString("base64") }, now: portalNow },
+        ),
+        "a master key that is not thirty-two bytes mints nothing",
+      ),
+    ),
+    "key_invalid",
+    "which is a key failure",
+  );
+  expectEqual(
+    portalReason(
+      expectThrows(
+        () => mintPortalToken(
+          { kind: "invoice", companyId: portalCompanyId, resourceId: portalInvoiceId, capability: "pay", lifetimeSeconds: 3_600 },
+          { keys: { primary: portalMasterKey, previous: [portalRetiredKey, portalForeignKey, portalRetiredKey] }, now: portalNow },
+        ),
+        "the same master key twice in one ring is a ring that cannot be resolved",
+      ),
+    ),
+    "keyring_invalid",
+    "which is a ring failure",
+  );
+  expectEqual(
+    portalReason(
+      expectThrows(
+        () => mintPortalToken(
+          { kind: "invoice", companyId: portalCompanyId, resourceId: portalInvoiceId, capability: "pay", lifetimeSeconds: 3_600 },
+          {
+            keys: {
+              primary: portalMasterKey,
+              previous: [portalRetiredKey, portalForeignKey, randomBytes(32).toString("base64"), randomBytes(32).toString("base64")],
+            },
+            now: portalNow,
+          },
+        ),
+        "a ring larger than a rotation needs is refused rather than searched",
+      ),
+    ),
+    "keyring_invalid",
+    "with the ring as the reason",
+  );
+  expectEqual(
+    portalReason(
+      expectThrows(
+        () =>
+          mintPortalToken(
+            { kind: "invoice", companyId: portalCompanyId, resourceId: portalInvoiceId, capability: "pay", lifetimeSeconds: 3_600 },
+            { keys: portalKeys, now: 1.5 },
+          ),
+        "a clock that is not a whole second mints nothing",
+      ),
+    ),
+    "request_invalid",
+    "and that is a request failure",
+  );
+  expectEqual(
+    portalReason(
+      expectThrows(
+        () =>
+          mintPortalToken(
+            { kind: "invoice", companyId: portalCompanyId, resourceId: portalInvoiceId, capability: "pay", lifetimeSeconds: 3_600 },
+            { keys: portalKeys, now: 4_102_444_800 - 100 },
+          ),
+        "a link that would expire past the range of a timestamp is refused",
+      ),
+    ),
+    "request_invalid",
+    "rather than written with an expiry it cannot name",
+  );
+
+  const mintedByPrimary = portalMint();
+
+  expectEqual(
+    portalOpenFailure(mintedByPrimary, "a link minted by the primary key does not open with a retired one", {
+      keys: { primary: portalForeignKey },
+    }),
+    "signature_invalid",
+    "the primary key is the only one that mints",
+  );
+  expectEqual(
+    openPortalToken(mintedByPrimary, { keys: { primary: portalForeignKey, previous: [portalMasterKey] }, now: portalNow }).kind,
+    "invoice",
+    "while a retired key still verifies what it signed during a rotation",
+  );
+}
+
+function checkPortalTokenOpen(): void {
+  const token = portalMint({ lifetimeSeconds: 3_600 });
+
+  expectEqual(openPortalToken(token, { keys: portalKeys, now: portalNow + 3_599 }).kind, "invoice", "a link opens until its last second");
+  expectEqual(portalOpenFailure(token, "a link does not open at the instant it expires", { now: portalNow + 3_600 }), "token_expired", "and not at the instant it expires");
+  expectEqual(portalOpenFailure(token, "a link does not open after it expires", { now: portalNow + 90_000 }), "token_expired", "nor afterwards");
+
+  const future = forgedPortalToken(portalPayload({ issuedAt: portalNow + 61, expiresAt: portalNow + 61 + 3_600 }));
+
+  expectEqual(
+    portalOpenFailure(future, "a link issued further ahead than the skew is not yet valid"),
+    "token_not_yet_valid",
+    "a link issued in the future is refused until the skew covers it",
+  );
+  expectEqual(
+    openPortalToken(forgedPortalToken(portalPayload({ issuedAt: portalNow + 60, expiresAt: portalNow + 60 + 3_600 })), {
+      keys: portalKeys,
+      now: portalNow,
+    }).kind,
+    "invoice",
+    "and one minute of skew is tolerated",
+  );
+
+  const [header = "", payloadPart = "", signaturePart = ""] = token.split(".");
+  const editedPayload = `${payloadPart.slice(0, 10)}${payloadPart[10] === "A" ? "B" : "A"}${payloadPart.slice(11)}`;
+
+  expectEqual(
+    portalOpenFailure(`${header}.${editedPayload}.${signaturePart}`, "one edited payload character is refused"),
+    "signature_invalid",
+    "an edited payload fails the signature",
+  );
+  expectEqual(
+    portalOpenFailure(`${header}.${payloadPart}.${secondSpelling(signaturePart) ?? signaturePart}`, "a second spelling of the signature is refused"),
+    "token_invalid",
+    "a signature with spare bits set in its last character is not the signature this platform wrote",
+  );
+  expectEqual(
+    portalOpenFailure(`${header}.${payloadPart}.${portalMint().split(".")[2] ?? ""}`, "a signature from another link is refused"),
+    "signature_invalid",
+    "a signature belongs to the payload it was computed over",
+  );
+
+  const payloadOnlySignature = (() => {
+    const key = portalSigningKey(portalMasterKey);
+    const signature = createHmac("sha256", key).update(payloadPart, "utf8").digest("base64url");
+
+    key.fill(0);
+
+    return signature;
+  })();
+
+  expectEqual(
+    portalOpenFailure(`${header}.${payloadPart}.${payloadOnlySignature}`, "a signature that does not cover the header is refused"),
+    "signature_invalid",
+    "the header is signed too, so a token cannot be relabelled",
+  );
+
+  expectEqual(portalOpenFailure(`kdpt2.${payloadPart}.${signaturePart}`, "a link of a later version is refused as such"), "token_version", "a later version is named rather than forged");
+  expectEqual(portalOpenFailure(`kdpt01.${payloadPart}.${signaturePart}`, "a version written with a leading zero is not this version"), "token_version", "and a spelled out version is not this one either");
+  expectEqual(portalOpenFailure(`KDPT1.${payloadPart}.${signaturePart}`, "an upper case header is not a header"), "token_invalid", "the format is one case");
+
+  for (const [broken, description] of [
+    ["", "an empty string"],
+    [".", "a single dot"],
+    [`${header}.${payloadPart}`, "two parts instead of three"],
+    [`${header}.${payloadPart}.${signaturePart}.extra`, "four parts instead of three"],
+    [`${header}..${signaturePart}`, "an empty payload"],
+    [`${header}.${payloadPart}.`, "an empty signature"],
+    [`${header}.${payloadPart}!.${signaturePart}`, "a payload character that is not base64url"],
+    [`${header}.${payloadPart}.${signaturePart}!`, "a signature character that is not base64url"],
+    [forgedPortalToken("not json at all"), "a payload that is not JSON"],
+    ["x".repeat(2_000), "a string longer than a link"],
+  ] as const) {
+    expectEqual(portalOpenFailure(broken, `${description} is not a link`), "token_invalid", `${description} is refused as malformed`);
+  }
+
+  expectEqual(
+    portalOpenFailure(`${header}.${payloadPart}.${Buffer.from(Buffer.from(signaturePart, "base64url").subarray(0, 31)).toString("base64url")}`, "a thirty-one byte signature is refused"),
+    "token_invalid",
+    "a signature is exactly thirty-two bytes",
+  );
+  expectEqual(
+    portalOpenFailure(`${header}.${payloadPart}.${Buffer.concat([Buffer.from(signaturePart, "base64url"), Buffer.from([0])]).toString("base64url")}`, "a thirty-three byte signature is refused"),
+    "token_invalid",
+    "neither longer nor shorter",
+  );
+
+  for (const [payload, description, reason] of [
+    [portalPayload({ version: 2 }), "a payload that says version two", "token_invalid"],
+    [portalPayload({ kind: "receipt" }), "an unknown kind", "token_invalid"],
+    [portalPayload({ capability: "delete" }), "an unknown capability", "token_invalid"],
+    [portalPayload({ kind: "invoice", capability: "sign" }), "an invoice that may be signed", "token_invalid"],
+    [portalPayload({ companyId: "not-a-uuid" }), "a company id that is not a uuid", "token_invalid"],
+    [portalPayload({ resourceId: portalCompanyId.toUpperCase() }), "an upper case uuid", "token_invalid"],
+    [portalPayload({ tokenId: "A".repeat(21) }), "a link id of the wrong length", "token_invalid"],
+    [portalPayload({ tokenId: "AAAAAAAAAAAAAAAAAAAAAB" }), "a link id in its second spelling", "token_invalid"],
+    [JSON.stringify({ ...JSON.parse(portalPayload()) as Record<string, unknown>, extra: "field" }), "a claim with an extra field", "token_invalid"],
+    [JSON.stringify({ version: 1, kind: "invoice" }), "a claim missing six fields", "token_invalid"],
+    [portalPayload({ issuedAt: "1800000000" }), "a timestamp as a string", "token_invalid"],
+    [portalPayload({ issuedAt: 1_800_000_000.5 }), "a timestamp with a fraction", "token_invalid"],
+    [portalPayload({ expiresAt: portalNow - 1 }), "an expiry before the issue", "lifetime_invalid"],
+    [portalPayload({ expiresAt: portalNow }), "an expiry at the issue", "lifetime_invalid"],
+    [portalPayload({ expiresAt: portalNow + 299 }), "a lifetime below the floor", "lifetime_invalid"],
+    [portalPayload({ expiresAt: portalNow + 2_592_001 }), "a lifetime above the ceiling", "lifetime_invalid"],
+  ] as const) {
+    expectEqual(portalOpenFailure(forgedPortalToken(payload), `${description} is refused`), reason, `a signed ${description} is refused as ${reason}`);
+  }
+
+  const reordered = JSON.stringify(
+    (({ tokenId, kind, capability, companyId, resourceId, issuedAt, expiresAt }) => ({
+      tokenId,
+      kind,
+      capability,
+      companyId,
+      resourceId,
+      issuedAt,
+      expiresAt,
+      version: 1,
+    }))(JSON.parse(portalPayload()) as Record<string, never>),
+  );
+
+  expectEqual(
+    portalOpenFailure(forgedPortalToken(reordered), "a claim in another field order is refused"),
+    "token_invalid",
+    "one payload has one spelling, so one link has one signature",
+  );
+  expectEqual(
+    portalOpenFailure(forgedPortalToken(` ${portalPayload()}`), "a claim with leading whitespace is refused"),
+    "token_invalid",
+    "and whitespace is a second spelling too",
+  );
+  expectEqual(
+    portalOpenFailure(forgedPortalToken(portalPayload({ padding: "x".repeat(600) })), "a payload past the ceiling is refused"),
+    "payload_too_large",
+    "a payload is bounded before it is parsed, and says so",
+  );
+
+  expectEqual(openPortalToken(token, { keys: portalKeys, now: portalNow, expect: { kind: "invoice" } }).kind, "invoice", "a reader may require the kind it expected");
+  expectEqual(
+    openPortalToken(token, {
+      keys: portalKeys,
+      now: portalNow,
+      expect: { kind: "invoice", companyId: portalCompanyId, resourceId: portalInvoiceId, capability: "pay" },
+    }).resourceId,
+    portalInvoiceId,
+    "and every claim it was promised",
+  );
+
+  for (const [expectation, description] of [
+    [{ kind: "estimate" }, "another kind"],
+    [{ companyId: "018f2b8a-0000-4000-8000-0000000000ff" }, "another company"],
+    [{ resourceId: portalEstimateId }, "another resource"],
+    [{ capability: "view" }, "another capability"],
+  ] as const) {
+    expectEqual(portalOpenFailure(token, `${description} in the expectation does not match`, { expect: expectation }), "audience_mismatch", `a link does not open when ${description} was expected`);
+  }
+
+  expectEqual(portalOpenFailure(token, "a foreign key does not open a link", { keys: { primary: portalForeignKey } }), "signature_invalid", "a link opens only with the key that signed it");
+  expectEqual(
+    portalOpenFailure(token, "a ring larger than a rotation needs opens nothing", {
+      keys: {
+        primary: portalMasterKey,
+        previous: [portalRetiredKey, portalForeignKey, randomBytes(32).toString("base64"), randomBytes(32).toString("base64")],
+      },
+    }),
+    "keyring_invalid",
+    "the ring is refused before the token is read",
+  );
+  expectEqual(portalOpenFailure(token, "a ring with one key twice opens nothing", { keys: { primary: portalMasterKey, previous: [portalMasterKey] } }), "keyring_invalid", "nor is a duplicated ring resolved");
+  expectEqual(portalOpenFailure(token, "a short master key opens nothing", { keys: { primary: "AAAA" } }), "key_invalid", "and a key of the wrong length is a key failure");
+  expectEqual(
+    expectThrows(() => openPortalToken(token, { keys: portalKeys, now: 1.5 }), "a clock that is not a whole second opens nothing")?.code,
+    "INTERNAL_ERROR",
+    "a caller's bad clock is this platform's failure, not the visitor's",
+  );
+  expectEqual(
+    expectThrows(() => openPortalToken(token, { keys: portalKeys, now: portalNow + 3_600 }), "an expired link")?.code,
+    "RESOURCE_NOT_FOUND",
+    "while a link that does not open is the visitor's not found, whatever the reason",
+  );
+  expectEqual(
+    expectThrows(() => openPortalToken(token, { keys: portalKeys, now: portalNow + 3_600 }), "an expired link")?.status,
+    404,
+    "with the status of a page that is not there",
+  );
+
+  const first = portalMint({}, `${"C".repeat(21)}Q`);
+  const second = portalMint({}, `${"D".repeat(21)}Q`);
+
+  expectEqual(portalTokenDigest(first) === portalTokenDigest(first), true, "a digest is the same every time it is computed");
+  expectEqual(portalTokenDigest(first) === portalTokenDigest(second), false, "two links have two digests");
+  expectEqual(portalTokenDigest(first).length, PORTAL_TOKEN_DIGEST_PREFIX.length + 1 + 43, "a digest is a prefix and one SHA-256 in base64url");
+  expectEqual(portalTokenDigest(first).includes(first.slice(6, 60)), false, "and it does not carry the link it names");
+  expectEqual(
+    portalReason(expectThrows(() => portalTokenDigest("not a link"), "a string that is not a link has no digest")),
+    "token_invalid",
+    "so only something this platform could have written is named",
+  );
+  expectEqual(
+    portalReason(expectThrows(() => portalTokenDigest(`${first.split(".")[0]}.${first.split(".")[1]}`), "a link without a signature has no digest")),
+    "token_invalid",
+    "and a link without its signature is not one",
+  );
+}
+
+function checkPortalTokenRevocation(): void {
+  const token = portalMint({}, `${"E".repeat(21)}Q`);
+  const other = portalMint({}, `${"F".repeat(21)}Q`);
+  const seen: string[] = [];
+  const revocations = {
+    isRevoked: (tokenId: string): boolean => {
+      seen.push(tokenId);
+
+      return tokenId === `${"E".repeat(21)}Q`;
+    },
+  };
+
+  expectEqual(openPortalToken(other, { keys: portalKeys, now: portalNow, revocations }).tokenId, `${"F".repeat(21)}Q`, "a link that was not revoked opens");
+  expectEqual(seen.join(","), `${"F".repeat(21)}Q`, "and the lookup is asked about that link's id alone");
+  expectEqual(portalOpenFailure(token, "a revoked link is refused", { revocations }), "token_revoked", "a revoked link is refused");
+  expectEqual(seen.at(-1), `${"E".repeat(21)}Q`, "with the id the caller minted");
+
+  const quiet = { calls: 0, isRevoked: (): boolean => { quiet.calls += 1; return true; } };
+  const [header = "", payloadPart = "", signaturePart = ""] = token.split(".");
+  const edited = `${header}.${payloadPart.slice(0, 10)}${payloadPart[10] === "A" ? "B" : "A"}${payloadPart.slice(11)}.${signaturePart}`;
+
+  expectEqual(portalOpenFailure(edited, "an edited link is refused before the lookup", { revocations: quiet }), "signature_invalid", "an edited link never reaches the revocation store");
+  expectEqual(quiet.calls, 0, "so the store is not a probe for which ids exist");
+  expectEqual(portalOpenFailure(token, "an expired link is refused before the lookup is believed", { now: portalNow + 3_600, revocations: quiet }), "token_expired", "an expired link is refused by the clock");
+  expectEqual(quiet.calls, 0, "and the store is not asked about a link that is out of date");
+  expectEqual(portalOpenFailure(token, "a link with a foreign key is refused before the lookup", { keys: { primary: portalForeignKey }, revocations: quiet }), "signature_invalid", "a foreign signature is refused");
+  expectEqual(quiet.calls, 0, "and the store is not asked about a link that platform never signed");
+
+  expectEqual(openPortalToken(token, { keys: portalKeys, now: portalNow }).tokenId, `${"E".repeat(21)}Q`, "a link opens when the caller offers no revocation list");
+}
+
+async function checkPortalTokenWiring(): Promise<void> {
+  const source = await readFile(new URL("./portal-token.ts", import.meta.url), "utf8");
+
+  expect(source.includes('from "node:crypto"'), "the primitives come from the platform");
+  expect(source.includes("createHmac"), "the signature is an HMAC");
+  expect(source.includes("hkdfSync"), "the key is derived from the master key, never read from the environment");
+  expectEqual(source.includes("timingSafeEqual"), true, "and compared in constant time");
+  expectEqual(source.split("timingSafeEqual").length - 1, 2, "once in the import and once in the comparison");
+  expectEqual(source.includes("process.env"), false, "the module reads no environment variable itself");
+  expectEqual(source.includes("console."), false, "and logs nothing, so no link reaches a log");
+  expectEqual(source.includes("fetch("), false, "and makes no request");
+  expectEqual(source.includes("createCipheriv"), false, "a link is signed, not encrypted: it carries nothing secret");
+  expectEqual(source.includes("createDecipheriv"), false, "and nothing is decrypted to read it");
+  expect(source.includes("readonly now: number"), "the clock is passed in, so the gate can stand on the boundary");
+  expectEqual(source.includes("new Date("), false, "no date is formatted either");
+  expectEqual(source.includes("Math.random"), false, "and the link id comes from the platform's random source");
+  expectEqual(source.includes("setCookie"), false, "a link is not a session: it sets nothing");
+  expect(source.includes('from "./encryption.ts"'), "it asks the encryption module for the key format and the canonical base64 rule");
+  expect(source.includes("decodeCanonicalBase64Url"), "so there is one canonical rule in the tree");
+  expect(source.includes("isEncryptionKey"), "and one definition of a thirty-two byte key");
+  expect(source.split(".fill(0)").length - 1 >= 2, "every derived key is wiped on the way out");
+  expectEqual(source.includes("supabase"), false, "the module asks no database: the revocation lookup is the caller's");
+  expectEqual(source.includes('from "../auth/'), false, "and borrows nothing from the authentication tree");
+  expect(source.includes("strict()"), "the payload schema refuses a field the signature covers and no reader uses");
+
+  const importCount = source.split('import {').length - 1;
+
+  expectEqual(importCount, 6, "the module imports six things: a buffer, the primitives, the schema, the errors, the freeze helper and the encryption module");
+
+  for (const problem of PORTAL_TOKEN_PROBLEMS) {
+    expect(source.includes(`"${problem}"`), `${problem} is a reason this module can give`);
+  }
+
+  const roots = [new URL("../../lib/", import.meta.url), new URL("../../app/", import.meta.url)];
+  const signingUsers: string[] = [];
+
+  for (const root of roots) {
+    const prefix = root.pathname.endsWith("/lib/") ? "lib/" : "app/";
+    const entries = (await readdir(root, { recursive: true }))
+      .map((entry) => entry.replaceAll("\\", "/"))
+      .filter((entry) => entry.endsWith(".ts") || entry.endsWith(".tsx"));
+
+    for (const entry of entries) {
+      const text = await readFile(new URL(entry, root), "utf8");
+
+      if (!entry.endsWith("verify.ts") && text.includes(PORTAL_TOKEN_SIGNING_INFO)) {
+        signingUsers.push(`${prefix}${entry}`);
+      }
+    }
+  }
+
+  expectEqual(signingUsers.sort().join(","), "lib/security/portal-token.ts", "exactly one module derives the portal signing key");
+
+  const tokenUsers: string[] = [];
+
+  for (const root of roots) {
+    const prefix = root.pathname.endsWith("/lib/") ? "lib/" : "app/";
+    const entries = (await readdir(root, { recursive: true }))
+      .map((entry) => entry.replaceAll("\\", "/"))
+      .filter((entry) => entry.endsWith(".ts") || entry.endsWith(".tsx"));
+
+    for (const entry of entries) {
+      const text = await readFile(new URL(entry, root), "utf8");
+
+      if (!entry.endsWith("verify.ts") && text.includes(`${PORTAL_TOKEN_PREFIX}${PORTAL_TOKEN_VERSION}.`)) {
+        tokenUsers.push(`${prefix}${entry}`);
+      }
+    }
+  }
+
+  expectEqual(tokenUsers.sort().join(","), "lib/security/portal-token.ts", "and exactly one module writes a link");
+}
+
 async function checkTree(): Promise<void> {
   const securityRoot = new URL("./", import.meta.url);
   const securityFiles = (await readdir(securityRoot)).filter((name) => name.endsWith(".ts"));
@@ -3446,6 +4112,10 @@ async function main(): Promise<void> {
   checkEncryptionKeys();
   checkEncryptionSecrets();
   checkEncryptionFiles();
+  checkPortalTokenKeys();
+  checkPortalTokenMint();
+  checkPortalTokenOpen();
+  checkPortalTokenRevocation();
   await checkCspWiring();
   await checkSecurityHeaderWiring();
   await checkUploadWiring();
@@ -3455,6 +4125,7 @@ async function main(): Promise<void> {
   await checkAuditIntegrity();
   await checkAuditWiring();
   await checkEncryptionWiring();
+  await checkPortalTokenWiring();
   await checkTree();
 
   if (failures.length > 0) {

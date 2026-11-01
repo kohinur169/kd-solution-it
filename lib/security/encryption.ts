@@ -327,15 +327,24 @@ export function sealSecret(
  * without this check, four different envelopes would decode to the same tag and three of them would
  * open. An envelope whose every character means something is an envelope where an edit is either
  * malformed or caught by the tag.
+ *
+ * Exported because STEP 065's portal token carries the same kind of part, and one canonical rule for
+ * both is one rule to get right.
  */
-function isCanonicalBase64Url(value: string, bytes: number): boolean {
+export function decodeCanonicalBase64Url(value: string): Buffer | null {
   if (!base64UrlPartPattern.test(value)) {
-    return false;
+    return null;
   }
 
   const decoded = Buffer.from(value, "base64url");
 
-  return decoded.byteLength === bytes && decoded.toString("base64url") === value;
+  return decoded.toString("base64url") === value ? decoded : null;
+}
+
+function isCanonicalBase64Url(value: string, bytes: number): boolean {
+  const decoded = decodeCanonicalBase64Url(value);
+
+  return decoded !== null && decoded.byteLength === bytes;
 }
 
 /** The parts of a secret envelope, or null when the text is not one this module wrote. */

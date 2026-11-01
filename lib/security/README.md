@@ -3,11 +3,11 @@
 
 Owner: STEP 056 (input sanitiser for text, rich text and URLs), STEP 057 (the double submit token),
 STEP 058 (the destination rule), STEP 059 (the Content Security Policy), STEP 060 (the security headers),
-STEP 061 (the upload validator), STEP 062 (the rate limiter), STEP 063 (the audit writer) and STEP 064
-(the encryption service). Later STEPs call these functions; they do not write a second escape, a second
-URL check, a second allowlist, a second CSRF token, a second DNS check, a second policy header, a second
-header table, a second file type check, a second counter, a second way to append to an audit chain or a
-second cipher.
+STEP 061 (the upload validator), STEP 062 (the rate limiter), STEP 063 (the audit writer), STEP 064
+(the encryption service) and STEP 065 (the signed portal link). Later STEPs call these functions; they do
+not write a second escape, a second URL check, a second allowlist, a second CSRF token, a second DNS
+check, a second policy header, a second header table, a second file type check, a second counter, a
+second way to append to an audit chain, a second cipher or a second kind of signed link.
 
 | File | Purpose |
 | --- | --- |
@@ -24,6 +24,7 @@ second cipher.
 | rate-limit.ts | How often one address, one account and one route may ask: three buckets, one counter, one decision |
 | audit.ts | How an entry enters the chain: the policy, the redaction, the link, and the proof the chain still verifies |
 | encryption.ts | AES-256-GCM for secrets and files: a keyring with rotation, a bound context, and a chunked file envelope |
+| portal-token.ts | The client portal link: what it claims, how long it lives, and how it is revoked |
 | verify.ts | The gate behind `npm run check:security`, and the attack corpus it runs |
 
 ## The four rules
@@ -197,6 +198,47 @@ older `v1.<iv>.<tag>.<ciphertext>` shape, which names no key. Nothing in this mo
 shape, the gate asserts both, and a later STEP can move those values across by opening with the auth
 function and re-sealing here.
 
+## What a portal link is, and why it is signed
+
+`portal-token.ts` mints and reads the one credential a client ever holds: the link behind `i/<token>` and
+`e/<token>` of FEATURE_LIST section 2. There is no login for a client, so the link is the whole
+authorization, and it is a text the client can edit. The signature is what makes an edit useless.
+
+**The link is signed, not encrypted.** It carries nothing secret - an invoice id is not a password - so
+the payload is readable and a route can route on it without a database round trip. What the HMAC over
+the header and the payload stops is *invention*: changing `invoice` to `payment_link`, changing one
+company's id to another's, extending the expiry, or adding a field. The payload is also one canonical
+spelling, rebuilt and compared on read, so one set of claims has one link and one digest - a store that
+revokes a digest can only ever be naming one token.
+
+**Expiry is a lifetime, not a date.** A caller asks for a number of seconds between five minutes and
+thirty days, and the reader checks the signed span against the same ceiling, so a token with a lifetime
+this platform would not mint is refused even when its signature is genuine. The clock is an argument,
+never `Date.now()` inside the module, which is what lets the gate stand exactly on the boundary - the
+last second the link opens, and the instant it stops.
+
+**Revocation is a lookup the caller owns.** A link is revoked when the document behind it is voided or
+reissued, and that record belongs to the STEP that owns the document. The module takes a predicate and
+calls it *last*: after the signature verifies, after the clock agrees, and after the claim is trusted.
+A forged id, an expired link and an edited payload therefore never reach a database, so a public route
+is not a free oracle for which invoice ids exist. The store keeps `portalTokenDigest(token)` - a
+`kdpd1.` SHA-256 - and never the token itself.
+
+**One failure looks like every other.** Every refusal of an open is a 404 with one machine reason in
+`cause`, because a visitor who can tell "wrong signature" from "expired" from "revoked" by the response
+alone has a probe. A key ring or a clock this platform got wrong is an `INTERNAL_ERROR` instead: that is
+the platform's mistake, not the visitor's.
+
+**The key is derived, not deployed.** `ENCRYPTION_MASTER_KEY` is the only long lived secret in the
+environment, so the signing key is HKDF-SHA-256 of it under `kd-portal-token:v1` - one secret, two
+purposes, neither able to stand in for the other. The ring accepts retired master keys, so a link minted
+a minute before a key change still opens; a link is not stored, so nothing has to be re-signed.
+
+The seam with the portal STEPs of 181-190: they mint with `mintPortalToken`, open with `openPortalToken`
+and pass the expectation - kind, company, resource, capability - of the page they are rendering. This
+module decides whether a link is genuine, in date and not revoked. It never decides what the link is
+allowed to show.
+
 ## How an entry enters the audit chain
 
 `audit.ts` is the writer of the *platform*, as `lib/auth/audit.ts` is the writer of the authentication
@@ -304,6 +346,8 @@ a browser rendering a quarantined PDF inline is the one thing a magic byte check
 | Slug | 80 code points | a URL segment that stays readable in a log |
 | Rich text | 100 000 code points, 5 000 nodes, depth 20 | a document, bounded in size and in nesting |
 | URL | 2 048 code points | the length a browser and a proxy both handle |
+| Portal link lifetime | 300 to 2 592 000 seconds | long enough to be read, short enough to be forgotten |
+| Portal link payload | 512 bytes | the claims of one link, before anything is parsed |
 
 Ceilings count **code points**, not UTF-16 units, so an emoji costs one and a limit means the same
 number of characters in every script.
