@@ -5,6 +5,7 @@ import Script from "next/script";
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { rateLimitSentence } from "@/lib/auth/refusal-message";
 import { formatMessage, getMessage } from "@/lib/i18n/messages";
+import { csrfHeaders } from "@/lib/security/csrf-client";
 
 /**
  * The signup form.
@@ -165,9 +166,10 @@ export function SignupForm({ siteKey, policies }: SignupFormProperties): ReactNo
     setState("submitting");
 
     try {
+      const csrf = await csrfHeaders();
       const response = await fetch("/api/auth/signup", {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", ...csrf },
         body: JSON.stringify({
           fullName,
           email,

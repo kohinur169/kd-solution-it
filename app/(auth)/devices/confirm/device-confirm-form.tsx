@@ -3,6 +3,7 @@
 
 import { useState, type FormEvent, type ReactNode } from "react";
 import { getMessage } from "@/lib/i18n/messages";
+import { csrfHeaders } from "@/lib/security/csrf-client";
 import { readStoredDeviceProofKey } from "@/lib/auth/device-proof-store";
 import { rateLimitSentence } from "@/lib/auth/refusal-message";
 
@@ -111,9 +112,10 @@ export function DeviceConfirmForm({ label }: DeviceConfirmFormProperties): React
         return;
       }
 
+      const csrf = await csrfHeaders();
       const response = await fetch("/api/auth/devices/confirm", {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", ...csrf },
         body: JSON.stringify({ deviceId: key.deviceId, code }),
       });
 

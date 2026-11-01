@@ -4,6 +4,7 @@
 import { useRouter } from "next/navigation";
 import { useState, type FormEvent, type ReactNode } from "react";
 import { deviceProofHeaders } from "@/lib/auth/device-proof-store";
+import { csrfHeaders } from "@/lib/security/csrf-client";
 import { rateLimitSentence } from "@/lib/auth/refusal-message";
 import { formatMessage, getMessage } from "@/lib/i18n/messages";
 import type { TwoFactorResetRequestView } from "@/lib/auth/two-factor-reset";
@@ -99,9 +100,10 @@ function RequestCard({ request }: { readonly request: TwoFactorResetRequestView 
         return;
       }
 
+      const csrf = await csrfHeaders();
       const response = await fetch("/api/office/2fa-reset-requests/decision", {
         method: "POST",
-        headers: { "content-type": "application/json", ...proof },
+        headers: { "content-type": "application/json", ...proof, ...csrf },
         body,
       });
       if (!response.ok) {

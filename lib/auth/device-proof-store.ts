@@ -1,4 +1,5 @@
 // path: lib/auth/device-proof-store.ts
+import { csrfHeaders } from "../security/csrf-client.ts";
 import {
   DEFAULT_PROOF_KEY_ALGORITHM,
   encodeBase64Url,
@@ -266,7 +267,7 @@ export async function bindSession(): Promise<SessionBindingOutcome> {
   try {
     response = await fetch(rotationPath, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...(await csrfHeaders()) },
       body: JSON.stringify({ deviceId: key.deviceId }),
       credentials: "same-origin",
       cache: "no-store",
@@ -402,7 +403,7 @@ export async function enrolDeviceProofKey(): Promise<DeviceProofOutcome> {
   try {
     response = await fetch(enrolmentPath, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...(await csrfHeaders()) },
       body: JSON.stringify(publicProofKeyOf(key)),
       credentials: "same-origin",
       cache: "no-store",

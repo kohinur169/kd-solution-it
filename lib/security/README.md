@@ -1,8 +1,9 @@
 // path: lib/security/README.md
 # lib/security/
 
-Owner: STEP 056 (input sanitiser for text, rich text and URLs). Later STEPs call these functions;
-they do not write a second escape, a second URL check or a second allowlist.
+Owner: STEP 056 (input sanitiser for text, rich text and URLs) and STEP 057 (the double submit
+token). Later STEPs call these functions; they do not write a second escape, a second URL check, a
+second allowlist or a second CSRF token.
 
 | File | Purpose |
 | --- | --- |
@@ -10,6 +11,8 @@ they do not write a second escape, a second URL check or a second allowlist.
 | host.ts | Which IPv4, IPv6 and named hosts a server-side request may reach - the SSRF rule |
 | url.ts | `sanitizeHttpUrl`, `sanitizeRelativePath`, `isSafeRedirect` and the throwing wrappers |
 | html.ts | The rich text allowlist: tokenise, filter, **rebuild**, escape |
+| csrf.ts | The server half of the double submit token: mint, cookie, compare, `requireCsrfToken` |
+| csrf-client.ts | The browser half: read the cookie, add the header, ask `/api/auth/csrf` when absent |
 | verify.ts | The gate behind `npm run check:security`, and the attack corpus it runs |
 
 ## The four rules
@@ -43,6 +46,20 @@ outbound call to a URL a merchant supplied - webhooks, a KYC document link, a re
 second check; this module cannot do it from the string alone, and pretending otherwise is how SSRF
 gets through a library that looks complete.
 
+## Why the CSRF module is split in two
+
+`csrf.ts` imports `node:crypto` for a random token and a `timingSafeEqual` comparison. A `"use client"`
+module that imported it would pull the Node builtin into a browser bundle, so the browser gets
+`csrf-client.ts`, which imports **nothing** - not a type, not a constant, not even for convenience. The
+cookie name survives the duplication because both halves agree with a comment and the auth gate
+asserts the agreement; an import would be tidier and would break the build.
+
+The token is a second value on purpose. `__Host-kd_session` is `HttpOnly` and `SameSite=Strict`, and a
+cross-site form post carries neither - but a same-site subdomain, or a browser that mishandles
+`SameSite`, is exactly the gap the header closes: a script on another origin can make the browser send
+a cookie, and cannot read a value to put in a header. The cookie is therefore **readable by design**,
+and the one place that fact is allowed to look like a mistake is this paragraph.
+
 ## Ceilings
 
 | Value | Ceiling | Why |
@@ -67,4 +84,5 @@ number of characters in every script.
   text is how a database ends up holding `O&#39;Brien`.
 - **No browser sanitiser.** The stack names DOMPurify for client-side rich text preview. That is a
   package request in the STEP 056 handoff, because `package.json` is not a STEP's to edit.
-- **No CSRF token.** STEP 057 owns it.
+- **No CSRF token in `text.ts`.** A token is not text that a user typed; it is 32 random bytes with a
+  comparison rule, and it lives in `csrf.ts` beside the cookie policy it has to agree with.

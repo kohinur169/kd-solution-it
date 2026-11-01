@@ -7,6 +7,7 @@ import { getAuthRuntime } from "@/lib/auth/runtime";
 import { requireTrustedDevice, verifySensitiveRequest } from "@/lib/auth/request-proof";
 import { decideTwoFactorReset } from "@/lib/auth/two-factor-reset";
 import { logger } from "@/lib/logger/logger";
+import { requireCsrfToken } from "@/lib/security/csrf";
 
 export const dynamic = "force-dynamic";
 
@@ -52,6 +53,9 @@ function readOptionalText(body: unknown, key: string): string | null {
  */
 export const POST = withErrorResponse(
   async (request: Request): Promise<NextResponse<DecisionResponseBody>> => {
+    // STEP 057: the first thing a mutation checks, because it costs one string comparison.
+    requireCsrfToken(request, { secure: getAuthRuntime().cookiePolicy.secure });
+
     const declaredLength = request.headers.get("content-length");
 
     if (declaredLength !== null) {

@@ -8,6 +8,7 @@ import { readRequestActor } from "@/lib/auth/request-actor";
 import { requireFreshReauthentication } from "@/lib/auth/step-up";
 import { getAuthRuntime } from "@/lib/auth/runtime";
 import { logger } from "@/lib/logger/logger";
+import { requireCsrfToken } from "@/lib/security/csrf";
 
 export const dynamic = "force-dynamic";
 
@@ -43,6 +44,9 @@ function readField(body: unknown, key: string): unknown {
  */
 export const POST = withErrorResponse(
   async (request: Request): Promise<NextResponse<UnlockResponseBody>> => {
+    // STEP 057: the first thing a mutation checks, because it costs one string comparison.
+    requireCsrfToken(request, { secure: getAuthRuntime().cookiePolicy.secure });
+
     const declaredLength = request.headers.get("content-length");
 
     if (declaredLength !== null) {

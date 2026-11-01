@@ -55,6 +55,7 @@ export const RATE_LIMIT_SCOPES = [
   "session_reauth",
   "session_list",
   "session_revoke",
+  "csrf",
 ] as const;
 
 export type RateLimitScope = (typeof RATE_LIMIT_SCOPES)[number];
@@ -89,6 +90,7 @@ export const RATE_LIMIT_POLICIES: Readonly<Record<RateLimitScope, RateLimitPolic
   session_reauth: { limit: 30, windowSeconds: 300 },
   session_list: { limit: 120, windowSeconds: 300 },
   session_revoke: { limit: 30, windowSeconds: 300 },
+  csrf: { limit: 120, windowSeconds: 300 },
 } as const satisfies Record<RateLimitScope, RateLimitPolicy>);
 
 /** The endpoint a route limits, or null for a route that is not an authentication endpoint. */
@@ -107,6 +109,7 @@ export const RATE_LIMITED_PATHS: Readonly<Record<string, RateLimitScope>> = Obje
   "/api/auth/session/reauth": "session_reauth",
   "/api/auth/sessions": "session_list",
   "/api/auth/sessions/revoke": "session_revoke",
+  "/api/auth/csrf": "csrf",
 } as const satisfies Record<string, RateLimitScope>);
 
 /** The audit action written when an address is refused for the first time in a window. */

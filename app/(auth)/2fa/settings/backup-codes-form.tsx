@@ -4,6 +4,7 @@
 import Link from "next/link";
 import { useState, type FormEvent, type ReactNode } from "react";
 import { deviceProofHeaders } from "@/lib/auth/device-proof-store";
+import { csrfHeaders } from "@/lib/security/csrf-client";
 import { formatMessage, getMessage } from "@/lib/i18n/messages";
 
 /**
@@ -109,9 +110,10 @@ export function BackupCodesForm({ initialStatus }: BackupCodesFormProperties): R
         return;
       }
 
-      const response = await fetch("/api/auth/2fa/backup-codes", {
+      const csrf = await csrfHeaders();
+const response = await fetch("/api/auth/2fa/backup-codes", {
         method: "POST",
-        headers: { "content-type": "application/json", ...proof },
+        headers: { "content-type": "application/json", ...proof, ...csrf },
         body,
       });
       const payload: unknown = await response.json().catch(() => null);

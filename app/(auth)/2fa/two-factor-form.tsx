@@ -3,6 +3,7 @@
 
 import { useState, type FormEvent, type ReactNode } from "react";
 import { getMessage } from "@/lib/i18n/messages";
+import { csrfHeaders } from "@/lib/security/csrf-client";
 
 /**
  * The enrolment form: create the key, confirm one code, keep the backup codes.
@@ -146,9 +147,10 @@ export function TwoFactorForm(): ReactNode {
     setBusy(true);
 
     try {
+      const csrf = await csrfHeaders();
       const response = await fetch("/api/auth/2fa/enroll", {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", ...csrf },
         body: "{}",
       });
       const payload = await readJson(response);
@@ -191,9 +193,10 @@ export function TwoFactorForm(): ReactNode {
     setBusy(true);
 
     try {
+      const csrf = await csrfHeaders();
       const response = await fetch("/api/auth/2fa/confirm", {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", ...csrf },
         body: JSON.stringify({ code }),
       });
       const payload = await readJson(response);

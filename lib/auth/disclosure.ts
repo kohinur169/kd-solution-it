@@ -104,6 +104,11 @@ export const ANONYMOUS_AUTH_SURFACES: readonly AnonymousSurface[] = deepFreeze([
     note: "A followed link either becomes a session or is refused with the same sentence an expired link has always produced.",
   },
   {
+    path: "/api/auth/csrf",
+    codes: [...TRANSPORT_CODES],
+    note: "STEP 057's double submit token. Anonymous by necessity - the sign in and sign up forms need it before a session exists - and it answers a token or a transport failure, never a statement about a record.",
+  },
+  {
     path: "/api/auth/2fa/reset",
     codes: [...TRANSPORT_CODES, "VALIDATION_FAILED"],
     note: "Anonymous by necessity: the person who lost their second factor cannot sign in. One accepted answer, whatever the platform found.",

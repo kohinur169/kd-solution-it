@@ -3,6 +3,7 @@
 
 import { useState, type FormEvent, type ReactNode } from "react";
 import { deviceProofHeaders } from "@/lib/auth/device-proof-store";
+import { csrfHeaders } from "@/lib/security/csrf-client";
 import { getMessage, formatMessage } from "@/lib/i18n/messages";
 
 /**
@@ -141,9 +142,10 @@ export function ReauthForm(): ReactNode {
         return;
       }
 
-      const response = await fetch("/api/auth/session/reauth", {
+      const csrf = await csrfHeaders();
+const response = await fetch("/api/auth/session/reauth", {
         method: "POST",
-        headers: { "content-type": "application/json", ...proof },
+        headers: { "content-type": "application/json", ...proof, ...csrf },
         body,
       });
 

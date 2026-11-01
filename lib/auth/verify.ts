@@ -111,6 +111,20 @@ import {
   rateLimitKeyHash,
   rateLimitScopeForPath,
 } from "./rate-limit.ts";
+import {
+  csrfCookie,
+  csrfPolicy,
+  csrfTokensMatch,
+  createCsrfToken,
+  CSRF_FIELD,
+  CSRF_PROTECTED_PATHS,
+  CSRF_RULE,
+  CSRF_TOKEN_PATH,
+  CSRF_TOKEN_PATTERN,
+  readCsrfCookie,
+  requireCsrfToken,
+  verifyCsrfRequest,
+} from "../security/csrf.ts";
 import { getMessage } from "../i18n/messages.ts";
 import type { Logger } from "../logger/logger.ts";
 import {
@@ -9107,7 +9121,9 @@ async function checkSessionRotation(): Promise<void> {
   expectEqual(hashSessionToken(minted).length, 43, "the hash is 43 characters too");
   expect(hashSessionToken(minted) !== minted, "the hash is not the token");
   expectEqual(hashSessionToken(minted), hashSessionToken(minted), "the hash is deterministic");
-  expect(hashSessionToken(`${minted.slice(0, 42)}A`) !== hashSessionToken(minted), "a changed token hashes differently");
+  const changedToken = `${minted.slice(0, 42)}${minted.endsWith("A") ? "B" : "A"}`;
+
+  expect(hashSessionToken(changedToken) !== hashSessionToken(minted), "a changed token hashes differently");
   expect(isSessionToken(minted), "a minted token is a session token");
   expect(!isSessionToken("short"), "a short string is not a session token");
   expect(!isSessionToken(`${minted}=`), "a padded string is not a session token");
@@ -12071,7 +12087,7 @@ async function checkRateLimit(): Promise<void> {
     .filter((entry) => entry.endsWith("/route.ts"))
     .sort();
 
-  expectEqual(authEntries.length, 14, "fourteen authentication routes exist");
+  expectEqual(authEntries.length, 15, "fifteen authentication routes exist");
   expectEqual(
     authEntries.length,
     Object.keys(RATE_LIMITED_PATHS).length,
@@ -12454,6 +12470,201 @@ async function checkSanitizerWiring(): Promise<void> {
   );
 }
 
+/**
+ * STEP 057: the double submit token on every mutation.
+ *
+ * A CSRF defence is only as good as its coverage, so this check is mostly a statement about the tree:
+ * every route that answers a `POST` must call the guard, and every browser file that sends one must
+ * carry the header. The behaviour half then proves the four ways a request can fail - no cookie, no
+ * header, a malformed value and a value that does not match - all answer the same sentence, and that
+ * the token endpoint is anonymous, rate limited and classified like every other auth route.
+ */
+async function checkCsrfProtection(): Promise<void> {
+  // ---- the token, as a value
+  const token = createCsrfToken();
+
+  expectEqual(CSRF_TOKEN_PATTERN.test(token), true, "a token has the one shape the pattern allows");
+  expectEqual(token.length, 43, "and is 43 base64url characters, which is 32 bytes");
+  expectEqual(createCsrfToken() === createCsrfToken(), false, "two tokens are never the same one");
+  expectEqual(CSRF_TOKEN_PATTERN.test("short"), false, "a short value is not a token");
+  expectEqual(CSRF_TOKEN_PATTERN.test(`${"a".repeat(43)}!`), false, "and neither is a longer one with a symbol");
+
+  const securePolicy = csrfPolicy({ secure: true });
+  const insecurePolicy = csrfPolicy({ secure: false });
+  const cookie = csrfCookie(token, securePolicy);
+
+  expectEqual(securePolicy.cookieName, "__Host-kd_csrf", "the secure cookie carries the host-only prefix");
+  expectEqual(insecurePolicy.cookieName, "kd_csrf", "and a development deployment uses the bare name");
+  expect(cookie.startsWith(`__Host-kd_csrf=${token}`), "the cookie value is the token");
+  expect(cookie.includes("Path=/"), "it is rooted, which the prefix requires");
+  expect(cookie.includes("Secure"), "and Secure, which the prefix also requires");
+  expect(cookie.includes("SameSite=Strict"), "it is strict, so another site never sends it");
+  expectEqual(cookie.includes("HttpOnly"), false, "and it is readable, because the page must send it back");
+  expect(cookie.includes("Domain=") === false, "it carries no Domain, or the prefix would be refused");
+  expect(csrfCookie(token, insecurePolicy).includes("Secure") === false, "the development cookie is not Secure");
+
+  // ---- reading it back
+  expectEqual(readCsrfCookie(`a=1; __Host-kd_csrf=${token}; b=2`, securePolicy), token, "the cookie of the header is read");
+  expectEqual(readCsrfCookie(`kd_csrf=${token}`, securePolicy), null, "and the other name is not it");
+  expectEqual(readCsrfCookie(`__Host-kd_csrf=${token}`, insecurePolicy), null, "the reverse holds too");
+  expectEqual(readCsrfCookie(null, securePolicy), null, "no header is no token");
+  expectEqual(readCsrfCookie(`__Host-kd_csrf=bad`, securePolicy), null, "a malformed value is no token");
+
+  expectEqual(csrfTokensMatch(token, token), true, "a token matches itself");
+  expectEqual(csrfTokensMatch(token, createCsrfToken()), false, "and not another one");
+  expectEqual(csrfTokensMatch(token, "short"), false, "nor a value of another length");
+
+  // ---- the decision, and the one sentence every failure earns
+  const withBoth = (headerToken: string, cookieToken: string): Request =>
+    new Request("https://example.test/api/auth/signin", {
+      method: "POST",
+      headers: { cookie: `__Host-kd_csrf=${cookieToken}`, "x-csrf-token": headerToken },
+    });
+
+  expectEqual(verifyCsrfRequest(withBoth(token, token)).ok, true, "a request carrying both halves passes");
+  expectEqual(verifyCsrfRequest(new Request("https://example.test/", { method: "POST" })).reason, "missing_cookie", "no cookie is the first refusal");
+  expectEqual(
+    verifyCsrfRequest(
+      new Request("https://example.test/", { method: "POST", headers: { cookie: `__Host-kd_csrf=${token}` } }),
+    ).reason,
+    "missing_header",
+    "a cookie without the header is the second",
+  );
+  expectEqual(
+    verifyCsrfRequest(
+      new Request("https://example.test/", {
+        method: "POST",
+        headers: { cookie: `__Host-kd_csrf=${token}`, "x-csrf-token": "not-a-token" },
+      }),
+    ).reason,
+    "malformed_token",
+    "a value that is not a token is the third",
+  );
+  expectEqual(verifyCsrfRequest(withBoth(createCsrfToken(), token)).reason, "mismatch", "and two different tokens the fourth");
+
+  const refusal = await captureRejection(
+    () => Promise.resolve(requireCsrfToken(new Request("https://example.test/", { method: "POST" }))),
+    "the guard refuses a request with no token",
+  );
+
+  expectEqual(refusal?.code, "VALIDATION_FAILED", "with the catalogue's validation code");
+  expectEqual(refusal?.details[0]?.field, CSRF_FIELD, "naming the csrf field");
+  expectEqual(refusal?.details[0]?.rule, CSRF_RULE, "and one rule for every way it can fail");
+  expectEqual(
+    isAllowedOnSurface("/api/auth/signin", "VALIDATION_FAILED"),
+    true,
+    "which the sign in surface is allowed to answer",
+  );
+  expectEqual(
+    isAllowedOnSurface("/api/auth/signin", "PERMISSION_DENIED"),
+    false,
+    "unlike the code a role failure uses, which is why this one is not that",
+  );
+  expectEqual(requireCsrfToken(withBoth(token, token)), token, "and the guard answers the token it accepted");
+
+  // ---- the routes: every mutation is protected, and protected first
+  const appSources = await readAppTree();
+  const postRoutes = appSources
+    .filter((file) => file.path.startsWith("/api/") && file.path.endsWith("/route.ts"))
+    .filter((file) => file.source.includes("export const POST"))
+    .map((file) => file.path.replace("/", "/api/").replace("/api/api/", "/api/").replace(/\/route\.ts$/u, ""))
+    .sort();
+
+  expectEqual(postRoutes.length, CSRF_PROTECTED_PATHS.length, "every route that answers a POST is on the protected list");
+  expectEqual(
+    postRoutes.join(","),
+    [...CSRF_PROTECTED_PATHS].sort().join(","),
+    "and the list names exactly those routes",
+  );
+
+  for (const path of CSRF_PROTECTED_PATHS) {
+    const routePath = `${path.replace("/api/", "")}/route.ts`;
+    const source = routePath.startsWith("office/")
+      ? appSourceOf(appSources, `/api/office/${routePath.slice("office/".length)}`)
+      : appSourceOf(appSources, `/api/auth/${routePath.slice("auth/".length)}`);
+
+    expect(source.length > 0, `${path} exists on disk`);
+    expectEqual(source.split("requireCsrfToken(").length - 1, 1, `${path} checks the token exactly once`);
+    expect(
+      source.indexOf("requireCsrfToken(") < source.indexOf("readRequestActor(") ||
+        !source.includes("readRequestActor("),
+      `${path} checks the token before it looks the session up`,
+    );
+    expect(
+      source.indexOf("requireCsrfToken(") < source.indexOf("request.text()") ||
+        !source.includes("request.text()"),
+      `${path} checks the token before it reads the body`,
+    );
+
+    if (path.startsWith("/api/auth/")) {
+      expect(
+        source.indexOf("enforceRateLimit(") < source.indexOf("requireCsrfToken("),
+        `${path} counts the request before it judges the token`,
+      );
+    }
+  }
+
+  // ---- the client: every browser file that mutates carries the header
+  const browserMutations = appSources
+    .filter((file) => file.source.includes('method: "POST"'))
+    .map((file) => file.path)
+    .sort();
+
+  expectEqual(browserMutations.length, 10, "ten browser files send a mutation");
+  expectEqual(
+    browserMutations.reduce((total, path) => total + (appSourceOf(appSources, path).split('method: "POST"').length - 1), 0),
+    12,
+    "across twelve call sites",
+  );
+  const postCalls = (source: string): number => source.split('method: "POST"').length - 1;
+  const tokenSpreads = (source: string): number =>
+    (source.match(/\.\.\.csrf\b/gu)?.length ?? 0) + (source.match(/\.\.\.\(await csrfHeaders\(\)\)/gu)?.length ?? 0);
+
+  expectEqual(
+    browserMutations.every((path) => appSourceOf(appSources, path).includes("csrfHeaders(")),
+    true,
+    "and every one of them asks for the token",
+  );
+  expectEqual(
+    browserMutations.every((path) => tokenSpreads(appSourceOf(appSources, path)) === postCalls(appSourceOf(appSources, path))),
+    true,
+    "spreading it into the headers of every mutation it sends, one spread per call",
+  );
+  expect(
+    appSourceOf(appSources, "/(auth)/signin/signin-form.tsx").includes("csrfHeaders("),
+    "the sign in form carries it, which is the one form with no session yet",
+  );
+
+  // ---- the token endpoint
+  const tokenRoute = appSourceOf(appSources, "/api/auth/csrf/route.ts");
+
+  expect(tokenRoute.length > 0, "the token endpoint exists");
+  expect(tokenRoute.includes("csrfCookie("), "it installs the cookie it answers with");
+  expect(tokenRoute.includes('"cache-control": "no-store"'), "and is never cached, because one token per cache is a shared token");
+  expect(tokenRoute.includes('scope: "csrf"'), "it is rate limited like every other auth route");
+  expectEqual(rateLimitScopeForPath(CSRF_TOKEN_PATH), "csrf", "through the scope its path maps to");
+  expectEqual(classifiedPaths().includes("/api/auth/csrf"), true, "and classified as an anonymous surface");
+  expectEqual(
+    ANONYMOUS_AUTH_SURFACES.find((surface) => surface.path === "/api/auth/csrf")?.codes.includes("VALIDATION_FAILED"),
+    false,
+    "it answers a token or a transport failure, never a statement about a record",
+  );
+
+  // ---- the module boundary: the server half needs Node, the browser half must not
+  const serverSource = await readFile(new URL("../security/csrf.ts", import.meta.url), "utf8");
+  const browserSource = await readFile(new URL("../security/csrf-client.ts", import.meta.url), "utf8");
+
+  const proofStore = await readFile(new URL("./device-proof-store.ts", import.meta.url), "utf8");
+
+  expect(proofStore.includes("csrfHeaders("), "even the shared proof store carries the token on both of its calls");
+  expect(serverSource.includes('from "node:crypto"'), "the token is minted with the platform's random source");
+  expect(serverSource.includes("timingSafeEqual"), "and compared without an early exit");
+  expectEqual(browserSource.includes('from "node:'), false, "the browser half imports no Node builtin");
+  expectEqual(browserSource.includes("import "), false, "and imports nothing at all, so no server module reaches a bundle");
+  expect(browserSource.includes("document.cookie"), "it reads the cookie the server will compare against");
+  expect(browserSource.includes(CSRF_TOKEN_PATH), "and asks the one endpoint that issues a token");
+}
+
 async function main(): Promise<void> {
   checkConfig();
   checkClaims();
@@ -12496,6 +12707,7 @@ async function main(): Promise<void> {
   await checkSessionList();
   await checkRateLimit();
   await checkSanitizerWiring();
+  await checkCsrfProtection();
 
   if (failures.length > 0) {
     process.stderr.write(`auth gate failed with ${failures.length} problem(s):\n`);

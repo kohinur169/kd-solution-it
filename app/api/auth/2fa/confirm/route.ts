@@ -8,6 +8,7 @@ import { getAuthRuntime } from "@/lib/auth/runtime";
 import { enforceRateLimit } from "@/lib/auth/rate-limit";
 import { confirmTotpEnrolment } from "@/lib/auth/two-factor";
 import { logger } from "@/lib/logger/logger";
+import { requireCsrfToken } from "@/lib/security/csrf";
 
 export const dynamic = "force-dynamic";
 
@@ -37,6 +38,9 @@ export const POST = withErrorResponse(
     // STEP 055: section 22 line 242. Counted first, so a burst costs one statement and
     // never reaches the body, the session or the work behind them.
     await enforceRateLimit({ request, scope: "two_factor_confirm" }, getAuthRuntime());
+
+    // STEP 057: a form post from another origin cannot read the token this compares.
+    requireCsrfToken(request, { secure: getAuthRuntime().cookiePolicy.secure });
 
     const declaredLength = request.headers.get("content-length");
 

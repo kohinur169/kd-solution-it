@@ -491,6 +491,22 @@ the authority. A permission check uses the record, never a claim.
     `TRANSPORT_CODES`, and the audit entry `auth.rate_limited` is written once per window - the
     counter is exact, so the record of an attack is one line rather than a copy of it.
 
+90. Every mutation compares two copies of one random token. `__Host-kd_csrf` is issued by an
+    anonymous `GET /api/auth/csrf` and readable by the page; `requireCsrfToken` refuses a request whose
+    `x-csrf-token` header does not equal it, in constant time, before the body is read and before the
+    session is looked up. The guard sits directly **after** `enforceRateLimit`, so an attacker burns a
+    counter slot whether or not the token is right.
+91. The refusal is `VALIDATION_FAILED`, not `PERMISSION_DENIED`. A request with no token has no
+    identity to speak of - it may not carry a session at all - and a permission code would tell an
+    anonymous caller something about a record it never asked about. One code, one rule
+    (`csrf_token_invalid`), one field (`csrf`), whatever the way it failed.
+92. The list of protected routes is data, not a habit. `CSRF_PROTECTED_PATHS` in `lib/security/csrf.ts`
+    names every path that answers a `POST`, and `checkCsrfProtection()` in `verify.ts` compares it with
+    the tree: a new `POST` route with no guard fails the gate, and so does a browser file that sends a
+    mutation without spreading `csrfHeaders()` into its headers. The browser helper is
+    `lib/security/csrf-client.ts`, which imports nothing - `csrf.ts` would pull `node:crypto` into the
+    bundle.
+
 ## Adding an operation
 
 1. Add the method to the `AuthClient` or `AdminAuthClient` interface and its implementation,

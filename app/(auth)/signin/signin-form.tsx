@@ -9,6 +9,7 @@ import {
   readStoredDeviceProofKey,
 } from "@/lib/auth/device-proof-store";
 import { formatMessage, getMessage } from "@/lib/i18n/messages";
+import { csrfHeaders } from "@/lib/security/csrf-client";
 import { rateLimitSentence } from "@/lib/auth/refusal-message";
 
 /**
@@ -283,9 +284,10 @@ export function SigninForm({ siteKey, afterSigninPath }: SigninFormProperties): 
     setSubmitting(true);
 
     try {
+      const csrf = await csrfHeaders();
       const response = await fetch("/api/auth/signin", {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", ...csrf },
         body: JSON.stringify({ email, password, turnstileToken }),
       });
 
@@ -355,9 +357,10 @@ export function SigninForm({ siteKey, afterSigninPath }: SigninFormProperties): 
     setVerifying(true);
 
     try {
+      const csrf = await csrfHeaders();
       const response = await fetch("/api/auth/2fa/verify", {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", ...csrf },
         body: JSON.stringify({ challengeToken: challenge.token, code }),
       });
 

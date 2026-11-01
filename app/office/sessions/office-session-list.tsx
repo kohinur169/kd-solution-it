@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { useState, type ReactNode } from "react";
 import type { SessionView } from "@/lib/auth/session-list";
 import { deviceProofHeaders } from "@/lib/auth/device-proof-store";
+import { csrfHeaders } from "@/lib/security/csrf-client";
 import { rateLimitSentence } from "@/lib/auth/refusal-message";
 import { getMessage } from "@/lib/i18n/messages";
 
@@ -97,7 +98,7 @@ export function OfficeSessionList({ userId, sessions }: OfficeSessionListPropert
 
       const response = await fetch(path, {
         method: "POST",
-        headers: { "content-type": "application/json", ...proof },
+        headers: { "content-type": "application/json", ...proof, ...(await csrfHeaders()) },
         body,
       });
 
