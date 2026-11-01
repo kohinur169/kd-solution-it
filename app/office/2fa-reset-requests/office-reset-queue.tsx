@@ -3,6 +3,7 @@
 
 import { useRouter } from "next/navigation";
 import { useState, type FormEvent, type ReactNode } from "react";
+import { deviceProofHeaders } from "@/lib/auth/device-proof-store";
 import { formatMessage, getMessage } from "@/lib/i18n/messages";
 import type { TwoFactorResetRequestView } from "@/lib/auth/two-factor-reset";
 
@@ -70,15 +71,33 @@ function RequestCard({ request }: { readonly request: TwoFactorResetRequestView 
     setBusy(true);
 
     try {
+      const body = JSON.stringify({
+        requestId: request.id,
+        action: chosen,
+        ...(chosen === "contacted" ? { documentReference } : {}),
+        ...(chosen === "contacted" || note.trim().length === 0 ? {} : { note }),
+      });
+
+      // STEP 050: a decision removes a second factor, so the cookie is not enough. The proof signs
+      // this exact body for this exact path; without a key on this browser there is nothing to sign
+      // with, and saying so is better than a request that is refused after the office member waits.
+      const proof = await deviceProofHeaders(
+        "POST",
+        "/api/office/2fa-reset-requests/decision",
+        body,
+      );
+
+      if (proof === null) {
+        setMessage(getMessage("device.proofRequired"));
+        setBusy(false);
+
+        return;
+      }
+
       const response = await fetch("/api/office/2fa-reset-requests/decision", {
         method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          requestId: request.id,
-          action: chosen,
-          ...(chosen === "contacted" ? { documentReference } : {}),
-          ...(chosen === "contacted" || note.trim().length === 0 ? {} : { note }),
-        }),
+        headers: { "content-type": "application/json", ...proof },
+        body,
       });
       if (!response.ok) {
         setMessage(messageForStatus(response.status));

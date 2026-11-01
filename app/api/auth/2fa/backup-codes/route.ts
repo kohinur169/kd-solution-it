@@ -4,6 +4,7 @@ import { AppError } from "@/lib/errors/app-error";
 import { withErrorResponse } from "@/lib/errors/respond";
 import { readRequestActor } from "@/lib/auth/request-actor";
 import { regenerateBackupCodes } from "@/lib/auth/backup-codes";
+import { verifySensitiveRequest } from "@/lib/auth/request-proof";
 import { getAuthRuntime } from "@/lib/auth/runtime";
 import { logger } from "@/lib/logger/logger";
 
@@ -40,10 +41,25 @@ export const POST = withErrorResponse(
       }
     }
 
+    // The body is read once, as text, because the signature covers these exact bytes: a parse
+    // followed by a re-serialise would verify a different document from the one that was signed.
+    const bodyText = await request.text();
+    const runtime = getAuthRuntime();
+    const actor = await readRequestActor(request.headers.get("cookie"), {
+      directory: runtime.directory,
+      cookiePolicy: runtime.cookiePolicy,
+    });
+
+    // Before the parser sees a byte: a tampered body fails the proof, not a schema.
+    await verifySensitiveRequest(
+      { request, bodyText, actor },
+      { rest: runtime.rest, audit: runtime.audit },
+    );
+
     let body: unknown;
 
     try {
-      body = await request.json();
+      body = JSON.parse(bodyText) as unknown;
     } catch {
       throw new AppError("VALIDATION_FAILED", {
         details: [{ field: "code", rule: "invalid_format" }],
@@ -60,12 +76,6 @@ export const POST = withErrorResponse(
         details: [{ field: "code", rule: "invalid_format" }],
       });
     }
-
-    const runtime = getAuthRuntime();
-    const actor = await readRequestActor(request.headers.get("cookie"), {
-      directory: runtime.directory,
-      cookiePolicy: runtime.cookiePolicy,
-    });
 
     const result = await regenerateBackupCodes(
       { userId: actor.userId, code },

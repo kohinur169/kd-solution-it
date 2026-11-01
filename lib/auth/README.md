@@ -352,6 +352,31 @@ the authority. A permission check uses the record, never a claim.
     same way from the losing side; past ten live devices the answer is `CONFLICT` and nothing is
     written; and every written or refreshed row appends `user.device_enrolled` or
     `user.device_proof_refreshed` with the algorithm and the device label, never the key.
+67. A proof is evidence beside the session, never instead of it. `verifySensitiveRequest` runs
+    after `readRequestActor`: a request without a session is refused by the session read, and a
+    request with one but without a proof is refused by the proof check. The six refusal reasons
+    (`missing-header`, `malformed-header`, `query-not-signed`, `path-not-sensitive`,
+    `method-mismatch`, `stale-timestamp`, `unknown-device`, `signature`, `replayed`) all answer the
+    same `AUTHENTICATION_REQUIRED` with an empty detail list and one `user.request_proof_rejected`
+    entry naming only the reason and the method - the nonce, the signature and the key never reach
+    the audit trail.
+68. The message is the contract. `requestProofMessage` joins seven newline separated lines:
+    `kd-proof-v1`, the upper cased method, the pathname, the body digest, the timestamp, the nonce
+    and the device row id. The version line means a later revision can sign differently without
+    reinterpreting an old signature; the pathname is signed without its query, so a request that
+    carries one is refused as `query-not-signed` rather than verified against the wrong path; and
+    the body is covered by its base64url SHA-256 (`-` for an empty body), which is why every route
+    reads the body once with `await request.text()` and parses that same string afterwards.
+69. Five minutes of clock, two of them real. A signature is accepted when its timestamp is within
+    `REQUEST_PROOF_WINDOW_MS` (120 s) of the server clock on both sides, and the nonce table
+    refuses a nonce past `signed_at + interval '10 minutes'`, so a timestamp cannot be stretched
+    into a long lived replay window. The unique index on `(device_proof_key_id, nonce)` is the
+    replay guard: the insert happens before any endpoint work, and a conflict is the refusal.
+70. The registry is the boundary, and the gate reads the disk. `SENSITIVE_ENDPOINTS` lists the
+    method and path of every endpoint that requires a proof, and `checkRequestProof()` compares it
+    with the routes that import `verifySensitiveRequest`: a listed endpoint whose file does not
+    call it, and a route that calls it without being listed, both fail. Adding an endpoint is
+    therefore a change in one file, proved by a check, not by memory.
 
 ## Adding an operation
 

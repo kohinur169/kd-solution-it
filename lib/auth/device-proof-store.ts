@@ -1,10 +1,15 @@
 // path: lib/auth/device-proof-store.ts
 import {
   DEFAULT_PROOF_KEY_ALGORITHM,
+  encodeBase64Url,
   generateProofKeyPair,
   isProofKeyAlgorithm,
   isStoredProofKey,
   publicProofKeyOf,
+  requestBodyDigest,
+  requestProofMessage,
+  REQUEST_PROOF_HEADERS,
+  signProofMessage,
   type ProofKeyAlgorithm,
   type StoredProofKey,
 } from "./proof-key.ts";
@@ -152,6 +157,58 @@ export async function readStoredDeviceProofKey(): Promise<StoredProofKey | null>
 
     return null;
   } catch {
+    return null;
+  }
+}
+
+/**
+ * The four headers that prove one request came from this browser.
+ *
+ * Returns null - rather than a set of headers that would be refused - when this browser has no key,
+ * has a key the platform has never seen (no device id yet), or cannot use WebCrypto at all. A caller
+ * that gets null shows one sentence instead of sending a request whose answer is a foregone `401`.
+ *
+ * The body passed in must be the exact text that goes on the wire. The digest is over these bytes,
+ * so a caller that re-serialises the object afterwards is signing a different document - which is
+ * why this function takes the string and not the value.
+ */
+export async function deviceProofHeaders(
+  method: string,
+  path: string,
+  body: string,
+): Promise<Readonly<Record<string, string>> | null> {
+  if (!deviceProofSupported()) {
+    return null;
+  }
+
+  const key = await readStoredDeviceProofKey();
+
+  if (key === null || key.deviceId === null) {
+    return null;
+  }
+
+  const timestamp = String(Date.now());
+  const nonce = encodeBase64Url(crypto.getRandomValues(new Uint8Array(16)));
+
+  const message = requestProofMessage({
+    method,
+    path,
+    bodyDigest: await requestBodyDigest(body),
+    timestamp,
+    nonce,
+    deviceKeyId: key.deviceId,
+  });
+
+  try {
+    return {
+      [REQUEST_PROOF_HEADERS.deviceKey]: key.deviceId,
+      [REQUEST_PROOF_HEADERS.timestamp]: timestamp,
+      [REQUEST_PROOF_HEADERS.nonce]: nonce,
+      [REQUEST_PROOF_HEADERS.signature]: await signProofMessage(key.privateKey, key.algorithm, message),
+    };
+  } catch {
+    // A key object that cannot sign is a key object this origin cannot use; the caller treats it the
+    // same way as no key at all, and the next sign in regenerates the pair.
     return null;
   }
 }

@@ -4,6 +4,7 @@ import { AppError } from "@/lib/errors/app-error";
 import { withErrorResponse } from "@/lib/errors/respond";
 import { readRequestActor } from "@/lib/auth/request-actor";
 import { getAuthRuntime } from "@/lib/auth/runtime";
+import { verifySensitiveRequest } from "@/lib/auth/request-proof";
 import { decideTwoFactorReset } from "@/lib/auth/two-factor-reset";
 import { logger } from "@/lib/logger/logger";
 
@@ -61,10 +62,25 @@ export const POST = withErrorResponse(
       }
     }
 
+    // One read, as text: the signature covers these bytes, so the parser below must be given the
+    // same document the device signed.
+    const bodyText = await request.text();
+    const runtime = getAuthRuntime();
+    const actor = await readRequestActor(request.headers.get("cookie"), {
+      directory: runtime.directory,
+      cookiePolicy: runtime.cookiePolicy,
+    });
+
+    // A proof before a parse: an altered body fails here rather than as a schema problem.
+    await verifySensitiveRequest(
+      { request, bodyText, actor },
+      { rest: runtime.rest, audit: runtime.audit },
+    );
+
     let body: unknown;
 
     try {
-      body = await request.json();
+      body = JSON.parse(bodyText) as unknown;
     } catch {
       throw new AppError("VALIDATION_FAILED", {
         details: [{ field: "action", rule: "invalid_format" }],
@@ -82,12 +98,6 @@ export const POST = withErrorResponse(
         ],
       });
     }
-
-    const runtime = getAuthRuntime();
-    const actor = await readRequestActor(request.headers.get("cookie"), {
-      directory: runtime.directory,
-      cookiePolicy: runtime.cookiePolicy,
-    });
 
     const decision = await decideTwoFactorReset(
       {

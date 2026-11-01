@@ -143,6 +143,188 @@ export async function proofKeyFingerprint(spkiBytes: Uint8Array): Promise<string
   return encodeBase64Url(new Uint8Array(digest));
 }
 
+/**
+ * The headers one signed request carries.
+ *
+ * Four names rather than one envelope: a proxy, a log or a browser devtools panel then shows which
+ * part is missing, and no part can smuggle another. They are all `x-` prefixed and all lower case,
+ * because `Headers` normalises names that way and a comparison against a mixed case literal is a bug
+ * waiting to be written.
+ */
+export const REQUEST_PROOF_HEADERS = deepFreeze({
+  deviceKey: "x-device-proof-key",
+  timestamp: "x-device-proof-timestamp",
+  nonce: "x-device-proof-nonce",
+  signature: "x-device-proof-signature",
+} as const);
+
+/** The first line of the signed message. A change to the layout is a new version, never a silent one. */
+export const REQUEST_PROOF_VERSION = "kd-proof-v1";
+
+/**
+ * How far from the server's clock a signed request may be.
+ *
+ * Two minutes is short enough that a captured request is worth almost nothing and long enough that a
+ * phone with a slightly wrong clock still works. The browser signs its own `Date.now()`, and the
+ * server refuses anything outside `now - window` to `now + window`, so a replay after the window is
+ * refused by the clock rather than by the nonce table.
+ */
+export const REQUEST_PROOF_WINDOW_MS = 120_000;
+
+/** A nonce is sixteen random bytes in base64url; the bound allows a longer one from a future client. */
+export const REQUEST_PROOF_NONCE_PATTERN = /^[A-Za-z0-9_-]{16,64}$/u;
+
+/** A timestamp is epoch milliseconds, and nothing else. */
+export const REQUEST_PROOF_TIMESTAMP_PATTERN = /^\d{13}$/u;
+
+/** A device row id: a UUID, or the shorter identifier a double in the gate uses. */
+export const REQUEST_PROOF_DEVICE_KEY_PATTERN = /^[A-Za-z0-9-]{8,64}$/u;
+
+/** An ES256 signature is 64 bytes, so 86 base64url characters; the ceiling leaves room for the rest. */
+export const REQUEST_PROOF_SIGNATURE_MAXIMUM_LENGTH = 512;
+
+/** The six fields a proof binds together. */
+export interface RequestProofParts {
+  readonly method: string;
+  readonly path: string;
+  /** Base64url SHA-256 of the raw body, or `-` when the body is empty. */
+  readonly bodyDigest: string;
+  readonly timestamp: string;
+  readonly nonce: string;
+  readonly deviceKeyId: string;
+}
+
+/**
+ * The message a device signs.
+ *
+ * Six newline separated fields under a version line. Newlines are the delimiter because every field
+ * is bounded and none of them may contain one - a path cannot, a base64url digest cannot, a decimal
+ * timestamp cannot - so no two different requests can produce the same message by moving a boundary.
+ * The version line is first so a future change of layout is a change of version rather than a change
+ * of meaning for signatures that already exist.
+ */
+export function requestProofMessage(parts: RequestProofParts): string {
+  return [
+    REQUEST_PROOF_VERSION,
+    parts.method.toUpperCase(),
+    parts.path,
+    parts.bodyDigest,
+    parts.timestamp,
+    parts.nonce,
+    parts.deviceKeyId,
+  ].join("\n");
+}
+
+/** Base64url SHA-256 of the bytes, the one digest shape this module uses. */
+export async function sha256Base64Url(bytes: Uint8Array): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new Uint8Array(bytes));
+
+  return encodeBase64Url(new Uint8Array(digest));
+}
+
+/**
+ * The digest of a request body, as the signed message names it.
+ *
+ * An empty body is `-` rather than the digest of the empty string, so a request with no body and a
+ * request with the body `""` cannot be confused by a reader of the message.
+ */
+export async function requestBodyDigest(bodyText: string): Promise<string> {
+  if (bodyText.length === 0) {
+    return "-";
+  }
+
+  return sha256Base64Url(new TextEncoder().encode(bodyText));
+}
+
+/** The WebCrypto parameters of one algorithm, for importing a public key and verifying with it. */
+function verifyParameters(algorithm: ProofKeyAlgorithm): {
+  readonly import: AlgorithmIdentifier | EcKeyImportParams;
+  readonly verify: AlgorithmIdentifier | EcdsaParams;
+} {
+  switch (algorithm) {
+    case "ES256":
+      return {
+        import: { name: "ECDSA", namedCurve: "P-256" },
+        verify: { name: "ECDSA", hash: "SHA-256" },
+      };
+    case "ES384":
+      return {
+        import: { name: "ECDSA", namedCurve: "P-384" },
+        verify: { name: "ECDSA", hash: "SHA-384" },
+      };
+    case "EdDSA":
+      return { import: { name: "Ed25519" }, verify: { name: "Ed25519" } };
+  }
+}
+
+/**
+ * Sign one message with the device's private key.
+ *
+ * The key is the non-extractable one `generateProofKeyPair` created, so this function can produce a
+ * signature and nothing else: it cannot hand out the key it used, and neither can a script that calls
+ * it. ECDSA in WebCrypto produces the raw `r||s` pair (64 bytes for P-256), which is the format the
+ * verification side expects.
+ */
+export async function signProofMessage(
+  privateKey: CryptoKey,
+  algorithm: ProofKeyAlgorithm,
+  message: string,
+): Promise<string> {
+  const signature = await crypto.subtle.sign(
+    verifyParameters(algorithm).verify,
+    privateKey,
+    new TextEncoder().encode(message),
+  );
+
+  return encodeBase64Url(new Uint8Array(signature));
+}
+
+/** The input of a verification: the stored public half, the algorithm of its row, and one signature. */
+export interface ProofMessageVerification {
+  readonly publicKeyBase64Url: string;
+  readonly algorithm: ProofKeyAlgorithm;
+  readonly message: string;
+  readonly signatureBase64Url: string;
+}
+
+/**
+ * Verify one signature against the stored public key.
+ *
+ * False covers every way this can fail - a key that is not a key, a signature of the wrong length, a
+ * message that was tampered with, a pair that does not belong together - because the caller's answer
+ * is the same in all of them and a distinction here would only be a description of the key handling
+ * for whoever probes it.
+ */
+export async function verifyProofMessage(input: ProofMessageVerification): Promise<boolean> {
+  const publicKey = decodeBase64Url(input.publicKeyBase64Url);
+  const signature = decodeBase64Url(input.signatureBase64Url);
+
+  if (publicKey === null || signature === null) {
+    return false;
+  }
+
+  const parameters = verifyParameters(input.algorithm);
+
+  try {
+    const key = await crypto.subtle.importKey(
+      "spki",
+      new Uint8Array(publicKey),
+      parameters.import,
+      false,
+      ["verify"],
+    );
+
+    return await crypto.subtle.verify(
+      parameters.verify,
+      key,
+      new Uint8Array(signature),
+      new TextEncoder().encode(input.message),
+    );
+  } catch {
+    return false;
+  }
+}
+
 /** A generated pair, plus the two values the platform stores and compares. */
 export interface GeneratedProofKey {
   /** Non-extractable: the private half cannot be read out of the key object it lives in. */

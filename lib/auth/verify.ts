@@ -1,6 +1,6 @@
 // path: lib/auth/verify.ts
 import { Buffer } from "node:buffer";
-import { readdir } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 import process from "node:process";
 import { z } from "zod";
 import { AppError } from "../errors/app-error.ts";
@@ -25,7 +25,21 @@ import {
   PROOF_KEY_LABEL_MAXIMUM_LENGTH,
   proofKeyLabel,
   publicProofKeyOf,
+  requestBodyDigest,
+  requestProofMessage,
+  REQUEST_PROOF_HEADERS,
+  REQUEST_PROOF_VERSION,
+  REQUEST_PROOF_WINDOW_MS,
+  sha256Base64Url,
+  signProofMessage,
+  verifyProofMessage,
+  type ProofKeyAlgorithm,
 } from "./proof-key.ts";
+import {
+  isSensitivePath,
+  SENSITIVE_ENDPOINTS,
+  verifySensitiveRequest,
+} from "./request-proof.ts";
 import {
   ANONYMOUS_AUTH_SURFACES,
   ANONYMOUS_REFUSAL,
@@ -8085,6 +8099,692 @@ async function checkDeviceProofKey(): Promise<void> {
   expectEqual(isStoredProofKey(null), false, "nothing is not a record");
 }
 
+/* ------------------------------------------------ request proof (050) */
+
+interface ProofDeviceRow {
+  readonly id: string;
+  readonly user_id: string;
+  readonly public_key: string;
+  readonly algorithm: string;
+  readonly trusted_at: string | null;
+  readonly revoked_at: string | null;
+  readonly deleted_at: string | null;
+}
+
+interface ProofNonceRow {
+  readonly device_proof_key_id: string;
+  readonly nonce: string;
+  readonly method: string;
+  readonly path: string;
+  readonly signed_at: string;
+  readonly expires_at: string;
+}
+
+interface ProofWorld {
+  readonly devices: readonly ProofDeviceRow[];
+  readonly nonces: readonly ProofNonceRow[];
+  seedDevice(values: {
+    readonly id: string;
+    readonly user_id: string;
+    readonly public_key: string;
+    readonly algorithm?: string;
+    readonly trusted_at?: string | null;
+    readonly revoked_at?: string | null;
+  }): void;
+  readonly rest: RestClient;
+}
+
+/**
+ * A fake pair of tables for the proof check: the enrolled keys `0009` holds and the spent nonces
+ * `0088` holds, with the unique index that makes a replay a replay.
+ */
+function createProofWorld(): ProofWorld {
+  const devices: ProofDeviceRow[] = [];
+  const nonces: ProofNonceRow[] = [];
+
+  return {
+    devices,
+    nonces,
+    seedDevice(values) {
+      devices.push({
+        id: values.id,
+        user_id: values.user_id,
+        public_key: values.public_key,
+        algorithm: values.algorithm ?? "ES256",
+        trusted_at: values.trusted_at ?? null,
+        revoked_at: values.revoked_at ?? null,
+        deleted_at: null,
+      });
+    },
+    rest: {
+      select<TRow>(table: string, query: string): Promise<readonly TRow[]> {
+        if (table !== "device_proof_keys") {
+          return Promise.resolve([]);
+        }
+
+        const id = /(?:^|[&?])id=eq\.([^&]+)/u.exec(query)?.[1] ?? null;
+        const userId = /(?:^|[&?])user_id=eq\.([^&]+)/u.exec(query)?.[1] ?? null;
+        const live = query.includes("revoked_at=is.null")
+          ? devices.filter((row) => row.revoked_at === null && row.deleted_at === null)
+          : devices;
+
+        return Promise.resolve(
+          live
+            .filter((row) => id === null || row.id === decodeURIComponent(id))
+            .filter((row) => userId === null || row.user_id === decodeURIComponent(userId))
+            .slice(0, 1) as unknown as readonly TRow[],
+        );
+      },
+      insert(table: string, rows: readonly Readonly<Record<string, unknown>>[]): Promise<void> {
+        if (table !== "request_proof_nonces") {
+          return Promise.resolve();
+        }
+
+        for (const row of rows) {
+          const nonce: ProofNonceRow = {
+            device_proof_key_id: String(row["device_proof_key_id"]),
+            nonce: String(row["nonce"]),
+            method: String(row["method"]),
+            path: String(row["path"]),
+            signed_at: String(row["signed_at"]),
+            expires_at: String(row["expires_at"]),
+          };
+
+          if (
+            nonces.some(
+              (spent) =>
+                spent.device_proof_key_id === nonce.device_proof_key_id && spent.nonce === nonce.nonce,
+            )
+          ) {
+            throw new AppError("CONFLICT");
+          }
+
+          nonces.push(nonce);
+        }
+
+        return Promise.resolve();
+      },
+      insertReturning<TRow>(): Promise<readonly TRow[]> {
+        return Promise.resolve([]);
+      },
+      update(): Promise<void> {
+        return Promise.resolve();
+      },
+      rpc(): Promise<unknown> {
+        return Promise.resolve(null);
+      },
+    },
+  };
+}
+
+/** One signed request, assembled the way a browser assembles it. */
+interface SignedCall {
+  readonly request: Request;
+  readonly nonce: string;
+  readonly timestamp: string;
+}
+
+interface SignCallOptions {
+  readonly path: string;
+  readonly body: string;
+  readonly deviceKeyId: string;
+  readonly privateKey: CryptoKey;
+  readonly algorithm?: ProofKeyAlgorithm;
+  /** The message that is signed, when it must differ from the request that is sent. */
+  readonly signedPath?: string;
+  readonly signedBody?: string;
+  readonly signedMethod?: string;
+  readonly signedTimestamp?: string;
+  readonly method?: string;
+  readonly timestamp?: number;
+  readonly nonce?: string;
+  readonly signatureOverride?: string;
+  readonly omit?: readonly string[];
+  readonly search?: string;
+}
+
+/**
+ * Build one signed request, exactly as `deviceProofHeaders()` builds one.
+ *
+ * The `signed*` fields exist so a check can prove that a message signed over something else is
+ * refused: a signature that only ever covers what it should is a signature nobody has tested.
+ */
+async function signedCall(options: SignCallOptions): Promise<SignedCall> {
+  const timestamp = String(options.timestamp ?? NOW);
+  const nonce = options.nonce ?? encodeBase64Url(crypto.getRandomValues(new Uint8Array(16)));
+  const algorithm = options.algorithm ?? "ES256";
+  const message = requestProofMessage({
+    method: options.signedMethod ?? options.method ?? "POST",
+    path: options.signedPath ?? options.path,
+    bodyDigest: await requestBodyDigest(options.signedBody ?? options.body),
+    timestamp: options.signedTimestamp ?? timestamp,
+    nonce,
+    deviceKeyId: options.deviceKeyId,
+  });
+  const signature =
+    options.signatureOverride ??
+    (await signProofMessage(options.privateKey, algorithm, message));
+  const omitted = options.omit ?? [];
+  const headers: Record<string, string> = { "content-type": "application/json" };
+
+  for (const [name, value] of [
+    [REQUEST_PROOF_HEADERS.deviceKey, options.deviceKeyId],
+    [REQUEST_PROOF_HEADERS.timestamp, timestamp],
+    [REQUEST_PROOF_HEADERS.nonce, nonce],
+    [REQUEST_PROOF_HEADERS.signature, signature],
+  ] as const) {
+    if (!omitted.includes(name)) {
+      headers[name] = value;
+    }
+  }
+
+  return {
+    nonce,
+    timestamp,
+    request: new Request(`https://platform.test${options.path}${options.search ?? ""}`, {
+      method: options.method ?? "POST",
+      headers,
+      body: options.body,
+    }),
+  };
+}
+
+/**
+ * The signature check on the endpoints where a cookie is not enough.
+ *
+ * Every value here is produced by the module the browser loads - a real non-extractable key, a real
+ * signature over the real canonical message - and checked by the module the server runs. The fake
+ * tables enforce the one rule that matters in the database: `0088`'s unique index on
+ * `(device, nonce)`, which is what turns a replay into a conflict.
+ */
+async function checkRequestProof(): Promise<void> {
+  // ---- the message layout
+  const parts = {
+    method: "post",
+    path: "/api/office/account-locks/unlock",
+    bodyDigest: "-",
+    timestamp: "1800000000000",
+    nonce: "AAAAAAAAAAAAAAAAAAAAAA",
+    deviceKeyId: "device-050",
+  };
+  const message = requestProofMessage(parts);
+  const lines = message.split("\n");
+
+  expectEqual(lines.length, 7, "the message is seven lines");
+  expectEqual(lines[0], REQUEST_PROOF_VERSION, "the first line is the version");
+  expectEqual(lines[1], "POST", "the method is upper cased in the message");
+  expectEqual(lines[2], parts.path, "the third line is the path");
+  expectEqual(lines[3], "-", "an empty body is a dash");
+  expectEqual(lines[4], parts.timestamp, "the fifth line is the timestamp");
+  expectEqual(lines[5], parts.nonce, "the sixth line is the nonce");
+  expectEqual(lines[6], parts.deviceKeyId, "the last line is the device");
+  expectEqual(
+    requestProofMessage({ ...parts, timestamp: "1800000000001" }) !== message,
+    true,
+    "a different timestamp is a different message",
+  );
+  expectEqual(
+    requestProofMessage({ ...parts, path: `${parts.path}x` }) !== message,
+    true,
+    "a different path is a different message",
+  );
+  expectEqual(
+    requestProofMessage({ ...parts, bodyDigest: "x" }) !== message,
+    true,
+    "a different body is a different message",
+  );
+
+  // ---- the digest
+  expectEqual(await requestBodyDigest(""), "-", "an empty body has no digest");
+  expectEqual(
+    await sha256Base64Url(new TextEncoder().encode("")),
+    "47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+    "the empty string hashes to the known SHA-256",
+  );
+  expectEqual(
+    (await requestBodyDigest("{}")).length,
+    43,
+    "a body digest is a base64url SHA-256",
+  );
+  expect(
+    (await requestBodyDigest("{}")) !== (await requestBodyDigest('{"a":1}')),
+    "two bodies have two digests",
+  );
+
+  // ---- signing and verifying, for all three algorithms
+  for (const algorithm of ["ES256", "ES384", "EdDSA"] as const) {
+    const pair = await generateProofKeyPair(algorithm);
+    const signature = await signProofMessage(pair.privateKey, algorithm, message);
+
+    expect(signature.length > 60, `an ${algorithm} signature is a base64url string`);
+
+    const verified = await verifyProofMessage({
+      publicKeyBase64Url: pair.publicKeyBase64Url,
+      algorithm,
+      message,
+      signatureBase64Url: signature,
+    });
+
+    expect(verified, `an ${algorithm} signature verifies with its own key`);
+    expect(
+      await verifyProofMessage({
+        publicKeyBase64Url: pair.publicKeyBase64Url,
+        algorithm,
+        message: `${message}x`,
+        signatureBase64Url: signature,
+      }) === false,
+      `an ${algorithm} signature does not verify over a different message`,
+    );
+
+    const other = await generateProofKeyPair(algorithm);
+
+    expect(
+      await verifyProofMessage({
+        publicKeyBase64Url: other.publicKeyBase64Url,
+        algorithm,
+        message,
+        signatureBase64Url: signature,
+      }) === false,
+      `an ${algorithm} signature does not verify with another key`,
+    );
+  }
+
+  const pair = await generateProofKeyPair();
+  const goodSignature = await signProofMessage(pair.privateKey, "ES256", message);
+
+  expect(
+    await verifyProofMessage({
+      publicKeyBase64Url: pair.publicKeyBase64Url,
+      algorithm: "ES256",
+      message,
+      signatureBase64Url: `${goodSignature.slice(0, -4)}AAAA`,
+    }) === false,
+    "a tampered signature does not verify",
+  );
+  expect(
+    await verifyProofMessage({
+      publicKeyBase64Url: "not-a-key",
+      algorithm: "ES256",
+      message,
+      signatureBase64Url: goodSignature,
+    }) === false,
+    "a key that is not a key does not verify",
+  );
+  expect(
+    await verifyProofMessage({
+      publicKeyBase64Url: pair.publicKeyBase64Url,
+      algorithm: "ES256",
+      message,
+      signatureBase64Url: "AAAA",
+    }) === false,
+    "a signature of the wrong length does not verify",
+  );
+
+  // ---- the check, against the tables it reads
+  const world = createProofWorld();
+  const audit = createInMemoryAuditTrail();
+  const dependencies = { rest: world.rest, audit, now: () => NOW };
+  const actor = {
+    userId: USER_ID,
+    companyId: FIRM_ID,
+    roles: ["owner"] as const,
+    sessionId: "session-050",
+    assuranceLevel: "aal2" as const,
+    authenticatedAtEpochMs: NOW - 60_000,
+    expiresAtEpochMs: NOW + 3_600_000,
+    emailVerified: true,
+    twoFactorSatisfied: true,
+    twoFactorEnrolmentRequired: false,
+  };
+  const path = "/api/office/account-locks/unlock";
+  const body = '{"lockId":"018f3b1c-6666-7c2a-9d1e-2b3c4d5e6f75","note":"called the owner"}';
+
+  world.seedDevice({
+    id: "device-050",
+    user_id: USER_ID,
+    public_key: pair.publicKeyBase64Url,
+  });
+
+  const call = await signedCall({
+    path,
+    body,
+    deviceKeyId: "device-050",
+    privateKey: pair.privateKey,
+  });
+  const outcome = await verifySensitiveRequest(
+    { request: call.request, bodyText: body, actor },
+    dependencies,
+  );
+
+  expectEqual(outcome.deviceKeyId, "device-050", "a correct proof names the device");
+  expectEqual(outcome.algorithm, "ES256", "the outcome reports the algorithm of the row");
+  expectEqual(outcome.trusted, false, "an unconfirmed device is reported as untrusted");
+  expectEqual(outcome.signedAtEpochMs, NOW, "the outcome reports the signed instant");
+  expectEqual(outcome.nonce, call.nonce, "the outcome reports the nonce it spent");
+  expectEqual(world.nonces.length, 1, "one proof spends one nonce");
+  expectEqual(world.nonces[0]?.nonce, call.nonce, "the row stores the nonce");
+  expectEqual(world.nonces[0]?.path, path, "the row stores the path");
+  expectEqual(world.nonces[0]?.method, "POST", "the row stores the method");
+  expectEqual(
+    world.nonces[0]?.expires_at,
+    new Date(NOW + 120_000).toISOString(),
+    "the row expires one window after the signed instant",
+  );
+  expectEqual(audit.entries.length, 0, "a verified proof writes no audit entry of its own");
+
+  // ---- replay
+  const replay = await captureRejection(
+    () => verifySensitiveRequest({ request: call.request, bodyText: body, actor }, dependencies),
+    "a replayed request is refused",
+  );
+
+  expectEqual(replay.code, "AUTHENTICATION_REQUIRED", "a replay answers the shared refusal");
+  expectEqual(replay.details.length, 0, "a replay names no detail");
+  expectEqual(world.nonces.length, 1, "a replay spends nothing twice");
+  expectEqual(
+    audit.entries.at(-1)?.action,
+    "user.request_proof_rejected",
+    "a replay is audited as a rejected proof",
+  );
+  expectEqual(audit.entries.at(-1)?.payload["reason"], "replayed", "the entry names the reason");
+  expect(
+    JSON.stringify(audit.entries.at(-1)?.payload ?? null).includes(call.nonce) === false,
+    "the entry does not quote the nonce",
+  );
+
+  // ---- the window, on both sides
+  const boundary = await signedCall({
+    path,
+    body,
+    deviceKeyId: "device-050",
+    privateKey: pair.privateKey,
+    timestamp: NOW - REQUEST_PROOF_WINDOW_MS,
+  });
+
+  const boundaryOutcome = await verifySensitiveRequest(
+    { request: boundary.request, bodyText: body, actor },
+    dependencies,
+  );
+
+  expectEqual(
+    boundaryOutcome.signedAtEpochMs,
+    NOW - REQUEST_PROOF_WINDOW_MS,
+    "a request exactly one window old is still accepted",
+  );
+
+  for (const offset of [-REQUEST_PROOF_WINDOW_MS - 1, REQUEST_PROOF_WINDOW_MS + 1]) {
+    const stale = await signedCall({
+      path,
+      body,
+      deviceKeyId: "device-050",
+      privateKey: pair.privateKey,
+      timestamp: NOW + offset,
+    });
+    const refusal = await captureRejection(
+      () => verifySensitiveRequest({ request: stale.request, bodyText: body, actor }, dependencies),
+      `a request ${String(offset)} milliseconds from now is refused`,
+    );
+
+    expectEqual(refusal.code, "AUTHENTICATION_REQUIRED", "a request outside the window is refused");
+    expectEqual(
+      audit.entries.at(-1)?.payload["reason"],
+      "stale-timestamp",
+      "the entry names the clock as the reason",
+    );
+  }
+
+  // ---- the device the proof names
+  const unknownDevice = await signedCall({
+    path,
+    body,
+    deviceKeyId: "device-unknown",
+    privateKey: pair.privateKey,
+  });
+  const unknownRefusal = await captureRejection(
+    () => verifySensitiveRequest({ request: unknownDevice.request, bodyText: body, actor }, dependencies),
+    "a device this account does not hold is refused",
+  );
+
+  expectEqual(unknownRefusal.code, "AUTHENTICATION_REQUIRED", "an unknown device is refused");
+  expectEqual(
+    audit.entries.at(-1)?.payload["reason"],
+    "unknown-device",
+    "the entry names the unknown device",
+  );
+
+  world.seedDevice({
+    id: "device-neighbour",
+    user_id: OTHER_USER_ID,
+    public_key: pair.publicKeyBase64Url,
+  });
+
+  const neighbour = await signedCall({
+    path,
+    body,
+    deviceKeyId: "device-neighbour",
+    privateKey: pair.privateKey,
+  });
+
+  await captureRejection(
+    () => verifySensitiveRequest({ request: neighbour.request, bodyText: body, actor }, dependencies),
+    "another account's device is refused",
+  );
+  expectEqual(
+    audit.entries.at(-1)?.payload["reason"],
+    "unknown-device",
+    "another account's device is unknown to this actor",
+  );
+
+  world.seedDevice({
+    id: "device-revoked",
+    user_id: USER_ID,
+    public_key: pair.publicKeyBase64Url,
+    revoked_at: new Date(NOW - 1_000).toISOString(),
+  });
+
+  const revokedCall = await signedCall({
+    path,
+    body,
+    deviceKeyId: "device-revoked",
+    privateKey: pair.privateKey,
+  });
+
+  await captureRejection(
+    () => verifySensitiveRequest({ request: revokedCall.request, bodyText: body, actor }, dependencies),
+    "a revoked device is refused",
+  );
+  expectEqual(audit.entries.at(-1)?.payload["reason"], "unknown-device", "a revoked device is not live");
+
+  world.seedDevice({
+    id: "device-trusted",
+    user_id: USER_ID,
+    public_key: pair.publicKeyBase64Url,
+    trusted_at: new Date(NOW - 500_000).toISOString(),
+  });
+
+  const trustedCall = await signedCall({
+    path,
+    body,
+    deviceKeyId: "device-trusted",
+    privateKey: pair.privateKey,
+  });
+  const trusted = await verifySensitiveRequest(
+    { request: trustedCall.request, bodyText: body, actor },
+    dependencies,
+  );
+
+  expectEqual(trusted.trusted, true, "a confirmed device is reported as trusted");
+
+  // ---- the message a request actually signs
+  const tamperedCases: readonly (readonly [string, Partial<SignCallOptions>, string])[] = [
+    ["a body that was altered after signing", { signedBody: '{"lockId":"other"}' }, "signature"],
+    ["a path the caller did not sign", { signedPath: "/api/auth/2fa/backup-codes" }, "signature"],
+    ["a message signed over a different method", { signedMethod: "DELETE" }, "signature"],
+    ["a request whose method is not the registered one", { method: "PUT" }, "method-mismatch"],
+    ["a timestamp the caller did not sign", { signedTimestamp: String(NOW - 1_000) }, "signature"],
+  ];
+
+  for (const [description, overrides, reason] of tamperedCases) {
+    const attempt = await signedCall({
+      path,
+      body,
+      deviceKeyId: "device-050",
+      privateKey: pair.privateKey,
+      ...overrides,
+    });
+    await captureRejection(
+      () => verifySensitiveRequest({ request: attempt.request, bodyText: body, actor }, dependencies),
+      `${description} is refused`,
+    );
+
+    expectEqual(
+      audit.entries.at(-1)?.payload["reason"],
+      reason,
+      `${description} is refused as ${reason}`,
+    );
+  }
+
+  const foreignSignature = await generateProofKeyPair();
+  const forged = await signedCall({
+    path,
+    body,
+    deviceKeyId: "device-050",
+    privateKey: foreignSignature.privateKey,
+  });
+
+  await captureRejection(
+    () => verifySensitiveRequest({ request: forged.request, bodyText: body, actor }, dependencies),
+    "a signature from another key is refused",
+  );
+  expectEqual(audit.entries.at(-1)?.payload["reason"], "signature", "the entry names the signature");
+
+  // ---- the request the proof does not cover
+  const withQuery = await signedCall({
+    path,
+    body,
+    deviceKeyId: "device-050",
+    privateKey: pair.privateKey,
+    search: "?lockId=1",
+  });
+
+  await captureRejection(
+    () => verifySensitiveRequest({ request: withQuery.request, bodyText: body, actor }, dependencies),
+    "a request with a query string is refused",
+  );
+  expectEqual(
+    audit.entries.at(-1)?.payload["reason"],
+    "query-not-signed",
+    "the entry names the unsigned query",
+  );
+
+  const unlistedPath = await signedCall({
+    path: "/api/office/2fa-reset-requests",
+    body,
+    deviceKeyId: "device-050",
+    privateKey: pair.privateKey,
+  });
+
+  await captureRejection(
+    () => verifySensitiveRequest({ request: unlistedPath.request, bodyText: body, actor }, dependencies),
+    "a path outside the registry is refused",
+  );
+  expectEqual(
+    audit.entries.at(-1)?.payload["reason"],
+    "path-not-sensitive",
+    "the entry names the path",
+  );
+
+  // ---- the headers
+  for (const header of [
+    REQUEST_PROOF_HEADERS.deviceKey,
+    REQUEST_PROOF_HEADERS.timestamp,
+    REQUEST_PROOF_HEADERS.nonce,
+    REQUEST_PROOF_HEADERS.signature,
+  ]) {
+    const missing = await signedCall({
+      path,
+      body,
+      deviceKeyId: "device-050",
+      privateKey: pair.privateKey,
+      omit: [header],
+    });
+
+    await captureRejection(
+      () =>
+        verifySensitiveRequest({ request: missing.request, bodyText: body, actor }, dependencies),
+      `a request without ${header} is refused`,
+    );
+
+    expectEqual(
+      audit.entries.at(-1)?.payload["reason"],
+      "missing-header",
+      `the entry names the missing ${header}`,
+    );
+  }
+
+  const malformed = new Request(`https://platform.test${path}`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      [REQUEST_PROOF_HEADERS.deviceKey]: "x",
+      [REQUEST_PROOF_HEADERS.timestamp]: "now",
+      [REQUEST_PROOF_HEADERS.nonce]: "short",
+      [REQUEST_PROOF_HEADERS.signature]: "AAAA",
+    },
+    body,
+  });
+
+  await captureRejection(
+    () => verifySensitiveRequest({ request: malformed, bodyText: body, actor }, dependencies),
+    "a header of the wrong shape is refused",
+  );
+  expectEqual(
+    audit.entries.at(-1)?.payload["reason"],
+    "malformed-header",
+    "the entry names the shape",
+  );
+
+  // ---- the registry, against the routes on disk
+  const paths = SENSITIVE_ENDPOINTS.map((endpoint) => endpoint.path);
+
+  expectEqual(new Set(paths).size, paths.length, "no endpoint is listed twice");
+
+  for (const endpoint of SENSITIVE_ENDPOINTS) {
+    expect(endpoint.note.length > 20, `${endpoint.path} says why it is on the list`);
+    expectEqual(isSensitivePath(endpoint.path), true, `${endpoint.path} is recognised as sensitive`);
+
+    const source = await readFile(new URL(`../../app${endpoint.path}/route.ts`, import.meta.url), "utf8");
+
+    expect(
+      source.includes("verifySensitiveRequest("),
+      `${endpoint.path} calls the proof check`,
+    );
+    expect(
+      source.includes('request.text()'),
+      `${endpoint.path} hands the raw body to the check`,
+    );
+    expect(
+      source.indexOf("verifySensitiveRequest(") < source.indexOf("JSON.parse("),
+      `${endpoint.path} verifies the proof before it parses the body`,
+    );
+  }
+
+  expectEqual(isSensitivePath("/api/auth/devices"), false, "an ordinary route is not sensitive");
+
+  // ---- the request the browser builds is the request this module rebuilds
+  const browserCall = await signedCall({
+    path,
+    body,
+    deviceKeyId: "device-050",
+    privateKey: pair.privateKey,
+    nonce: "BBBBBBBBBBBBBBBBBBBBBB",
+    timestamp: NOW + 1_000,
+  });
+
+  expectEqual(browserCall.timestamp, String(NOW + 1_000), "the browser signs its own instant");
+  expectEqual(browserCall.request.headers.get(REQUEST_PROOF_HEADERS.nonce), "BBBBBBBBBBBBBBBBBBBBBB", "the nonce travels in its own header");
+}
+
 async function main(): Promise<void> {
   checkConfig();
   checkClaims();
@@ -8120,6 +8820,7 @@ async function main(): Promise<void> {
   await checkAccountUnlock();
   await checkDisclosure();
   await checkDeviceProofKey();
+  await checkRequestProof();
 
   if (failures.length > 0) {
     process.stderr.write(`auth gate failed with ${failures.length} problem(s):\n`);

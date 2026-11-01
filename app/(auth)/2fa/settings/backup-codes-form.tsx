@@ -3,6 +3,7 @@
 
 import Link from "next/link";
 import { useState, type FormEvent, type ReactNode } from "react";
+import { deviceProofHeaders } from "@/lib/auth/device-proof-store";
 import { formatMessage, getMessage } from "@/lib/i18n/messages";
 
 /**
@@ -95,10 +96,23 @@ export function BackupCodesForm({ initialStatus }: BackupCodesFormProperties): R
     setBusy(true);
 
     try {
+      const body = JSON.stringify({ code });
+
+      // STEP 050: ten new codes are ten new ways in, so the request is signed with the device key
+      // as well as carrying the cookie and the current code.
+      const proof = await deviceProofHeaders("POST", "/api/auth/2fa/backup-codes", body);
+
+      if (proof === null) {
+        setMessage(getMessage("device.proofRequired"));
+        setBusy(false);
+
+        return;
+      }
+
       const response = await fetch("/api/auth/2fa/backup-codes", {
         method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ code }),
+        headers: { "content-type": "application/json", ...proof },
+        body,
       });
       const payload: unknown = await response.json().catch(() => null);
 

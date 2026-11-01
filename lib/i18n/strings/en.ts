@@ -206,6 +206,10 @@ const catalog = {
     unreadableResponse: "The server answered with something this page cannot read. Try again.",
     codeRejected: "That code was not accepted. Wait for the next one in the app and enter it before it changes.",
   },
+  device: {
+    proofRequired:
+      "This browser has not registered its device key yet. Sign in again on this browser, then repeat this action.",
+  },
   resetRequest: {
     eyebrow: "Account recovery",
     title: "Recover an account without the app",
