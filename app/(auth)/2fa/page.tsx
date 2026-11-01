@@ -36,7 +36,7 @@ export default function TwoFactorPage(): ReactNode {
 
         <p className="mt-8 border-t border-border pt-4 text-sm">
           <Link className="font-semibold text-primary underline-offset-4 hover:underline" href="/">
-            {getMessage("verify.home")}
+            {getMessage("twoFactor.home")}
           </Link>
         </p>
       </section>

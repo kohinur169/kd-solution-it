@@ -64,10 +64,13 @@ the authority. A permission check uses the record, never a claim.
    the key as a header, the failure type has no message field, and the cookie is HttpOnly.
 5. The cookie is `__Host-kd_session` outside development and `kd_session` there, written only by
    `cookies.ts` with `HttpOnly`, `SameSite=Strict`, `Path=/`, `Secure` in the secure case and no
-   `Domain`. A route builds its policy with `createAuthCookiePolicy(config, lifetime)`, never with
-   `createCookiePolicy` directly, because the prefix decision belongs to one function. The prefix
-   is what makes a tossed parent domain cookie impossible. No other module writes a session
-   cookie, and a new cookie is a new STEP.
+   `Domain`. A route builds its policy with `createAuthCookiePolicy(config, lifetime, masterKey)`,
+   never with `createCookiePolicy` directly, because the prefix decision belongs to one function.
+   The prefix is what makes a tossed parent domain cookie impossible. No other module writes a
+   session cookie, and a new cookie is a new STEP. The payload carries an HMAC-SHA-256 signature
+   whose key is derived from `ENCRYPTION_MASTER_KEY` with HKDF and its own info string, so a payload
+   a browser wrote for itself is refused before it is decoded: a claim read from an unverified
+   value is a claim whoever wrote the cookie chose.
 6. There is no browser client, by design. STEP 004 keeps `SUPABASE_URL` and the keys on the
    server, so the browser talks to the platform's own routes and only ever holds an opaque
    session cookie.

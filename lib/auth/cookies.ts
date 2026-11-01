@@ -1,5 +1,6 @@
 // path: lib/auth/cookies.ts
 import { Buffer } from "node:buffer";
+import { createHmac, hkdfSync, timingSafeEqual } from "node:crypto";
 import { z } from "zod";
 import type { AuthConfig } from "./config.ts";
 import { MAXIMUM_ACCESS_TOKEN_LENGTH } from "./jwt.ts";
@@ -24,10 +25,16 @@ import { MAXIMUM_ACCESS_TOKEN_LENGTH } from "./jwt.ts";
  * smaller ceiling, exactly the way Supabase's own client does, and assembling it back refuses a
  * gap: a partial cookie is a broken session, never a session with fewer bytes.
  *
- * The value is base64url of a JSON object. It is not encrypted, because it never leaves the
- * server except into an HttpOnly cookie of the same origin and it holds nothing but the tokens
- * themselves; the tokens are opaque and signed by the provider, so a tampered payload fails the
- * provider's check or this file's shape check.
+ * The value is base64url of a JSON object and an HMAC-SHA-256 signature over it. The signature is
+ * the part that makes the cookie a session rather than a suggestion: the payload is read on every
+ * request, and a reader that only checked its shape would believe a payload a browser wrote. The
+ * key is derived from `ENCRYPTION_MASTER_KEY` with HKDF and its own info string, so one secret
+ * serves two purposes without either being able to stand in for the other, and no new environment
+ * variable has to be remembered at deploy time.
+ *
+ * The signature is not encryption. The tokens inside are opaque to the browser and to anyone who
+ * reads the cookie off the wire, and the payload holds nothing else, so confidentiality is the
+ * provider's and integrity is this file's.
  */
 
 /**
@@ -50,6 +57,15 @@ export const AUTH_COOKIE_CHUNK_BYTES = 3_180;
 
 /** Chunks per session. Eight chunks is 25 KiB of cookie, far beyond any real token pair. */
 export const AUTH_COOKIE_MAXIMUM_CHUNKS = 8;
+
+/** Bytes of derived key the HMAC uses. */
+const cookieSigningKeyBytes = 32;
+
+/** The HKDF info string of the cookie key, so the master key's purposes never overlap. */
+const cookieSigningInfo = "kd-session-cookie:v1";
+
+/** The version of the signature scheme, carried inside the signed value. */
+const cookieSignatureVersion = "v1";
 
 const cookieNamePattern = /^[A-Za-z0-9_-]{1,48}$/u;
 
@@ -78,12 +94,36 @@ export interface AuthCookiePolicy {
   readonly secure: boolean;
   /** Seconds a cookie may live. Kept here so a caller cannot extend a session by writing one. */
   readonly defaultMaxAgeSeconds: number;
+  /** The derived HMAC key, base64url of 32 bytes. Never leaves this module's policies. */
+  readonly signingKey: string;
 }
 
 export interface AuthCookiePolicyOptions {
   readonly name?: string;
   readonly secure: boolean;
   readonly defaultMaxAgeSeconds: number;
+  /** The 32 byte master key, base64 encoded, that the signing key is derived from. */
+  readonly masterKey: string;
+}
+
+/**
+ * Derive the cookie signing key from the platform's master key.
+ *
+ * HKDF with a fixed info string, so the key that signs a cookie is not the key that seals a
+ * secret: a value sealed under one cannot be replayed as the other, and a rotation of one purpose
+ * is a decision about that purpose alone. A master key shorter than 32 bytes is a configuration
+ * mistake and throws at boot, not at the first request.
+ */
+function deriveCookieSigningKey(masterKey: string): string {
+  const master = Buffer.from(masterKey, "base64");
+
+  if (master.byteLength < cookieSigningKeyBytes) {
+    throw new Error("the session signing master key must be at least 32 bytes of base64");
+  }
+
+  return Buffer.from(
+    hkdfSync("sha256", master, Buffer.alloc(0), cookieSigningInfo, cookieSigningKeyBytes),
+  ).toString("base64url");
 }
 
 /** Build the policy once per process. A name that is not cookie safe is a programming error. */
@@ -109,6 +149,7 @@ export function createCookiePolicy(options: AuthCookiePolicyOptions): AuthCookie
     name,
     secure: options.secure,
     defaultMaxAgeSeconds: options.defaultMaxAgeSeconds,
+    signingKey: deriveCookieSigningKey(options.masterKey),
   };
 }
 
@@ -122,11 +163,13 @@ export function createCookiePolicy(options: AuthCookiePolicyOptions): AuthCookie
 export function createAuthCookiePolicy(
   config: AuthConfig,
   defaultMaxAgeSeconds: number,
+  masterKey: string,
 ): AuthCookiePolicy {
   return createCookiePolicy({
     name: config.secureCookies ? `${AUTH_SECURE_COOKIE_PREFIX}${AUTH_COOKIE_NAME}` : AUTH_COOKIE_NAME,
     secure: config.secureCookies,
     defaultMaxAgeSeconds,
+    masterKey,
   });
 }
 
@@ -152,6 +195,26 @@ function attributes(policy: AuthCookiePolicy, maxAgeSeconds: number): string {
 }
 
 /**
+ * Sign one encoded payload.
+ *
+ * The version travels inside the signed text rather than beside it, so a later scheme signs a
+ * value this verifier cannot accept, instead of signing a string this verifier would accept.
+ */
+function signEncoded(policy: AuthCookiePolicy, encoded: string): string {
+  return createHmac("sha256", policy.signingKey)
+    .update(`${cookieSignatureVersion}.${encoded}`)
+    .digest("base64url");
+}
+
+/** True when a value carries the signature this policy would have written over it. */
+function verifySignature(policy: AuthCookiePolicy, encoded: string, signature: string): boolean {
+  const expected = Buffer.from(signEncoded(policy, encoded), "utf8");
+  const received = Buffer.from(signature, "utf8");
+
+  return expected.byteLength === received.byteLength && timingSafeEqual(expected, received);
+}
+
+/**
  * Encode one session payload into the cookies that carry it.
  *
  * The lifetime of the cookie is the lifetime of the session, capped by the policy, so a session
@@ -170,7 +233,8 @@ export function encodeSessionCookies(
     throw new Error("the session payload is not a session this platform can store");
   }
 
-  const encoded = Buffer.from(JSON.stringify(parsed.data), "utf8").toString("base64url");
+  const body = Buffer.from(JSON.stringify(parsed.data), "utf8").toString("base64url");
+  const encoded = `${body}.${signEncoded(policy, body)}`;
   const chunkCount = Math.max(1, Math.ceil(encoded.length / AUTH_COOKIE_CHUNK_BYTES));
 
   if (chunkCount > AUTH_COOKIE_MAXIMUM_CHUNKS) {
@@ -317,9 +381,24 @@ export function decodeSessionCookies(
     return null;
   }
 
-  const encoded = assemble(policy, cookieHeader);
+  const assembled = assemble(policy, cookieHeader);
 
-  if (encoded === null || encoded.length === 0) {
+  if (assembled === null || assembled.length === 0) {
+    return null;
+  }
+
+  const separator = assembled.lastIndexOf(".");
+
+  if (separator <= 0 || separator === assembled.length - 1) {
+    return null;
+  }
+
+  const encoded = assembled.slice(0, separator);
+  const signature = assembled.slice(separator + 1);
+
+  // The signature is checked before the payload is decoded, parsed or given to zod: an unsigned
+  // or altered value is not a session this platform wrote, and it never becomes one by accident.
+  if (!verifySignature(policy, encoded, signature)) {
     return null;
   }
 

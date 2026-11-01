@@ -237,6 +237,10 @@ async function captureRejection(
 const COMPLIANT_PASSWORD = "Correct-Horse-Battery-9";
 
 const NOW = 1_800_000_000_000;
+
+/** A 32 byte master key for the policies the gate builds. Not a secret, never a real key. */
+const SESSION_MASTER_KEY = Buffer.alloc(32, 7).toString("base64");
+const OTHER_SESSION_MASTER_KEY = Buffer.alloc(32, 8).toString("base64");
 const USER_ID = "018f3b1c-1111-7c2a-9d1e-2b3c4d5e6f70";
 const OTHER_USER_ID = "018f3b1c-3333-7c2a-9d1e-2b3c4d5e6f72";
 const SESSION_ID = "018f3b1c-2222-7c2a-9d1e-2b3c4d5e6f71";
@@ -542,7 +546,7 @@ const developmentConfig: AuthConfig = buildAuthConfig({
 });
 
 function cookiePolicy(secure = true): AuthCookiePolicy {
-  return createAuthCookiePolicy(secure ? config : developmentConfig, 3_600);
+  return createAuthCookiePolicy(secure ? config : developmentConfig, 3_600, SESSION_MASTER_KEY);
 }
 
 function sessionPayload(
@@ -591,6 +595,69 @@ function checkCookies(): void {
     "a single cookie round trips the refresh token",
   );
 
+  // A cookie a browser writes for itself is not a session. This is the whole point of the
+  // signature: a payload that only has the right shape proves nothing about who wrote it.
+  const forgedBody = Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
+
+  expectEqual(
+    decodeSessionCookies(policy, `${policy.name}=${forgedBody}`),
+    null,
+    "an unsigned payload is not a session",
+  );
+  expectEqual(
+    decodeSessionCookies(policy, `${policy.name}=${forgedBody}.`),
+    null,
+    "an empty signature is not a session",
+  );
+  expectEqual(
+    decodeSessionCookies(
+      policy,
+      `${policy.name}=${forgedBody}.${Buffer.from("0".repeat(43), "utf8").toString("base64url")}`,
+    ),
+    null,
+    "a made up signature is not a session",
+  );
+
+  const validValue = (cookie.slice(`${policy.name}=`.length).split(";")[0] ?? "");
+  const lastDot = validValue.lastIndexOf(".");
+  const tamperedBody = `${(validValue.slice(0, lastDot) || "").slice(0, -1)}A${validValue.slice(lastDot)}`;
+  const otherPolicy = createCookiePolicy({
+    name: policy.name,
+    secure: true,
+    defaultMaxAgeSeconds: 3_600,
+    masterKey: OTHER_SESSION_MASTER_KEY,
+  });
+
+  expectEqual(
+    decodeSessionCookies(policy, `${policy.name}=${tamperedBody}`),
+    null,
+    "a payload changed after signing is not a session",
+  );
+  expectEqual(
+    decodeSessionCookies(otherPolicy, cookie),
+    null,
+    "a cookie signed under another master key is not a session",
+  );
+  expectEqual(
+    decodeSessionCookies(policy, `${policy.name}=${validValue}`)?.userId,
+    USER_ID,
+    "the untouched value is still the session",
+  );
+
+  expectThrows(
+    () =>
+      createCookiePolicy({
+        secure: true,
+        defaultMaxAgeSeconds: 3_600,
+        masterKey: Buffer.alloc(16, 1).toString("base64"),
+      }),
+    "a master key shorter than the signing key is refused at boot",
+  );
+  expect(
+    policy.signingKey !== OTHER_SESSION_MASTER_KEY && policy.signingKey.length > 20,
+    "the policy carries a derived key, never the master key itself",
+  );
+
   expectEqual(
     encodeSessionCookies(cookiePolicy(false), payload, NOW)[0]?.includes("Secure"),
     false,
@@ -611,12 +678,17 @@ function checkCookies(): void {
         name: "__Host-kd_session",
         secure: false,
         defaultMaxAgeSeconds: 3_600,
+        masterKey: SESSION_MASTER_KEY,
       }),
     "a secure prefix without the Secure flag is refused",
   );
   expectEqual(
     encodeSessionCookies(
-      createCookiePolicy({ secure: true, defaultMaxAgeSeconds: 600 }),
+      createCookiePolicy({
+        secure: true,
+        defaultMaxAgeSeconds: 600,
+        masterKey: SESSION_MASTER_KEY,
+      }),
       payload,
       NOW,
     )[0]?.includes("Max-Age=600"),
@@ -704,11 +776,22 @@ function checkCookies(): void {
   );
 
   expectThrows(
-    () => createCookiePolicy({ secure: true, defaultMaxAgeSeconds: 3_600, name: "bad name" }),
+    () =>
+      createCookiePolicy({
+        secure: true,
+        defaultMaxAgeSeconds: 3_600,
+        name: "bad name",
+        masterKey: SESSION_MASTER_KEY,
+      }),
     "a cookie name that is not cookie safe is refused",
   );
   expectThrows(
-    () => createCookiePolicy({ secure: true, defaultMaxAgeSeconds: 0 }),
+    () =>
+      createCookiePolicy({
+        secure: true,
+        defaultMaxAgeSeconds: 0,
+        masterKey: SESSION_MASTER_KEY,
+      }),
     "a cookie policy without a lifetime is refused",
   );
   expectThrows(
@@ -3980,7 +4063,7 @@ async function main(): Promise<void> {
   }
 
   process.stdout.write(
-    `auth gate passed: ${checkCount} checks, cookie "${createAuthCookiePolicy(config, 3_600).name}", ` +
+    `auth gate passed: ${checkCount} checks, cookie "${cookiePolicy().name}", ` +
       `${AUTH_COOKIE_MAXIMUM_CHUNKS} chunk ceiling\n`,
   );
 }

@@ -123,9 +123,20 @@ async function readJson(response: Response): Promise<unknown> {
   return response.json().catch(() => null);
 }
 
+/**
+ * The four screens this form can show.
+ *
+ * `done` exists because the three state form had a defect worth fixing before STEP 042 built on
+ * it: after "I have saved the codes" the component fell back to `idle`, so a person who had just
+ * enrolled was offered the button that starts an enrolment again, and pressing it answered
+ * `CONFLICT`. A flow that ends has to end somewhere.
+ */
+type Stage = "idle" | "started" | "codes" | "done";
+
 export function TwoFactorForm(): ReactNode {
+  const [stage, setStage] = useState<Stage>("idle");
   const [enrolment, setEnrolment] = useState<EnrolmentBody | null>(null);
-  const [backupCodes, setBackupCodes] = useState<readonly string[] | null>(null);
+  const [backupCodes, setBackupCodes] = useState<readonly string[]>([]);
   const [code, setCode] = useState("");
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
@@ -166,6 +177,7 @@ export function TwoFactorForm(): ReactNode {
       }
 
       setEnrolment(parsed);
+      setStage("started");
       setBusy(false);
     } catch {
       setMessage(getMessage("twoFactor.unreadableResponse"));
@@ -211,7 +223,7 @@ export function TwoFactorForm(): ReactNode {
       }
 
       setBackupCodes(parsed.backupCodes);
-      setEnrolment(null);
+      setStage("codes");
       setBusy(false);
     } catch {
       setMessage(getMessage("twoFactor.unreadableResponse"));
@@ -219,7 +231,7 @@ export function TwoFactorForm(): ReactNode {
     }
   }
 
-  if (backupCodes !== null) {
+  if (stage === "codes") {
     return (
       <div className="mt-6">
         <h2 className="text-lg font-semibold tracking-tight">{getMessage("twoFactor.backupTitle")}</h2>
@@ -241,22 +253,29 @@ export function TwoFactorForm(): ReactNode {
           className={primaryButtonClassName}
           type="button"
           onClick={(): void => {
-            setBackupCodes(null);
-            setMessage(getMessage("twoFactor.enrolledBody"));
+            setBackupCodes([]);
+            setStage("done");
           }}
         >
           {getMessage("twoFactor.done")}
         </button>
-        {message === null ? null : (
-          <p className="mt-3 text-sm text-muted-foreground" role="status">
-            {message}
-          </p>
-        )}
       </div>
     );
   }
 
-  if (enrolment === null) {
+  if (stage === "done") {
+    return (
+      <div className="mt-6">
+        <h2 className="text-lg font-semibold tracking-tight">{getMessage("twoFactor.enrolledTitle")}</h2>
+        <p className="mt-2 text-sm text-muted-foreground">{getMessage("twoFactor.enrolledBody")}</p>
+        <p className="mt-4 rounded-lg border border-border bg-muted/40 p-3 text-sm" role="status">
+          {getMessage("twoFactor.backupWarning")}
+        </p>
+      </div>
+    );
+  }
+
+  if (stage === "idle" || enrolment === null) {
     return (
       <div className="mt-6">
         <h2 className="text-lg font-semibold tracking-tight">{getMessage("twoFactor.startTitle")}</h2>

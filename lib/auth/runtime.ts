@@ -109,7 +109,11 @@ export function getAuthRuntime(): AuthRuntime {
       signingKey: () => serverEnv().AUDIT_SIGNING_KEY,
     }),
     attempts: createRestLoginAttemptRecorder(createRestClient(config, http)),
-    cookiePolicy: createAuthCookiePolicy(config, AUTH_SESSION_MAX_AGE_SECONDS),
+    cookiePolicy: createAuthCookiePolicy(
+      config,
+      AUTH_SESSION_MAX_AGE_SECONDS,
+      serverEnv().ENCRYPTION_MASTER_KEY,
+    ),
     directory: createSupabaseActorDirectory(config, http),
     masterKey: () => serverEnv().ENCRYPTION_MASTER_KEY,
   };

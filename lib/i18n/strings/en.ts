@@ -158,6 +158,8 @@ const catalog = {
     backupWarning:
       "Keep these somewhere safe and offline. Anyone holding one of them can pass the second factor once.",
     done: "I have saved the codes",
+    enrolledTitle: "Two factor authentication is on",
+    home: "Go to the home page",
     enrolledBody:
       "This account now needs the authenticator app, or one of the backup codes, to sign in. The next sign in from a new browser asks for the code.",
     alreadyEnrolled:
