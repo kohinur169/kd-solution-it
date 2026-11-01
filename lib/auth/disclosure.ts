@@ -144,6 +144,14 @@ export const SESSION_AUTH_SURFACES: readonly SessionSurface[] = deepFreeze([
     path: "/api/auth/2fa/backup-codes",
     note: "The merchant mints or spends backup codes of their own account.",
   },
+  {
+    path: "/api/auth/sessions",
+    note: "Section 22's session list (STEP 054): the signed-in person reads the live sessions of their own account, filtered by the actor's user id, and the answer names devices rather than addresses.",
+  },
+  {
+    path: "/api/auth/sessions/revoke",
+    note: "Section 22's instant revocation (STEP 054): the owner ends one of their own sessions or every session except the one asking. The answer carries a count and never an account.",
+  },
 ]);
 
 /** What signup answers for an address that is new, and for one that is not. One shape, one body. */

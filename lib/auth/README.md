@@ -456,6 +456,23 @@ the authority. A permission check uses the record, never a claim.
     before the code, so a locked account cannot be used to test one. The instant is bounded from both
     sides, in two files: `0010` refuses one that predates `issued_at`, `0091` one that reaches past
     `expires_at`, and the family ceiling of `0089` follows from the row's own.
+84. A session list is filtered by the actor, never by the request. `listOwnSessions` takes the
+    `userId` from the session that asked, so `GET /api/auth/sessions` has nothing in it a caller could
+    point at another account; the office read takes an account id and checks the role inside the
+    service, not in the route and not in the page, so a second caller cannot reach a weaker version of
+    it. Reading somebody else's sessions is a use of a permission and writes
+    `session.list_read_by_office` before the rows are returned.
+85. Two reasons, and the row says which. The owner ends a session with `SIGNED_OUT`, an office role
+    with `ADMIN_REVOKED` - both already in `0010`'s closed vocabulary, so an incident can tell "the
+    account closed this door" from "the platform did" without reading two entries. `revoked_at` is the
+    only thing that ends a session: every reader in the platform, `readRequestActor` first, treats a
+    revoked row as gone, so a revoke takes effect on the next request and not on a later sweep.
+86. Closing a door never waits, opening one always does. `POST /api/auth/sessions/revoke` is signed by
+    STEP 050's proof and refuses an unconfirmed device of STEP 052, but it does **not** call
+    `requireFreshReauthentication`: a person who thinks their laptop was stolen must be able to end
+    that session without fetching an authenticator first. The office half -
+    `POST /api/office/sessions/revoke` - does call it, because signing a merchant out of every device is
+    an act on somebody else's account, which is the case section 22 names.
 
 ## Adding an operation
 

@@ -111,6 +111,16 @@ export const SENSITIVE_ENDPOINTS: readonly SensitiveEndpoint[] = [
     path: "/api/office/account-locks/unlock",
     note: "Section 22: an unlock ends the lock that stopped a password guess.",
   },
+  {
+    method: "POST",
+    path: "/api/auth/sessions/revoke",
+    note: "Section 22's instant revocation (STEP 054): the owner ends a session of their own account, so the request that ends a door is signed by the browser holding the key.",
+  },
+  {
+    method: "POST",
+    path: "/api/office/sessions/revoke",
+    note: "Section 22's instant revocation (STEP 054) for an office role: the request that signs a merchant out is signed, so a copied office cookie cannot spend it.",
+  },
 ];
 
 /** True when this path is one this platform requires a proof for. */

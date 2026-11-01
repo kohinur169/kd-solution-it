@@ -41,8 +41,10 @@ import {
   isSessionToken,
   issueSessionToken,
   resolveSessionToken,
+  createRestSessionTokenStore,
   revokeDeviceSessions,
   revokeSession,
+  SESSION_REVOCATION_REASONS,
   SESSION_ABSOLUTE_WINDOW_MS,
   SESSION_ROTATION_GRACE_MS,
   SESSION_ROTATION_INTERVAL_MS,
@@ -87,6 +89,15 @@ import {
   isCatalogCode,
   isDisclosingDetail,
 } from "./disclosure.ts";
+import {
+  listAccountSessions,
+  listOwnSessions,
+  revokeAccountSession,
+  revokeOtherOwnSessions,
+  revokeOwnSession,
+  SESSION_LIST_LIMIT,
+  SESSION_MANAGEMENT_OFFICE_ROLES,
+} from "./session-list.ts";
 import { getMessage } from "../i18n/messages.ts";
 import type { Logger } from "../logger/logger.ts";
 import {
@@ -9790,9 +9801,10 @@ async function checkSessionRotation(): Promise<void> {
     (file) => file.path.endsWith(".tsx") && file.source.includes("<SessionKeeper"),
   );
 
-  // The settings screen, the new device confirmation and the step-up screen are the three signed-in
-  // pages of section 22; each keeps the token rotating while the person reads it.
-  expectEqual(keepers.length, 4, "every signed-in page keeps its session rotating");
+  // The settings screen, the new device confirmation, the step-up screen and STEP 054's two session
+  // lists; each keeps the token rotating while the person reads it. The office half is one of them
+  // because reading another account's sessions must not leave the reader's own token unrotated.
+  expectEqual(keepers.length, 6, "every signed-in page keeps its session rotating");
 }
 
 /**
@@ -11341,6 +11353,640 @@ async function checkStepUp(): Promise<void> {
   );
 }
 
+/** A row of `public.sessions`, in the shape STEP 054 reads and writes. */
+interface SessionListRow {
+  id: string;
+  user_id: string;
+  device_proof_key_id: string | null;
+  issued_at: string;
+  last_seen_at: string;
+  expires_at: string;
+  revoked_at: string | null;
+  revocation_reason: string | null;
+  deleted_at: string | null;
+}
+
+/** A row of `public.device_proof_keys`, only the columns the list shows. */
+interface SessionListDeviceRow {
+  id: string;
+  label: string | null;
+  trusted_at: string | null;
+  revoked_at: string | null;
+  deleted_at: string | null;
+}
+
+interface SessionListWorld {
+  readonly rest: RestClient;
+  readonly sessions: SessionTokenStore;
+  readonly audit: ReturnType<typeof createInMemoryAuditTrail>;
+  readonly rows: SessionListRow[];
+  readonly devices: SessionListDeviceRow[];
+  /** Every query the service sent, in order. */
+  readonly queries: string[];
+  /** Clauses this double does not understand: a stale double must fail rather than match everything. */
+  readonly unknown: string[];
+}
+
+/** The second live session of the owner, and the one the fixtures revoke. */
+const SECOND_SESSION_ID = "018f3b1c-4444-7c2a-9d1e-2b3c4d5e6f73";
+const REVOKED_SESSION_ID = "018f3b1c-5555-7c2a-9d1e-2b3c4d5e6f74";
+const OTHER_SESSION_ID = "018f3b1c-6666-7c2a-9d1e-2b3c4d5e6f75";
+const TRUSTED_DEVICE_ID = "018f3b1c-7777-7c2a-9d1e-2b3c4d5e6f76";
+const UNTRUSTED_DEVICE_ID = "018f3b1c-8888-7c2a-9d1e-2b3c4d5e6f77";
+
+/**
+ * The rows the session list reads, in memory.
+ *
+ * It keeps the two facts the service depends on - a row belongs to one account, and a revoked row is
+ * not live - because a double that matched every query would prove nothing about the filters the
+ * service sends. An unknown clause is recorded rather than ignored.
+ */
+function sessionListWorld(): SessionListWorld {
+  const rows: SessionListRow[] = [
+    {
+      id: SESSION_ID,
+      user_id: USER_ID,
+      device_proof_key_id: TRUSTED_DEVICE_ID,
+      issued_at: new Date(NOW - 120_000).toISOString(),
+      last_seen_at: new Date(NOW - 30_000).toISOString(),
+      expires_at: new Date(NOW + 3_600_000).toISOString(),
+      revoked_at: null,
+      revocation_reason: null,
+      deleted_at: null,
+    },
+    {
+      id: SECOND_SESSION_ID,
+      user_id: USER_ID,
+      device_proof_key_id: UNTRUSTED_DEVICE_ID,
+      issued_at: new Date(NOW - 600_000).toISOString(),
+      last_seen_at: new Date(NOW - 300_000).toISOString(),
+      expires_at: new Date(NOW + 1_800_000).toISOString(),
+      revoked_at: null,
+      revocation_reason: null,
+      deleted_at: null,
+    },
+    {
+      id: OTHER_SESSION_ID,
+      user_id: OTHER_USER_ID,
+      device_proof_key_id: TRUSTED_DEVICE_ID,
+      issued_at: new Date(NOW - 60_000).toISOString(),
+      last_seen_at: new Date(NOW - 60_000).toISOString(),
+      expires_at: new Date(NOW + 3_600_000).toISOString(),
+      revoked_at: null,
+      revocation_reason: null,
+      deleted_at: null,
+    },
+    {
+      id: REVOKED_SESSION_ID,
+      user_id: USER_ID,
+      device_proof_key_id: TRUSTED_DEVICE_ID,
+      issued_at: new Date(NOW - 900_000).toISOString(),
+      last_seen_at: new Date(NOW - 900_000).toISOString(),
+      expires_at: new Date(NOW + 600_000).toISOString(),
+      revoked_at: new Date(NOW - 800_000).toISOString(),
+      revocation_reason: "SIGNED_OUT",
+      deleted_at: null,
+    },
+  ];
+  const devices: SessionListDeviceRow[] = [
+    { id: TRUSTED_DEVICE_ID, label: "Office laptop", trusted_at: new Date(NOW - 86_400_000).toISOString(), revoked_at: null, deleted_at: null },
+    { id: UNTRUSTED_DEVICE_ID, label: null, trusted_at: null, revoked_at: null, deleted_at: null },
+  ];
+  const queries: string[] = [];
+  const unknown: string[] = [];
+  const audit = createInMemoryAuditTrail();
+
+  function matches(query: string, row: SessionListRow): boolean {
+    for (const clause of query.split("&")) {
+      const separator = clause.indexOf("=");
+
+      if (separator <= 0) {
+        continue;
+      }
+
+      const key = clause.slice(0, separator);
+      const raw = clause.slice(separator + 1);
+      const value = decodeURIComponent(raw);
+
+      if (key === "select" || key === "order" || key === "limit") {
+        continue;
+      }
+
+      if (key === "id") {
+        if (value.startsWith("eq.") && row.id !== decodeURIComponent(value.slice(3))) {
+          return false;
+        }
+
+        if (value.startsWith("neq.") && row.id === decodeURIComponent(value.slice(4))) {
+          return false;
+        }
+
+        if (value.startsWith("in.(")) {
+          const listed = value
+            .slice(4, -1)
+            .split(",")
+            .map((entry) => decodeURIComponent(entry));
+
+          if (!listed.includes(row.id)) {
+            return false;
+          }
+        }
+
+        continue;
+      }
+
+      if (key === "user_id" && value.startsWith("eq.")) {
+        if (row.user_id !== decodeURIComponent(value.slice(3))) {
+          return false;
+        }
+
+        continue;
+      }
+
+      if (key === "revoked_at" || key === "deleted_at") {
+        if (value === "is.null") {
+          if (row[key] !== null) {
+            return false;
+          }
+
+          continue;
+        }
+      }
+
+      unknown.push(clause);
+    }
+
+    return true;
+  }
+
+  const rest: RestClient = {
+    async select<TRow>(table: string, query: string, schema: z.ZodType<TRow>): Promise<readonly TRow[]> {
+      queries.push(`${table}?${query}`);
+
+      if (table === "sessions") {
+        return rows.filter((row) => matches(query, row)).map((row) => schema.parse(row));
+      }
+
+      if (table === "users") {
+        const wanted = rows.some((row) => row.user_id === USER_ID) ? USER_ID : OTHER_USER_ID;
+
+        return query.includes(`id=eq.${encodeURIComponent(wanted)}`) ? [schema.parse({ id: wanted })] : [];
+      }
+
+      if (table === "device_proof_keys") {
+        return devices
+          .filter((device) => query.includes(encodeURIComponent(device.id)) || devices.length > 0)
+          .map((device) => schema.parse(device));
+      }
+
+      unknown.push(`table ${table}`);
+
+      return [];
+    },
+    async insert(): Promise<void> {
+      throw new AppError("INTERNAL_ERROR");
+    },
+    async insertReturning<TRow>(): Promise<readonly TRow[]> {
+      throw new AppError("INTERNAL_ERROR");
+    },
+    async update(
+      table: string,
+      query: string,
+      values: Readonly<Record<string, unknown>>,
+    ): Promise<void> {
+      queries.push(`update ${table}?${query}`);
+
+      if (table !== "sessions") {
+        unknown.push(`update ${table}`);
+
+        return;
+      }
+
+      for (const row of rows) {
+        if (matches(query, row)) {
+          Object.assign(row as unknown as Record<string, unknown>, values);
+        }
+      }
+    },
+    async rpc(): Promise<unknown> {
+      throw new AppError("INTERNAL_ERROR");
+    },
+  };
+
+  return { rest, sessions: createRestSessionTokenStore(rest), audit, rows, devices, queries, unknown };
+}
+
+/**
+ * STEP 054: the session list and the instant revoke.
+ *
+ * The service is proved against a table that keeps one account apart from another, because that is
+ * the property the whole STEP rests on: a list that leaked a second account's session and a revoke
+ * that could end one are the same defect in two directions. The routes are then read on disk for the
+ * order of their checks, and the pages for the rotation they must keep.
+ */
+async function checkSessionList(): Promise<void> {
+  // ---- the role list, and the reason it matches a list that already exists
+  expectEqual(
+    SESSION_MANAGEMENT_OFFICE_ROLES.join(","),
+    ACCOUNT_UNLOCK_OFFICE_ROLES.join(","),
+    "the session office roles are the roles that already handle merchants",
+  );
+  expectEqual(SESSION_LIST_LIMIT, 50, "the list stops at fifty sessions");
+
+  // ---- the owner's list
+  const world = sessionListWorld();
+  const owner = officeActor({ roles: ["owner"], userId: USER_ID });
+  const listed = await listOwnSessions(owner, {
+    rest: world.rest,
+    audit: world.audit,
+    sessions: world.sessions,
+    now: () => NOW,
+  });
+
+  expectEqual(listed.length, 2, "the list shows the owner's two live sessions");
+  expectEqual(
+    listed.some((session) => session.id === REVOKED_SESSION_ID),
+    false,
+    "a revoked session is not listed",
+  );
+  expectEqual(
+    listed.some((session) => session.id === OTHER_SESSION_ID),
+    false,
+    "another account's session is never listed",
+  );
+  expectEqual(
+    listed.find((session) => session.current)?.id,
+    SESSION_ID,
+    "the session asking is marked, not hidden",
+  );
+  expectEqual(
+    listed.find((session) => session.id === SESSION_ID)?.deviceLabel,
+    "Office laptop",
+    "the row names the device it is bound to",
+  );
+  expectEqual(
+    listed.find((session) => session.id === SECOND_SESSION_ID)?.deviceLabel,
+    null,
+    "a device with no label says so instead of inventing one",
+  );
+  expectEqual(
+    listed.find((session) => session.id === SESSION_ID)?.deviceTrusted,
+    true,
+    "a confirmed device is reported as confirmed",
+  );
+  expectEqual(
+    listed.find((session) => session.id === SECOND_SESSION_ID)?.deviceTrusted,
+    false,
+    "an unconfirmed device is reported as unconfirmed",
+  );
+
+  const listQuery = world.queries[0] ?? "";
+
+  expect(listQuery.includes(`user_id=eq.${encodeURIComponent(USER_ID)}`), "the list is filtered by the actor's own account");
+  expect(listQuery.includes("revoked_at=is.null"), "the list reads only live rows");
+  expect(listQuery.includes("deleted_at=is.null"), "the list skips soft deleted rows");
+  expect(listQuery.includes("&order=issued_at.desc"), "the newest session is first");
+  expect(listQuery.includes("ip_address") === false, "the list selects no address");
+  expect(listQuery.includes("user_agent") === false, "the list selects no user agent");
+  expect(listQuery.includes("token_hash") === false, "the list never reads a token hash");
+
+  await expectRejects(
+    () =>
+      listOwnSessions(
+        { ...owner, sessionId: null },
+        { rest: world.rest, audit: world.audit, sessions: world.sessions },
+      ),
+    "AUTHENTICATION_REQUIRED",
+    "a caller without a session has no list",
+  );
+
+  // ---- the owner's revoke
+  const own = sessionListWorld();
+  const ownAudit = own.audit;
+
+  await expectRejects(
+    () =>
+      revokeOwnSession(
+        { actor: owner, sessionId: OTHER_SESSION_ID, ipAddress: null, userAgent: null },
+        { rest: own.rest, audit: ownAudit, sessions: own.sessions, now: () => NOW },
+      ),
+    "RESOURCE_NOT_FOUND",
+    "another account's session is not revocable and is not even acknowledged",
+  );
+
+  await expectRejects(
+    () =>
+      revokeOwnSession(
+        { actor: owner, sessionId: REVOKED_SESSION_ID, ipAddress: null, userAgent: null },
+        { rest: own.rest, audit: ownAudit, sessions: own.sessions, now: () => NOW },
+      ),
+    "RESOURCE_NOT_FOUND",
+    "a session that already ended is refused instead of stamped twice",
+  );
+
+  await expectRejects(
+    () =>
+      revokeOwnSession(
+        { actor: owner, sessionId: "../users", ipAddress: null, userAgent: null },
+        { rest: own.rest, audit: ownAudit, sessions: own.sessions, now: () => NOW },
+      ),
+    "RESOURCE_NOT_FOUND",
+    "an identifier that is not an identifier never reaches a query",
+  );
+
+  expectEqual(
+    own.rows.find((row) => row.id === OTHER_SESSION_ID)?.revoked_at,
+    null,
+    "no refusal touched another account's row",
+  );
+
+  const revoked = await revokeOwnSession(
+    { actor: owner, sessionId: SECOND_SESSION_ID, ipAddress: "203.0.113.7", userAgent: "test" },
+    { rest: own.rest, audit: ownAudit, sessions: own.sessions, now: () => NOW },
+  );
+  const secondRow = own.rows.find((row) => row.id === SECOND_SESSION_ID);
+
+  expectEqual(revoked.wasCurrent, false, "ending another session is not ending this one");
+  expectEqual(secondRow?.revoked_at, new Date(NOW).toISOString(), "the revoked row carries the instant");
+  expectEqual(secondRow?.revocation_reason, "SIGNED_OUT", "an owner's revoke is a sign out");
+  expect(
+    SESSION_REVOCATION_REASONS.includes("SIGNED_OUT"),
+    "the reason written is one the migration already allows",
+  );
+
+  const ownerEntry = ownAudit.entries.at(-1);
+
+  expectEqual(ownerEntry?.action, "session.revoked_by_owner", "the revoke is audited under its own name");
+  expectEqual(ownerEntry?.actorUserId, USER_ID, "the audit names the account that acted");
+  expectEqual(ownerEntry?.entityId, SECOND_SESSION_ID, "the audit names the session that ended");
+
+  const self = await revokeOwnSession(
+    { actor: owner, sessionId: SESSION_ID, ipAddress: null, userAgent: null },
+    { rest: own.rest, audit: ownAudit, sessions: own.sessions, now: () => NOW },
+  );
+
+  expectEqual(self.wasCurrent, true, "ending the session asking is reported as such, so the screen can say so");
+
+  // ---- every other session at once
+  const everyone = sessionListWorld();
+  const others = await revokeOtherOwnSessions(
+    { actor: owner, ipAddress: null, userAgent: null },
+    { rest: everyone.rest, audit: everyone.audit, sessions: everyone.sessions, now: () => NOW },
+  );
+
+  expectEqual(others, 1, "the count is the number of sessions that ended");
+  expectEqual(
+    everyone.rows.find((row) => row.id === SESSION_ID)?.revoked_at,
+    null,
+    "the session asking survives its own request",
+  );
+  expectEqual(
+    everyone.rows.find((row) => row.id === SECOND_SESSION_ID)?.revocation_reason,
+    "SIGNED_OUT",
+    "the other sessions are signed out",
+  );
+  expectEqual(
+    everyone.rows.find((row) => row.id === OTHER_SESSION_ID)?.revoked_at,
+    null,
+    "another account's live session is untouched",
+  );
+  expectEqual(
+    everyone.audit.entries.at(-1)?.action,
+    "session.others_revoked",
+    "the sweep is audited with a name of its own",
+  );
+  expectEqual(
+    (everyone.audit.entries.at(-1)?.payload as { readonly revoked_sessions?: unknown } | undefined)
+      ?.revoked_sessions,
+    1,
+    "the audit entry says how many doors were closed",
+  );
+
+  const entriesAfterSweep = everyone.audit.entries.length;
+  const again = await revokeOtherOwnSessions(
+    { actor: owner, ipAddress: null, userAgent: null },
+    { rest: everyone.rest, audit: everyone.audit, sessions: everyone.sessions, now: () => NOW },
+  );
+
+  expectEqual(again, 0, "a second sweep has nothing to end");
+  expectEqual(everyone.audit.entries.length, entriesAfterSweep, "and writes no entry for nothing");
+
+  // ---- the office half
+  const office = sessionListWorld();
+  const support = officeActor({ roles: ["support"] });
+  const merchant = officeActor({ roles: ["owner"], userId: USER_ID });
+  const finance = officeActor({ roles: ["finance_ops"] });
+
+  await expectRejects(
+    () =>
+      listAccountSessions(
+        { actor: merchant, userId: OTHER_USER_ID },
+        { rest: office.rest, audit: office.audit, sessions: office.sessions },
+      ),
+    "PERMISSION_DENIED",
+    "a merchant cannot read another account's sessions",
+  );
+
+  await expectRejects(
+    () =>
+      listAccountSessions(
+        { actor: finance, userId: OTHER_USER_ID },
+        { rest: office.rest, audit: office.audit, sessions: office.sessions },
+      ),
+    "PERMISSION_DENIED",
+    "a role outside the four cannot read them either",
+  );
+
+  await expectRejects(
+    () =>
+      listAccountSessions(
+        { actor: support, userId: "not-an-identifier" },
+        { rest: office.rest, audit: office.audit, sessions: office.sessions },
+      ),
+    "RESOURCE_NOT_FOUND",
+    "an account id that is not an identifier answers a plain not found",
+  );
+
+  const accountSessions = await listAccountSessions(
+    { actor: support, userId: USER_ID },
+    { rest: office.rest, audit: office.audit, sessions: office.sessions },
+  );
+
+  expectEqual(accountSessions.length, 2, "the office reads the account's live sessions");
+  expectEqual(
+    accountSessions.some((session) => session.current),
+    false,
+    "no row is marked current: the officer is not in this account",
+  );
+  expectEqual(
+    office.audit.entries.at(-1)?.action,
+    "session.list_read_by_office",
+    "reading another account's sessions is audited",
+  );
+  expectEqual(
+    office.audit.entries.at(-1)?.actorUserId,
+    OTHER_USER_ID,
+    "the read names the officer, not the account read",
+  );
+
+  await expectRejects(
+    () =>
+      revokeAccountSession(
+        { actor: support, userId: OTHER_USER_ID, sessionId: SESSION_ID, ipAddress: null, userAgent: null },
+        { rest: office.rest, audit: office.audit, sessions: office.sessions, now: () => NOW },
+      ),
+    "RESOURCE_NOT_FOUND",
+    "a session id paired with the wrong account ends nothing",
+  );
+
+  await expectRejects(
+    () =>
+      revokeAccountSession(
+        { actor: merchant, userId: OTHER_USER_ID, sessionId: OTHER_SESSION_ID, ipAddress: null, userAgent: null },
+        { rest: office.rest, audit: office.audit, sessions: office.sessions, now: () => NOW },
+      ),
+    "PERMISSION_DENIED",
+    "a merchant cannot end another account's session through the office path",
+  );
+
+  const officeRevoke = await revokeAccountSession(
+    {
+      actor: support,
+      userId: USER_ID,
+      sessionId: SECOND_SESSION_ID,
+      ipAddress: "203.0.113.7",
+      userAgent: "test",
+    },
+    { rest: office.rest, audit: office.audit, sessions: office.sessions, now: () => NOW },
+  );
+  const officeRow = office.rows.find((row) => row.id === SECOND_SESSION_ID);
+  const officeEntry = office.audit.entries.at(-1);
+
+  expectEqual(officeRevoke.sessionId, SECOND_SESSION_ID, "the office revoke answers the session it ended");
+  expectEqual(officeRow?.revocation_reason, "ADMIN_REVOKED", "an office revoke is recorded as one");
+  expect(
+    SESSION_REVOCATION_REASONS.includes("ADMIN_REVOKED"),
+    "the office reason is in the vocabulary the migration closed",
+  );
+  expectEqual(officeEntry?.action, "session.revoked_by_office", "the office revoke has its own audit name");
+  expectEqual(officeEntry?.actorUserId, OTHER_USER_ID, "the audit names the officer as the actor");
+  expectEqual(
+    (officeEntry?.payload as { readonly subject_user_id?: unknown } | undefined)?.subject_user_id,
+    USER_ID,
+    "and names the account whose session ended",
+  );
+
+  // ---- the deferred clauses: none, or the double is stale
+  for (const each of [world, own, everyone, office]) {
+    expectEqual(each.unknown.length, 0, "the double understood every clause the service sent");
+  }
+
+  // ---- the vocabulary of the audit actions
+  const actions = ["session.revoked_by_owner", "session.others_revoked", "session.list_read_by_office", "session.revoked_by_office"];
+
+  for (const action of actions) {
+    expectEqual(/^[a-z][a-z0-9]*(\.[a-z0-9_]+)+$/.test(action), true, `the audit name "${action}" matches the catalog pattern`);
+    expect(action.length <= 64, `the audit name "${action}" fits in sixty four characters`);
+  }
+
+  // ---- the service, on disk
+  const serviceSource = await readFile(new URL("./session-list.ts", import.meta.url), "utf8");
+
+  expectEqual(
+    serviceSource.split("requireAnyRole(").length - 1,
+    2,
+    "both office functions check the role themselves",
+  );
+
+  for (const action of actions) {
+    expectEqual(serviceSource.split(`"${action}"`).length - 1, 1, `the service writes "${action}" once`);
+  }
+
+  for (const column of ["ip_address", "user_agent", "fingerprint", "token_hash"]) {
+    expectEqual(
+      serviceSource.includes(column),
+      false,
+      `the session list never touches ${column}`,
+    );
+  }
+
+  // ---- the routes and the pages, on disk
+  const appRoot = new URL("../../app/", import.meta.url);
+  const appEntries = await readdir(appRoot, { recursive: true });
+  const appSources = await Promise.all(
+    appEntries
+      .map((entry) => entry.replaceAll("\\", "/"))
+      .filter((entry) => entry.endsWith(".tsx") || entry.endsWith(".ts"))
+      .map(async (entry) => ({
+        path: `/${entry}`,
+        source: await readFile(new URL(entry, appRoot), "utf8"),
+      })),
+  );
+  const readApp = (path: string): string =>
+    appSources.find((file) => file.path === path)?.source ?? "";
+
+  const ownerRevokeRoute = readApp("/api/auth/sessions/revoke/route.ts");
+  const officeRevokeRoute = readApp("/api/office/sessions/revoke/route.ts");
+
+  expect(ownerRevokeRoute.includes("verifySensitiveRequest("), "the owner's revoke is a signed request");
+  expectEqual(
+    ownerRevokeRoute.includes("requireFreshReauthentication"),
+    false,
+    "the owner's revoke is not gated on freshness: closing a door should never wait",
+  );
+  expect(
+    ownerRevokeRoute.indexOf("readRequestActor(") < ownerRevokeRoute.indexOf("JSON.parse("),
+    "the actor is read before the body is parsed",
+  );
+
+  expect(officeRevokeRoute.includes("verifySensitiveRequest("), "the office revoke is a signed request");
+  expect(officeRevokeRoute.includes("requireFreshReauthentication(actor)"), "the office revoke needs the fresh window");
+  expect(
+    officeRevokeRoute.indexOf("verifySensitiveRequest(") <
+      officeRevokeRoute.indexOf("requireFreshReauthentication(actor)"),
+    "the proof is checked before the freshness, so a stranger learns nothing about the clock",
+  );
+  expect(
+    officeRevokeRoute.indexOf("requireFreshReauthentication(actor)") <
+      officeRevokeRoute.indexOf("JSON.parse("),
+    "and both before the body is read",
+  );
+
+  expect(readApp("/api/auth/sessions/route.ts").includes("listOwnSessions("), "the owner's read calls the service");
+  expect(
+    readApp("/office/sessions/page.tsx").includes("listAccountSessions("),
+    "the office page reads through the service, where the role check lives",
+  );
+  expectEqual(
+    readApp("/api/office/sessions/route.ts").includes("SESSION_MANAGEMENT_OFFICE_ROLES"),
+    false,
+    "the office route adds no second copy of the role list",
+  );
+  expect(
+    readApp("/office/sessions/page.tsx").includes("searchParams"),
+    "the office page asks for an account instead of guessing one",
+  );
+
+  for (const path of ["/(auth)/sessions/page.tsx", "/office/sessions/page.tsx"]) {
+    expect(readApp(path).includes("<SessionKeeper"), `the page ${path} keeps the token rotating`);
+  }
+
+  // ---- the two lists a request must be signed for, and the two surfaces that are classified
+  expect(
+    SENSITIVE_ENDPOINTS.some((endpoint) => endpoint.path === "/api/auth/sessions/revoke"),
+    "the owner's revoke is on the signed endpoint list",
+  );
+  expect(
+    SENSITIVE_ENDPOINTS.some((endpoint) => endpoint.path === "/api/office/sessions/revoke"),
+    "the office revoke is on the signed endpoint list",
+  );
+  expect(classifiedPaths().includes("/api/auth/sessions"), "the owner's list is a classified surface");
+  expect(
+    classifiedPaths().includes("/api/auth/sessions/revoke"),
+    "the owner's revoke is a classified surface",
+  );
+}
+
 async function main(): Promise<void> {
   checkConfig();
   checkClaims();
@@ -11380,6 +12026,7 @@ async function main(): Promise<void> {
   await checkSessionRotation();
   await checkDeviceTrust();
   await checkStepUp();
+  await checkSessionList();
 
   if (failures.length > 0) {
     process.stderr.write(`auth gate failed with ${failures.length} problem(s):\n`);
