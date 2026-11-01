@@ -503,6 +503,14 @@ handoff file.
   archived, `company_transactions` is corrected by a reversing entry rather than deleted,
   `processor_bills` stores a generated variance over the matched amount, and `compliance_items`
   moves its expiry and its last alert forward only.
+- STEP 033 answers who is asking the database. `public.current_actor_id()` reads the `app.user_id`
+  setting of a server connection and then the `sub` claim of a Supabase JWT, both through
+  `public.uuid_or_null()`, so a malformed claim is no actor rather than an error, and
+  `public.current_actor_company_id()` maps an active, undeleted person to a company as the table
+  owner, which keeps a policy on `users` from asking itself. The 22 merchant tables of batch one
+  gain a permissive `<table>_tenant_isolation` policy beside their deny: `companies` compares its
+  own `id` and the other 21 compare `company_id`, and every one of those columns starts an index.
+  A suspended, deleted or anonymous caller resolves to no company and sees nothing.
 - `public.uuid_generate_v7()` is defined in `0001`, because PostgreSQL before 18 has no native
   UUID v7. Ids sort by creation time, carry version nibble 7 and the RFC 4122 variant bits, and
   take their random tail from `gen_random_uuid()`.

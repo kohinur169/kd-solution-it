@@ -4,7 +4,7 @@
 Owner: STEP 012-036 and every later STEP that adds a table.
 
 Append-only numbered SQL migrations applied with the Supabase CLI against the project of the
-current environment. STEP 012 to STEP 032 created the first sixty eight files; `npm run
+current environment. STEP 012 to STEP 033 created the first seventy files; `npm run
 check:migrations` keeps them honest.
 
 Each row names the objects its file creates. The index count is the number of indexes the
@@ -80,6 +80,8 @@ table has once the file has run, the primary key included, so it is what `\d` pr
 | 0066_company_transactions.sql | The `company_transactions` row for one income or expense of the platform company, the category tied to its direction, the tax bounded by the amount, the guard that refuses a delete, its three indexes and the policy |
 | 0067_processor_bills.sql | The `processor_bills` row per provider and period with the billed and matched amounts, the generated variance, the matching status walk, its three indexes and the policy |
 | 0068_compliance_items.sql | The `compliance_items` row per certificate or filing with its issue and expiry dates, its alert window, the renewal instant an archive keeps, the guard that moves both forward, its three indexes and the policy |
+| 0069_actor_session.sql | The three helpers the tenant policies read: `uuid_or_null`, which spells a canonical uuid or returns null and never raises, `current_actor_id`, which reads the `app.user_id` setting and then the `sub` claim of the JWT, and the `security definer` `current_actor_company_id`, which maps an active and undeleted person to a company; it creates no table |
+| 0070_tenant_policies_batch_one.sql | The 22 `<table>_tenant_isolation` policies of batch one, permissive, for all commands and addressed to `public`, beside the deny they do not replace, plus the two `company_id` indexes the last two tables needed; it creates no table |
 
 Every file is paired with `<name>.down.sql`, which undoes exactly what its forward file created and
 nothing else.
@@ -342,7 +344,20 @@ nothing else.
     generated column, the matched amount only rises and the bill is never deleted.
     `compliance_items` moves its expiry and its last alert forward only, keeps the renewal
     instant when the item is archived, and is archived rather than deleted.
-48. Numbering is contiguous from 0001. A migration is never renumbered after it has been applied
+49. A tenant policy sits beside the deny, never in place of it. A table of a tenant batch keeps
+    its `<table>_default_deny` untouched and gains `<table>_tenant_isolation`, permissive, for
+    all commands, to `public`, comparing `company_id` with `public.current_actor_company_id()`
+    in both `using` and `with check`; `companies` compares its own `id`, because the tenant is
+    the row. Every column such a predicate reads starts an index, and a table that arrives
+    without one gets it in the same file.
+50. The actor is identified in one place. `public.current_actor_id()` reads the `app.user_id`
+    setting of a server connection first and the `sub` claim of a Supabase JWT second, and
+    returns null rather than raising for anything that is not a canonical lower case uuid.
+    `public.current_actor_company_id()` reads that person's `company_id` from `public.users`,
+    requires an `active` row with no `deleted_at`, and is the only `security definer` of the
+    pair, so the policy on `users` cannot ask itself the question from inside its own predicate.
+    No `auth` schema, extension or role is created for any of it.
+51. Numbering is contiguous from 0001. A migration is never renumbered after it has been applied
     anywhere.
 
 ## Commands
