@@ -67,6 +67,13 @@ import {
   TWO_FACTOR_CHALLENGE_TTL_MS,
   TWO_FACTOR_MAXIMUM_ATTEMPTS,
 } from "./two-factor-login.ts";
+import {
+  ACCOUNT_UNLOCK_MAIL_MAX_ATTEMPTS,
+  ACCOUNT_UNLOCK_NOTE_MAX_LENGTH,
+  ACCOUNT_UNLOCK_OFFICE_ROLES,
+  ACCOUNT_UNLOCK_TEMPLATE_KEY,
+  unlockAccountLock,
+} from "./account-unlock.ts";
 import { signInMerchant, signinInputSchema } from "./signin.ts";
 import { createAuthClient, type AuthClient } from "./client.ts";
 import { authAdminUserUrl, authTokenUrl, buildAuthConfig, type AuthConfig } from "./config.ts";
@@ -284,6 +291,9 @@ const USER_ID = "018f3b1c-1111-7c2a-9d1e-2b3c4d5e6f70";
 const OTHER_USER_ID = "018f3b1c-3333-7c2a-9d1e-2b3c4d5e6f72";
 const SESSION_ID = "018f3b1c-2222-7c2a-9d1e-2b3c4d5e6f71";
 const FIRM_ID = "018f3b1c-4444-7c2a-9d1e-2b3c4d5e6f73";
+/** One lock row of `account_locks`, as the office unlock of STEP 047 addresses it. */
+const LOCK_ID = "018f3b1c-6666-7c2a-9d1e-2b3c4d5e6f75";
+
 /** The owner of FIRM_ID in the gate: the address the section 22 alert is addressed to. */
 const OWNER_USER_ID = "018f3b1c-5555-7c2a-9d1e-2b3c4d5e6f74";
 
@@ -6668,6 +6678,510 @@ async function checkLockAlert(): Promise<void> {
 }
 
 
+/** An office actor whose flags the unlock guard reads, for a check that is not the reset flow. */
+function officeActor(options: {
+  readonly roles: readonly PlatformRole[];
+  readonly twoFactorSatisfied?: boolean;
+  readonly userId?: string;
+}): RequestActor {
+  return {
+    userId: options.userId ?? OTHER_USER_ID,
+    companyId: null,
+    roles: options.roles,
+    sessionId: SESSION_ID,
+    assuranceLevel: options.twoFactorSatisfied === false ? "aal1" : "aal2",
+    authenticatedAtEpochMs: NOW - 60_000,
+    expiresAtEpochMs: NOW + 3_600_000,
+    emailVerified: true,
+    twoFactorSatisfied: options.twoFactorSatisfied ?? true,
+    twoFactorEnrolmentRequired: false,
+  };
+}
+
+interface UnlockLockRow {
+  readonly id: string;
+  readonly user_id: string;
+  readonly company_id: string | null;
+  readonly triggered_by: "password" | "totp";
+  readonly locked_at: string;
+  readonly expires_at: string;
+  readonly owner_alerted_at: string | null;
+  owner_contact_confirmed_at: string | null;
+  unlocked_at: string | null;
+  unlocked_by: string | null;
+  unlock_note: string | null;
+  expired_at: string | null;
+}
+
+interface UnlockWorld {
+  readonly rest: RestClient;
+  readonly rows: UnlockLockRow[];
+  /** The emails the unlock queued, in the shape `0061` stores them. */
+  readonly sends: AlertSendRow[];
+  /** Every table the service asked for, in order, with the verb it used. */
+  readonly touched: string[];
+}
+
+/**
+ * The one table the unlock service is allowed to touch, in memory.
+ *
+ * It keeps what the answer depends on - which lock is open, whether a person or the clock closed it,
+ * and whether the conditional update found the row it was written for - and it records every other
+ * table the service asks for, because an unlock that quietly wrote `users` or `login_attempts` would
+ * be a second way to clear a lock.
+ */
+function unlockWorld(options: {
+  readonly row?: Partial<UnlockLockRow>;
+  readonly rows?: readonly Partial<UnlockLockRow>[];
+  /** Another officer, or the clock, won between the read and the write. */
+  readonly loseRace?: boolean;
+  /** The sending method section 23 has active, or null when the office configured none. */
+  readonly sendingMethod?: "smtp" | "api" | null;
+  /** The address of the unlocked account, or null when the row has none. */
+  readonly accountEmail?: string | null;
+  /** The email queue refuses the confirmation. */
+  readonly failQueue?: boolean;
+} = {}): UnlockWorld {
+  const base: UnlockLockRow = {
+    id: LOCK_ID,
+    user_id: USER_ID,
+    company_id: FIRM_ID,
+    triggered_by: "password",
+    locked_at: new Date(NOW - 600_000).toISOString(),
+    expires_at: new Date(NOW - 600_000 + 7_200_000).toISOString(),
+    owner_alerted_at: new Date(NOW - 599_000).toISOString(),
+    owner_contact_confirmed_at: null,
+    unlocked_at: null,
+    unlocked_by: null,
+    unlock_note: null,
+    expired_at: null,
+  };
+  const rows: UnlockLockRow[] = (options.rows ?? [options.row ?? {}]).map((row) => ({
+    ...base,
+    ...row,
+  }));
+  const sends: AlertSendRow[] = [];
+  const touched: string[] = [];
+  const method = options.sendingMethod === undefined ? "smtp" : options.sendingMethod;
+  const accountEmail = options.accountEmail === undefined ? "owner@firm.test" : options.accountEmail;
+
+  const rest: RestClient = {
+    select<TRow>(table: string, query: string): Promise<readonly TRow[]> {
+      touched.push(`select:${table}`);
+
+      if (table === "email_settings") {
+        return Promise.resolve(
+          (method === null ? [] : [{ method }]) as unknown as readonly TRow[],
+        );
+      }
+
+      if (table === "users") {
+        return Promise.resolve(
+          (accountEmail === null ? [] : [{ email: accountEmail }]) as unknown as readonly TRow[],
+        );
+      }
+
+      if (table !== "account_locks") {
+        return Promise.resolve([] as readonly TRow[]);
+      }
+
+      const byId = /(?:^|[&?])id=eq\.([^&]+)/u.exec(query)?.[1];
+      const byUser = /(?:^|[&?])user_id=eq\.([^&]+)/u.exec(query)?.[1];
+      const live = query.includes("unlocked_at=is.null")
+        ? rows.filter((row) => row.unlocked_at === null && row.expired_at === null)
+        : rows;
+      const matched =
+        byId === undefined
+          ? live.filter((row) => row.user_id === decodeURIComponent(byUser ?? ""))
+          : live.filter((row) => row.id === byId);
+
+      return Promise.resolve(matched.map((row) => ({ ...row })) as unknown as readonly TRow[]);
+    },
+    insert(): Promise<void> {
+      touched.push("insert:unknown");
+      return Promise.reject(new Error("the unlock service inserts nothing directly"));
+    },
+    insertReturning<TRow>(
+      table: string,
+      values: readonly Readonly<Record<string, unknown>>[],
+    ): Promise<readonly TRow[]> {
+      touched.push(`insert:${table}`);
+
+      if (table !== "email_send_logs" || options.failQueue === true) {
+        return Promise.reject(new Error(`the unlock service must not insert into ${table}`));
+      }
+
+      const written: AlertSendRow[] = values.map((row) => ({
+        id: `send-${String(sends.length + 1)}`,
+        company_id: (row["company_id"] as string | null | undefined) ?? null,
+        template_key: String(row["template_key"]),
+        recipient_email: String(row["recipient_email"]),
+        recipient_user_id: (row["recipient_user_id"] as string | null | undefined) ?? null,
+        subject: String(row["subject"]),
+        provider: String(row["provider"]),
+        max_attempts: Number(row["max_attempts"]),
+        reference_kind: (row["reference_kind"] as string | null | undefined) ?? null,
+        reference_id: (row["reference_id"] as string | null | undefined) ?? null,
+        queued_at: String(row["queued_at"]),
+        status: "queued",
+        failure_reason: null,
+      }));
+
+      sends.push(...written);
+
+      return Promise.resolve(written.map((row) => ({ id: row.id })) as unknown as readonly TRow[]);
+    },
+    update(table: string, query: string, values: Readonly<Record<string, unknown>>): Promise<void> {
+      touched.push(`update:${table}`);
+
+      if (table !== "account_locks") {
+        return Promise.reject(new Error(`the unlock service must not write ${table}`));
+      }
+
+      const id = /(?:^|[&?])id=eq\.([^&]+)/u.exec(query)?.[1] ?? "";
+
+      for (const row of rows) {
+        if (row.id !== id || options.loseRace === true) {
+          continue;
+        }
+
+        if (query.includes("unlocked_at=is.null") && row.unlocked_at !== null) {
+          continue;
+        }
+
+        if (query.includes("expired_at=is.null") && row.expired_at !== null) {
+          continue;
+        }
+
+        Object.assign(row, values);
+      }
+
+      return Promise.resolve();
+    },
+    rpc: (): Promise<unknown> => Promise.resolve(null),
+  };
+
+  return { rest, rows, sends, touched };
+}
+
+/**
+ * The office unlock of section 22, proved twice over: the permission, and the record.
+ *
+ * The permission checks are first because they are the security of the whole STEP: a merchant
+ * holding `owner` - including the owner of the locked company - must not be able to end their own
+ * lock, and neither must the roles that never touch access. The record checks come second: an unlock
+ * that a person performed names the person, stamps the contact, keeps the note and writes exactly one
+ * audit entry, while an unlock the platform cannot describe is refused before it happens.
+ */
+async function checkAccountUnlock(): Promise<void> {
+  expectEqual(
+    ACCOUNT_UNLOCK_OFFICE_ROLES.join(","),
+    "super_admin,ceo,compliance_kyc,support",
+    "the roles that may unlock are the office roles that talk to a merchant",
+  );
+  expectEqual(ACCOUNT_UNLOCK_NOTE_MAX_LENGTH, 280, "the note ceiling is the column's");
+
+  const note = "Called the owner on the number on file and confirmed the address by email.";
+  const request = {
+    lockId: LOCK_ID,
+    note,
+    ownerContactConfirmed: true,
+  } as const;
+
+  // ---- every permitted office role may unlock, and the record is the same for each
+  for (const role of ACCOUNT_UNLOCK_OFFICE_ROLES) {
+    const world = unlockWorld();
+    const audit = createInMemoryAuditTrail();
+    const result = await unlockAccountLock(
+      { ...request, actor: officeActor({ roles: [role] }) },
+      { rest: world.rest, audit, logger: captureLogger().logger, now: () => NOW },
+    );
+
+    expectEqual(result.status, "unlocked", `${role} may unlock an account`);
+  }
+
+  // ---- the roles that must never do it, including the merchant's own owner role
+  for (const roles of [["owner"], ["blogger"], ["finance_ops"], ["client"], []] as const) {
+    const world = unlockWorld();
+
+    await expectRejects(
+      () =>
+        unlockAccountLock(
+          { ...request, actor: officeActor({ roles: roles as readonly PlatformRole[] }) },
+          { rest: world.rest, audit: createInMemoryAuditTrail(), logger: captureLogger().logger, now: () => NOW },
+        ),
+      "PERMISSION_DENIED",
+      `roles [${roles.join(",")}] cannot unlock an account`,
+    );
+    expectEqual(world.touched.length, 0, "a refused caller causes no read and no write");
+  }
+
+  // ---- an office session without a second factor is not enough
+  const unproven = unlockWorld();
+
+  await expectRejects(
+    () =>
+      unlockAccountLock(
+        { ...request, actor: officeActor({ roles: ["super_admin"], twoFactorSatisfied: false }) },
+        { rest: unproven.rest, audit: createInMemoryAuditTrail(), logger: captureLogger().logger, now: () => NOW },
+      ),
+    "PERMISSION_DENIED",
+    "an office session that has not answered a second factor cannot unlock",
+  );
+  expectEqual(unproven.touched.length, 0, "the second factor is checked before anything is read");
+
+  // ---- the unlock itself
+  const world = unlockWorld();
+  const audit = createInMemoryAuditTrail();
+  const officer = officeActor({ roles: ["support"] });
+  const unlocked = await unlockAccountLock(
+    { ...request, note: `  ${note}  `, actor: officer },
+    { rest: world.rest, audit, logger: captureLogger().logger, now: () => NOW },
+  );
+  const row = world.rows[0];
+
+  expectEqual(unlocked.lockId, LOCK_ID, "the answer names the lock it closed");
+  expectEqual(unlocked.userId, USER_ID, "the answer names the account that may sign in again");
+  expectEqual(unlocked.companyId, FIRM_ID, "the answer names the company of the account");
+  expectEqual(unlocked.unlockedAt, new Date(NOW).toISOString(), "the answer names the unlock instant");
+  expectEqual(row?.unlocked_at, unlocked.unlockedAt, "the row records the unlock instant");
+  expectEqual(row?.unlocked_by, officer.userId, "the row records the officer who unlocked");
+  expectEqual(
+    row?.owner_contact_confirmed_at,
+    unlocked.unlockedAt,
+    "the unlock records that the owner was contacted, at the same instant",
+  );
+  expectEqual(row?.unlock_note, note, "the row keeps the note, trimmed");
+  expectEqual(unlocked.ownerContactConfirmedAt, unlocked.unlockedAt, "the answer says when contact was recorded");
+  expectEqual(audit.entries.length, 1, "an unlock writes exactly one audit entry");
+  expectEqual(audit.entries[0]?.action, "user.login_unlocked", "the entry names the unlock");
+  expectEqual(audit.entries[0]?.actorUserId, officer.userId, "the entry names the officer");
+  expectEqual(audit.entries[0]?.entityId, USER_ID, "the entry points at the unlocked account");
+  expectEqual(audit.entries[0]?.companyId, FIRM_ID, "the entry is chained on the merchant's company");
+  expectEqual(audit.entries[0]?.payload["lock_id"], LOCK_ID, "the entry names the lock row");
+  expectEqual(audit.entries[0]?.payload["triggered_by"], "password", "the entry names the factor that locked");
+  expectEqual(audit.entries[0]?.payload["owner_alerted"], true, "the entry records whether the owner was told");
+  expectEqual(audit.entries[0]?.payload["note_length"], note.length, "the entry records the length, never the note");
+  expectEqual(audit.entries[0]?.payload["lock_age_seconds"], 600, "the entry records how long the lock lasted");
+  expectEqual(
+    [...new Set(world.touched.map((entry) => entry.split(":")[1]))].sort().join(","),
+    "account_locks,email_send_logs,email_settings,users",
+    "the unlock touches the lock row and the email queue, and no other table",
+  );
+  expectEqual(world.touched.includes("update:users"), false, "the unlock never writes the account row");
+  expectEqual(
+    world.touched.includes("update:login_attempts"),
+    false,
+    "the unlock never resets the streak that caused the lock",
+  );
+
+  // ---- the lock is closed for the sign in service too
+  const afterUnlock = await readAccountLock(world.rest, USER_ID, NOW);
+
+  expectEqual(afterUnlock.locked, false, "an unlocked account is not locked for the sign in service");
+  expectEqual(afterUnlock.remainingSeconds, null, "an unlocked account has no remaining time");
+
+  // ---- the account is told, through the queue of section 23
+  expectEqual(ACCOUNT_UNLOCK_TEMPLATE_KEY, "account_unlock", "the confirmation uses the template of section 23");
+  expectEqual(ACCOUNT_UNLOCK_MAIL_MAX_ATTEMPTS, 3, "a confirmation is retried three times at most");
+  expectEqual(world.sends.length, 1, "an unlock queues one confirmation email");
+  expectEqual(world.sends[0]?.template_key, "account_unlock", "the queue row carries the template key");
+  expectEqual(world.sends[0]?.recipient_email, "owner@firm.test", "the confirmation goes to the unlocked account");
+  expectEqual(world.sends[0]?.recipient_user_id, USER_ID, "the row names the account it is about");
+  expectEqual(world.sends[0]?.company_id, FIRM_ID, "the row names the company of the account");
+  expectEqual(world.sends[0]?.provider, "smtp", "the row follows the sending method of section 23");
+  expectEqual(world.sends[0]?.max_attempts, ACCOUNT_UNLOCK_MAIL_MAX_ATTEMPTS, "the row carries its retry ceiling");
+  expectEqual(world.sends[0]?.reference_kind, "account", "the row points at an account");
+  expectEqual(world.sends[0]?.reference_id, USER_ID, "the row points at the unlocked account");
+  expectEqual(world.sends[0]?.queued_at, unlocked.unlockedAt, "the row is queued at the unlock instant");
+  expectEqual(
+    world.sends[0]?.subject,
+    getMessage("email.accountUnlock.subject"),
+    "the subject is the catalog string, not a literal in the service",
+  );
+
+  // ---- no sender, no address, and a queue that refuses: the unlock still stands
+  const silentOffice = unlockWorld({ sendingMethod: null });
+  const silentLogger = captureLogger();
+  const withoutSender = await unlockAccountLock(
+    { ...request, actor: officer },
+    { rest: silentOffice.rest, audit: createInMemoryAuditTrail(), logger: silentLogger.logger, now: () => NOW },
+  );
+
+  expectEqual(withoutSender.status, "unlocked", "an unlock succeeds when the office configured no sender");
+  expectEqual(silentOffice.sends.length, 0, "no sender means no confirmation row");
+  expectEqual(silentLogger.warnings.length, 1, "the missing sender is logged for an operator");
+
+  const anonymous = unlockWorld({ accountEmail: null });
+  const anonymousLogger = captureLogger();
+  const withoutAddress = await unlockAccountLock(
+    { ...request, actor: officer },
+    { rest: anonymous.rest, audit: createInMemoryAuditTrail(), logger: anonymousLogger.logger, now: () => NOW },
+  );
+
+  expectEqual(withoutAddress.status, "unlocked", "an unlock succeeds when the account has no address");
+  expectEqual(anonymous.sends.length, 0, "no address means no confirmation row");
+  expectEqual(anonymousLogger.warnings.length, 1, "the missing address is logged");
+
+  const refusedQueue = unlockWorld({ failQueue: true });
+  const refusedLogger = captureLogger();
+  let queuedAnyway: Awaited<ReturnType<typeof unlockAccountLock>> | null = null;
+  let queueFailure: unknown = null;
+
+  try {
+    queuedAnyway = await unlockAccountLock(
+      { ...request, actor: officer },
+      { rest: refusedQueue.rest, audit: createInMemoryAuditTrail(), logger: refusedLogger.logger, now: () => NOW },
+    );
+  } catch (error) {
+    queueFailure = error;
+  }
+
+  expectEqual(queueFailure, null, "a queue that refuses the confirmation does not reject the unlock");
+  expectEqual(queuedAnyway?.status, "unlocked", "a queue that refuses the confirmation does not undo the unlock");
+  expectEqual(refusedQueue.rows[0]?.unlocked_at !== null, true, "the lock stays closed after the failed queue");
+  expectEqual(refusedLogger.warnings.length, 1, "the failed confirmation is logged");
+
+  // ---- a contact recorded earlier keeps its own instant
+  const earlier = new Date(NOW - 300_000).toISOString();
+  const earlyWorld = unlockWorld({ row: { owner_contact_confirmed_at: earlier } });
+
+  const early = await unlockAccountLock(
+    { ...request, actor: officer },
+    { rest: earlyWorld.rest, audit: createInMemoryAuditTrail(), logger: captureLogger().logger, now: () => NOW },
+  );
+
+  expectEqual(
+    earlyWorld.rows[0]?.owner_contact_confirmed_at,
+    earlier,
+    "a contact recorded before the unlock keeps its instant",
+  );
+  expectEqual(early.ownerContactConfirmedAt, earlier, "the answer keeps the earlier contact instant");
+
+  // ---- the contact confirmation is required, and it is a field, not a formality
+  const unconfirmed = unlockWorld();
+
+  await expectRejects(
+    () =>
+      unlockAccountLock(
+        { ...request, ownerContactConfirmed: false, actor: officer },
+        { rest: unconfirmed.rest, audit: createInMemoryAuditTrail(), logger: captureLogger().logger, now: () => NOW },
+      ),
+    "VALIDATION_FAILED",
+    "an unlock without the contact confirmed is refused",
+  );
+  expectEqual(unconfirmed.touched.length, 0, "an unconfirmed unlock reads nothing");
+  expectEqual(unconfirmed.rows[0]?.unlocked_at, null, "an unconfirmed unlock closes nothing");
+
+  // ---- the note is required, bounded and trimmed
+  for (const [label, candidate] of [
+    ["an empty note", ""],
+    ["a whitespace note", "   "],
+    ["a note past the ceiling", "x".repeat(ACCOUNT_UNLOCK_NOTE_MAX_LENGTH + 1)],
+  ] as const) {
+    const invalid = unlockWorld();
+
+    await expectRejects(
+      () =>
+        unlockAccountLock(
+          { ...request, note: candidate, actor: officer },
+          { rest: invalid.rest, audit: createInMemoryAuditTrail(), logger: captureLogger().logger, now: () => NOW },
+        ),
+      "VALIDATION_FAILED",
+      `${label} is refused`,
+    );
+    expectEqual(invalid.rows[0]?.unlocked_at, null, `${label} closes no lock`);
+  }
+
+  // ---- an id that is not a lock, and a lock that does not exist
+  const notAnId = unlockWorld();
+
+  await expectRejects(
+    () =>
+      unlockAccountLock(
+        { ...request, lockId: "not-a-lock", actor: officer },
+        { rest: notAnId.rest, audit: createInMemoryAuditTrail(), logger: captureLogger().logger, now: () => NOW },
+      ),
+    "RESOURCE_NOT_FOUND",
+    "an id that is not shaped like a lock id is not found",
+  );
+
+  const missing = unlockWorld({ rows: [] });
+
+  await expectRejects(
+    () =>
+      unlockAccountLock(
+        { ...request, actor: officer },
+        { rest: missing.rest, audit: createInMemoryAuditTrail(), logger: captureLogger().logger, now: () => NOW },
+      ),
+    "RESOURCE_NOT_FOUND",
+    "a lock that does not exist is not found",
+  );
+
+  // ---- a lock that is already closed is history, whichever closed it
+  for (const [label, closed] of [
+    ["an unlocked lock", { unlocked_at: new Date(NOW - 60_000).toISOString(), unlocked_by: OTHER_USER_ID }],
+    ["an expired lock", { expired_at: new Date(NOW - 60_000).toISOString() }],
+    [
+      "a lock whose two hours are over",
+      { expires_at: new Date(NOW - 1_000).toISOString() },
+    ],
+  ] as const) {
+    const settled = unlockWorld({ row: closed });
+    const settledAudit = createInMemoryAuditTrail();
+
+    await expectRejects(
+      () =>
+        unlockAccountLock(
+          { ...request, actor: officer },
+          { rest: settled.rest, audit: settledAudit, logger: captureLogger().logger, now: () => NOW },
+        ),
+      "CONFLICT",
+      `${label} cannot be unlocked again`,
+    );
+    expectEqual(settledAudit.entries.length, 0, `${label} writes no audit entry`);
+  }
+
+  // ---- a second officer who won the race
+  const raced = unlockWorld({ loseRace: true });
+  const racedAudit = createInMemoryAuditTrail();
+
+  await expectRejects(
+    () =>
+      unlockAccountLock(
+        { ...request, actor: officer },
+        { rest: raced.rest, audit: racedAudit, logger: captureLogger().logger, now: () => NOW },
+      ),
+    "CONFLICT",
+    "an unlock that another officer performed first is a conflict",
+  );
+  expectEqual(racedAudit.entries.length, 0, "a lost race writes no audit entry");
+
+  // ---- an unlock the platform cannot record is not reported as done
+  const unrecorded = unlockWorld();
+  const failingAudit = {
+    append: (): Promise<void> => Promise.reject(new Error("the audit chain is unavailable")),
+  } as unknown as Parameters<typeof unlockAccountLock>[1]["audit"];
+  let recordFailure: unknown = null;
+
+  try {
+    await unlockAccountLock(
+      { ...request, actor: officer },
+      { rest: unrecorded.rest, audit: failingAudit, logger: captureLogger().logger, now: () => NOW },
+    );
+  } catch (error) {
+    recordFailure = error;
+  }
+
+  expect(recordFailure !== null, "an unlock that cannot be audited fails rather than returning success");
+  expectEqual(
+    unrecorded.rows[0]?.unlocked_at !== null,
+    true,
+    "the row is closed before the audit is attempted, so the failure is visible to the next caller",
+  );
+}
+
+
 async function main(): Promise<void> {
   checkConfig();
   checkClaims();
@@ -6700,6 +7214,7 @@ async function main(): Promise<void> {
   await checkTwoFactorReset();
   await checkLoginLock();
   await checkLockAlert();
+  await checkAccountUnlock();
 
   if (failures.length > 0) {
     process.stderr.write(`auth gate failed with ${failures.length} problem(s):\n`);

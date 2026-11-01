@@ -276,6 +276,37 @@ the authority. A permission check uses the record, never a claim.
     the address: the audit chain is forever, and an address that must be erasable later does not
     belong in it.
 
+53. The unlock is a service, not a route. `unlockAccountLock` decides everything section 22 asks for:
+    the role, the second factor, the contact confirmation, whether the lock is still open, the note
+    and the audit entry. `app/api/office/account-locks/unlock` reads a body and a cookie and calls it,
+    so the screen of STEP 078 and the step-up guard of STEP 053 get the same guards as the endpoint and
+    cannot get a weaker copy of them.
+54. Who may end a lock, and who may not. `ACCOUNT_UNLOCK_OFFICE_ROLES` is `super_admin`, `ceo`,
+    `compliance_kyc` and `support`: the office roles that talk to a merchant. `owner` is not in it -
+    the owner of a locked company cannot unlock themselves, which is the whole point of the office
+    having the key - and neither are `finance_ops` (money, not access) and `blogger` (content only).
+    The actor must also have answered a second factor, because section 22 makes TOTP mandatory for
+    every role holding account.
+55. The contact is a field and a column, and the note is a constraint. The caller confirms the owner
+    was reached, the update stamps `owner_contact_confirmed_at`, `0012` refuses an unlock without that
+    instant and `0087` refuses an unlock without `unlock_note`. A code path added later cannot close a
+    lock quietly, and the officer's note is the only free text the row keeps - the audit chain stores
+    its length, never its words.
+56. One conditional update, a read back, then the audit. The write only matches a row that is still
+    open, so a second officer and the clock cannot both win; the read back turns a lost race into
+    `CONFLICT` instead of a success that never happened. A lock whose two hours are over is `CONFLICT`
+    even when its row was never closed, because the sign in service already treats it as open.
+57. The unlock is not a third way out of a lock. It closes the row and writes nothing else: the
+    failures in `login_attempts` remain, `users` is untouched, and the next successful sign in is what
+    ends that streak. Section 22 lists an office unlock after contact and the clock, and this module
+    adds neither a counter reset nor a password change.
+58. The merchant is told, through the email queue. Section 23 lists "account unlock confirmation"
+    among the automatic activity emails, so the unlock writes one `email_send_logs` row with
+    `template_key = 'account_unlock'` to the address of the account that was locked, using the same
+    queue as the lock alert of STEP 046. It is queued last and caught: a platform with no sender, an
+    account with no address and a queue that refuses the row are logged answers, and an unlock never
+    fails because its confirmation could not be queued.
+
 ## Adding an operation
 
 1. Add the method to the `AuthClient` or `AdminAuthClient` interface and its implementation,

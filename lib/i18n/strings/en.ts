@@ -280,6 +280,10 @@ const catalog = {
       /** Subject of the section 23 alert of section 22: the owner is told their account locked. */
       subject: "Your account was locked for two hours after failed sign in attempts",
     },
+    accountUnlock: {
+      /** Subject of the section 23 confirmation: the office ended the lock and the account works. */
+      subject: "Your account was unlocked. Sign in and check your recent activity",
+    },
   },
   policies: {
     kyc_kyb: "KYC and KYB Policy",
