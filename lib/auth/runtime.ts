@@ -1,6 +1,7 @@
 // path: lib/auth/runtime.ts
 import { getServerConfig } from "../../config/server.ts";
 import { serverEnv } from "../env/server.ts";
+import { logger } from "../logger/logger.ts";
 import { createAuthAdminClient, type AdminAuthClient } from "./admin-client.ts";
 import {
   BREACH_RANGE_MAXIMUM_BYTES,
@@ -10,6 +11,7 @@ import {
 import { createRestAuditTrail, type AuditTrail } from "./audit.ts";
 import { createAuthClient, type AuthClient } from "./client.ts";
 import { createAuthCookiePolicy, type AuthCookiePolicy } from "./cookies.ts";
+import { createLockAlertNotifier, type LockAlertNotifier } from "./lock-alert.ts";
 import { getAuthConfig, type AuthConfig } from "./config.ts";
 import {
   createRestLoginAttemptRecorder,
@@ -59,6 +61,8 @@ export interface AuthRuntime {
   readonly cookiePolicy: AuthCookiePolicy;
   /** Reads an actor for a cookie: the session of STEP 039 and of every authenticated route. */
   readonly directory: ActorDirectory;
+  /** Tells a company owner that their account just locked, through the email queue of section 23. */
+  readonly lockAlerts: LockAlertNotifier;
   /**
    * The key that seals a secret at rest, read lazily from the environment.
    *
@@ -85,10 +89,17 @@ export function getAuthRuntime(): AuthRuntime {
     maximumResponseBytes: BREACH_RANGE_MAXIMUM_BYTES,
   });
 
+  const rest = createRestClient(config, http);
+  const audit = createRestAuditTrail({
+    config,
+    http,
+    signingKey: () => serverEnv().AUDIT_SIGNING_KEY,
+  });
+
   runtime = {
     config,
     http,
-    rest: createRestClient(config, http),
+    rest,
     settings,
     client: createAuthClient(config, http),
     admin: createAuthAdminClient(config, http),
@@ -103,18 +114,15 @@ export function getAuthRuntime(): AuthRuntime {
       isProduction: server.isProduction,
     }),
     policies: createRestPolicyCatalog(config, http),
-    audit: createRestAuditTrail({
-      config,
-      http,
-      signingKey: () => serverEnv().AUDIT_SIGNING_KEY,
-    }),
-    attempts: createRestLoginAttemptRecorder(createRestClient(config, http)),
+    audit,
+    attempts: createRestLoginAttemptRecorder(rest),
     cookiePolicy: createAuthCookiePolicy(
       config,
       AUTH_SESSION_MAX_AGE_SECONDS,
       serverEnv().ENCRYPTION_MASTER_KEY,
     ),
     directory: createSupabaseActorDirectory(config, http),
+    lockAlerts: createLockAlertNotifier({ rest, audit, logger }),
     masterKey: () => serverEnv().ENCRYPTION_MASTER_KEY,
   };
 

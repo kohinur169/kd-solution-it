@@ -4,6 +4,7 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { z } from "zod";
 import { AppError } from "../errors/app-error.ts";
 import type { AuditTrail } from "./audit.ts";
+import type { LockAlertNotifier } from "./lock-alert.ts";
 import { encodeSessionCookies, type AuthCookiePolicy, type SessionCookiePayload } from "./cookies.ts";
 import { credentialRejectionError } from "./failures.ts";
 import type { DeviceContext } from "./device-context.ts";
@@ -133,6 +134,8 @@ export interface TwoFactorLoginDependencies {
   readonly rest: RestClient;
   readonly audit: AuditTrail;
   readonly attempts: LoginAttemptRecorder;
+  /** Tells the owner when a second consecutive wrong code locks the account (section 22). */
+  readonly alerts: LockAlertNotifier;
   readonly cookiePolicy: AuthCookiePolicy;
   /** Read lazily: the module never touches the environment at import time. */
   readonly masterKey: () => string;
@@ -424,6 +427,7 @@ export async function completeTwoFactorChallenge(
         rest: dependencies.rest,
         attempts: dependencies.attempts,
         audit: dependencies.audit,
+        alerts: dependencies.alerts,
         now: () => instant,
       },
     );

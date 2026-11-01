@@ -12,6 +12,16 @@ import {
   signAuditHash,
 } from "./audit.ts";
 import { isAddress, readClientAddress, readUserAgent } from "./client-address.ts";
+import { getMessage } from "../i18n/messages.ts";
+import type { Logger } from "../logger/logger.ts";
+import {
+  createLockAlertNotifier,
+  LOCK_ALERT_MAX_ATTEMPTS,
+  LOCK_ALERT_TEMPLATE_KEY,
+  type LockAlertFacts,
+  type LockAlertNotifier,
+  type LockAlertOutcome,
+} from "./lock-alert.ts";
 import { emailHash, readDeviceContext } from "./device-context.ts";
 import {
   createInMemoryLoginAttemptRecorder,
@@ -274,6 +284,8 @@ const USER_ID = "018f3b1c-1111-7c2a-9d1e-2b3c4d5e6f70";
 const OTHER_USER_ID = "018f3b1c-3333-7c2a-9d1e-2b3c4d5e6f72";
 const SESSION_ID = "018f3b1c-2222-7c2a-9d1e-2b3c4d5e6f71";
 const FIRM_ID = "018f3b1c-4444-7c2a-9d1e-2b3c4d5e6f73";
+/** The owner of FIRM_ID in the gate: the address the section 22 alert is addressed to. */
+const OWNER_USER_ID = "018f3b1c-5555-7c2a-9d1e-2b3c4d5e6f74";
 
 const environment = {
   SUPABASE_URL: "https://project-ref.supabase.co",
@@ -3449,6 +3461,8 @@ interface SigninFixture {
   readonly user: Record<string, unknown> | null;
   readonly attempts: ReturnType<typeof createInMemoryLoginAttemptRecorder>;
   readonly audit: ReturnType<typeof createInMemoryAuditTrail>;
+  /** The owner alerts the sign in service asked for, with the facts it asked about. */
+  readonly alerts: ReturnType<typeof createInMemoryLockAlerts>;
   readonly inserts: { table: string; rows: readonly Readonly<Record<string, unknown>>[] }[];
   /** Access tokens whose provider session the service ended, because no sign in happened. */
   readonly signOuts: readonly string[];
@@ -3527,11 +3541,13 @@ function signinFixture(options: SigninRestOptions & {
     rpc: (): Promise<unknown> => Promise.resolve(null),
   };
   const audit = createInMemoryAuditTrail();
+  const alerts = createInMemoryLockAlerts();
 
   return {
     inserts,
     attempts,
     audit,
+    alerts,
     signOuts,
     user,
     dependencies: {
@@ -3552,6 +3568,7 @@ function signinFixture(options: SigninRestOptions & {
       }),
       attempts,
       audit,
+      alerts: alerts.notifier,
       cookiePolicy: cookiePolicy(),
       masterKey: () => MASTER_KEY,
       now: () => NOW,
@@ -4257,6 +4274,8 @@ function twoFactorLoginFixture(options: {
   readonly attempts: ReturnType<typeof createInMemoryLoginAttemptRecorder>;
   readonly audit: ReturnType<typeof createInMemoryAuditTrail>;
   readonly dependencies: Parameters<typeof completeTwoFactorChallenge>[1];
+  /** The owner alerts the challenge asked for, with the facts it asked about. */
+  readonly alerts: ReturnType<typeof createInMemoryLockAlerts>;
 } {
   const secret = options.secret ?? generateTotpSecret();
   const state: ChallengeState = {
@@ -4363,16 +4382,19 @@ function twoFactorLoginFixture(options: {
     rpc: (): Promise<unknown> => Promise.resolve(null),
   };
   const audit = createInMemoryAuditTrail();
+  const alerts = createInMemoryLockAlerts();
 
   return {
     state,
     updates,
     attempts,
     audit,
+    alerts,
     dependencies: {
       rest,
       audit,
       attempts,
+      alerts: alerts.notifier,
       cookiePolicy: cookiePolicy(),
       masterKey: () => MASTER_KEY,
       now: () => NOW,
@@ -5604,6 +5626,52 @@ const rejectedSignIn: AuthOutcome<AuthSession> = {
 };
 
 /**
+ * The owner alert, as the sign in services see it: one call per lock that starts.
+ *
+ * The notifier itself is proved below against a rest double that keeps the tables `lib/auth/lock-alert.ts`
+ * writes. This double exists so the sign in services and the lock service can be asked a different
+ * question - how many times they ask for an alert, and about what - without a database in the way.
+ */
+function createInMemoryLockAlerts(): {
+  readonly notifier: LockAlertNotifier;
+  readonly calls: LockAlertFacts[];
+  /** Makes the next call reject, to prove a broken mail path cannot break a lock. */
+  failNext(): void;
+  /** Makes the next call answer with a status other than `queued`. */
+  answerNext(status: LockAlertOutcome["status"]): void;
+} {
+  const calls: LockAlertFacts[] = [];
+  const control = { fails: false, answer: null as LockAlertOutcome["status"] | null };
+
+  return {
+    calls,
+    failNext(): void {
+      control.fails = true;
+    },
+    answerNext(status: LockAlertOutcome["status"]): void {
+      control.answer = status;
+    },
+    notifier: {
+      alertOnLock(facts: LockAlertFacts): Promise<LockAlertOutcome> {
+        calls.push(facts);
+
+        if (control.fails) {
+          control.fails = false;
+
+          return Promise.reject(new Error("the alert service is down"));
+        }
+
+        const status = control.answer ?? "queued";
+
+        control.answer = null;
+
+        return Promise.resolve({ status, sendId: status === "queued" ? `send-${calls.length}` : null });
+      },
+    },
+  };
+}
+
+/**
  * The rest client of the lock service alone: two tables, both in memory.
  *
  * The lock module reads and writes `account_locks` and `login_attempts` and nothing else, so the gate
@@ -5674,7 +5742,14 @@ async function checkLoginLock(): Promise<void> {
   const touched: string[] = [];
   const rest = lockRest(table, attempts, touched);
   let instant = NOW;
-  const dependencies = { rest, attempts, audit, now: (): number => instant };
+  const alerts = createInMemoryLockAlerts();
+  const dependencies = {
+    rest,
+    attempts,
+    audit,
+    alerts: alerts.notifier,
+    now: (): number => instant,
+  };
   const failure = {
     userId: USER_ID,
     companyId: FIRM_ID,
@@ -5687,6 +5762,7 @@ async function checkLoginLock(): Promise<void> {
 
   expectEqual(first.opened, false, "one failed password does not open a lock");
   expectEqual(first.recorded, true, "the failure is recorded as an attempt");
+  expectEqual(alerts.calls.length, 0, "one failure alerts nobody, because there is no lock yet");
   expectEqual(table.rows.length, 0, "one failed password writes no lock row");
   expectEqual(attempts.attempts.length, 1, "the failure is one attempt row");
   expectEqual(attempts.attempts[0]?.userId, USER_ID, "the attempt names the account it failed on");
@@ -5698,6 +5774,13 @@ async function checkLoginLock(): Promise<void> {
   const second = await recordFailedSignIn(failure, dependencies);
 
   expectEqual(second.opened, true, "the second consecutive failure opens the lock");
+  expectEqual(alerts.calls.length, 1, "the lock that starts alerts the owner exactly once");
+  expectEqual(alerts.calls[0]?.userId, USER_ID, "the alert names the locked account");
+  expectEqual(alerts.calls[0]?.companyId, FIRM_ID, "the alert names the company whose owner is told");
+  expectEqual(alerts.calls[0]?.factor, "password", "the alert says which factor reached two");
+  expectEqual(alerts.calls[0]?.failedAttempts, 2, "the alert counts the failures that caused it");
+  expectEqual(alerts.calls[0]?.lockedAt, table.rows[0]?.locked_at, "the alert carries the lock instant");
+  expectEqual(alerts.calls[0]?.expiresAt, table.rows[0]?.expires_at, "the alert carries the deadline");
   expectEqual(second.lock.locked, true, "the answer reports the account as locked");
   expectEqual(table.rows.length, 1, "one lock row exists");
   expectEqual(table.rows[0]?.triggered_by, "password", "the lock names the factor that reached two");
@@ -5721,6 +5804,7 @@ async function checkLoginLock(): Promise<void> {
   const third = await recordFailedSignIn(failure, dependencies);
 
   expectEqual(third.opened, false, "a third failure opens no second lock");
+  expectEqual(alerts.calls.length, 1, "a lock that was already there does not alert the owner again");
   expectEqual(table.rows.length, 1, "the live key keeps one lock row");
   expectEqual(
     audit.entries.filter((entry) => entry.action === "user.login_locked").length,
@@ -5735,6 +5819,7 @@ async function checkLoginLock(): Promise<void> {
     rest: lockRest(broken, brokenAttempts),
     attempts: brokenAttempts,
     audit: createInMemoryAuditTrail(),
+    alerts: createInMemoryLockAlerts().notifier,
     now: () => NOW,
   };
 
@@ -5760,6 +5845,7 @@ async function checkLoginLock(): Promise<void> {
     rest: lockRest(challengedTable, challengedAttempts),
     attempts: challengedAttempts,
     audit: createInMemoryAuditTrail(),
+    alerts: createInMemoryLockAlerts().notifier,
     now: () => NOW,
   };
 
@@ -5784,6 +5870,7 @@ async function checkLoginLock(): Promise<void> {
     rest: lockRest(blockedTable, blockedAttempts),
     attempts: blockedAttempts,
     audit: createInMemoryAuditTrail(),
+    alerts: createInMemoryLockAlerts().notifier,
     now: () => NOW,
   };
 
@@ -5808,6 +5895,7 @@ async function checkLoginLock(): Promise<void> {
     rest: lockRest(factors, factorAttempts),
     attempts: factorAttempts,
     audit: createInMemoryAuditTrail(),
+    alerts: createInMemoryLockAlerts().notifier,
     now: () => NOW,
   };
 
@@ -5820,6 +5908,26 @@ async function checkLoginLock(): Promise<void> {
 
   expectEqual(twoCodeFailures.opened, true, "two consecutive wrong codes open the lock");
   expectEqual(factors.rows[0]?.triggered_by, "totp", "the lock names the code factor");
+
+  // ---- a broken alert path cannot stop a lock from existing
+  const deafTable = createLockTable();
+  const deafAttempts = createInMemoryLoginAttemptRecorder();
+  const deafAlerts = createInMemoryLockAlerts();
+  const deafDependencies = {
+    rest: lockRest(deafTable, deafAttempts),
+    attempts: deafAttempts,
+    audit: createInMemoryAuditTrail(),
+    alerts: deafAlerts.notifier,
+    now: () => NOW,
+  };
+
+  deafAlerts.failNext();
+  await recordFailedSignIn(failure, deafDependencies);
+  const despiteBrokenAlert = await recordFailedSignIn(failure, deafDependencies);
+
+  expectEqual(despiteBrokenAlert.opened, true, "a lock starts even when the owner alert cannot be queued");
+  expectEqual(deafTable.rows.length, 1, "the lock row exists although the alert failed");
+  expectEqual(deafAlerts.calls.length, 1, "the owner alert is asked for once, and only when the lock starts");
 
   // ---- the guard the password reset of a later STEP uses
   const expiry = table.rows[0]?.expires_at ?? "";
@@ -5867,6 +5975,7 @@ async function checkLoginLock(): Promise<void> {
     rest: lockRest(office, officeAttempts),
     attempts: officeAttempts,
     audit: createInMemoryAuditTrail(),
+    alerts: createInMemoryLockAlerts().notifier,
     now: () => NOW,
   };
 
@@ -6013,6 +6122,7 @@ async function checkLoginLock(): Promise<void> {
   );
 
   expectEqual(failingTable.rows.length, 0, "one wrong password does not lock the account");
+  expectEqual(failing.alerts.calls.length, 0, "one wrong password asks for no alert");
 
   await expectRejects(
     () =>
@@ -6025,6 +6135,10 @@ async function checkLoginLock(): Promise<void> {
   );
 
   expectEqual(failingTable.rows.length, 1, "two wrong passwords lock the account");
+  expectEqual(failing.alerts.calls.length, 1, "the sign in path asks for the owner alert once the lock starts");
+  expectEqual(failing.alerts.calls[0]?.userId, USER_ID, "the alert is about the account that locked");
+  expectEqual(failing.alerts.calls[0]?.companyId, FIRM_ID, "the alert names the company of the account");
+  expectEqual(failing.alerts.calls[0]?.factor, "password", "the alert names the password factor");
   expectEqual(failingTable.rows[0]?.triggered_by, "password", "the lock names the password factor");
   expectEqual(failingTable.rows[0]?.user_id, USER_ID, "the lock names the account of the address");
   expectEqual(
@@ -6106,6 +6220,7 @@ async function checkLoginLock(): Promise<void> {
 
   expectEqual(wrongCode.code, "AUTHENTICATION_REQUIRED", "a wrong code is the generic rejection");
   expectEqual(codeTable.rows.length, 0, "one wrong code does not lock the account");
+  expectEqual(codeFixture.alerts.calls.length, 0, "one wrong code asks for no alert");
   expectEqual(
     codeFixture.attempts.attempts.at(-1)?.factor,
     "totp",
@@ -6126,6 +6241,8 @@ async function checkLoginLock(): Promise<void> {
 
   expectEqual(codeTable.rows.length, 1, "two wrong codes lock the account");
   expectEqual(codeTable.rows[0]?.triggered_by, "totp", "the lock names the code factor");
+  expectEqual(codeFixture.alerts.calls.length, 1, "two wrong codes ask for the owner alert once");
+  expectEqual(codeFixture.alerts.calls[0]?.factor, "totp", "the alert names the code factor");
 
   const thirdHandle = await issue();
   const lockedCorrectCode = await captureRejection(
@@ -6163,6 +6280,394 @@ async function checkLoginLock(): Promise<void> {
 
 /* ------------------------------------------------------------------ main */
 
+/**
+ * A logger that keeps the sentences a service wrote, without a JSON line in the way.
+ *
+ * The owner alert logs the outcomes that are answers rather than successes - no sender configured,
+ * no owner recorded - and an operator finding those lines is the difference between "the office never
+ * set up email" and "the platform is broken".
+ */
+function captureLogger(): { readonly logger: Logger; readonly warnings: string[] } {
+  const warnings: string[] = [];
+  const handle: Logger = {
+    debug: (): void => undefined,
+    info: (): void => undefined,
+    warn: (message: string): void => {
+      warnings.push(message);
+    },
+    error: (): void => undefined,
+    child: (): Logger => handle,
+  };
+
+  return { logger: handle, warnings };
+}
+
+interface AlertLockRow {
+  readonly id: string;
+  readonly user_id: string;
+  alert_send_id: string | null;
+  owner_alerted_at: string | null;
+}
+
+interface AlertSendRow {
+  readonly id: string;
+  readonly company_id: string | null;
+  readonly template_key: string;
+  readonly recipient_email: string;
+  readonly recipient_user_id: string | null;
+  readonly subject: string;
+  readonly provider: string;
+  readonly max_attempts: number;
+  readonly reference_kind: string | null;
+  readonly reference_id: string | null;
+  readonly queued_at: string;
+  status: string;
+  failure_reason: string | null;
+}
+
+interface AlertWorld {
+  readonly rest: RestClient;
+  readonly locks: AlertLockRow[];
+  readonly sends: AlertSendRow[];
+  readonly updates: { table: string; query: string; values: Readonly<Record<string, unknown>> }[];
+}
+
+/**
+ * The four tables `lib/auth/lock-alert.ts` reads and the two it writes, in memory.
+ *
+ * The point of the double is not to imitate PostgREST but to keep the state that decides the answer:
+ * which lock is open, whether it already names an alert, whether the office configured a sender,
+ * whether the company has an owner, and whether the claim on the lock was won. Every one of those is
+ * a switch a check below flips on purpose.
+ */
+function alertWorld(options: {
+  readonly locks?: readonly AlertLockRow[];
+  readonly method?: "smtp" | "api" | null;
+  readonly ownerUserId?: string | null;
+  readonly ownerEmail?: string | null;
+  readonly failTable?: string | null;
+  /** Another request claimed the lock first, between this call's read and its update. */
+  readonly loseClaim?: boolean;
+  /** The queue accepted the insert but answered with no representation. */
+  readonly returnNoSendId?: boolean;
+} = {}): AlertWorld {
+  const locks = (options.locks ?? []).map((row) => ({ ...row }));
+  const sends: AlertSendRow[] = [];
+  const updates: { table: string; query: string; values: Readonly<Record<string, unknown>> }[] = [];
+  const method = options.method === undefined ? "smtp" : options.method;
+  const ownerUserId = options.ownerUserId === undefined ? OWNER_USER_ID : options.ownerUserId;
+  const ownerEmail = options.ownerEmail === undefined ? "owner@firm.test" : options.ownerEmail;
+
+  const rest: RestClient = {
+    select<TRow>(table: string, query: string): Promise<readonly TRow[]> {
+      if (options.failTable === table) {
+        return Promise.reject(new Error("the database did not answer"));
+      }
+
+      if (table === "account_locks") {
+        const byId = /(?:^|[&?])id=eq\.([^&]+)/u.exec(query)?.[1];
+        const byUser = /(?:^|[&?])user_id=eq\.([^&]+)/u.exec(query)?.[1];
+        const matched = locks.filter((row) =>
+          byId === undefined ? row.user_id === decodeURIComponent(byUser ?? "") : row.id === byId,
+        );
+
+        return Promise.resolve(matched.map((row) => ({ ...row })) as unknown as readonly TRow[]);
+      }
+
+      if (table === "email_settings") {
+        return Promise.resolve(
+          (method === null ? [] : [{ method }]) as unknown as readonly TRow[],
+        );
+      }
+
+      if (table === "role_assignments") {
+        return Promise.resolve(
+          (ownerUserId === null ? [] : [{ user_id: ownerUserId }]) as unknown as readonly TRow[],
+        );
+      }
+
+      if (table === "users") {
+        return Promise.resolve(
+          (ownerEmail === null ? [] : [{ email: ownerEmail }]) as unknown as readonly TRow[],
+        );
+      }
+
+      return Promise.resolve([] as readonly TRow[]);
+    },
+    insert(): Promise<void> {
+      return Promise.resolve();
+    },
+    insertReturning<TRow>(
+      table: string,
+      rows: readonly Readonly<Record<string, unknown>>[],
+    ): Promise<readonly TRow[]> {
+      if (table !== "email_send_logs") {
+        return Promise.resolve([] as readonly TRow[]);
+      }
+
+      const written: AlertSendRow[] = [];
+
+      for (const values of rows) {
+        const row: AlertSendRow = {
+          id: `send-${String(sends.length + written.length + 1)}`,
+          company_id: (values["company_id"] as string | null | undefined) ?? null,
+          template_key: String(values["template_key"]),
+          recipient_email: String(values["recipient_email"]),
+          recipient_user_id: (values["recipient_user_id"] as string | null | undefined) ?? null,
+          subject: String(values["subject"]),
+          provider: String(values["provider"]),
+          max_attempts: Number(values["max_attempts"]),
+          reference_kind: (values["reference_kind"] as string | null | undefined) ?? null,
+          reference_id: (values["reference_id"] as string | null | undefined) ?? null,
+          queued_at: String(values["queued_at"]),
+          status: "queued",
+          failure_reason: null,
+        };
+
+        written.push(row);
+      }
+
+      sends.push(...written);
+
+      return Promise.resolve(
+        (options.returnNoSendId === true ? [] : written.map((row) => ({ id: row.id }))) as unknown as readonly TRow[],
+      );
+    },
+    update(table: string, query: string, values: Readonly<Record<string, unknown>>): Promise<void> {
+      updates.push({ table, query, values });
+
+      if (table === "account_locks") {
+        const id = /(?:^|[&?])id=eq\.([^&]+)/u.exec(query)?.[1] ?? "";
+
+        for (const row of locks) {
+          if (row.id !== id) {
+            continue;
+          }
+
+          if (query.includes("alert_send_id=is.null") && row.alert_send_id !== null) {
+            continue;
+          }
+
+          if (options.loseClaim === true) {
+            continue;
+          }
+
+          Object.assign(row, values);
+        }
+
+        return Promise.resolve();
+      }
+
+      if (table === "email_send_logs") {
+        const id = /(?:^|[&?])id=eq\.([^&]+)/u.exec(query)?.[1] ?? "";
+
+        for (const row of sends) {
+          if (row.id === id && row.status === "queued") {
+            Object.assign(row, values);
+          }
+        }
+      }
+
+      return Promise.resolve();
+    },
+    rpc: (): Promise<unknown> => Promise.resolve(null),
+  };
+
+  return { rest, locks, sends, updates };
+}
+
+/**
+ * The owner alert of section 22, proved end to end against the tables it writes.
+ *
+ * Six properties, and each one is a sentence from the specification or a way the platform must not
+ * break: the alert is queued once per lock with the template section 23 already knows; a second call
+ * for the same lock queues nothing; a lock whose company has no owner, or whose platform has no
+ * sender, is still a lock and no email; a storage failure is an answer and not an exception; and a
+ * losing race sends one email, not two.
+ */
+async function checkLockAlert(): Promise<void> {
+  expectEqual(LOCK_ALERT_TEMPLATE_KEY, "login_lock_alert", "the alert uses the template of section 23");
+  expectEqual(LOCK_ALERT_MAX_ATTEMPTS, 3, "an alert is retried three times at most");
+
+  // ---- the alert of a lock that just started
+  const queuedWorld = alertWorld({
+    locks: [{ id: "lock-1", user_id: USER_ID, alert_send_id: null, owner_alerted_at: null }],
+  });
+  const queuedAudit = createInMemoryAuditTrail();
+  const queuedLogger = captureLogger();
+  const queuedFacts: LockAlertFacts = {
+    userId: USER_ID,
+    companyId: FIRM_ID,
+    factor: "password",
+    lockedAt: new Date(NOW).toISOString(),
+    expiresAt: new Date(NOW + 7_200_000).toISOString(),
+    failedAttempts: 2,
+    ipAddress: "203.0.113.9",
+    userAgent: "gate",
+  };
+  const notifier = createLockAlertNotifier({
+    rest: queuedWorld.rest,
+    audit: queuedAudit,
+    logger: queuedLogger.logger,
+    now: () => NOW,
+  });
+
+  const queued = await notifier.alertOnLock(queuedFacts);
+
+  expectEqual(queued.status, "queued", "a lock with an owner and a sender queues the alert");
+  expectEqual(queuedWorld.sends.length, 1, "one lock queues one email");
+  expectEqual(queued.sendId, queuedWorld.sends[0]?.id, "the answer names the queue row it wrote");
+  expectEqual(queuedWorld.sends[0]?.template_key, "login_lock_alert", "the row carries the template key");
+  expectEqual(queuedWorld.sends[0]?.recipient_email, "owner@firm.test", "the row is addressed to the owner");
+  expectEqual(queuedWorld.sends[0]?.recipient_user_id, USER_ID, "the row names the locked account");
+  expectEqual(queuedWorld.sends[0]?.provider, "smtp", "the row follows the sending method of section 23");
+  expectEqual(queuedWorld.sends[0]?.max_attempts, LOCK_ALERT_MAX_ATTEMPTS, "the row carries its retry ceiling");
+  expectEqual(queuedWorld.sends[0]?.reference_kind, "account", "the row points at an account");
+  expectEqual(queuedWorld.sends[0]?.reference_id, USER_ID, "the row points at the locked account");
+  expectEqual(
+    queuedWorld.sends[0]?.subject,
+    getMessage("email.lockAlert.subject"),
+    "the subject is the catalog string, not a literal in the service",
+  );
+  expectEqual(queuedWorld.locks[0]?.alert_send_id, queuedWorld.sends[0]?.id, "the lock names the email");
+  expectEqual(
+    queuedWorld.locks[0]?.owner_alerted_at,
+    new Date(NOW).toISOString(),
+    "the lock records when the owner was alerted",
+  );
+  expectEqual(queuedAudit.entries.length, 1, "the alert is audited once");
+  expectEqual(queuedAudit.entries[0]?.action, "user.login_lock_alerted", "the audit entry names the alert");
+  expectEqual(queuedAudit.entries[0]?.payload["send_id"], queuedWorld.sends[0]?.id, "the entry names the email");
+  expectEqual(queuedAudit.entries[0]?.payload["recipient"], "owner", "the entry says who was told");
+  expectEqual(queuedAudit.entries[0]?.actorUserId, null, "nobody was signed in when the lock started");
+  expectEqual(queuedLogger.warnings.length, 0, "a queued alert warns about nothing");
+
+  // ---- a second call for the same lock queues nothing
+  const again = await notifier.alertOnLock(queuedFacts);
+
+  expectEqual(again.status, "already_alerted", "a lock that already alerted its owner is not alerted twice");
+  expectEqual(queuedWorld.sends.length, 1, "the second call writes no second email");
+  expectEqual(queuedAudit.entries.length, 1, "the second call audits nothing");
+
+  // ---- no sending method configured is an answer, not a break
+  const noMethod = alertWorld({
+    locks: [{ id: "lock-1", user_id: USER_ID, alert_send_id: null, owner_alerted_at: null }],
+    method: null,
+  });
+  const noMethodLogger = captureLogger();
+  const noMethodOutcome = await createLockAlertNotifier({
+    rest: noMethod.rest,
+    audit: createInMemoryAuditTrail(),
+    logger: noMethodLogger.logger,
+    now: () => NOW,
+  }).alertOnLock(queuedFacts);
+
+  expectEqual(
+    noMethodOutcome.status,
+    "sender_not_configured",
+    "a platform with no active sending method queues nothing",
+  );
+  expectEqual(noMethod.sends.length, 0, "no sender means no queue row");
+  expectEqual(noMethod.locks[0]?.owner_alerted_at, null, "the lock does not claim an alert it never queued");
+  expectEqual(noMethodLogger.warnings.length, 1, "the missing sending method is logged for an operator");
+
+  // ---- a platform account has no merchant owner
+  const platformLock = alertWorld({
+    locks: [{ id: "lock-1", user_id: USER_ID, alert_send_id: null, owner_alerted_at: null }],
+  });
+  const noCompany = await createLockAlertNotifier({
+    rest: platformLock.rest,
+    audit: createInMemoryAuditTrail(),
+    logger: captureLogger().logger,
+    now: () => NOW,
+  }).alertOnLock({ ...queuedFacts, companyId: null });
+
+  expectEqual(noCompany.status, "no_owner", "an account without a company has no owner to alert");
+  expectEqual(platformLock.sends.length, 0, "no owner means no email");
+
+  // ---- a company whose owner assignment was revoked
+  const noOwner = alertWorld({
+    locks: [{ id: "lock-1", user_id: USER_ID, alert_send_id: null, owner_alerted_at: null }],
+    ownerUserId: null,
+  });
+  const missingOwner = await createLockAlertNotifier({
+    rest: noOwner.rest,
+    audit: createInMemoryAuditTrail(),
+    logger: captureLogger().logger,
+    now: () => NOW,
+  }).alertOnLock(queuedFacts);
+
+  expectEqual(missingOwner.status, "no_owner", "a company without a live owner assignment alerts nobody");
+  expectEqual(noOwner.sends.length, 0, "an unreachable owner means no email");
+
+  // ---- a lock that is no longer open
+  const noLock = alertWorld();
+  const withoutLock = await createLockAlertNotifier({
+    rest: noLock.rest,
+    audit: createInMemoryAuditTrail(),
+    logger: captureLogger().logger,
+    now: () => NOW,
+  }).alertOnLock(queuedFacts);
+
+  expectEqual(withoutLock.status, "no_lock", "an account with no open lock queues no alert");
+  expectEqual(noLock.sends.length, 0, "no lock means no email");
+
+  // ---- a storage failure is an answer, never an exception
+  const brokenRead = alertWorld({
+    locks: [{ id: "lock-1", user_id: USER_ID, alert_send_id: null, owner_alerted_at: null }],
+    failTable: "account_locks",
+  });
+  const brokenLogger = captureLogger();
+  const brokenOutcome = await createLockAlertNotifier({
+    rest: brokenRead.rest,
+    audit: createInMemoryAuditTrail(),
+    logger: brokenLogger.logger,
+    now: () => NOW,
+  }).alertOnLock(queuedFacts);
+
+  expectEqual(brokenOutcome.status, "failed", "a database that did not answer is a failed alert");
+  expectEqual(brokenOutcome.sendId, null, "a failed alert names no queue row");
+  expectEqual(brokenLogger.warnings.length, 1, "a failed alert is logged");
+
+  // ---- a losing race: the email is queued, the lock is claimed elsewhere, the row is dropped
+  const raced = alertWorld({
+    locks: [{ id: "lock-1", user_id: USER_ID, alert_send_id: null, owner_alerted_at: null }],
+    loseClaim: true,
+  });
+  const raceOutcome = await createLockAlertNotifier({
+    rest: raced.rest,
+    audit: createInMemoryAuditTrail(),
+    logger: captureLogger().logger,
+    now: () => NOW,
+  }).alertOnLock(queuedFacts);
+
+  expectEqual(raceOutcome.status, "already_alerted", "a claim that lost the race reports an existing alert");
+  expectEqual(raced.sends.length, 1, "the losing call wrote one queue row");
+  expectEqual(raced.sends[0]?.status, "dropped", "the row of the losing call is dropped, so no second email");
+  expectEqual(
+    raced.sends[0]?.failure_reason,
+    "The lock already alerted its owner.",
+    "the dropped row says why it was dropped",
+  );
+  expectEqual(raced.locks[0]?.owner_alerted_at, null, "a losing call does not stamp the lock");
+
+  // ---- a queue that accepted a row but answered with nothing
+  const silent = alertWorld({
+    locks: [{ id: "lock-1", user_id: USER_ID, alert_send_id: null, owner_alerted_at: null }],
+    returnNoSendId: true,
+  });
+  const silentOutcome = await createLockAlertNotifier({
+    rest: silent.rest,
+    audit: createInMemoryAuditTrail(),
+    logger: captureLogger().logger,
+    now: () => NOW,
+  }).alertOnLock(queuedFacts);
+
+  expectEqual(silentOutcome.status, "failed", "a queue row with no id cannot be named, so the alert failed");
+  expectEqual(silent.locks[0]?.alert_send_id, null, "a nameless row leaves the lock unpointed");
+}
+
+
 async function main(): Promise<void> {
   checkConfig();
   checkClaims();
@@ -6194,6 +6699,7 @@ async function main(): Promise<void> {
   await checkBackupCodeRegeneration();
   await checkTwoFactorReset();
   await checkLoginLock();
+  await checkLockAlert();
 
   if (failures.length > 0) {
     process.stderr.write(`auth gate failed with ${failures.length} problem(s):\n`);

@@ -252,6 +252,30 @@ the authority. A permission check uses the record, never a claim.
     written, because the live key would otherwise make the account unlockable by time and lockable by
     nothing. The office unlock is STEP 047's, through the `0012` columns this module never writes.
 
+49. The owner is alerted through the email queue, not by this module. `lib/auth/lock-alert.ts` runs
+    once per lock that starts, resolves the owner of the company (`role_assignments` with `role =
+    'owner'` and `0012`'s company scope), and writes one `email_send_logs` row (`0061`) with
+    `template_key = 'login_lock_alert'`, the sending method the office made active in
+    `email_settings` (`0059`), and `reference_kind = 'account'`. It sends nothing: SMTP, the
+    templates and the retry sweep are section 23, STEP 221 to STEP 230.
+50. One alert per lock, claimed in the database. `0086` points the lock at that row
+    (`account_locks.alert_send_id`) and stamps `owner_alerted_at` in one update that only matches
+    while the column is still null; the claim is read back afterwards, and a call that lost the race
+    marks its own row `dropped` so the owner gets one email and the log still tells the whole story.
+    A unique index refuses two locks that claim one email, and a check refuses a lock that says it
+    alerted its owner without naming the email that did it.
+51. No owner, no sender, no email - and still a lock. A platform account has no merchant owner and a
+    platform without a configured sending method has no way to send, so those are answers
+    (`no_owner`, `sender_not_configured`) with a log line for the office, not reasons to fail the
+    sign in. The notifier never throws, and the lock service catches it as well, because the refusal
+    the stranger is owed has already been decided. `owner_alerted_at` means "the platform took
+    responsibility for telling the owner": delivery, its attempts and its provider message id stay in
+    `email_send_logs.status`, one place and one truth.
+52. The alert is audited, the address is not. `user.login_lock_alerted` records the send id, the
+    template, the factor, the lock window and that the recipient was the owner. It does not record
+    the address: the audit chain is forever, and an address that must be erasable later does not
+    belong in it.
+
 ## Adding an operation
 
 1. Add the method to the `AuthClient` or `AdminAuthClient` interface and its implementation,

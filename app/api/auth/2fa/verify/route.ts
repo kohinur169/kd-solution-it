@@ -80,6 +80,7 @@ export const POST = withErrorResponse(
         rest: runtime.rest,
         audit: runtime.audit,
         attempts: runtime.attempts,
+        alerts: runtime.lockAlerts,
         cookiePolicy: runtime.cookiePolicy,
         masterKey: runtime.masterKey,
       },

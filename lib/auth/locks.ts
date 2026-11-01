@@ -2,6 +2,7 @@
 import { z } from "zod";
 import { AppError } from "../errors/app-error.ts";
 import type { AuditTrail } from "./audit.ts";
+import type { LockAlertNotifier } from "./lock-alert.ts";
 import type {
   LoginAttemptFactor,
   LoginAttemptRecorder,
@@ -36,11 +37,13 @@ import type { RestClient } from "./rest.ts";
  *
  * ## What is deliberately not here
  *
- * The owner alert is STEP 046's: the lock row it reads is written by this module, and
- * `owner_alerted_at` stays null until that STEP sends the email. The office unlock is STEP 047's: the
- * columns it needs (`owner_contact_confirmed_at`, `unlocked_at`, `unlocked_by`, `unlock_note`) are in
- * `0012` and this module never writes them. The IP based rate limit is STEP 055's. This module is
- * only the question "is this account locked" and the transition "a failure just happened".
+ * The email itself is `lib/auth/lock-alert.ts` of STEP 046, called once, after the row exists: this
+ * module decides that a lock started, and that module decides who to tell and writes the queue row
+ * of section 23. The two are split because a lock must not fail when the office has not configured
+ * a sender. The office unlock is STEP 047's: the columns it needs
+ * (`owner_contact_confirmed_at`, `unlocked_at`, `unlocked_by`, `unlock_note`) are in `0012` and this
+ * module never writes them. The IP based rate limit is STEP 055's. This module is only the question
+ * "is this account locked" and the transition "a failure just happened".
  *
  * ## Failing closed on the read, best effort on the count
  *
@@ -212,13 +215,15 @@ export interface FailedSignInDependencies {
   readonly rest: RestClient;
   readonly attempts: LoginAttemptRecorder;
   readonly audit: AuditTrail;
+  /** Tells the owner their account just locked. Best effort, and never a reason to fail the lock. */
+  readonly alerts: LockAlertNotifier;
   readonly now?: () => number;
 }
 
 export interface FailedSignInResult {
   /** The state of the account after the attempt: locked when this very attempt started the lock. */
   readonly lock: AccountLockState;
-  /** True when this attempt opened the lock - the event STEP 046 alerts the owner about. */
+  /** True when this attempt opened the lock - the event the owner is alerted about. */
   readonly opened: boolean;
   /** True when the attempt row was written, false when it could not be. */
   readonly recorded: boolean;
@@ -230,7 +235,9 @@ export interface FailedSignInResult {
  * Never throws: the caller has already decided to refuse the attempt, and a counter that could not be
  * consulted must not change the sentence a stranger reads. The answer says what happened, so a route
  * can log it, and the `user.login_locked` audit entry is written exactly once - when this call is the
- * one that created the row, not when it found one already there.
+ * one that created the row, not when it found one already there. The owner alert of STEP 046 goes out
+ * on the same condition, for the same reason: a lock that started is a lock somebody must hear about,
+ * and a lock that was already there must not send a second email.
  */
 export async function recordFailedSignIn(
   input: FailedSignIn,
@@ -253,10 +260,12 @@ export async function recordFailedSignIn(
     recorded = false;
   }
 
+  // The whole lock step is caught, not only its inner writes: "never throws" is a promise to the
+  // route, and a notifier that throws is a notifier that would otherwise turn a refusal into a 500.
   const opened = await openLockWhenStreakIsReached(input, {
     ...dependencies,
     now: () => instant,
-  });
+  }).catch(() => false);
   const lock = await readAccountLock(dependencies.rest, input.userId, instant).catch(
     (): AccountLockState => ACCOUNT_UNLOCKED,
   );
@@ -331,6 +340,22 @@ async function openLockWhenStreakIsReached(
         locked_until: expiresAt,
         locked_for_seconds: Math.round(LOGIN_LOCK_DURATION_MS / 1_000),
       },
+      ipAddress: input.ipAddress,
+      userAgent: input.userAgent,
+    })
+    .catch(() => undefined);
+
+  // Section 22: "The owner receives an email alert when the lock starts." The notifier writes the
+  // queue row of section 23 and stamps `owner_alerted_at`; it answers with what happened instead of
+  // throwing, and the catch is there for the one implementation that might forget.
+  await dependencies.alerts
+    .alertOnLock({
+      userId: input.userId,
+      companyId: input.companyId,
+      factor: input.factor,
+      lockedAt,
+      expiresAt,
+      failedAttempts: streak,
       ipAddress: input.ipAddress,
       userAgent: input.userAgent,
     })

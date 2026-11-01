@@ -275,6 +275,12 @@ const catalog = {
     cancel: "Cancel",
     home: "Go to the home page",
   },
+  email: {
+    lockAlert: {
+      /** Subject of the section 23 alert of section 22: the owner is told their account locked. */
+      subject: "Your account was locked for two hours after failed sign in attempts",
+    },
+  },
   policies: {
     kyc_kyb: "KYC and KYB Policy",
     ubo: "UBO Policy",

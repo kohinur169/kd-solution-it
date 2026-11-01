@@ -2,6 +2,7 @@
 import { z } from "zod";
 import { AppError } from "../errors/app-error.ts";
 import type { AuditTrail } from "./audit.ts";
+import type { LockAlertNotifier } from "./lock-alert.ts";
 import type { AuthClient } from "./client.ts";
 import {
   encodeSessionCookies,
@@ -118,6 +119,8 @@ export interface SigninDependencies {
   readonly turnstile: TurnstileGuard;
   readonly attempts: LoginAttemptRecorder;
   readonly audit: AuditTrail;
+  /** Tells the owner when a second consecutive wrong password locks the account (section 22). */
+  readonly alerts: LockAlertNotifier;
   readonly cookiePolicy: AuthCookiePolicy;
   /** The key that seals a pending session while the code is asked for. */
   readonly masterKey: () => string;
@@ -249,6 +252,7 @@ export async function signInMerchant(
           rest: dependencies.rest,
           attempts: dependencies.attempts,
           audit: dependencies.audit,
+          alerts: dependencies.alerts,
           now,
         },
       );
@@ -362,6 +366,7 @@ export async function signInMerchant(
         rest: dependencies.rest,
         audit: dependencies.audit,
         attempts: dependencies.attempts,
+        alerts: dependencies.alerts,
         cookiePolicy: dependencies.cookiePolicy,
         masterKey: dependencies.masterKey,
         ...(dependencies.now === undefined ? {} : { now: dependencies.now }),
