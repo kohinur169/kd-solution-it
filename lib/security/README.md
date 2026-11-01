@@ -3,9 +3,10 @@
 
 Owner: STEP 056 (input sanitiser for text, rich text and URLs), STEP 057 (the double submit token),
 STEP 058 (the destination rule), STEP 059 (the Content Security Policy), STEP 060 (the security headers),
-STEP 061 (the upload validator) and STEP 062 (the rate limiter). Later STEPs call these functions; they do
-not write a second escape, a second URL check, a second allowlist, a second CSRF token, a second DNS
-check, a second policy header, a second header table, a second file type check or a second counter.
+STEP 061 (the upload validator), STEP 062 (the rate limiter) and STEP 063 (the audit writer). Later STEPs
+call these functions; they do not write a second escape, a second URL check, a second allowlist, a second
+CSRF token, a second DNS check, a second policy header, a second header table, a second file type check, a
+second counter or a second way to append to an audit chain.
 
 | File | Purpose |
 | --- | --- |
@@ -20,6 +21,7 @@ check, a second policy header, a second header table, a second file type check o
 | headers.ts | The security headers of every response, in two scopes: a document and a static file |
 | upload.ts | What a file must be before it is stored: purpose, size, magic bytes, and the quarantine verdict |
 | rate-limit.ts | How often one address, one account and one route may ask: three buckets, one counter, one decision |
+| audit.ts | How an entry enters the chain: the policy, the redaction, the link, and the proof the chain still verifies |
 | verify.ts | The gate behind `npm run check:security`, and the attack corpus it runs |
 
 ## The four rules
@@ -151,6 +153,44 @@ response was a 500. Serving it is what found it, and the fix is the rule this fi
 `/_next/static/` and `/_next/image` are build output, because those are the paths the framework itself
 serves as files. Everything else is a document, and pays one nonce for the guarantee that a page can
 never be rendered without a policy.
+
+## How an entry enters the audit chain
+
+`audit.ts` is the writer of the *platform*, as `lib/auth/audit.ts` is the writer of the authentication
+flows. The write path is the same three calls in the same order - `public.audit_next_link` for the head
+the row must extend, `public.audit_hash_v1` for the canonical hash, then the insert - and the gate reads
+both modules and asserts that parity, so there is one way to append and not two.
+
+What this module adds is the part that decides whether an entry may be written at all:
+
+1. **The rules of `0013`, before the database states them.** A dotted action of at most 64 characters, an
+   entity type of at most 48, an entity type and an entity id together or neither, uuid columns, an
+   address of family 4 or 6, a payload object of at most 8 192 bytes. A constraint violation in production
+   is an insert with no useful message; here it is a named reason in the `cause`, which never reaches a
+   client.
+2. **Redaction, at the only moment it is still cheap.** The chain is append-only and permanent, so a
+   token that reaches it can never be removed - not by a job and not by a rollback. A payload key that
+   names a credential (`password`, `apiKey`, `x-auth-token`, `csrf_token`, `proof_key`, `backup_code`,
+   `card_number`, a seed) is replaced with `[redacted]` before the size is measured and before the hash is
+   asked for, so the hash covers what was stored rather than what was offered.
+3. **No hash in TypeScript.** `0075` owns the canonical form - the v1 string, its field order, the
+   microsecond timestamp, the canonical JSON - and every row already in the table was hashed by it. A
+   second implementation would drift at the first format change, and the drift would appear as a chain
+   that fails to verify months later. The gate asserts the module contains no hash function at all.
+4. **No key in `lib/security`.** The Ed25519 signature arrives as a `signHash` function, and
+   `signAuditHash` from the auth module satisfies it as it stands. A secret is read in one place.
+
+The other half is the answer to "has anyone edited the log?". `public.audit_verify_chain` walks a range
+and reports the first break, with the position and the reason; `public.audit_merkle_root` computes the
+RFC 6962 root over the stored row hashes, so publishing it on a schedule (section 31) makes any rewrite
+of any row change the root of every range that contains it. `readAuditIntegrityReport` is what the export
+job records - and it refuses to publish: a root over a broken chain would certify the tampering, and a
+root over an empty range certifies nothing, so both are a failed job rather than a report.
+
+A write that cannot be completed is never reported as done. A malformed head, a hash that is not a hash,
+a hash equal to the previous one, a signature that is not eighty-six base64url characters, or an insert
+that fails, all stop the entry: the caller learns that the mutation was not recorded, and no retry forks
+the chain.
 
 ## How often a request may ask
 

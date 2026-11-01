@@ -63,6 +63,45 @@ import {
   type ResolvedHeader,
 } from "./headers.ts";
 import {
+  auditEntryProblem,
+  auditPayloadBytes,
+  buildAuditEntry,
+  createAuditWriter,
+  isAuditSecretKey,
+  readAuditIntegrityReport,
+  readAuditMerkleRoot,
+  redactAuditPayload,
+  requireAuditEntry,
+  verifyAuditChain,
+  AUDIT_ACTION_PATTERN,
+  AUDIT_ENTRY_PROBLEMS,
+  AUDIT_ENTITY_TYPE_PATTERN,
+  AUDIT_GENESIS_HASH,
+  AUDIT_HASH_ARGUMENTS,
+  AUDIT_HASH_FUNCTION,
+  AUDIT_HASH_PATTERN,
+  AUDIT_MAXIMUM_ACTION_LENGTH,
+  AUDIT_MAXIMUM_ENTITY_TYPE_LENGTH,
+  AUDIT_MAXIMUM_PAYLOAD_BYTES,
+  AUDIT_MAXIMUM_PAYLOAD_DEPTH,
+  AUDIT_MAXIMUM_USER_AGENT_LENGTH,
+  AUDIT_MERKLE_FUNCTION,
+  AUDIT_NEXT_LINK_FUNCTION,
+  AUDIT_PLATFORM_CHAIN_ID,
+  AUDIT_REDACTED,
+  AUDIT_ROW_FIELDS,
+  AUDIT_SECRET_KEY_FRAGMENTS,
+  AUDIT_SEQUENCE_START,
+  AUDIT_SIGNATURE_PATTERN,
+  AUDIT_SIGNING_KEY_ID_PATTERN,
+  AUDIT_TABLE,
+  AUDIT_VERIFY_FUNCTION,
+  type AuditEntry,
+  type AuditEntryProblem,
+  type AuditRpcClient,
+  type AuditStoreClient,
+} from "./audit.ts";
+import {
   canonicalRateLimitAddress,
   consumeRateLimitBuckets,
   enforceRouteRateLimit,
@@ -2108,6 +2147,701 @@ async function checkRateLimitWiring(): Promise<void> {
   );
 }
 
+/** ---- Audit: one chain, one writer, and the proof that nobody edited it. */
+
+interface RecordedAuditCall {
+  readonly functionName: string;
+  readonly arguments: Readonly<Record<string, unknown>>;
+}
+
+interface FakeAuditStore {
+  readonly client: AuditStoreClient;
+  readonly calls: RecordedAuditCall[];
+  readonly rows: (readonly Readonly<Record<string, unknown>>[])[];
+  readonly tables: string[];
+}
+
+interface FakeAuditStoreOptions {
+  readonly nextLink?: unknown;
+  readonly hash?: unknown;
+  readonly signature?: string;
+  readonly failInsert?: boolean;
+}
+
+/** A store that answers like `0075` and records what the writer asked it. */
+function createFakeAuditStore(options: FakeAuditStoreOptions = {}): FakeAuditStore {
+  const calls: RecordedAuditCall[] = [];
+  const rows: (readonly Readonly<Record<string, unknown>>[])[] = [];
+  const tables: string[] = [];
+  const client: AuditStoreClient = {
+    rpc(functionName, arguments_) {
+      calls.push({ functionName, arguments: arguments_ });
+
+      if (functionName === "audit_next_link") {
+        return Promise.resolve(
+          "nextLink" in options ? options.nextLink : [{ next_sequence: 1, prev_hash: AUDIT_GENESIS_HASH }],
+        );
+      }
+
+      if (functionName === "audit_hash_v1") {
+        return Promise.resolve("hash" in options ? options.hash : "c".repeat(64));
+      }
+
+      return Promise.resolve(null);
+    },
+    insert(table, inserted) {
+      calls.push({ functionName: "insert", arguments: { table } });
+      tables.push(table);
+      rows.push(inserted);
+
+      return options.failInsert === true
+        ? Promise.reject(new AppError("DEPENDENCY_FAILED"))
+        : Promise.resolve();
+    },
+  };
+
+  return { client, calls, rows, tables };
+}
+
+const auditCompanyId = "018f2b8a-3333-4c2d-9c3e-0123456789ab";
+const auditEntityId = "018f2b8a-4444-4c2d-9c3e-0123456789ab";
+const auditUserId = "018f2b8a-5555-4c2d-9c3e-0123456789ab";
+const auditFixedNow = Date.parse("2026-11-01T10:00:00.000Z");
+
+function auditTestEntry(overrides: Partial<AuditEntry> = {}): AuditEntry {
+  return {
+    action: "invoice.sent",
+    actorUserId: auditUserId,
+    entityType: "invoice",
+    entityId: auditEntityId,
+    payload: { total: 100, currency: "usd" },
+    companyId: auditCompanyId,
+    ...overrides,
+  };
+}
+
+function auditWriterFor(store: FakeAuditStore, signature = "s".repeat(86)): ReturnType<typeof createAuditWriter> {
+  return createAuditWriter({
+    store: store.client,
+    signHash: () => signature,
+    // Deliberately not the key of the first rotation, so a writer that ignored this option and
+    // hard coded a key id would be caught by the row it wrote.
+    signingKeyId: "audit-v2",
+    now: () => auditFixedNow,
+  });
+}
+
+function checkAuditPolicy(): void {
+  expectEqual(AUDIT_ACTION_PATTERN.source, "^[a-z][a-z0-9]*([.][a-z0-9_]+)+$", "the action pattern is the dotted name audit_logs_action_check states");
+  expectEqual(AUDIT_MAXIMUM_ACTION_LENGTH, 64, "with the length that check allows");
+  expectEqual(AUDIT_ENTITY_TYPE_PATTERN.source, "^[a-z][a-z0-9_]*$", "the entity type pattern is the one audit_logs_entity_type_check states");
+  expectEqual(AUDIT_MAXIMUM_ENTITY_TYPE_LENGTH, 48, "with its length");
+  expectEqual(AUDIT_HASH_PATTERN.source, "^[0-9a-f]{64}$", "a hash is sixty-four lower case hex characters");
+  expectEqual(AUDIT_SIGNATURE_PATTERN.source, "^[A-Za-z0-9_-]{86}$", "a signature is the base64url of sixty-four bytes");
+  expectEqual(AUDIT_SIGNING_KEY_ID_PATTERN.source, "^[a-z0-9][a-z0-9-]{2,47}$", "a key id is the shape the column stores");
+  expectEqual(AUDIT_MAXIMUM_PAYLOAD_BYTES, 8_192, "the payload ceiling is the one audit_logs_payload_check states");
+  expectEqual(AUDIT_MAXIMUM_USER_AGENT_LENGTH, 512, "so is the user agent ceiling");
+  expectEqual(AUDIT_GENESIS_HASH, "0".repeat(64), "the first row of a chain points at sixty-four zeros");
+  expectEqual(AUDIT_GENESIS_HASH.length, 64, "which is a hash's length");
+  expectEqual(AUDIT_PLATFORM_CHAIN_ID, "00000000-0000-0000-0000-000000000000", "the platform chain is the zero uuid");
+  expectEqual(AUDIT_TABLE, "audit_logs", "the table is the append-only one");
+  expectEqual(AUDIT_SEQUENCE_START, 1, "every chain starts at one");
+  expectEqual(AUDIT_REDACTED, "[redacted]", "a redacted value is marked rather than removed");
+  expectEqual(AUDIT_HASH_ARGUMENTS.length, 9, "audit_hash_v1 takes nine arguments");
+  expectEqual(AUDIT_ROW_FIELDS.length, 16, "and a row writes sixteen columns");
+  expect(Object.isFrozen(AUDIT_HASH_ARGUMENTS), "the argument list is frozen");
+  expect(Object.isFrozen(AUDIT_ROW_FIELDS), "and so is the column list");
+  expect(Object.isFrozen(AUDIT_SECRET_KEY_FRAGMENTS), "and the credential vocabulary");
+
+  const validActions = [
+    "a.b",
+    "invoice.sent",
+    "session.revoked_by_owner",
+    "user.two_factor_reset_requested",
+    "payments.settled",
+    "security.rate_limited",
+    "x.y",
+  ];
+
+  for (const action of validActions) {
+    expect(AUDIT_ACTION_PATTERN.test(action) && action.length <= AUDIT_MAXIMUM_ACTION_LENGTH, `${action} is a writable action`);
+  }
+
+  const invalidActions = [
+    "approve",
+    "auth.",
+    "auth..b",
+    ".auth.b",
+    "Auth.b",
+    "auth.B",
+    "auth.b-c",
+    "auth. b",
+    "1auth.b",
+    "auth_b",
+    "auth.b c",
+    "",
+    "a".repeat(70),
+  ];
+
+  for (const action of invalidActions) {
+    expect(
+      !AUDIT_ACTION_PATTERN.test(action) || action.length > AUDIT_MAXIMUM_ACTION_LENGTH,
+      `${JSON.stringify(action)} is not a writable action`,
+    );
+  }
+}
+
+function checkAuditRedaction(): void {
+  const secretKeys = [
+    "password",
+    "Password",
+    "new_password",
+    "passphrase",
+    "client_secret",
+    "apiKey",
+    "api-key",
+    "API_KEY",
+    "private_key",
+    "authorization",
+    "x-auth-token",
+    "token",
+    "refresh_token",
+    "cookie",
+    "csrf",
+    "proof_key",
+    "otp",
+    "totp_code",
+    "backup_code",
+    "card_number",
+    "cvv",
+    "signing_seed",
+  ];
+
+  for (const key of secretKeys) {
+    expect(isAuditSecretKey(key), `${key} names a credential`);
+  }
+
+  const plainKeys = ["total", "amount", "action", "route", "limit", "score", "key_hashes", "scopes", "window_seconds", "currency", "email"];
+
+  for (const key of plainKeys) {
+    expect(!isAuditSecretKey(key), `${key} is a value, not a credential`);
+  }
+
+  const payload = {
+    total: 100,
+    password: "hunter2",
+    nested: { apiKey: "sk_live_1", keep: "value" },
+    list: [{ token: "t", amount: 5 }],
+    Authorization: "Bearer abc",
+  };
+  const redacted = redactAuditPayload(payload);
+  const rendered = JSON.stringify(redacted);
+
+  expectEqual(redacted["total"], 100, "a plain value is kept");
+  expectEqual(redacted["password"], AUDIT_REDACTED, "a password is replaced");
+  expectEqual(redacted["Authorization"], AUDIT_REDACTED, "so is an authorisation header");
+  expectEqual((redacted["nested"] as Record<string, unknown>)["apiKey"], AUDIT_REDACTED, "and a nested key");
+  expectEqual((redacted["nested"] as Record<string, unknown>)["keep"], "value", "while its neighbour survives");
+  expectEqual(((redacted["list"] as readonly Record<string, unknown>[])[0] ?? {})["token"], AUDIT_REDACTED, "and one inside an array");
+  expectEqual(((redacted["list"] as readonly Record<string, unknown>[])[0] ?? {})["amount"], 5, "and only that one");
+  expectEqual(payload.password, "hunter2", "the caller's object is not modified");
+  expect(Object.isFrozen(redacted), "the redacted payload is frozen");
+  expect(Object.isFrozen(redacted["nested"]), "and so is every nested object");
+  expect(!rendered.includes("hunter2") && !rendered.includes("sk_live_1"), "no credential survives in the JSON");
+  expectEqual(JSON.stringify(redactAuditPayload(payload)), rendered, "redaction is deterministic");
+  expectEqual(JSON.stringify(redactAuditPayload(redacted)), rendered, "and idempotent");
+
+  let deep: Record<string, unknown> = { value: 1 };
+
+  for (let level = 0; level < AUDIT_MAXIMUM_PAYLOAD_DEPTH + 2; level += 1) {
+    deep = { nested: deep };
+  }
+
+  const tooDeep = expectThrows(
+    () => redactAuditPayload(deep),
+    "a payload nested deeper than the ceiling is a mistake rather than a value",
+  );
+
+  expectEqual(tooDeep?.code, "INTERNAL_ERROR", "and is refused as one");
+}
+
+function checkAuditEntry(): void {
+  const built = buildAuditEntry(
+    auditTestEntry({
+      ipAddress: "2001:DB8::1",
+      userAgent: "  probe/1.0  ",
+      payload: { total: 100, token: "t" },
+      sessionId: null,
+    }),
+  );
+
+  expectEqual(built.ipAddress, "2001:db8::1", "the address is stored in one spelling");
+  expectEqual(built.userAgent, "probe/1.0", "the user agent is trimmed");
+  expectEqual(built.payload["token"], AUDIT_REDACTED, "the payload is redacted on the way in");
+  expectEqual(built.payload["total"], 100, "and its plain values are kept");
+  expect(Object.isFrozen(built), "the entry is frozen");
+
+  const problems: readonly (readonly [Partial<AuditEntry>, AuditEntryProblem])[] = [
+    [{ action: "approve" }, "action_invalid"],
+    [{ action: `${"a".repeat(30)}.${"b".repeat(40)}` }, "action_too_long"],
+    [{ entityType: "Invoice" }, "entity_type_invalid"],
+    [{ entityType: "i".repeat(49) }, "entity_type_too_long"],
+    [{ entityId: null }, "entity_pair_invalid"],
+    [{ entityType: null }, "entity_pair_invalid"],
+    [{ entityId: "not-a-uuid" }, "entity_id_invalid"],
+    [{ actorUserId: "nobody" }, "actor_invalid"],
+    [{ companyId: "no-company" }, "company_invalid"],
+    [{ sessionId: "session" }, "session_invalid"],
+    [{ payload: [] as unknown as Readonly<Record<string, unknown>> }, "payload_not_object"],
+    [{ payload: { note: "x".repeat(AUDIT_MAXIMUM_PAYLOAD_BYTES) } }, "payload_too_large"],
+    [{ ipAddress: "1.2.3.4:8080" }, "address_invalid"],
+    [{ userAgent: "" }, "user_agent_invalid"],
+    [{ userAgent: "u".repeat(AUDIT_MAXIMUM_USER_AGENT_LENGTH + 1) }, "user_agent_invalid"],
+  ];
+
+  for (const [override, expected] of problems) {
+    expectEqual(auditEntryProblem(auditTestEntry(override)), expected, `${expected} is named rather than left to the database`);
+  }
+
+  expectEqual(auditEntryProblem(auditTestEntry()), null, "a well formed entry has no problem");
+  expectEqual(
+    auditPayloadBytes({ a: 1, b: "two" }),
+    new TextEncoder().encode(JSON.stringify({ a: 1, b: "two" })).length,
+    "the payload is measured the way audit_logs_payload_check measures it",
+  );
+  expectEqual(requireAuditEntry(auditTestEntry()).action, "invoice.sent", "and passes the guard unchanged");
+  expectEqual(
+    new Set(AUDIT_ENTRY_PROBLEMS).size,
+    AUDIT_ENTRY_PROBLEMS.length,
+    "every problem reason is distinct",
+  );
+  expect(
+    problems.every(([, reason]) => AUDIT_ENTRY_PROBLEMS.includes(reason)),
+    "and every reason a check can name is in the export",
+  );
+}
+
+async function checkAuditWriter(): Promise<void> {
+  const store = createFakeAuditStore();
+  const signed: string[] = [];
+  const watching = createAuditWriter({
+    store: store.client,
+    signHash: (hash) => {
+      signed.push(hash);
+
+      return "s".repeat(86);
+    },
+    signingKeyId: "audit-v2",
+    now: () => auditFixedNow,
+  });
+  const record = await watching.append(auditTestEntry({ payload: { total: 100, password: "hunter2" } }));
+
+  expectEqual(store.calls.map((call) => call.functionName).join(","), "audit_next_link,audit_hash_v1,insert", "the writer asks the chain, asks the hash, then writes");
+  expectEqual(store.calls[0]?.arguments["p_chain"], auditCompanyId, "the tenant is the chain");
+  expectEqual(store.tables[0], AUDIT_TABLE, "and the row goes to the audit table");
+  expectEqual(Object.keys(store.calls[1]?.arguments ?? {}).join(","), AUDIT_HASH_ARGUMENTS.join(","), "the hash is asked with the nine arguments, in order");
+  expectEqual(store.calls[1]?.arguments["payload"] !== undefined, true, "with the payload as redacted");
+  expectEqual(
+    JSON.stringify(store.calls[1]?.arguments["payload"]),
+    JSON.stringify({ total: 100, password: AUDIT_REDACTED }),
+    "which no longer carries the credential",
+  );
+  const row = store.rows[0]?.[0] ?? {};
+  expectEqual(Object.keys(row).join(","), AUDIT_ROW_FIELDS.join(","), "the row writes the sixteen columns in order");
+  expectEqual(row["company_id"], auditCompanyId, "with the tenant");
+  expectEqual(row["payload"] !== undefined ? JSON.stringify(row["payload"]) : "", JSON.stringify({ total: 100, password: AUDIT_REDACTED }), "the same redacted payload is stored");
+  expectEqual(row["sequence"], 1, "at the head's next sequence");
+  expectEqual(row["prev_hash"], AUDIT_GENESIS_HASH, "pointing at the genesis link of the first row");
+  expectEqual(row["hash"], "c".repeat(64), "with the hash the database computed");
+  expectEqual(row["signature"], "s".repeat(86), "and the signature over it");
+  expectEqual(row["signing_key_id"], "audit-v2", "naming the key that signed");
+  expectEqual(row["created_at"], "2026-11-01T10:00:00.000Z", "at the event instant");
+  expectEqual(row["updated_at"], row["created_at"], "which is also the update instant");
+  expectEqual(signed[0], "c".repeat(64), "the signer was given the hash that was stored");
+  expectEqual(record.hash, "c".repeat(64), "and the record reports the link");
+  expectEqual(record.chainId, auditCompanyId, "the chain it extended");
+  expectEqual(record.sequence, 1, "the position it took");
+  expectEqual(record.signingKeyId, "audit-v2", "and the key id, as configured rather than as assumed");
+
+  const platformStore = createFakeAuditStore({ nextLink: [{ next_sequence: 9, prev_hash: "b".repeat(64) }] });
+
+  await auditWriterFor(platformStore).append(auditTestEntry({ companyId: null, entityType: null, entityId: null, actorUserId: null }));
+
+  expectEqual(platformStore.calls[0]?.arguments["p_chain"], AUDIT_PLATFORM_CHAIN_ID, "a platform event extends the platform chain");
+  expectEqual(platformStore.rows[0]?.[0]?.["company_id"], null, "with no tenant");
+  expectEqual(platformStore.rows[0]?.[0]?.["prev_hash"], "b".repeat(64), "and continues from the head it was given");
+
+  const badLinks: readonly unknown[] = [
+    null,
+    [],
+    [{}],
+    [{ next_sequence: 0, prev_hash: AUDIT_GENESIS_HASH }],
+    [{ next_sequence: 1.5, prev_hash: AUDIT_GENESIS_HASH }],
+    [{ next_sequence: "1", prev_hash: AUDIT_GENESIS_HASH }],
+    [{ next_sequence: 1, prev_hash: "XYZ" }],
+    [{ next_sequence: 1, prev_hash: "b".repeat(64) }],
+    [{ next_sequence: 2, prev_hash: AUDIT_GENESIS_HASH }],
+  ];
+
+  for (const nextLink of badLinks) {
+    const brokenStore = createFakeAuditStore({ nextLink });
+    const failure = await expectThrowsAsync(
+      () => auditWriterFor(brokenStore).append(auditTestEntry()),
+      `a head of ${JSON.stringify(nextLink)} is not a head this writer will extend`,
+    );
+
+    expectEqual(failure?.code, "DEPENDENCY_FAILED", "and no row is written");
+    expectEqual(brokenStore.rows.length, 0, "with nothing inserted");
+  }
+
+  const badHashes: readonly unknown[] = [null, "", "XYZ", "c".repeat(63), "C".repeat(64), ["a".repeat(64), "b".repeat(64)]];
+
+  for (const hash of badHashes) {
+    const brokenStore = createFakeAuditStore({ hash });
+    const failure = await expectThrowsAsync(
+      () => auditWriterFor(brokenStore).append(auditTestEntry()),
+      `a hash of ${JSON.stringify(hash)} is not a hash`,
+    );
+
+    expectEqual(failure?.code, "DEPENDENCY_FAILED", "and the write stops");
+    expectEqual(brokenStore.rows.length, 0, "before anything is inserted");
+  }
+
+  const sameHashStore = createFakeAuditStore({
+    nextLink: [{ next_sequence: 2, prev_hash: "c".repeat(64) }],
+    hash: "c".repeat(64),
+  });
+  const repeated = await expectThrowsAsync(
+    () => auditWriterFor(sameHashStore).append(auditTestEntry()),
+    "a hash equal to the previous one is refused, as audit_logs_hash_differs_check refuses it",
+  );
+
+  expectEqual(repeated?.code, "DEPENDENCY_FAILED", "with the dependency code");
+
+  const shortSignature = createFakeAuditStore();
+  const unsigned = await expectThrowsAsync(
+    () => auditWriterFor(shortSignature, "too-short").append(auditTestEntry()),
+    "a signature that is not eighty-six base64url characters is a writer fault",
+  );
+
+  expectEqual(unsigned?.code, "INTERNAL_ERROR", "reported as one");
+  expectEqual(shortSignature.rows.length, 0, "and the row is not written unsigned");
+
+  const failingStore = createFakeAuditStore({ failInsert: true });
+  const failed = await expectThrowsAsync(
+    () => auditWriterFor(failingStore).append(auditTestEntry()),
+    "an insert that fails is a failed write",
+  );
+
+  expectEqual(failed?.code, "DEPENDENCY_FAILED", "and the caller is told the mutation is not recorded");
+
+  const refusingStore = createFakeAuditStore();
+  const invalid = await expectThrowsAsync(
+    () => auditWriterFor(refusingStore).append(auditTestEntry({ action: "approve" })),
+    "an entry that cannot exist is refused before the chain is touched",
+  );
+
+  expectEqual(invalid?.code, "INTERNAL_ERROR", "with the internal code, because it is a bug not a request");
+  expectEqual(refusingStore.calls.length, 0, "and nothing was asked of the database");
+
+  const badKey = expectThrows(
+    () => createAuditWriter({ store: createFakeAuditStore().client, signHash: () => "", signingKeyId: "A" }),
+    "a key id the column would refuse is refused when the writer is built",
+  );
+
+  expectEqual(badKey?.code, "INTERNAL_ERROR", "as a configuration fault");
+
+  const sequenceStore = createFakeAuditStore({ nextLink: [{ next_sequence: 2, prev_hash: "b".repeat(64) }] });
+
+  await auditWriterFor(sequenceStore).append(auditTestEntry());
+  await auditWriterFor(sequenceStore).append(auditTestEntry());
+
+  expectEqual(sequenceStore.calls.length, 6, "a second append walks the chain again");
+  expectEqual(sequenceStore.rows.length, 2, "and writes a second row");
+}
+
+async function checkAuditIntegrity(): Promise<void> {
+  const validStore: AuditRpcClient = {
+    rpc(functionName, arguments_) {
+      if (functionName === AUDIT_VERIFY_FUNCTION) {
+        return Promise.resolve([
+          {
+            chain_id: arguments_["p_chain"],
+            checked_rows: 12,
+            is_valid: true,
+            first_broken_sequence: null,
+            broken_reason: null,
+            head_sequence: 12,
+            head_hash: "d".repeat(64),
+          },
+        ]);
+      }
+
+      return Promise.resolve("e".repeat(64));
+    },
+  };
+
+    const verification = await verifyAuditChain({ chainId: auditCompanyId }, { rest: validStore });
+
+    expectEqual(verification.checkedRows, 12, "a valid chain reports how many rows were walked");
+    expectEqual(verification.valid, true, "and that it is valid");
+    expectEqual(verification.firstBrokenSequence, null, "with no break");
+    expectEqual(verification.headSequence, 12, "and the head it read");
+
+    const calls: Readonly<Record<string, unknown>>[] = [];
+    const recording: AuditRpcClient = {
+      rpc(functionName, arguments_) {
+        calls.push(arguments_);
+
+        return validStore.rpc(functionName, arguments_);
+      },
+    };
+
+    await verifyAuditChain({ chainId: auditCompanyId, fromSequence: 5, toSequence: 9 }, { rest: recording });
+    expectEqual(calls[0]?.["p_from_sequence"], 5, "a range walks from the sequence it was given");
+    expectEqual(calls[0]?.["p_to_sequence"], 9, "to the one it was given");
+
+    await verifyAuditChain({ chainId: auditCompanyId }, { rest: recording });
+    expectEqual(calls[1]?.["p_from_sequence"], 1, "and the whole chain starts at one");
+    expectEqual(calls[1]?.["p_to_sequence"], null, "and ends at the head");
+
+    const broken: AuditRpcClient = {
+      rpc: () =>
+        Promise.resolve([
+          {
+            chain_id: auditCompanyId,
+            checked_rows: 12,
+            is_valid: false,
+            first_broken_sequence: 7,
+            broken_reason: "hash mismatch",
+            head_sequence: 12,
+            head_hash: "d".repeat(64),
+          },
+        ]),
+    };
+    const brokenVerification = await verifyAuditChain({ chainId: auditCompanyId }, { rest: broken });
+
+    expectEqual(brokenVerification.valid, false, "a tampered chain is reported as invalid");
+    expectEqual(brokenVerification.firstBrokenSequence, 7, "with the position of the break");
+    expectEqual(brokenVerification.brokenReason, "hash mismatch", "and the reason it broke");
+
+    const badVerifications: readonly unknown[] = [
+      null,
+      [],
+      [{}],
+      [{ checked_rows: -1, is_valid: true, first_broken_sequence: null, broken_reason: null, head_sequence: 1, head_hash: "d".repeat(64) }],
+      [{ checked_rows: 1, is_valid: "yes", first_broken_sequence: null, broken_reason: null, head_sequence: 1, head_hash: "d".repeat(64) }],
+      [{ checked_rows: 1, is_valid: true, first_broken_sequence: 1, broken_reason: null, head_sequence: 1, head_hash: "d".repeat(64) }],
+      [{ checked_rows: 1, is_valid: false, first_broken_sequence: null, broken_reason: null, head_sequence: 1, head_hash: "d".repeat(64) }],
+      [{ checked_rows: 1, is_valid: false, first_broken_sequence: 1, broken_reason: "", head_sequence: 1, head_hash: "d".repeat(64) }],
+      [{ checked_rows: 1, is_valid: true, first_broken_sequence: null, broken_reason: null, head_sequence: 1, head_hash: "nope" }],
+    ];
+
+    for (const body of badVerifications) {
+      const failure = await expectThrowsAsync(
+        () => verifyAuditChain({ chainId: auditCompanyId }, { rest: { rpc: () => Promise.resolve(body) } }),
+        `a verdict of ${JSON.stringify(body)} is not a verdict`,
+      );
+
+      expectEqual(failure?.code, "DEPENDENCY_FAILED", "and is refused rather than believed");
+    }
+
+    for (const range of [{ chainId: "not-a-chain" }, { chainId: auditCompanyId, fromSequence: 0 }, { chainId: auditCompanyId, fromSequence: 5, toSequence: 4 }]) {
+      const failure = await expectThrowsAsync(
+        () => verifyAuditChain(range, { rest: validStore }),
+        `the range ${JSON.stringify(range)} cannot be walked`,
+      );
+
+      expectEqual(failure?.code, "INTERNAL_ERROR", "and is a caller fault");
+    }
+
+    expectEqual(await readAuditMerkleRoot({ chainId: auditCompanyId }, { rest: validStore }), "e".repeat(64), "the root of a range is returned");
+    expectEqual(await readAuditMerkleRoot({ chainId: auditCompanyId }, { rest: { rpc: () => Promise.resolve(null) } }), null, "an empty range has no root");
+    expectEqual(await readAuditMerkleRoot({ chainId: auditCompanyId }, { rest: { rpc: () => Promise.resolve("") } }), null, "and neither has a blank answer");
+    const badRoot = await expectThrowsAsync(
+      () => readAuditMerkleRoot({ chainId: auditCompanyId }, { rest: { rpc: () => Promise.resolve("not-a-root") } }),
+      "a root that is not a hash is refused",
+    );
+
+    expectEqual(badRoot?.code, "DEPENDENCY_FAILED", "with the dependency code");
+
+    const report = await readAuditIntegrityReport({ chainId: auditCompanyId, fromSequence: 1, toSequence: 12 }, { rest: validStore });
+
+    expectEqual(report.root, "e".repeat(64), "the report carries the root");
+    expectEqual(report.valid, true, "and the verdict");
+    expectEqual(report.fromSequence, 1, "and the range it covers");
+    expectEqual(report.toSequence, 12, "at both ends");
+    expectEqual(report.headHash, "d".repeat(64), "and the head hash an operator compares");
+
+    const brokenReport = await expectThrowsAsync(
+      () => readAuditIntegrityReport({ chainId: auditCompanyId }, { rest: broken }),
+      "a root is never published over a broken chain",
+    );
+
+    expectEqual(brokenReport?.code, "DEPENDENCY_FAILED", "the export fails instead");
+    expectEqual(
+      (brokenReport?.cause as Record<string, unknown> | undefined)?.["rule"],
+      "audit_chain",
+      "naming the chain as the reason",
+    );
+    expectEqual(
+      (brokenReport?.cause as Record<string, unknown> | undefined)?.["broken_sequence"],
+      7,
+      "and where it broke",
+    );
+
+    const emptyRootStore: AuditRpcClient = {
+      rpc(functionName) {
+        if (functionName === AUDIT_VERIFY_FUNCTION) {
+          return Promise.resolve([
+            {
+              checked_rows: 0,
+              is_valid: true,
+              first_broken_sequence: null,
+              broken_reason: null,
+              head_sequence: null,
+              head_hash: null,
+            },
+          ]);
+        }
+
+        return Promise.resolve(null);
+      },
+    };
+    const emptyReport = await expectThrowsAsync(
+      () => readAuditIntegrityReport({ chainId: auditCompanyId }, { rest: emptyRootStore }),
+      "a root over nothing certifies nothing",
+    );
+
+    expectEqual(emptyReport?.code, "DEPENDENCY_FAILED", "and the export fails rather than publishing one");
+    expectEqual(
+      (emptyReport?.cause as Record<string, unknown> | undefined)?.["rule"],
+      "audit_root",
+      "naming the root as the reason",
+    );
+}
+
+async function checkAuditWiring(): Promise<void> {
+  const source = await readFile(new URL("./audit.ts", import.meta.url), "utf8");
+  const authSource = await readFile(new URL("../auth/audit.ts", import.meta.url), "utf8");
+  const logs = await readFile(new URL("../../migrations/0013_audit_logs.sql", import.meta.url), "utf8");
+  const functions = await readFile(new URL("../../migrations/0075_audit_chain_functions.sql", import.meta.url), "utf8");
+
+  expect(source.includes(`"${AUDIT_NEXT_LINK_FUNCTION}"`), "the writer asks the chain for its head");
+  expect(source.includes(`"${AUDIT_HASH_FUNCTION}"`), "and the database for the hash");
+  expect(source.includes(`"${AUDIT_VERIFY_FUNCTION}"`), "and verifies a range");
+  expect(source.includes(`"${AUDIT_MERKLE_FUNCTION}"`), "and computes its root");
+  expectEqual(source.includes("createHash"), false, "the module computes no hash of its own");
+  expectEqual(source.includes("node:crypto"), false, "and holds no key: the signature arrives from outside");
+  expectEqual(source.includes("process.env"), false, "so it never reads a secret");
+  expectEqual(source.includes("from \"../auth"), false, "and depends on nothing in the auth tree");
+  expect(source.includes("from \"./rate-limit.ts\""), "an address is the one spelling of STEP 062 rather than a second parser");
+  expectEqual(source.split("store.insert(").length - 1, 1, "there is exactly one insert in the module");
+
+  expect(authSource.includes(AUDIT_NEXT_LINK_FUNCTION), "the auth writer asks the same chain");
+  expect(authSource.includes(AUDIT_HASH_FUNCTION), "for the same hash");
+  expect(authSource.includes(AUDIT_PLATFORM_CHAIN_ID), "and knows the same platform chain");
+
+  expect(
+    authSource.indexOf(`"${AUDIT_NEXT_LINK_FUNCTION}"`) < authSource.indexOf(`"${AUDIT_HASH_FUNCTION}"`) &&
+      authSource.indexOf(`"${AUDIT_HASH_FUNCTION}"`) < authSource.indexOf(`insert("${AUDIT_TABLE}"`),
+    "in the same order: link, hash, insert",
+  );
+  expectEqual(
+    objectKeysAfter(authSource, `rpc("${AUDIT_HASH_FUNCTION}", {`).join(","),
+    AUDIT_HASH_ARGUMENTS.join(","),
+    "the auth writer passes the same nine hash arguments in the same order",
+  );
+  expectEqual(
+    objectKeysAfter(authSource, `insert("${AUDIT_TABLE}", [`).join(","),
+    AUDIT_ROW_FIELDS.join(","),
+    "and writes the same sixteen columns",
+  );
+
+  expect(
+    logs.includes(`action ~ '${AUDIT_ACTION_PATTERN.source.replaceAll("[.]", "\\.")}'`),
+    "0013 states the action pattern this module enforces, in the SQL spelling of the same expression",
+  );
+  expect(logs.includes(`char_length(action) <= ${AUDIT_MAXIMUM_ACTION_LENGTH}`), "and its length");
+  expect(logs.includes(`entity_type ~ '${AUDIT_ENTITY_TYPE_PATTERN.source}'`), "and the entity type pattern");
+  expect(logs.includes(`char_length(entity_type) <= ${AUDIT_MAXIMUM_ENTITY_TYPE_LENGTH}`), "and its length");
+  expect(logs.includes(`octet_length(payload::text) <= ${AUDIT_MAXIMUM_PAYLOAD_BYTES}`), "and the payload ceiling");
+  expect(logs.includes("jsonb_typeof(payload) = 'object'"), "the payload is an object");
+  expect(logs.includes(`prev_hash ~ '${AUDIT_HASH_PATTERN.source}'`), "the previous hash is a hash");
+  expect(logs.includes(`hash ~ '${AUDIT_HASH_PATTERN.source}'`), "and so is the hash");
+  expect(logs.includes(`signature ~ '${AUDIT_SIGNATURE_PATTERN.source}'`), "and the signature is a signature");
+  expect(logs.includes(`signing_key_id ~ '${AUDIT_SIGNING_KEY_ID_PATTERN.source}'`), "and the key id is one");
+  expect(logs.includes(`char_length(user_agent) between 1 and ${AUDIT_MAXIMUM_USER_AGENT_LENGTH}`), "and the user agent ceiling");
+  expect(logs.includes("before update or delete on public.audit_logs"), "the table refuses every change after the insert");
+  expect(logs.includes("audit_logs_chain_key"), "and one position per chain");
+  expect(logs.includes("audit_logs_hash_key"), "and one hash per row");
+
+  expect(functions.includes(`create function public.${AUDIT_NEXT_LINK_FUNCTION}`), "0075 defines the next link");
+  expect(functions.includes(`create function public.${AUDIT_HASH_FUNCTION}`), "and the canonical hash");
+  expect(functions.includes(`create function public.${AUDIT_VERIFY_FUNCTION}`), "and the chain walk");
+  expect(functions.includes(`create function public.${AUDIT_MERKLE_FUNCTION}`), "and the Merkle root");
+  expect(functions.includes("repeat('0', 64)"), "the genesis link is the one this module assumes");
+
+  for (const argument of AUDIT_HASH_ARGUMENTS) {
+    expect(functions.includes(`  ${argument} `), `audit_hash_v1 takes ${argument}`);
+  }
+
+  for (const argument of ["p_chain", "p_from_sequence", "p_to_sequence"]) {
+    expect(source.includes(argument), `the module names the ${argument} argument of the range functions`);
+  }
+
+  const appRoot = new URL("../../", import.meta.url);
+  const entries = (await readdir(appRoot, { recursive: true }))
+    .map((entry) => entry.replaceAll("\\", "/"))
+    .filter((entry) => (entry.startsWith("lib/") || entry.startsWith("app/")) && (entry.endsWith(".ts") || entry.endsWith(".tsx")));
+
+  const writers: string[] = [];
+  const dottedActions: string[] = [];
+
+  for (const entry of entries) {
+    const text = await readFile(new URL(entry, appRoot), "utf8");
+
+    if (
+      !entry.endsWith("verify.ts") &&
+      (text.includes(`insert("${AUDIT_TABLE}"`) || text.includes("insert(AUDIT_TABLE"))
+    ) {
+      writers.push(entry);
+    }
+
+    for (const match of text.matchAll(/action: "([A-Za-z0-9._-]+)"/gu)) {
+      const action = match[1] ?? "";
+
+      if (action.includes(".")) {
+        dottedActions.push(action);
+      }
+    }
+  }
+
+  expectEqual(writers.sort().join(","), "lib/auth/audit.ts,lib/security/audit.ts", "exactly two modules append to the chain");
+  expect(dottedActions.length >= 30, "the tree writes enough audit actions for the scan to mean something");
+  expect(
+    dottedActions.every((action) => AUDIT_ACTION_PATTERN.test(action) && action.length <= AUDIT_MAXIMUM_ACTION_LENGTH),
+    "and every dotted action in the tree is a name the column accepts",
+  );
+}
+
+/** The keys of the object literal a call is passed, in source order. */
+function objectKeysAfter(source: string, callText: string): readonly string[] {
+  const start = source.indexOf(callText);
+
+  if (start < 0) {
+    return [];
+  }
+
+  const rest = source.slice(start + callText.length);
+  const end = rest.search(/^[ \t]*[\]}]/mu);
+  const block = end < 0 ? rest : rest.slice(0, end);
+
+  // A row is written with `key: value` and, where the variable has the column's name, with the
+  // shorthand `key`, which the database receives identically.
+  return [...block.matchAll(/^[ \t]+([a-z_]+)[ \t]*[:,]/gmu)].map((match) => String(match[1]));
+}
+
 async function checkTree(): Promise<void> {
   const securityRoot = new URL("./", import.meta.url);
   const securityFiles = (await readdir(securityRoot)).filter((name) => name.endsWith(".ts"));
@@ -2184,11 +2918,17 @@ async function main(): Promise<void> {
   checkRateLimitRoutes();
   checkRateLimitBuckets();
   checkRateLimitReports();
+  checkAuditPolicy();
+  checkAuditRedaction();
+  checkAuditEntry();
   await checkCspWiring();
   await checkSecurityHeaderWiring();
   await checkUploadWiring();
   await checkRateLimitDecision();
   await checkRateLimitWiring();
+  await checkAuditWriter();
+  await checkAuditIntegrity();
+  await checkAuditWiring();
   await checkTree();
 
   if (failures.length > 0) {
