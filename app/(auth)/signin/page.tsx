@@ -45,6 +45,12 @@ export default function SigninPage(): ReactNode {
             {getMessage("signin.createAccount")}
           </Link>
         </p>
+
+        <p className="mt-2 text-sm">
+          <Link className="font-semibold text-primary underline-offset-4 hover:underline" href="/2fa/reset">
+            {getMessage("resetRequest.link")}
+          </Link>
+        </p>
       </section>
     </main>
   );

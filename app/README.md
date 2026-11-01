@@ -10,6 +10,7 @@ component only when it carries the "use client" directive for real interaction.
 | app/(auth) | STEP 037-055 | Signup, login, two factor, password and lock screens |
 | app/(dashboard) | STEP 079-126 | Merchant owner area |
 | app/(admin) | STEP 068-078 | Office dashboards and platform settings |
+| app/office | STEP 044 | Office queue for two factor reset requests |
 | app/(client-portal) | STEP 181-190 | Tokenized client links i/[token] and e/[token] |
 | app/api | per route | Route handlers, validated and rate limited |
 

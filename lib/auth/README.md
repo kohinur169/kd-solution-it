@@ -207,6 +207,25 @@ the authority. A permission check uses the record, never a claim.
     operator can diagnose and no retry can fix. The gate seals a pair at the documented maxima and
     completes a sign in with it.
 
+40. A recovery request is anonymous and answers one sentence. The merchant who lost the app cannot
+    sign in - that is the premise - so `requestTwoFactorReset` takes an address and a reason and no
+    session. An unknown address, a closed account, an account that never enrolled and a real request
+    all answer `{ accepted: true }`; only one of them writes a row. The route is `202` in every case,
+    and the audit entry records `reason_length`, never the reason and never the address.
+41. One account has one live request. `0084` puts a partial unique index on the live statuses
+    (`pending`, `contacted`), and the service treats the resulting `CONFLICT` as the same accepted
+    answer: a merchant who asks twice has still asked once, and the office already holds it.
+42. A reset is decided in order, and the order is the evidence. `contacted` moves a `pending` request
+    and requires a document reference; `approve` moves a `contacted` request and clears
+    `totp_secret_ciphertext`, `totp_confirmed_at` and `backup_code_hashes` in one update; `reject`
+    records a note. Everything else is `CONFLICT`, so an approval can never skip the record of what a
+    human verified. The roles are `super_admin`, `ceo`, `compliance_kyc` and `support`, and the check
+    lives in the service, not in the route or the page.
+43. The reset clears a factor and nothing else. It leaves the password, the sessions and the account
+    status alone: this is a second factor reset, not a suspension, and the merchant signs in with the
+    password alone and enrols again through STEP 041. Documents are a reference string because the
+    encrypted upload pipeline is STEP 100's; the audit records that a reference existed, not its text.
+
 ## Adding an operation
 
 1. Add the method to the `AuthClient` or `AdminAuthClient` interface and its implementation,

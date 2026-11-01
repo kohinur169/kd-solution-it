@@ -41,6 +41,12 @@ export default function TwoFactorPage(): ReactNode {
           >
             {getMessage("twoFactor.settingsLink")}
           </Link>
+          <Link
+            className="font-semibold text-primary underline-offset-4 hover:underline"
+            href="/2fa/reset"
+          >
+            {getMessage("resetRequest.link")}
+          </Link>
           <Link className="font-semibold text-primary underline-offset-4 hover:underline" href="/">
             {getMessage("twoFactor.home")}
           </Link>

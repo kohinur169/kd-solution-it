@@ -27,3 +27,8 @@ how many backup codes remain, and a form that replaces the whole set. The page r
 the account on the server (it is `force-dynamic`), so it renders three states - signed out,
 unavailable, ready - rather than a loading shell; the only client action posts to
 `/api/auth/2fa/backup-codes` with the current authenticator code.
+
+/2fa/reset is the recovery screen of STEP 044, for a merchant who kept neither the app nor the backup
+codes. It renders without a session - the person who needs it cannot sign in - and posts an address and
+a description to `/api/auth/2fa/reset`, which answers one `202` sentence whether or not the address has
+an account. `/2fa` and `/signin` both link to it, and the office side lives in `app/office`.

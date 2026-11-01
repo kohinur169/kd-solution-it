@@ -41,6 +41,13 @@ import {
 } from "./two-factor.ts";
 import { readTwoFactorStatus, regenerateBackupCodes } from "./backup-codes.ts";
 import {
+  decideTwoFactorReset,
+  listTwoFactorResetRequests,
+  requestTwoFactorReset,
+  resetRequestInputSchema,
+  TWO_FACTOR_RESET_OFFICE_ROLES,
+} from "./two-factor-reset.ts";
+import {
   challengeContext,
   completeTwoFactorChallenge,
   hashChallengeToken,
@@ -135,6 +142,7 @@ import type {
   AuthOutcome,
   AuthSession,
   PlatformRole,
+  RequestActor,
 } from "./types.ts";
 
 /**
@@ -4861,6 +4869,548 @@ async function checkBackupCodeRegeneration(): Promise<void> {
   );
 }
 
+/* ------------------------------------------------- two factor reset (044) */
+
+interface ResetRequestRow {
+  id: string;
+  user_id: string;
+  company_id: string | null;
+  status: string;
+  reason: string;
+  document_reference: string | null;
+  requested_ip: string | null;
+  requested_user_agent: string | null;
+  contacted_at: string | null;
+  decided_at: string | null;
+  decided_by: string | null;
+  decision_note: string | null;
+  created_at: string;
+}
+
+interface ResetStore {
+  readonly rest: RestClient;
+  readonly requests: ResetRequestRow[];
+  readonly queries: string[];
+  readonly writes: { table: string; values: Readonly<Record<string, unknown>> }[];
+  readonly account: {
+    id: string;
+    company_id: string | null;
+    email: string;
+    status: string;
+    deleted_at: string | null;
+    totp_confirmed_at: string | null;
+    totp_secret_ciphertext: string | null;
+    backup_code_hashes: readonly string[];
+  };
+}
+
+/** The one value of a `key=eq.value` predicate, decoded. */
+function queryEquals(query: string, key: string): string | null {
+  const match = new RegExp(`(?:^|[&?])${key}=eq\\.([^&]*)`, "u").exec(query);
+
+  return match?.[1] === undefined ? null : decodeURIComponent(match[1]);
+}
+
+/**
+ * A miniature PostgREST for the reset tables.
+ *
+ * It answers the four shapes the module uses - an address lookup, a row lookup by id, an insert and an
+ * update - and it enforces the one database rule the service has to survive: the partial unique index
+ * that allows a single live request per account. Everything else it records, so a check can prove what
+ * was written without a database.
+ */
+function createResetStore(): ResetStore {
+  const requests: ResetRequestRow[] = [];
+  const queries: string[] = [];
+  const writes: { table: string; values: Readonly<Record<string, unknown>> }[] = [];
+  const account: ResetStore["account"] = {
+    id: USER_ID,
+    company_id: FIRM_ID,
+    email: "owner@firm.test",
+    status: "active",
+    deleted_at: null,
+    totp_confirmed_at: new Date(NOW - 86_400_000).toISOString(),
+    totp_secret_ciphertext: "sealed-secret",
+    backup_code_hashes: ["scrypt$1$16384$8$c2FsdA$aGFzaA"],
+  };
+  let sequence = 70;
+
+  const rest: RestClient = {
+    select<TRow>(table: string, query: string): Promise<readonly TRow[]> {
+      queries.push(`${table}?${query}`);
+
+      if (table === "users") {
+        const email = queryEquals(query, "email");
+
+        return Promise.resolve(
+          (email === null || email !== account.email ? [] : [{ ...account }]) as unknown as readonly TRow[],
+        );
+      }
+
+      if (table !== "two_factor_reset_requests") {
+        return Promise.resolve([] as readonly TRow[]);
+      }
+
+      const id = queryEquals(query, "id");
+
+      if (id !== null) {
+        return Promise.resolve(
+          requests.filter((row) => row.id === id).map((row) => ({ ...row })) as unknown as readonly TRow[],
+        );
+      }
+
+      const live = query.includes("status=in.(pending,contacted)");
+
+      return Promise.resolve(
+        requests
+          .filter((row) => !live || row.status === "pending" || row.status === "contacted")
+          .map((row) => ({ ...row })) as unknown as readonly TRow[],
+      );
+    },
+    insert(table: string, rows: readonly Readonly<Record<string, unknown>>[]): Promise<void> {
+      if (table !== "two_factor_reset_requests") {
+        return Promise.resolve();
+      }
+
+      for (const row of rows) {
+        const userId = String(row["user_id"]);
+        const live = requests.some(
+          (existing) =>
+            existing.user_id === userId &&
+            (existing.status === "pending" || existing.status === "contacted"),
+        );
+
+        if (live) {
+          return Promise.reject(new AppError("CONFLICT"));
+        }
+
+        sequence += 1;
+        requests.push({
+          id: `018f3b1c-5555-7c2a-9d1e-2b3c4d5e6f${String(sequence)}`,
+          user_id: userId,
+          company_id: (row["company_id"] as string | null) ?? null,
+          status: String(row["status"]),
+          reason: String(row["reason"]),
+          document_reference: (row["document_reference"] as string | null) ?? null,
+          requested_ip: (row["requested_ip"] as string | null) ?? null,
+          requested_user_agent: (row["requested_user_agent"] as string | null) ?? null,
+          contacted_at: null,
+          decided_at: null,
+          decided_by: null,
+          decision_note: null,
+          created_at: "2027-01-15T08:00:00.000Z",
+        });
+      }
+
+      return Promise.resolve();
+    },
+    insertReturning<TRow>(): Promise<readonly TRow[]> {
+      return Promise.resolve([] as readonly TRow[]);
+    },
+    update(
+      table: string,
+      query: string,
+      values: Readonly<Record<string, unknown>>,
+    ): Promise<void> {
+      writes.push({ table, values });
+
+      if (table === "users") {
+        Object.assign(account, values);
+
+        return Promise.resolve();
+      }
+
+      const id = queryEquals(query, "id");
+      const row = requests.find((candidate) => candidate.id === id);
+
+      if (row !== undefined) {
+        Object.assign(row, values);
+      }
+
+      return Promise.resolve();
+    },
+    rpc: () => Promise.resolve(null),
+  };
+
+  return { rest, requests, queries, writes, account };
+}
+
+/** An office worker: a session that satisfied the second factor, with the roles of a support desk. */
+function resetActor(options: { readonly roles?: readonly PlatformRole[] } = {}): RequestActor {
+  return {
+    userId: USER_ID,
+    companyId: null,
+    roles: options.roles ?? ["support"],
+    sessionId: SESSION_ID,
+    assuranceLevel: "aal2",
+    authenticatedAtEpochMs: NOW - 60_000,
+    expiresAtEpochMs: NOW + 3_600_000,
+    emailVerified: true,
+    twoFactorSatisfied: true,
+    twoFactorEnrolmentRequired: false,
+  };
+}
+
+async function checkTwoFactorReset(): Promise<void> {
+  const longReason = "The phone with the authenticator app was lost and the backup codes with it.";
+
+  // The form is strict and normalises the address, so one mailbox is one account.
+  const normalised = resetRequestInputSchema.safeParse({
+    email: "  Owner@Firm.TEST ",
+    reason: longReason,
+  });
+
+  expectEqual(
+    normalised.success ? normalised.data.email : null,
+    "owner@firm.test",
+    "the form lowercases and trims the address",
+  );
+  expectEqual(
+    resetRequestInputSchema.safeParse({ email: "owner@firm.test", reason: "lost" }).success,
+    false,
+    "a reason shorter than ten characters is refused",
+  );
+  expectEqual(
+    resetRequestInputSchema.safeParse({
+      email: "owner@firm.test",
+      reason: longReason,
+      status: "approved",
+    }).success,
+    false,
+    "the form refuses a field the merchant must not set",
+  );
+
+  const store = createResetStore();
+  const audit = createInMemoryAuditTrail();
+  const dependencies = { rest: store.rest, audit, now: () => NOW };
+  const askInput = {
+    request: { email: "owner@firm.test", reason: longReason },
+    remoteIp: "203.0.113.7",
+    userAgent: "gate",
+  };
+
+  const first = await requestTwoFactorReset(askInput, dependencies);
+
+  expectEqual(first.accepted, true, "a request for an enrolled account is accepted");
+  expectEqual(store.requests.length, 1, "the request writes exactly one row");
+  expectEqual(store.requests[0]?.status, "pending", "a new request waits for the office");
+  expectEqual(store.requests[0]?.user_id, USER_ID, "the row names the account it is about");
+  expectEqual(store.requests[0]?.company_id, FIRM_ID, "the row joins the tenant chain");
+  expectEqual(store.requests[0]?.requested_ip, "203.0.113.7", "the row keeps the address it came from");
+  expectEqual(audit.entries.length, 1, "the request writes one audit entry");
+  expectEqual(
+    audit.entries[0]?.action,
+    "user.two_factor_reset_requested",
+    "the entry names the action",
+  );
+  expectEqual(audit.entries[0]?.actorUserId, null, "the entry has no actor: nobody was signed in");
+  expectEqual(
+    audit.entries[0]?.payload["reason_length"],
+    longReason.length,
+    "the entry records the length of the reason, not the reason",
+  );
+  expectEqual(
+    Object.keys(audit.entries[0]?.payload ?? {}).includes("email"),
+    false,
+    "the entry carries no address",
+  );
+
+  // A second ask is the live-key index doing its job, and it reads as the same answer.
+  const second = await requestTwoFactorReset(askInput, dependencies);
+
+  expectEqual(second.accepted, true, "a second request answers the same sentence");
+  expectEqual(store.requests.length, 1, "a second request writes no second row");
+  expectEqual(audit.entries.length, 1, "a second request writes no second audit entry");
+
+  // The four addresses the platform must answer without saying why.
+  const unknownAddress = await requestTwoFactorReset(
+    { ...askInput, request: { email: "stranger@firm.test", reason: longReason } },
+    dependencies,
+  );
+
+  expectEqual(unknownAddress.accepted, true, "an address with no account gets the same answer");
+
+  store.account.status = "suspended";
+
+  const closedAddress = await requestTwoFactorReset(askInput, dependencies);
+
+  expectEqual(closedAddress.accepted, true, "a closed account gets the same answer");
+
+  store.account.status = "active";
+  store.account.deleted_at = new Date(NOW).toISOString();
+
+  const deletedAddress = await requestTwoFactorReset(askInput, dependencies);
+
+  expectEqual(deletedAddress.accepted, true, "a deleted account gets the same answer");
+
+  store.account.deleted_at = null;
+  store.account.totp_confirmed_at = null;
+
+  const neverEnrolled = await requestTwoFactorReset(askInput, dependencies);
+
+  expectEqual(neverEnrolled.accepted, true, "an account with no second factor gets the same answer");
+  expectEqual(store.requests.length, 1, "none of the four wrote a row");
+  expectEqual(audit.entries.length, 1, "none of the four wrote an audit entry");
+
+  store.account.totp_confirmed_at = new Date(NOW - 86_400_000).toISOString();
+
+  const malformed = await captureRejection(
+    () => requestTwoFactorReset({ ...askInput, request: { email: "owner@firm.test", reason: "no" } }, dependencies),
+    "a too short reason is refused",
+  );
+
+  expectEqual(malformed.code, "VALIDATION_FAILED", "a too short reason is a form failure");
+  expectEqual(malformed.details?.[0]?.field, "reason", "the refusal names the reason field");
+
+  // The queue: who may read it, and what it holds.
+  const support = resetActor({ roles: ["support"] });
+  const finance = resetActor({ roles: ["finance_ops"] });
+
+  const queue = await listTwoFactorResetRequests({ actor: support, roles: TWO_FACTOR_RESET_OFFICE_ROLES, limit: 100 }, { rest: store.rest });
+
+  expectEqual(queue.length, 1, "the queue shows the one live request");
+  expectEqual(queue[0]?.status, "pending", "the queue keeps the status the database holds");
+  expectEqual(queue[0]?.reason, longReason, "the queue shows what the merchant reported");
+  expectEqual(queue[0]?.documentReference, null, "a pending request has no document yet");
+  expectEqual(
+    store.queries.at(-1)?.includes("status=in.(pending,contacted)"),
+    true,
+    "the queue reads only the two live statuses",
+  );
+  expectEqual(
+    store.queries.at(-1)?.includes("email"),
+    false,
+    "the queue selects no address",
+  );
+
+  await listTwoFactorResetRequests({ actor: support, roles: TWO_FACTOR_RESET_OFFICE_ROLES, limit: 5_000 }, { rest: store.rest });
+
+  expectEqual(store.queries.at(-1)?.endsWith("limit=200"), true, "a large limit is clamped to the ceiling");
+
+  await listTwoFactorResetRequests({ actor: support, roles: TWO_FACTOR_RESET_OFFICE_ROLES, limit: 0 }, { rest: store.rest });
+
+  expectEqual(store.queries.at(-1)?.endsWith("limit=1"), true, "a limit below one is raised to one");
+
+  await expectRejects(
+    () => listTwoFactorResetRequests({ actor: finance, roles: TWO_FACTOR_RESET_OFFICE_ROLES, limit: 50 }, { rest: store.rest }),
+    "PERMISSION_DENIED",
+    "a role outside the office list cannot read the queue",
+  );
+
+  const requestId = store.requests[0]?.id ?? "";
+
+  // The decisions, in the order the database allows them.
+  await expectRejects(
+    () =>
+      decideTwoFactorReset(
+        { actor: finance, requestId, action: "approve", documentReference: null, note: null },
+        dependencies,
+      ),
+    "PERMISSION_DENIED",
+    "a role outside the office list cannot decide a request",
+  );
+
+  await expectRejects(
+    () =>
+      decideTwoFactorReset(
+        { actor: support, requestId: "not-a-uuid", action: "approve", documentReference: null, note: null },
+        dependencies,
+      ),
+    "RESOURCE_NOT_FOUND",
+    "a malformed request id is not found, not a crash",
+  );
+
+  await expectRejects(
+    () =>
+      decideTwoFactorReset(
+        {
+          actor: support,
+          requestId: "018f3b1c-6666-7c2a-9d1e-2b3c4d5e6f75",
+          action: "approve",
+          documentReference: null,
+          note: null,
+        },
+        dependencies,
+      ),
+    "RESOURCE_NOT_FOUND",
+    "an unknown request id is not found",
+  );
+
+  await expectRejects(
+    () =>
+      decideTwoFactorReset(
+        { actor: support, requestId, action: "approve", documentReference: null, note: null },
+        dependencies,
+      ),
+    "CONFLICT",
+    "a reset cannot skip the record of the contact",
+  );
+
+  const noDocument = await captureRejection(
+    () =>
+      decideTwoFactorReset(
+        { actor: support, requestId, action: "contacted", documentReference: "  ", note: null },
+        dependencies,
+      ),
+    "a contact without a document is refused",
+  );
+
+  expectEqual(noDocument.code, "VALIDATION_FAILED", "a contact without a document is a form failure");
+  expectEqual(
+    noDocument.details?.[0]?.field,
+    "documentReference",
+    "the refusal names the document field",
+  );
+  expectEqual(store.requests[0]?.status, "pending", "a refused contact changes nothing");
+
+  const contacted = await decideTwoFactorReset(
+    {
+      actor: support,
+      requestId,
+      action: "contacted",
+      documentReference: "Passport and utility bill checked against the company record on 15 January.",
+      note: null,
+    },
+    dependencies,
+  );
+
+  expectEqual(contacted.status, "contacted", "the contact moves the request on");
+  expectEqual(store.requests[0]?.status, "contacted", "the row records the contact");
+  expectEqual(store.requests[0]?.contacted_at, new Date(NOW).toISOString(), "the row records when");
+  expectEqual(
+    store.requests[0]?.document_reference,
+    "Passport and utility bill checked against the company record on 15 January.",
+    "the row records what was verified",
+  );
+  expectEqual(
+    audit.entries.at(-1)?.action,
+    "user.two_factor_reset_contacted",
+    "the contact is audited",
+  );
+  expectEqual(audit.entries.at(-1)?.actorUserId, USER_ID, "the entry names the office worker");
+
+  await expectRejects(
+    () =>
+      decideTwoFactorReset(
+        { actor: support, requestId, action: "contacted", documentReference: "again", note: null },
+        dependencies,
+      ),
+    "CONFLICT",
+    "a contact cannot be recorded twice",
+  );
+
+  const approved = await decideTwoFactorReset(
+    { actor: support, requestId, action: "approve", documentReference: null, note: null },
+    dependencies,
+  );
+
+  expectEqual(approved.status, "approved", "an approval after the contact is accepted");
+  expectEqual(approved.userId, USER_ID, "the answer names the account that was reset");
+  expectEqual(store.requests[0]?.status, "approved", "the row records the decision");
+  expectEqual(store.requests[0]?.decided_by, USER_ID, "the row records who decided");
+  expectEqual(store.account.totp_secret_ciphertext, null, "the approval clears the authenticator secret");
+  expectEqual(store.account.totp_confirmed_at, null, "the approval clears the confirmation instant");
+  expectEqual(store.account.backup_code_hashes.length, 0, "the approval clears every backup code");
+  expectEqual(store.account.status, "active", "the approval leaves the account open");
+  expectEqual(audit.entries.at(-1)?.action, "user.two_factor_reset", "the approval is audited");
+  expectEqual(
+    audit.entries.at(-1)?.payload["method"],
+    "office_reset",
+    "the entry says the second factor was cleared by the office",
+  );
+  expectEqual(
+    audit.entries.at(-1)?.payload["document_reference_present"],
+    true,
+    "the entry records that documents were seen, not what they were",
+  );
+
+  await expectRejects(
+    () =>
+      decideTwoFactorReset(
+        { actor: support, requestId, action: "approve", documentReference: null, note: null },
+        dependencies,
+      ),
+    "CONFLICT",
+    "an approved request cannot be approved again",
+  );
+  await expectRejects(
+    () =>
+      decideTwoFactorReset(
+        { actor: support, requestId, action: "reject", documentReference: null, note: "late" },
+        dependencies,
+      ),
+    "CONFLICT",
+    "an approved request cannot be rejected afterwards",
+  );
+
+  const emptyQueue = await listTwoFactorResetRequests(
+    { actor: support, roles: TWO_FACTOR_RESET_OFFICE_ROLES, limit: 50 },
+    { rest: store.rest },
+  );
+
+  expectEqual(emptyQueue.length, 0, "a decided request leaves the queue");
+
+  // A reset account has no factor left to reset: asking again is answered and forgotten until the
+  // merchant enrols, which is exactly the second sentence of section 22.
+  const beforeEnrolment = await requestTwoFactorReset(
+    { ...askInput, request: { email: "owner@firm.test", reason: longReason } },
+    dependencies,
+  );
+
+  expectEqual(beforeEnrolment.accepted, true, "an account with a cleared factor gets the same answer");
+  expectEqual(store.requests.length, 1, "an account with a cleared factor writes no row");
+
+  // Once the merchant enrols again the slot is free and a rejection ends in the same place.
+  store.account.totp_confirmed_at = new Date(NOW).toISOString();
+
+  const afterReset = await requestTwoFactorReset(
+    { ...askInput, request: { email: "owner@firm.test", reason: longReason } },
+    dependencies,
+  );
+
+  expectEqual(afterReset.accepted, true, "an approved reset does not block a later request");
+  expectEqual(store.requests.length, 2, "the later request writes a new row");
+
+  const secondId = store.requests[1]?.id ?? "";
+
+  const noNote = await captureRejection(
+    () =>
+      decideTwoFactorReset(
+        { actor: support, requestId: secondId, action: "reject", documentReference: null, note: " " },
+        dependencies,
+      ),
+    "a rejection without a reason is refused",
+  );
+
+  expectEqual(noNote.code, "VALIDATION_FAILED", "a rejection without a reason is a form failure");
+  expectEqual(noNote.details?.[0]?.field, "note", "the refusal names the note field");
+
+  const rejected = await decideTwoFactorReset(
+    {
+      actor: support,
+      requestId: secondId,
+      action: "reject",
+      documentReference: null,
+      note: "The documents did not match the company record.",
+    },
+    dependencies,
+  );
+
+  expectEqual(rejected.status, "rejected", "a rejection is accepted");
+  expectEqual(store.requests[1]?.status, "rejected", "the row records the rejection");
+  expectEqual(store.requests[1]?.decided_by, USER_ID, "the row records who rejected it");
+  expectEqual(
+    store.requests[1]?.decision_note,
+    "The documents did not match the company record.",
+    "the row records why",
+  );
+  expectEqual(
+    audit.entries.at(-1)?.action,
+    "user.two_factor_reset_rejected",
+    "the rejection is audited",
+  );
+}
+
 /* ------------------------------------------------------------------ main */
 
 async function main(): Promise<void> {
@@ -4892,6 +5442,7 @@ async function main(): Promise<void> {
   await checkTwoFactor();
   await checkTwoFactorLogin();
   await checkBackupCodeRegeneration();
+  await checkTwoFactorReset();
 
   if (failures.length > 0) {
     process.stderr.write(`auth gate failed with ${failures.length} problem(s):\n`);
