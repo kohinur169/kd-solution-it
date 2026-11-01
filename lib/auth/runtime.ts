@@ -17,6 +17,7 @@ import {
 } from "./login-attempts.ts";
 import { createAuthHttpForConfig, type AuthHttp } from "./http.ts";
 import { createRestPolicyCatalog, type PolicyCatalog } from "./policies.ts";
+import { createSupabaseActorDirectory, type ActorDirectory } from "./directory.ts";
 import { createRestClient, type RestClient } from "./rest.ts";
 import { createRestSettings, type PlatformSettings } from "./settings.ts";
 import { createTurnstileGuard, type TurnstileGuard } from "./turnstile.ts";
@@ -56,6 +57,15 @@ export interface AuthRuntime {
   readonly audit: AuditTrail;
   readonly attempts: LoginAttemptRecorder;
   readonly cookiePolicy: AuthCookiePolicy;
+  /** Reads an actor for a cookie: the session of STEP 039 and of every authenticated route. */
+  readonly directory: ActorDirectory;
+  /**
+   * The key that seals a secret at rest, read lazily from the environment.
+   *
+   * Exposed as a function rather than a value for the reason the whole object is built lazily: a
+   * module that captured the key at import time would make a build machine need a runtime secret.
+   */
+  readonly masterKey: () => string;
 }
 
 let runtime: AuthRuntime | undefined;
@@ -100,6 +110,8 @@ export function getAuthRuntime(): AuthRuntime {
     }),
     attempts: createRestLoginAttemptRecorder(createRestClient(config, http)),
     cookiePolicy: createAuthCookiePolicy(config, AUTH_SESSION_MAX_AGE_SECONDS),
+    directory: createSupabaseActorDirectory(config, http),
+    masterKey: () => serverEnv().ENCRYPTION_MASTER_KEY,
   };
 
   return runtime;

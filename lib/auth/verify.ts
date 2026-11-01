@@ -16,6 +16,29 @@ import {
   createInMemoryLoginAttemptRecorder,
   createRestLoginAttemptRecorder,
 } from "./login-attempts.ts";
+import { encodeQr, encodeQrCodewords, qrRows, smallestVersion } from "../qr/qr.ts";
+import { qrPath } from "../qr/path.ts";
+import {
+  base32Decode,
+  base32Encode,
+  formatSecretForEntry,
+  generateBackupCodes,
+  generateTotpSecret,
+  isBackupCodeShaped,
+  normalizeBackupCode,
+  totpCodeForStep,
+  totpStep,
+  totpUri,
+  verifyTotpCode,
+  BACKUP_CODE_COUNT,
+} from "./totp.ts";
+import {
+  confirmTotpEnrolment,
+  hasConfirmedTwoFactor,
+  openEnrolledSecret,
+  startTotpEnrolment,
+  twoFactorContext,
+} from "./two-factor.ts";
 import { signInMerchant, signinInputSchema } from "./signin.ts";
 import { createAuthClient, type AuthClient } from "./client.ts";
 import { authAdminUserUrl, authTokenUrl, buildAuthConfig, type AuthConfig } from "./config.ts";
@@ -84,7 +107,7 @@ import {
 } from "./policies.ts";
 import { companySlug, registerMerchant } from "./registration.ts";
 import type { RestClient } from "./rest.ts";
-import { isSecretBox, openSecret, sealSecret } from "./secrets.ts";
+import { isSecretBox, openSecret, sealSecret, unpackSecretBox } from "./secrets.ts";
 import {
   createInMemorySettings,
   createRestSettings,
@@ -3503,6 +3526,417 @@ async function checkSignin(): Promise<void> {
   expect(parsed.success && parsed.data.email === "owner@example.com", "the form lowercases the address");
 }
 
+/** True when a stored value is not a box this build wrote. */
+function unpackableCiphertextRefused(text: string): boolean {
+  return unpackSecretBox(text) === null;
+}
+
+/** Assert that a stored enrolment secret is sealed, opens, and is not the secret in clear. */
+function expectStartSealed(value: unknown, secret: string): void {
+  const stored = typeof value === "string" ? value : "";
+
+  expect(stored.length > 40, "the stored secret is a sealed box");
+  expect(stored.startsWith("v1."), "the stored secret carries a version prefix");
+  expect(!stored.includes(secret), "the stored secret does not contain the secret in clear");
+}
+
+/* --------------------------------------------------- STEP 041: TOTP and QR */
+
+/**
+ * The RFC vectors.
+ *
+ * The secret is the ASCII string "12345678901234567890", which is the key every published test
+ * vector of RFC 6238 uses, and the answers below are the six digit forms of the numbers in the
+ * RFC's appendix. A vector that fails here means the platform would reject every code a real
+ * authenticator app shows, which is a total lockout, so the arithmetic is checked before anything
+ * is written to a database.
+ */
+function checkTotp(): void {
+  const rfcSecret = base32Encode(Buffer.from("12345678901234567890", "ascii"));
+
+  expectEqual(rfcSecret, "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ", "base32 encodes the RFC key");
+  expectEqual(
+    Buffer.from(base32Decode(rfcSecret) ?? new Uint8Array()).toString("ascii"),
+    "12345678901234567890",
+    "base32 decodes back to the RFC key",
+  );
+  expectEqual(base32Decode("0189"), null, "a base32 digit outside the alphabet is refused");
+  expectEqual(base32Decode(""), null, "an empty base32 secret is refused");
+
+  const key = base32Decode(rfcSecret) ?? new Uint8Array();
+
+  // RFC 6238, appendix B: SHA-1 codes at 59s, 1111111109s and 1111111111s, six digits.
+  expectEqual(totpCodeForStep(key, 1), "287082", "the code of step 1 is the RFC's");
+  expectEqual(
+    totpCodeForStep(key, Math.floor(1111111109 / 30)),
+    "081804",
+    "the code of the RFC's 2005 instant is the RFC's",
+  );
+  expectEqual(
+    totpCodeForStep(key, Math.floor(1111111111 / 30)),
+    "050471",
+    "the code of the RFC's late 2005 instant is the RFC's",
+  );
+  expectEqual(totpStep(59_000), 1, "a step is thirty seconds");
+
+  const secret = generateTotpSecret();
+
+  expectEqual(secret.length, 32, "a generated secret is 160 bits in base32");
+  expect(/^[A-Z2-7]+$/u.test(secret), "a generated secret is base32");
+  expect(generateTotpSecret() !== secret, "two enrolments never share a secret");
+  expectEqual(
+    formatSecretForEntry("ABCDEFGH"),
+    "ABCD EFGH",
+    "the manual entry form groups the secret in fours",
+  );
+
+  const instant = 1_700_000_000_000;
+  const current = totpCodeForStep(key, totpStep(instant));
+
+  expectEqual(verifyTotpCode(rfcSecret, current, instant), totpStep(instant), "the current code is accepted");
+  expectEqual(
+    verifyTotpCode(rfcSecret, totpCodeForStep(key, totpStep(instant) - 1), instant),
+    totpStep(instant) - 1,
+    "the previous step is accepted inside the window",
+  );
+  expectEqual(
+    verifyTotpCode(rfcSecret, totpCodeForStep(key, totpStep(instant) + 1), instant),
+    totpStep(instant) + 1,
+    "the next step is accepted inside the window",
+  );
+  expectEqual(
+    verifyTotpCode(rfcSecret, totpCodeForStep(key, totpStep(instant) + 2), instant),
+    null,
+    "a code two steps ahead is refused",
+  );
+  expectEqual(
+    verifyTotpCode(rfcSecret, totpCodeForStep(key, totpStep(instant) - 2), instant),
+    null,
+    "a code two steps behind is refused",
+  );
+  expectEqual(verifyTotpCode(rfcSecret, "000000", instant), null, "an unrelated code is refused");
+  expectEqual(verifyTotpCode(rfcSecret, "28708", instant), null, "a five digit code is refused");
+  expectEqual(verifyTotpCode(rfcSecret, "2870821", instant), null, "a seven digit code is refused");
+  expectEqual(verifyTotpCode(rfcSecret, "abcdef", instant), null, "a code of letters is refused");
+  expectEqual(verifyTotpCode("not base32!", current, instant), null, "a broken stored secret is refused");
+  expectEqual(
+    verifyTotpCode(rfcSecret, ` ${current} `, instant),
+    totpStep(instant),
+    "surrounding spaces around a typed code are forgiven",
+  );
+
+  const uri = totpUri("KD Solution IT", "owner@example.com", "ABCDEFGHIJKLMNOP");
+
+  expect(uri.startsWith("otpauth://totp/KD%20Solution%20IT:owner%40example.com?"), "the URI names issuer and account");
+  expect(uri.includes("secret=ABCDEFGHIJKLMNOP"), "the URI carries the secret");
+  expect(uri.includes("algorithm=SHA1"), "the URI names the algorithm");
+  expect(uri.includes("digits=6"), "the URI names the digits");
+  expect(uri.includes("period=30"), "the URI names the period");
+  expect(uri.includes("issuer=KD+Solution+IT"), "the URI repeats the issuer as a parameter");
+
+  const codes = generateBackupCodes(BACKUP_CODE_COUNT);
+
+  expectEqual(codes.length, 10, "an enrolment writes ten backup codes");
+  expectEqual(new Set(codes).size, 10, "the ten backup codes are distinct");
+  expect(codes.every((code) => /^[a-z2-9]{5}-[a-z2-9]{5}$/u.test(code)), "a backup code is xxxxx-xxxxx");
+  expect(
+    codes.every((code) => !/[01lo]/u.test(code)),
+    "a backup code has no character that is read as a digit",
+  );
+  expectEqual(normalizeBackupCode("ABCDE-FGHJK"), "abcdefghjk", "a typed code is normalised before hashing");
+  expectEqual(normalizeBackupCode(" abcde fghjk "), "abcdefghjk", "spaces do not change a backup code");
+  expect(isBackupCodeShaped("abcde-fghjk"), "a typed backup code has the right shape");
+  expect(!isBackupCodeShaped("abcde"), "a short string is not a backup code");
+  expect(!isBackupCodeShaped(totpCodeForStep(key, 1)), "a six digit code is not shaped like a backup code");
+  expect(!isBackupCodeShaped("abcde-123"), "a code of the wrong length is not shaped like a backup code");
+}
+
+/** The QR encoder, against the structure the specification defines rather than against an image. */
+function checkQr(): void {
+  expectEqual(smallestVersion(14), 1, "fourteen bytes fit version 1 at level M");
+  expectEqual(smallestVersion(15), 2, "fifteen bytes need version 2");
+  expectEqual(smallestVersion(106), 6, "the version boundaries follow the capacity table");
+  expectEqual(smallestVersion(213), 10, "the largest payload this build encodes is 213 bytes");
+  expectEqual(smallestVersion(214), null, "a payload beyond version 10 is refused, not truncated");
+
+  const text = totpUri("KD Solution IT", "owner@example.com", generateTotpSecret());
+  const matrix = encodeQr(text);
+  const codewords = encodeQrCodewords(text);
+
+  expect(matrix !== null, "an enrolment URI is encodable");
+  expect(codewords !== null, "an enrolment URI has codewords");
+
+  if (matrix === null || codewords === null) {
+    return;
+  }
+
+  expectEqual(matrix.size, 17 + matrix.version * 4, "the symbol is the size its version prescribes");
+  expectEqual(matrix.modules.length, matrix.size, "the matrix is square");
+  expectEqual(matrix.modules[0]?.length, matrix.size, "every row is the full width");
+
+  const rows = qrRows(matrix);
+
+  expectEqual(rows.length, matrix.size, "the row view has one line per module row");
+
+  const finder = [
+    "1111111",
+    "1000001",
+    "1011101",
+    "1011101",
+    "1011101",
+    "1000001",
+    "1111111",
+  ];
+  const corner = (top: number, left: number): string[] =>
+    Array.from({ length: 7 }, (_, index) => (rows[top + index] ?? "").slice(left, left + 7));
+
+  expectEqual(corner(0, 0).join("/"), finder.join("/"), "the top left finder is the finder pattern");
+  expectEqual(corner(0, matrix.size - 7).join("/"), finder.join("/"), "the top right finder is the finder pattern");
+  expectEqual(corner(matrix.size - 7, 0).join("/"), finder.join("/"), "the bottom left finder is the finder pattern");
+
+  const separatorRow = rows[7] ?? "";
+  const separatorColumn = Array.from({ length: 8 }, (_, index) => (rows[index] ?? "").charAt(7)).join("");
+
+  expect(!separatorRow.slice(0, 8).includes("1"), "the top left separator is light");
+  expect(!separatorColumn.includes("1"), "the separator above it is light");
+
+  let timingOk = true;
+
+  for (let index = 8; index < matrix.size - 8; index += 1) {
+    if ((rows[6] ?? "").charAt(index) !== (index % 2 === 0 ? "1" : "0")) {
+      timingOk = false;
+    }
+
+    if ((rows[index] ?? "").charAt(6) !== (index % 2 === 0 ? "1" : "0")) {
+      timingOk = false;
+    }
+  }
+
+  expect(timingOk, "the timing patterns alternate on row 6 and column 6");
+  expectEqual((rows[matrix.size - 8] ?? "").charAt(8), "1", "the dark module is set");
+
+  // Read both format copies back: they must agree with each other and with the value this build
+  // says it wrote. Level M and mask 0 is 0x5412, the row the specification's table publishes.
+  const verticalCopy = Array.from({ length: 15 }, (_, index) => {
+    const bit =
+      index < 6
+        ? (rows[index] ?? "").charAt(8)
+        : index < 8
+          ? (rows[(index + 1)] ?? "").charAt(8)
+          : (rows[matrix.size - 15 + index] ?? "").charAt(8);
+
+    return bit === "1" ? 1 : 0;
+  });
+  const horizontalCopy = Array.from({ length: 15 }, (_, index) => {
+    const bit =
+      index < 8
+        ? (rows[8] ?? "").charAt(matrix.size - 1 - index)
+        : index < 9
+          ? (rows[8] ?? "").charAt(7)
+          : (rows[8] ?? "").charAt(14 - index);
+
+    return bit === "1" ? 1 : 0;
+  });
+  const asNumber = (bits: readonly number[]): number =>
+    bits.reduce((total, bit, index) => total + bit * 2 ** index, 0);
+
+  expectEqual(asNumber(verticalCopy), 0x5412, "the vertical format copy carries level M and mask 0");
+  expectEqual(asNumber(horizontalCopy), 0x5412, "the horizontal format copy carries the same value");
+
+  const drawing = qrPath(matrix);
+
+  expectEqual(drawing.extent, (matrix.size + 8) * 4, "the drawing is the symbol plus a four module quiet zone");
+  expect(drawing.data.startsWith("M"), "the drawing is one path of runs");
+  expect(/^[Mhvz0-9 .-]+$/u.test(drawing.data), "a drawing holds only path instructions and numbers");
+  expect(!drawing.data.includes("NaN"), "every coordinate of the drawing is a number");
+
+  const rowsWithDark = rows.filter((row) => row.includes("1")).length;
+
+  expect(rowsWithDark > 0, "the symbol has dark modules");
+  expect(
+    drawing.data.split("M").length - 1 >= rowsWithDark,
+    "each row that has a dark module contributes at least one run",
+  );
+  expectEqual(encodeQr("x".repeat(214)), null, "an oversized payload is refused rather than truncated");
+}
+
+/** The enrolment state machine, against a REST double. */
+async function checkTwoFactor(): Promise<void> {
+  const now = NOW + 12_000;
+  const updates: { table: string; query: string; values: Readonly<Record<string, unknown>> }[] = [];
+  const rows: { totp_secret_ciphertext: string | null; totp_confirmed_at: string | null } = {
+    totp_secret_ciphertext: null,
+    totp_confirmed_at: null,
+  };
+  let missing = false;
+  const rest: RestClient = {
+    select<TRow>(): Promise<readonly TRow[]> {
+      if (missing) {
+        return Promise.resolve([]);
+      }
+
+      return Promise.resolve([
+        {
+          id: USER_ID,
+          email: "owner@example.com",
+          company_id: FIRM_ID,
+          totp_secret_ciphertext: rows.totp_secret_ciphertext,
+          totp_confirmed_at: rows.totp_confirmed_at,
+        } as unknown as TRow,
+      ]);
+    },
+    insert: () => Promise.resolve(),
+    insertReturning: () => Promise.resolve([]),
+    update: (table: string, query: string, values: Readonly<Record<string, unknown>>) => {
+      updates.push({ table, query, values });
+
+      if ("totp_secret_ciphertext" in values) {
+        rows.totp_secret_ciphertext = values["totp_secret_ciphertext"] as string;
+      }
+
+      if ("totp_confirmed_at" in values) {
+        rows.totp_confirmed_at = values["totp_confirmed_at"] as string | null;
+      }
+
+      return Promise.resolve();
+    },
+    rpc: () => Promise.resolve(null),
+  };
+  const audit = createInMemoryAuditTrail();
+  const dependencies = {
+    rest,
+    audit,
+    masterKey: () => MASTER_KEY,
+    issuer: "KD Solution IT",
+    now: () => now,
+  };
+
+  const started = await startTotpEnrolment({ userId: USER_ID }, dependencies);
+
+  expectEqual(updates.length, 1, "starting an enrolment writes one row");
+  expectEqual(updates[0]?.table, "users", "starting an enrolment writes the account");
+  expectEqual(updates[0]?.values["totp_confirmed_at"], null, "starting an enrolment confirms nothing");
+  expectStartSealed(updates[0]?.values["totp_secret_ciphertext"], started.secret);
+
+  expect(started.secret.length === 32, "the answered secret is base32");
+  expectEqual(started.secretForEntry, formatSecretForEntry(started.secret), "the answered key is the grouped secret");
+  expect(started.uri.startsWith("otpauth://totp/"), "the answer carries the account URI");
+  expect(started.uri.includes(`secret=${started.secret}`), "the URI carries the answered secret");
+  expect(started.qr !== null, "the answer carries a symbol");
+  expect(started.symbol !== null, "the answer carries a drawing");
+  expectEqual(audit.entries.length, 1, "starting an enrolment is audited");
+  expectEqual(audit.entries[0]?.action, "user.totp_enrolment_started", "the audit entry names the start");
+  expectEqual(audit.entries[0]?.companyId, FIRM_ID, "the audit entry joins the tenant chain");
+
+  const secret = openEnrolledSecret(
+    rows.totp_secret_ciphertext ?? "",
+    USER_ID,
+    MASTER_KEY,
+  );
+
+  expectEqual(secret, started.secret, "the stored secret opens to the answered secret");
+  expectThrows(
+    () => openEnrolledSecret(rows.totp_secret_ciphertext ?? "", OTHER_USER_ID, MASTER_KEY),
+    "a secret of one account does not open for another",
+  );
+  expectThrows(
+    () => openEnrolledSecret(rows.totp_secret_ciphertext ?? "", USER_ID, OTHER_MASTER_KEY),
+    "a secret does not open under another key",
+  );
+  expectEqual(unpackableCiphertextRefused(rows.totp_secret_ciphertext ?? ""), false, "the stored secret unpacks");
+
+  const wrongCode = await captureRejection(
+    () => confirmTotpEnrolment({ userId: USER_ID, code: "000000" }, dependencies),
+    "a wrong code is refused",
+  );
+
+  expectEqual(wrongCode.code, "VALIDATION_FAILED", "a wrong code is a form failure");
+  expectEqual(wrongCode.details?.[0]?.field, "code", "the wrong code names the code field");
+  expectEqual(updates.length, 1, "a wrong code writes nothing");
+  expectEqual(audit.entries.length, 1, "a wrong code audits nothing");
+
+  const shortCode = await captureRejection(
+    () => confirmTotpEnrolment({ userId: USER_ID, code: "12" }, dependencies),
+    "a malformed code is refused",
+  );
+
+  expectEqual(shortCode.details?.[0]?.rule, "invalid_format", "a malformed code is refused before any query");
+
+  const key = base32Decode(secret) ?? new Uint8Array();
+  const confirmed = await confirmTotpEnrolment(
+    { userId: USER_ID, code: totpCodeForStep(key, totpStep(now)) },
+    dependencies,
+  );
+
+  expectEqual(confirmed.backupCodes.length, 10, "confirming writes ten backup codes");
+  expectEqual(updates.length, 2, "confirming writes one row");
+  expectEqual(updates[1]?.values["totp_confirmed_at"], new Date(now).toISOString(), "confirming stamps the instant");
+  expect(Array.isArray(updates[1]?.values["backup_code_hashes"]), "confirming stores hashes");
+  expectEqual(
+    (updates[1]?.values["backup_code_hashes"] as readonly string[]).length,
+    10,
+    "one hash per code",
+  );
+  expect(
+    (updates[1]?.values["backup_code_hashes"] as readonly string[]).every(
+      (hash) => !confirmed.backupCodes.includes(hash) && hash.length > 40,
+    ),
+    "the stored values are verifiers, not the codes",
+  );
+  expectEqual(audit.entries.length, 2, "confirming is audited");
+  expectEqual(audit.entries[1]?.action, "user.totp_enrolled", "the audit entry names the enrolment");
+  expectEqual(audit.entries[1]?.payload["backup_codes"], 10, "the audit entry counts the codes");
+
+  const stored = (updates[1]?.values["backup_code_hashes"] as readonly string[])[0] ?? "";
+  const storedCode = normalizeBackupCode(confirmed.backupCodes[0] ?? "");
+
+  expect(await verifyPasswordHash(storedCode, stored), "a hash of the first code verifies that code");
+  expect(
+    !(await verifyPasswordHash(normalizeBackupCode(confirmed.backupCodes[1] ?? ""), stored)),
+    "a hash verifies only its code",
+  );
+  expectEqual(hasConfirmedTwoFactor({ totp_confirmed_at: rows.totp_confirmed_at }), true, "a confirmed account holds a second factor");
+  expectEqual(hasConfirmedTwoFactor({ totp_confirmed_at: null }), false, "an unconfirmed account does not");
+
+  await expectRejects(
+    () => startTotpEnrolment({ userId: USER_ID }, dependencies),
+    "CONFLICT",
+    "a confirmed account cannot start a second enrolment",
+  );
+  await expectRejects(
+    () => confirmTotpEnrolment({ userId: USER_ID, code: "123456" }, dependencies),
+    "CONFLICT",
+    "a confirmed account cannot confirm again",
+  );
+
+  rows.totp_confirmed_at = null;
+  rows.totp_secret_ciphertext = null;
+
+  await expectRejects(
+    () => confirmTotpEnrolment({ userId: USER_ID, code: "123456" }, dependencies),
+    "CONFLICT",
+    "a confirmation without a started enrolment is out of order",
+  );
+
+  missing = true;
+
+  await expectRejects(
+    () => startTotpEnrolment({ userId: USER_ID }, dependencies),
+    "AUTHENTICATION_REQUIRED",
+    "an account that no longer exists cannot enrol",
+  );
+
+  missing = false;
+  rows.totp_secret_ciphertext = "v1.not-a-box";
+
+  await expectRejects(
+    () => confirmTotpEnrolment({ userId: USER_ID, code: "123456" }, dependencies),
+    "INTERNAL_ERROR",
+    "a stored value this build did not write is refused",
+  );
+  expectEqual(twoFactorContext(USER_ID), `users.totp:${USER_ID}`, "the associated data names the account");
+}
+
 /* ------------------------------------------------------------------ main */
 
 async function main(): Promise<void> {
@@ -3529,6 +3963,9 @@ async function main(): Promise<void> {
   checkDeviceContext();
   await checkLoginAttempts();
   await checkSignin();
+  checkTotp();
+  checkQr();
+  await checkTwoFactor();
 
   if (failures.length > 0) {
     process.stderr.write(`auth gate failed with ${failures.length} problem(s):\n`);

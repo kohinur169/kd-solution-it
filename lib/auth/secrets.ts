@@ -71,6 +71,36 @@ function decodeMasterKey(masterKeyBase64: string): Buffer {
   return key;
 }
 
+/**
+ * Pack a sealed box into one column value.
+ *
+ * `platform_settings` has three columns for the parts and `users.totp_secret_ciphertext` has one, so
+ * the same box travels in two shapes. The prefix is a version, because a later cipher or a longer
+ * tag has to be readable beside the values already written.
+ */
+export function packSecretBox(box: SecretBox): string {
+  return `v1.${box.iv}.${box.tag}.${box.ciphertext}`;
+}
+
+/** Unpack a stored column value, or null when it is not a box this build wrote. */
+export function unpackSecretBox(text: string): SecretBox | null {
+  const parts = text.split(".");
+
+  if (parts.length !== 4 || parts[0] !== "v1") {
+    return null;
+  }
+
+  const [, iv, tag, ciphertext] = parts;
+
+  if (iv === undefined || tag === undefined || ciphertext === undefined) {
+    return null;
+  }
+
+  const box = { iv, tag, ciphertext };
+
+  return isSecretBox(box) ? box : null;
+}
+
 /** Encrypt one value for one setting. */
 export function sealSecret(
   masterKeyBase64: string,

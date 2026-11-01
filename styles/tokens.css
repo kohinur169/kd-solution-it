@@ -82,6 +82,15 @@
   --kd-surface-foreground: var(--palette-ink-925);
   --kd-surface-foreground: light-dark(var(--palette-ink-925), var(--palette-ink-100));
 
+  /* A machine readable symbol is not a themed surface. It stays dark on light in both themes,
+     because an inverted symbol is outside the specification and some scanners refuse it, so it
+     names its own pair rather than borrowing the page's foreground and background. */
+  --kd-symbol: var(--palette-ink-950);
+  --kd-symbol: light-dark(var(--palette-ink-950), var(--palette-ink-950));
+
+  --kd-symbol-background: var(--palette-white);
+  --kd-symbol-background: light-dark(var(--palette-white), var(--palette-white));
+
   --kd-muted: var(--palette-ink-100);
   --kd-muted: light-dark(var(--palette-ink-100), var(--palette-ink-800));
 
@@ -171,6 +180,8 @@
   --color-foreground: var(--kd-foreground);
   --color-surface: var(--kd-surface);
   --color-surface-foreground: var(--kd-surface-foreground);
+  --color-symbol: var(--kd-symbol);
+  --color-symbol-background: var(--kd-symbol-background);
   --color-muted: var(--kd-muted);
   --color-muted-foreground: var(--kd-muted-foreground);
   --color-border: var(--kd-border);

@@ -132,6 +132,40 @@ const catalog = {
       "The platform could not reach the identity provider. Follow the link again in a few minutes.",
     home: "Go to the home page",
   },
+  twoFactor: {
+    eyebrow: "Account security",
+    title: "Two factor authentication",
+    description:
+      "Section 22 requires a second factor on every account that holds a role. An authenticator app holds the secret: it shows a six digit code that changes every thirty seconds, and this page never sees that secret again after enrolment.",
+    startTitle: "Step one - add the account to your authenticator app",
+    startBody:
+      "Open your authenticator app, choose to add an account and scan the code below. If the app cannot use a camera, type the key instead.",
+    startSubmit: "Create the key",
+    starting: "Creating the key",
+    qrAlt: "QR code that adds this account to an authenticator app",
+    manualKeyLabel: "Key for manual entry",
+    copyHint: "The key is shown once. It is stored encrypted and cannot be read back on this page.",
+    confirmTitle: "Step two - confirm the code",
+    confirmBody:
+      "Enter the six digit code the app shows for this account. Confirming proves the app holds the key, and only then does the second factor protect the account.",
+    codeLabel: "Six digit code",
+    confirmSubmit: "Turn on two factor authentication",
+    confirming: "Checking the code",
+    backupTitle: "Save your backup codes",
+    backupBody:
+      "Each code signs you in once if you lose the authenticator app. They are shown only now: the platform keeps a verifier for each, never the code itself. Store them somewhere a stranger cannot reach.",
+    backupCodesLabel: "Backup codes",
+    backupWarning:
+      "Keep these somewhere safe and offline. Anyone holding one of them can pass the second factor once.",
+    done: "I have saved the codes",
+    enrolledBody:
+      "This account now needs the authenticator app, or one of the backup codes, to sign in. The next sign in from a new browser asks for the code.",
+    alreadyEnrolled:
+      "Two factor authentication is already on for this account. Replacing the authenticator app needs the recovery steps, not this page.",
+    signInRequired: "Sign in to manage two factor authentication.",
+    unreadableResponse: "The server answered with something this page cannot read. Try again.",
+    codeRejected: "That code was not accepted. Wait for the next one in the app and enter it before it changes.",
+  },
   policies: {
     kyc_kyb: "KYC and KYB Policy",
     ubo: "UBO Policy",

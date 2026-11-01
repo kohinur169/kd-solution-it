@@ -150,6 +150,26 @@ the authority. A permission check uses the record, never a claim.
     that binds it is STEP 051's, because `0009` needs a client public key and `0010` needs the key
     before a session can exist. A fabricated key would be a device the platform cannot verify.
 
+29. An enrolment is two steps and the first one protects nothing. `startTotpEnrolment` seals a fresh
+    secret into `users.totp_secret_ciphertext` with the associated data `users.totp:<id>` and leaves
+    `totp_confirmed_at` null; only `confirmTotpEnrolment` accepts a code, stamps the instant and
+    replaces `backup_code_hashes`. `hasConfirmedTwoFactor` is the only question the rest of the
+    platform may ask, so an account with a secret nobody proved is never treated as protected.
+30. The TOTP arithmetic is RFC 6238 and nothing else. `totp.ts` is SHA-1, six digits, thirty seconds
+    and a window of one step on either side, returning the step that matched so STEP 042 can refuse
+    a replay of the same step. The secret is 160 bits of `randomBytes` in unpadded base32, which is
+    the form every authenticator app reads.
+31. A backup code is shown once and stored as a verifier. Ten codes of ten characters from an
+    alphabet without `0`, `1`, `l` or `o`; `normalizeBackupCode` forgives case, spaces and the
+    separator before `hashPassword` runs, so a person who types it loosely still gets in, and the
+    column never holds a code that could be replayed.
+32. The QR code is encoded here, not fetched. `lib/qr/` writes the symbol itself - byte mode, level M,
+    versions 1 to 10, mask 0 - because a third party image service would receive the enrolment
+    secret, and a dependency cannot be added without a package request. `lib/qr/path.ts` turns the
+    matrix into one SVG path of horizontal runs, which the screen draws inside an `<svg>` it builds
+    from numbers; no string of markup is ever injected, and `fill-symbol`/`fill-symbol-background`
+    keep the symbol dark on light in both themes.
+
 ## Adding an operation
 
 1. Add the method to the `AuthClient` or `AdminAuthClient` interface and its implementation,
