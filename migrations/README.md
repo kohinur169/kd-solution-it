@@ -4,7 +4,7 @@
 Owner: STEP 012-036 and every later STEP that adds a table.
 
 Append-only numbered SQL migrations applied with the Supabase CLI against the project of the
-current environment. STEP 012 to STEP 034 created the first seventy one files; `npm run
+current environment. STEP 012 to STEP 035 created the first seventy four files; `npm run
 check:migrations` keeps them honest.
 
 Each row names the objects its file creates. The index count is the number of indexes the
@@ -83,6 +83,9 @@ table has once the file has run, the primary key included, so it is what `\d` pr
 | 0069_actor_session.sql | The three helpers the tenant policies read: `uuid_or_null`, which spells a canonical uuid or returns null and never raises, `current_actor_id`, which reads the `app.user_id` setting and then the `sub` claim of the JWT, and the `security definer` `current_actor_company_id`, which maps an active and undeleted person to a company; it creates no table |
 | 0070_tenant_policies_batch_one.sql | The 22 `<table>_tenant_isolation` policies of batch one, permissive, for all commands and addressed to `public`, beside the deny they do not replace, plus the two `company_id` indexes the last two tables needed; it creates no table |
 | 0071_payment_ledger_policies.sql | The 17 policies of batch two: `<table>_tenant_select` on the thirteen money and ledger tables, `<table>_tenant_insert` on `refunds`, `payout_bank_accounts` and `bank_change_requests` with the opening state and the requester pinned, and `<table>_tenant_update` on `disputes` inside the open envelope, plus the ten `<table>_tenant_idx` indexes a bare `company_id` predicate can use; it creates no table |
+| 0072_actor_roles.sql | `public.current_actor_roles()` and `public.current_actor_has_role(text)`: the live roles of the person asking, read as the owner so a role policy cannot recurse, and false for a revoked, future or suspended assignment; it creates no table |
+| 0073_office_and_secret_policies.sql | The 33 policies of the five office tables, the four per-person tables and the four credential and connection tables: `super_admin` full control, the person's own session, device key, attempt, lock, assignment, permission and dismissal, the announcement audience rule, and the merchant's own credentials pinned to a live insert and a revoked update, plus three `<table>_tenant_idx` indexes; it creates no table |
+| 0074_platform_and_audit_policies.sql | The 36 policies of the platform book, the configuration, the content and the machinery, each by the role that works it, the merchant's own entitlement and send log, and the two selects that make `audit_logs` readable while it stays append-only, plus the `plan_entitlements` index; it creates no table |
 
 Every file is paired with `<name>.down.sql`, which undoes exactly what its forward file created and
 nothing else.
@@ -367,7 +370,15 @@ nothing else.
     insert the approved, verified or cooling state; the dispute response is the one update, and
     its `using` and `with check` both stay inside the open envelope, so a merchant cannot submit
     a dispute or resolve one. No money table grants a delete.
-52. Numbering is contiguous from 0001. A migration is never renumbered after it has been applied
+53. An office role is read from `role_assignments`, never from a claim.
+    `public.current_actor_roles()` returns the live roles of the person asking and
+    `public.current_actor_has_role(text)` is its boolean form, so a policy names a role inside
+    `using` and stays `to public`, because no migration may create a role object. `super_admin`
+    keeps full control of the platform tables, each other role reads and writes only the groups
+    FEATURE_LIST section 2 gives it, a person reads its own session, device key, attempt, lock,
+    assignment, permission and dismissal, and `audit_logs` grants no write to anybody: the deny
+    policy and `audit_logs_append_only` are what answer a change.
+54. Numbering is contiguous from 0001. A migration is never renumbered after it has been applied
     anywhere.
 
 ## Commands

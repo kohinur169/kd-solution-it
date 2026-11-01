@@ -503,6 +503,13 @@ handoff file.
   archived, `company_transactions` is corrected by a reversing entry rather than deleted,
   `processor_bills` stores a generated variance over the matched amount, and `compliance_items`
   moves its expiry and its last alert forward only.
+- STEP 035 gives the office its rows and closes the layer. `public.current_actor_roles()` and
+  `current_actor_has_role()` read the seven roles from `role_assignments` as the table owner, and
+  69 policies place them: `super_admin` full control, `finance_ops` the platform book,
+  `compliance_kyc` the compliance tables, `ceo` what it approves, `blogger` the public pages,
+  `support` none of the credentials, and a person its own session, device key and assignment.
+  `audit_logs` is readable by the office and by each merchant for its own company, and writable by
+  nobody: the deny policy and the append-only trigger both refuse a change.
 - STEP 034 gives the money tables the same treatment, but by command rather than `for all`. The
   thirteen money and ledger tables grant `select` to their merchant, `refunds`,
   `payout_bank_accounts` and `bank_change_requests` grant an insert pinned to the opening state
