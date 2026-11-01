@@ -152,6 +152,13 @@ token is verified from the auth gate, where the route inventory is.
 1. `"check:auth": "node lib/auth/verify.ts"` and `"check:security": "node lib/security/verify.ts"`
    inside `verify`, after `check:errors`. Both gates run only when a person runs them today.
 2. `dompurify` for the client-side rich text preview the CMS STEP will own.
+3. **`minimatch` in the ESLint toolchain.** GitHub reports one moderate Dependabot alert on the default
+   branch and `npm audit --omit=dev` reports **0 vulnerabilities**: everything it names is a transitive
+   dev dependency under `eslint-config-next` (`@typescript-eslint/typescript-estree`,
+   `eslint-plugin-import`, `eslint-plugin-jsx-a11y`, `eslint-plugin-react`), so nothing in the shipped
+   application is affected. Clearing it is a `package.json` and lockfile change, which no STEP may make;
+   it belongs to whoever owns the toolchain bump, and it is recorded here rather than left in a
+   notification nobody reads.
 
 ## Deliberately not done
 
