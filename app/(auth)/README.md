@@ -21,3 +21,9 @@ code from the authenticator app, or a backup code, and posts it with the challen
 `/api/auth/2fa/verify`, which is the only writer of the session cookie on that path. `/2fa` is the
 enrolment screen and `/api/auth/2fa/verify` is the sign in step: different routes, different
 prerequisites.
+
+/2fa/settings is the two factor settings screen of STEP 043: it shows whether the second factor is on,
+how many backup codes remain, and a form that replaces the whole set. The page reads the session and
+the account on the server (it is `force-dynamic`), so it renders three states - signed out,
+unavailable, ready - rather than a loading shell; the only client action posts to
+`/api/auth/2fa/backup-codes` with the current authenticator code.

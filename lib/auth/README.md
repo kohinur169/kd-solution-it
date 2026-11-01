@@ -191,6 +191,22 @@ the authority. A permission check uses the record, never a claim.
     cookie carrying `assuranceLevel: "aal2"` and `readSession` takes the higher of the payload and
     the claim. A backup code counts as a satisfied second factor, and spending it is audited.
 
+37. A fresh set of backup codes is a step up, not a refresh. `regenerateBackupCodes` requires the
+    session and the current TOTP code, because ten new codes are ten new ways into the account and a
+    stolen session must not be able to mint them. A wrong code is `VALIDATION_FAILED` with
+    `field: "code"`; an account without a confirmed factor is `CONFLICT`, and the screen offers
+    enrolment instead.
+38. The set is replaced whole, never appended to. `users.backup_code_hashes` is written in one
+    update, so an old code stops working at that instant; a code the screen says is dead has to be
+    dead. The audit entry records `issued` and `replaced` as counts, never a code, and the response is
+    the only place a new code exists in clear.
+39. The sealed box and the column it lives in are sized together. `isSecretBox` accepts a ciphertext
+    up to the widest column any table gives a box (`auth-challenges` after `0083`, 16 384
+    characters), because a box this module sealed must be a box this module can open: a smaller cap
+    than the column turns a legitimate value into "not a box this build wrote", which is a refusal no
+    operator can diagnose and no retry can fix. The gate seals a pair at the documented maxima and
+    completes a sign in with it.
+
 ## Adding an operation
 
 1. Add the method to the `AuthClient` or `AdminAuthClient` interface and its implementation,

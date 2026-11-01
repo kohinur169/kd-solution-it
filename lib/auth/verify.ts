@@ -39,6 +39,7 @@ import {
   startTotpEnrolment,
   twoFactorContext,
 } from "./two-factor.ts";
+import { readTwoFactorStatus, regenerateBackupCodes } from "./backup-codes.ts";
 import {
   challengeContext,
   completeTwoFactorChallenge,
@@ -4651,6 +4652,215 @@ async function checkTwoFactorLogin(): Promise<void> {
   expectEqual(challenged.attempts.attempts[0]?.factor, "password", "the attempt names the password factor");
 }
 
+/* ------------------------------------------ STEP 043: fresh backup codes */
+
+/**
+ * The settings action that replaces a set of backup codes.
+ *
+ * The double here keeps what a database keeps: the account row with its verifiers, and the single
+ * update the action writes. The checks read the row back afterwards, so "the old codes stopped
+ * working" is proved by verifying the old code against the new column rather than by trusting the
+ * call that replaced it.
+ */
+async function checkBackupCodeRegeneration(): Promise<void> {
+  const secret = generateTotpSecret();
+  const oldPlain = "abcde-fghjk";
+  const oldHashes: string[] = [
+    await hashPassword(normalizeBackupCode(oldPlain)),
+    await hashPassword(normalizeBackupCode("mnpqr-stuvw")),
+  ];
+  const updates: { table: string; query: string; values: Readonly<Record<string, unknown>> }[] = [];
+  const account = {
+    id: USER_ID,
+    company_id: FIRM_ID,
+    status: "active",
+    deleted_at: null as string | null,
+    totp_secret_ciphertext: packSecretBox(sealSecret(MASTER_KEY, secret, twoFactorContext(USER_ID))),
+    totp_confirmed_at: new Date(NOW - 86_400_000).toISOString() as string | null,
+    backup_code_hashes: oldHashes as readonly string[],
+  };
+  const rest: RestClient = {
+    select<TRow>(): Promise<readonly TRow[]> {
+      return Promise.resolve([{ ...account }] as unknown as readonly TRow[]);
+    },
+    insert: () => Promise.resolve(),
+    insertReturning: () => Promise.resolve([]),
+    update(table: string, query: string, values: Readonly<Record<string, unknown>>) {
+      updates.push({ table, query, values });
+      account.backup_code_hashes = values["backup_code_hashes"] as readonly string[];
+
+      return Promise.resolve();
+    },
+    rpc: () => Promise.resolve(null),
+  };
+  const audit = createInMemoryAuditTrail();
+  const dependencies = { rest, audit, masterKey: () => MASTER_KEY, now: () => NOW };
+  const key = base32Decode(secret) ?? new Uint8Array();
+  const goodCode = totpCodeForStep(key, totpStep(NOW));
+
+  const before = await readTwoFactorStatus({ userId: USER_ID }, dependencies);
+
+  expectEqual(before.enrolled, true, "a confirmed account reads as enrolled");
+  expectEqual(before.backupCodesRemaining, 2, "the status counts the verifiers, not the codes");
+  expectEqual(
+    before.confirmedAt,
+    new Date(NOW - 86_400_000).toISOString(),
+    "the status answers when the factor was confirmed",
+  );
+
+  const regenerated = await regenerateBackupCodes({ userId: USER_ID, code: goodCode }, dependencies);
+
+  expectEqual(regenerated.backupCodes.length, 10, "a regeneration issues ten codes");
+  expectEqual(new Set(regenerated.backupCodes).size, 10, "the ten codes are distinct");
+  expectEqual(regenerated.replaced, 2, "the answer says how many were replaced");
+  expectEqual(updates.length, 1, "a regeneration writes one row");
+  expectEqual(updates[0]?.table, "users", "the write is the account row");
+  expect(
+    (updates[0]?.query ?? "").includes(`id=eq.${USER_ID}`),
+    "the write names the account it belongs to",
+  );
+  expectEqual(account.backup_code_hashes.length, 10, "the column now holds ten verifiers");
+  expect(
+    !(await verifyPasswordHash(normalizeBackupCode(oldPlain), account.backup_code_hashes[0] ?? "")),
+    "an old code no longer verifies against the first new verifier",
+  );
+  expect(
+    !(await verifyPasswordHash(normalizeBackupCode(oldPlain), account.backup_code_hashes[9] ?? "")),
+    "an old code no longer verifies against the last new verifier",
+  );
+
+  let matchedNew = false;
+
+  for (const hash of account.backup_code_hashes) {
+    if (await verifyPasswordHash(normalizeBackupCode(regenerated.backupCodes[0] ?? ""), hash)) {
+      matchedNew = true;
+    }
+  }
+
+  expect(matchedNew, "a code from the new set verifies against the stored column");
+  expectEqual(audit.entries.length, 1, "a regeneration writes one audit entry");
+  expectEqual(audit.entries[0]?.action, "user.backup_codes_regenerated", "the entry names the action");
+  expectEqual(audit.entries[0]?.payload["issued"], 10, "the entry counts the codes issued");
+  expectEqual(audit.entries[0]?.payload["replaced"], 2, "the entry counts the codes replaced");
+  expectEqual(audit.entries[0]?.companyId, FIRM_ID, "the entry joins the tenant chain");
+
+  const after = await readTwoFactorStatus({ userId: USER_ID }, dependencies);
+
+  expectEqual(after.backupCodesRemaining, 10, "the status reflects the fresh set");
+
+  const wrongCode = await captureRejection(
+    () => regenerateBackupCodes({ userId: USER_ID, code: "000000" }, dependencies),
+    "a wrong authenticator code is refused",
+  );
+
+  expectEqual(wrongCode.code, "VALIDATION_FAILED", "a wrong code is a form failure");
+  expectEqual(wrongCode.details?.[0]?.field, "code", "the refusal names the code field");
+  expectEqual(updates.length, 1, "a wrong code writes nothing");
+  expectEqual(audit.entries.length, 1, "a wrong code audits nothing");
+
+  const malformed = await captureRejection(
+    () => regenerateBackupCodes({ userId: USER_ID, code: "12" }, dependencies),
+    "a malformed code is refused",
+  );
+
+  expectEqual(malformed.details?.[0]?.rule, "invalid_format", "a malformed code fails on its shape");
+
+  account.totp_confirmed_at = null;
+
+  await expectRejects(
+    () => regenerateBackupCodes({ userId: USER_ID, code: goodCode }, dependencies),
+    "CONFLICT",
+    "an account without a confirmed factor has nothing to regenerate",
+  );
+
+  const notEnrolled = await readTwoFactorStatus({ userId: USER_ID }, dependencies);
+
+  expectEqual(notEnrolled.enrolled, false, "the status says the factor is not on");
+  expectEqual(notEnrolled.backupCodesRemaining, 0, "an unenrolled account holds no codes");
+  expectEqual(notEnrolled.confirmedAt, null, "an unenrolled account has no confirmation instant");
+
+  account.totp_confirmed_at = new Date(NOW - 86_400_000).toISOString();
+  account.status = "suspended";
+
+  await expectRejects(
+    () => regenerateBackupCodes({ userId: USER_ID, code: goodCode }, dependencies),
+    "AUTHENTICATION_REQUIRED",
+    "a closed account cannot regenerate codes",
+  );
+  await expectRejects(
+    () => readTwoFactorStatus({ userId: USER_ID }, dependencies),
+    "AUTHENTICATION_REQUIRED",
+    "a closed account cannot read the status",
+  );
+
+  account.status = "active";
+  account.deleted_at = new Date(NOW).toISOString();
+
+  await expectRejects(
+    () => regenerateBackupCodes({ userId: USER_ID, code: goodCode }, dependencies),
+    "AUTHENTICATION_REQUIRED",
+    "a deleted account cannot regenerate codes",
+  );
+
+  account.deleted_at = null;
+
+  const emptyRest: RestClient = {
+    select: <TRow>(): Promise<readonly TRow[]> => Promise.resolve([]),
+    insert: () => Promise.resolve(),
+    insertReturning: () => Promise.resolve([]),
+    update: () => Promise.resolve(),
+    rpc: () => Promise.resolve(null),
+  };
+
+  await expectRejects(
+    () =>
+      readTwoFactorStatus(
+        { userId: USER_ID },
+        { rest: emptyRest, audit, masterKey: () => MASTER_KEY, now: () => NOW },
+      ),
+    "AUTHENTICATION_REQUIRED",
+    "an account the platform has no row for cannot read the status",
+  );
+
+  // The fresh set works where the account needs it: at the second factor of a sign in.
+  const login = twoFactorLoginFixture({ backupCodeHashes: account.backup_code_hashes });
+  login.state.user.totp_secret_ciphertext = account.totp_secret_ciphertext;
+  login.state.user.totp_confirmed_at = account.totp_confirmed_at;
+
+  const issued = await issueTwoFactorChallenge(
+    {
+      userId: USER_ID,
+      companyId: FIRM_ID,
+      session: {
+        accessToken: makeAccessToken(baseClaims()),
+        refreshToken: "refresh-token-000000000000000000",
+        expiresAtEpochMs: NOW + 3_600_000,
+        sessionId: SESSION_ID,
+      },
+      device: readDeviceContext(null),
+      remoteIp: "203.0.113.9",
+      userAgent: "gate",
+    },
+    login.dependencies,
+  );
+  const signedIn = await completeTwoFactorChallenge(
+    {
+      challengeToken: issued.token,
+      code: regenerated.backupCodes[3] ?? "",
+      remoteIp: "203.0.113.9",
+      userAgent: "gate",
+    },
+    login.dependencies,
+  );
+
+  expectEqual(signedIn.method, "backup_code", "a code from the fresh set signs in");
+  expectEqual(
+    login.state.user.backup_code_hashes.length,
+    9,
+    "using one of the fresh codes leaves nine",
+  );
+}
+
 /* ------------------------------------------------------------------ main */
 
 async function main(): Promise<void> {
@@ -4681,6 +4891,7 @@ async function main(): Promise<void> {
   checkQr();
   await checkTwoFactor();
   await checkTwoFactorLogin();
+  await checkBackupCodeRegeneration();
 
   if (failures.length > 0) {
     process.stderr.write(`auth gate failed with ${failures.length} problem(s):\n`);

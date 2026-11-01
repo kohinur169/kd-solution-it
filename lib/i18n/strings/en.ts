@@ -171,6 +171,24 @@ const catalog = {
     done: "I have saved the codes",
     enrolledTitle: "Two factor authentication is on",
     home: "Go to the home page",
+    settingsTitle: "Two factor settings",
+    settingsDescription:
+      "Backup codes are the way in when the authenticator app is lost. Each one works once, and a fresh set replaces every code you already have, so the old ones stop working the moment the new ones are shown.",
+    settingsStatusTitle: "Current state",
+    settingsEnrolled: "Two factor authentication is on for this account.",
+    settingsNotEnrolled:
+      "Two factor authentication is not on for this account yet, so there is no code set to replace.",
+    settingsEnrolLink: "Turn on two factor authentication",
+    settingsCodesRemaining: "{count} backup codes remain.",
+    settingsCodesNone:
+      "No backup codes remain. Generate a fresh set now, or you will need the recovery process if the app is lost.",
+    settingsStepUpTitle: "Confirm with the authenticator app",
+    settingsStepUpBody:
+      "Generating a set of codes is generating new ways into the account, so the platform asks for the current six digit code first. It is in the app under this account.",
+    settingsSubmit: "Generate new backup codes",
+    settingsSubmitting: "Generating codes",
+    settingsReplacedTitle: "The previous set no longer works",
+    settingsReplacedBody: "{count} codes were replaced. Any code you saved before now signs nobody in.",
     enrolledBody:
       "This account now needs the authenticator app, or one of the backup codes, to sign in. The next sign in from a new browser asks for the code.",
     alreadyEnrolled:
