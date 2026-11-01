@@ -1,4 +1,5 @@
 // path: lib/security/verify.ts
+import { randomBytes } from "node:crypto";
 import { readFile, readdir } from "node:fs/promises";
 import process from "node:process";
 import { AppError } from "../errors/app-error.ts";
@@ -62,6 +63,31 @@ import {
   SECURITY_HEADER_NAMES,
   type ResolvedHeader,
 } from "./headers.ts";
+import {
+  decryptFile,
+  encryptFile,
+  encryptionAad,
+  isEncryptionKey,
+  isEncryptionKeyId,
+  isFileEnvelope,
+  isSecretEnvelope,
+  openSecret,
+  readFileEnvelopeInfo,
+  sealSecret,
+  secretEnvelopeKeyId,
+  ENCRYPTION_AAD_PREFIX,
+  ENCRYPTION_CHUNK_BYTES,
+  ENCRYPTION_FILE_MAGIC,
+  ENCRYPTION_IV_BYTES,
+  ENCRYPTION_KEY_BYTES,
+  ENCRYPTION_MAXIMUM_ENVELOPE_BYTES,
+  ENCRYPTION_MAXIMUM_PLAINTEXT_BYTES,
+  ENCRYPTION_MAXIMUM_SCOPE_LENGTH,
+  ENCRYPTION_MAXIMUM_SECRET_BYTES,
+  ENCRYPTION_PURPOSES,
+  ENCRYPTION_SECRET_PREFIX,
+  ENCRYPTION_TAG_BYTES,
+} from "./encryption.ts";
 import {
   auditEntryProblem,
   auditPayloadBytes,
@@ -2842,6 +2868,502 @@ function objectKeysAfter(source: string, callText: string): readonly string[] {
   return [...block.matchAll(/^[ \t]+([a-z_]+)[ \t]*[:,]/gmu)].map((match) => String(match[1]));
 }
 
+/** ---- Encryption: one keyring, two envelopes, and the proof that neither can be edited. */
+
+const encryptionKeyOne = { id: "k1", secret: randomBytes(ENCRYPTION_KEY_BYTES).toString("base64") };
+const encryptionKeyTwo = { id: "k2", secret: randomBytes(ENCRYPTION_KEY_BYTES).toString("base64") };
+const encryptionKeyring = { primary: encryptionKeyOne } as const;
+const encryptionSecretContext = { purpose: "secret" as const, scope: "company:018f2b8a:taxcloud" };
+const encryptionFileContext = { purpose: "file" as const, scope: "company:018f2b8a:file:018f2b8a" };
+
+function encryptionBytes(length: number): Uint8Array {
+  return new Uint8Array(randomBytes(length));
+}
+
+function sameBytes(left: Uint8Array, right: Uint8Array): boolean {
+  return left.byteLength === right.byteLength && Buffer.compare(Buffer.from(left), Buffer.from(right)) === 0;
+}
+
+function flipped(bytes: Uint8Array, offset: number): Uint8Array {
+  const copy = Uint8Array.from(bytes);
+  const value = copy[offset] ?? 0;
+
+  copy[offset] = (value ^ 0xff) & 0xff;
+
+  return copy;
+}
+
+function encryptionReason(error: AppError | null): string {
+  const cause = error?.cause;
+
+  return typeof cause === "object" && cause !== null && "reason" in cause
+    ? String((cause as Record<string, unknown>)["reason"])
+    : "";
+}
+
+function checkEncryptionKeys(): void {
+  expectEqual(ENCRYPTION_KEY_BYTES, 32, "a key is thirty-two bytes");
+  expectEqual(ENCRYPTION_IV_BYTES, 12, "an initialisation vector is twelve");
+  expectEqual(ENCRYPTION_TAG_BYTES, 16, "and a tag sixteen");
+  expectEqual(ENCRYPTION_SECRET_PREFIX, "kd1", "a stored secret says which envelope it is");
+  expectEqual(ENCRYPTION_FILE_MAGIC, "KDF1", "and a stored file says so in its first four bytes");
+  expectEqual(ENCRYPTION_AAD_PREFIX, "kd-aad-v1", "the context binding is versioned too");
+  expectEqual(
+    encryptionAad({ purpose: "secret", scope: "company:1" }).toString("utf8"),
+    "kd-aad-v1|secret|company:1",
+    "and states the purpose and the scope it binds a value to",
+  );
+  expectEqual(ENCRYPTION_PURPOSES.join(","), "secret,file", "there are exactly two purposes");
+  expect(Object.isFrozen(ENCRYPTION_PURPOSES), "and the list cannot be extended at runtime");
+  expectEqual(ENCRYPTION_CHUNK_BYTES, 65_536, "a file is sealed in sixty-four kilobyte chunks");
+  expectEqual(
+    ENCRYPTION_MAXIMUM_PLAINTEXT_BYTES,
+    52_428_800,
+    "which is the ceiling the files table also states",
+  );
+  expectEqual(
+    ENCRYPTION_MAXIMUM_ENVELOPE_BYTES,
+    ENCRYPTION_MAXIMUM_PLAINTEXT_BYTES +
+      64 +
+      Math.ceil(ENCRYPTION_MAXIMUM_PLAINTEXT_BYTES / ENCRYPTION_CHUNK_BYTES) * ENCRYPTION_TAG_BYTES,
+    "the envelope ceiling allows one tag per chunk and a header",
+  );
+  expect(
+    ENCRYPTION_MAXIMUM_ENVELOPE_BYTES > ENCRYPTION_MAXIMUM_PLAINTEXT_BYTES,
+    "and is larger than the plaintext it carries",
+  );
+
+  expect(isEncryptionKey(encryptionKeyOne.secret), "a key read from the environment is a key");
+  expect(isEncryptionKey(encryptionKeyOne.secret.replace(/=+$/u, "")), "in either base64 spelling");
+  expectEqual(isEncryptionKey(randomBytes(31).toString("base64")), false, "thirty-one bytes is not a key");
+  expectEqual(isEncryptionKey(randomBytes(33).toString("base64")), false, "nor is thirty-three");
+  expectEqual(isEncryptionKey(""), false, "nor is nothing");
+  expectEqual(isEncryptionKey("not a key!"), false, "nor is text that is not base64");
+  expectEqual(isEncryptionKey(`${randomBytes(32).toString("base64")}AAAA`), false, "nor is a key with something appended");
+  expectEqual(isEncryptionKey("A".repeat(42)), false, "nor is a key of the wrong length that still decodes");
+
+  // A forty-three character base64 spelling carries two bits that no byte uses, so the same key has
+  // a second spelling. Refusing it is what makes "almost the right key" a boot time failure.
+  const base64Alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  const canonicalKey = encryptionKeyOne.secret.replace(/=+$/u, "");
+  const lastCharacter = canonicalKey.at(-1) ?? "";
+  const lastIndex = base64Alphabet.indexOf(lastCharacter);
+  const secondSpelling = [1, 2, 3]
+    .map((delta) => `${canonicalKey.slice(0, -1)}${base64Alphabet[(lastIndex & 0x3c) | ((lastIndex + delta) & 3)] ?? lastCharacter}`)
+    .find(
+      (candidate) =>
+        candidate !== canonicalKey &&
+        Buffer.from(candidate, "base64").equals(Buffer.from(canonicalKey, "base64")),
+    );
+
+  expect(secondSpelling !== undefined, "a key of thirty-two bytes has a second base64 spelling");
+  expectEqual(isEncryptionKey(secondSpelling ?? ""), false, "and that spelling is refused: almost the right key is a wrong key");
+
+  for (const id of ["k1", "audit-v1", "2026-11", "a-b-c-1"]) {
+    expect(isEncryptionKeyId(id), `${id} is a key id`);
+  }
+
+  for (const id of ["K1", "1", "a", "k_1", "k 1", "k1!", "a".repeat(33), ""]) {
+    expectEqual(isEncryptionKeyId(id), false, `${JSON.stringify(id)} is not a key id`);
+  }
+
+  const unknownKey = expectThrows(
+    () => openSecret(encryptionKeyring, sealSecret({ primary: encryptionKeyTwo }, "value", encryptionSecretContext), encryptionSecretContext),
+    "a value sealed with a key the ring does not hold is not opened",
+  );
+
+  expectEqual(encryptionReason(unknownKey), "key_unknown", "and the reason is the missing key, not the value");
+
+  expectThrows(
+    () =>
+      sealSecret(
+        { primary: encryptionKeyOne, previous: [encryptionKeyTwo, { id: "k2", secret: encryptionKeyOne.secret }] },
+        "value",
+        encryptionSecretContext,
+      ),
+    "two keys with one id is a ring that cannot be resolved",
+  );
+  expectThrows(
+    () => sealSecret({ primary: { id: "k1", secret: "short" } }, "value", encryptionSecretContext),
+    "a key that is not thirty-two bytes is refused when it is used",
+  );
+  expectThrows(
+    () => sealSecret({ primary: { id: "K1", secret: encryptionKeyOne.secret } }, "value", encryptionSecretContext),
+    "and so is a key id that cannot be stored",
+  );
+  expectEqual(
+    encryptionReason(
+      expectThrows(
+        () =>
+          sealSecret(
+            { primary: encryptionKeyOne, previous: Array.from({ length: 16 }, (_, index) => ({ id: `k${index + 10}`, secret: encryptionKeyOne.secret })) },
+            "value",
+            encryptionSecretContext,
+          ),
+        "a ring with more keys than a rotation needs is refused rather than searched",
+      ),
+    ),
+    "keyring_invalid",
+    "with the ring as the reason",
+  );
+}
+
+function checkEncryptionSecrets(): void {
+  const plaintexts = [
+    "",
+    "sk_live_9f2c",
+    "\u09ac\u09be\u0982\u09b2\u09be \u099f\u09c7\u0995\u09cd\u09b8\u099f",
+    "line one\nline two\ttabbed",
+    "x".repeat(ENCRYPTION_MAXIMUM_SECRET_BYTES),
+  ];
+
+  for (const plaintext of plaintexts) {
+    const envelope = sealSecret(encryptionKeyring, plaintext, encryptionSecretContext);
+
+    expectEqual(isSecretEnvelope(envelope), true, "a sealed secret is a secret envelope");
+    expectEqual(secretEnvelopeKeyId(envelope), "k1", "which names the key that sealed it");
+    expectEqual(envelope.split(".").length, 5, "in five parts");
+    expectEqual(envelope.split(".")[0], "kd1", "with the prefix of this format");
+    expectEqual(envelope.split(".")[2]?.length, 16, "a twelve byte vector");
+    expectEqual(envelope.split(".")[3]?.length, 22, "and a sixteen byte tag");
+    expectEqual(openSecret(encryptionKeyring, envelope, encryptionSecretContext), plaintext, "and it opens to what was sealed");
+  }
+
+  const tooLarge = expectThrows(
+    () => sealSecret(encryptionKeyring, "x".repeat(ENCRYPTION_MAXIMUM_SECRET_BYTES + 1), encryptionSecretContext),
+    "a secret larger than a setting is refused",
+  );
+
+  expectEqual(encryptionReason(tooLarge), "secret_too_large", "rather than written into a column that cannot hold it");
+
+  const sealed = sealSecret(encryptionKeyring, "same value", encryptionSecretContext);
+  const distinct = new Set(Array.from({ length: 20 }, () => sealSecret(encryptionKeyring, "same value", encryptionSecretContext)));
+
+  expectEqual(distinct.size, 20, "the same plaintext never produces the same envelope twice");
+  const opens = Array.from({ length: 5 }, () => openSecret(encryptionKeyring, sealed, encryptionSecretContext));
+
+  expect(opens.every((value) => value === "same value"), "and one envelope opens the same way every time");
+
+  const wrongScope = expectThrows(
+    () => openSecret(encryptionKeyring, sealed, { purpose: "secret", scope: "company:other:taxcloud" }),
+    "an envelope moved to another scope does not open",
+  );
+  const wrongPurpose = expectThrows(
+    () => openSecret(encryptionKeyring, sealed, { purpose: "file", scope: encryptionSecretContext.scope }),
+    "nor does one moved to another purpose",
+  );
+
+  expectEqual(encryptionReason(wrongScope), "authentication_failed", "and both are the same refusal");
+  expectEqual(encryptionReason(wrongPurpose), "authentication_failed", "with no hint which it was");
+
+  const parts = sealed.split(".");
+  const rebuild = (index: number, value: string): string => {
+    const copy = [...parts];
+
+    copy[index] = value;
+
+    return copy.join(".");
+  };
+
+  expectEqual(isSecretEnvelope(rebuild(0, "kd2")), false, "a later format version is not read hopefully");
+  expectEqual(isSecretEnvelope(rebuild(1, "K1")), false, "an envelope with an impossible key id is not an envelope");
+  expectEqual(isSecretEnvelope(rebuild(2, "short")), false, "nor is one with a short vector");
+  expectEqual(isSecretEnvelope(rebuild(3, "short")), false, "nor one with a short tag");
+  expectEqual(isSecretEnvelope(rebuild(4, "!!")), false, "nor one whose ciphertext is not base64url");
+  expectEqual(isSecretEnvelope(parts.slice(0, 4).join(".")), false, "nor one with a part missing");
+  expectEqual(isSecretEnvelope(`v1.${parts.slice(2).join(".")}`), false, "and the format of STEP 045 is not this one");
+
+  for (const index of [2, 3, 4]) {
+    const tampered = rebuild(index, `${(parts[index] ?? "").slice(0, -1)}${(parts[index] ?? "").endsWith("A") ? "B" : "A"}`);
+    let refused = !isSecretEnvelope(tampered);
+
+    // A part whose spare bits changed is still a well formed envelope and fails the tag; a part that
+    // is no longer canonical base64url is refused before a key is chosen. Both are refusals, and the
+    // corpus counts one check either way so the gate's total does not depend on a random byte.
+    if (!refused) {
+      try {
+        openSecret(encryptionKeyring, tampered, encryptionSecretContext);
+      } catch {
+        refused = true;
+      }
+    }
+
+    expect(refused, `a changed part ${index} is refused, by the shape of the envelope or by its tag`);
+  }
+
+  const movedKey = rebuild(1, "k2");
+  const movedFailure = expectThrows(
+    () => openSecret({ primary: encryptionKeyTwo, previous: [encryptionKeyOne] }, movedKey, encryptionSecretContext),
+    "an envelope relabelled with another key of the ring does not open",
+  );
+
+  expectEqual(encryptionReason(movedFailure), "authentication_failed", "because the key is not the one that sealed it");
+
+  const rotated = openSecret({ primary: encryptionKeyTwo, previous: [encryptionKeyOne] }, sealed, encryptionSecretContext);
+
+  expectEqual(rotated, "same value", "a ring with the old key as previous still opens what it sealed");
+  expectEqual(
+    secretEnvelopeKeyId(sealSecret({ primary: encryptionKeyTwo, previous: [encryptionKeyOne] }, "same value", encryptionSecretContext)),
+    "k2",
+    "and new values are sealed with the new key",
+  );
+
+  const contextRefusals: readonly unknown[] = [
+    { purpose: "secret", scope: "" },
+    { purpose: "secret", scope: "x".repeat(ENCRYPTION_MAXIMUM_SCOPE_LENGTH + 1) },
+    { purpose: "secret", scope: "company|x" },
+    { purpose: "secret", scope: "company\nx" },
+    { purpose: "document", scope: "company:1" },
+  ];
+
+  for (const context of contextRefusals) {
+    const failure = expectThrows(
+      () => sealSecret(encryptionKeyring, "value", context as { purpose: "secret"; scope: string }),
+      `the context ${JSON.stringify(context)} cannot name a place`,
+    );
+
+    expectEqual(encryptionReason(failure), "context_invalid", "and is refused rather than swapped");
+  }
+}
+
+function checkEncryptionFiles(): void {
+  const sizes = [0, 1, ENCRYPTION_CHUNK_BYTES - 1, ENCRYPTION_CHUNK_BYTES, ENCRYPTION_CHUNK_BYTES + 1, 2 * ENCRYPTION_CHUNK_BYTES + 7];
+
+  for (const size of sizes) {
+    const plaintext = encryptionBytes(size);
+    const copied = Uint8Array.from(plaintext);
+    const envelope = encryptFile(encryptionKeyring, plaintext, encryptionFileContext);
+    const info = readFileEnvelopeInfo(envelope);
+    const chunks = Math.max(1, Math.ceil(size / ENCRYPTION_CHUNK_BYTES));
+
+    expectEqual(isFileEnvelope(envelope), true, `a sealed file of ${size} bytes is a file envelope`);
+    expectEqual(envelope.byteLength, 26 + 2 + size + chunks * ENCRYPTION_TAG_BYTES, `the envelope of ${size} bytes is a header plus one tag per chunk`);
+    expectEqual(info?.plaintextBytes, size, `and it states its plaintext size of ${size}`);
+    expectEqual(info?.chunkCount, chunks, `in ${chunks} chunks`);
+    expectEqual(info?.keyId, "k1", "sealed with the primary key");
+    expectEqual(info?.chunkBytes, ENCRYPTION_CHUNK_BYTES, "and the chunk size this build writes");
+    expect(sameBytes(decryptFile(encryptionKeyring, envelope, encryptionFileContext), plaintext), `and it opens to the bytes that were sealed (${size})`);
+    expect(sameBytes(plaintext, copied), `while the caller's buffer is left alone (${size})`);
+    expect(Buffer.from(envelope).toString("utf8", 0, 4) === ENCRYPTION_FILE_MAGIC, "the first four bytes are the magic");
+  }
+
+  expectEqual(isFileEnvelope(encryptionBytes(100)), false, "random bytes are not an envelope");
+  expectEqual(isFileEnvelope(new Uint8Array(10)), false, "and neither is a short buffer");
+  expectEqual(isFileEnvelope(new TextEncoder().encode("KDF1 but not really a file envelope at all")), false, "nor is text that starts with the magic");
+  expectEqual(
+    readFileEnvelopeInfo(encryptFile(encryptionKeyring, new Uint8Array(0), encryptionFileContext))?.chunkCount,
+    1,
+    "an empty file is one chunk with no ciphertext",
+  );
+  expectEqual(
+    encryptFile(encryptionKeyring, new Uint8Array(0), encryptionFileContext).byteLength,
+    26 + 2 + ENCRYPTION_TAG_BYTES,
+    "and its envelope is a header and one tag",
+  );
+
+  const plaintext = encryptionBytes(2 * ENCRYPTION_CHUNK_BYTES + 10);
+  const envelope = encryptFile(encryptionKeyring, plaintext, encryptionFileContext);
+  const header = 26 + 2;
+  const firstChunkTag = header;
+  const secondChunkTag = header + ENCRYPTION_TAG_BYTES + ENCRYPTION_CHUNK_BYTES;
+  const headerEdits: readonly (readonly [string, Uint8Array])[] = [
+    ["the magic", (() => { const copy = Uint8Array.from(envelope); copy.set([0x4b, 0x44, 0x46, 0x32], 0); return copy; })()],
+    ["the version", (() => { const copy = Uint8Array.from(envelope); copy[4] = 2; return copy; })()],
+    ["the chunk size", flipped(envelope, 8)],
+    ["the stated size", flipped(envelope, 12)],
+  ];
+
+  // The header is part of every chunk's association data, so an edited header would also fail the
+  // tag. It is asserted here as a parse refusal, because that is the answer a caller needs: these
+  // bytes are not an envelope this build wrote, and no key is looked up to find out.
+  for (const [label, edited] of headerEdits) {
+    expectEqual(isFileEnvelope(edited), false, `a file whose ${label} was changed is not an envelope`);
+    expectEqual(readFileEnvelopeInfo(edited), null, `and has no envelope information for ${label}`);
+  }
+
+  const bodyEdits: readonly (readonly [string, Uint8Array])[] = [
+    ["the base vector", flipped(envelope, 16)],
+    ["the first tag", flipped(envelope, firstChunkTag)],
+    ["the first ciphertext byte", flipped(envelope, firstChunkTag + ENCRYPTION_TAG_BYTES)],
+    ["the second chunk tag", flipped(envelope, secondChunkTag)],
+    ["the last byte", flipped(envelope, envelope.byteLength - 1)],
+  ];
+
+  for (const [label, edited] of bodyEdits) {
+    const failure = expectThrows(
+      () => decryptFile(encryptionKeyring, edited, encryptionFileContext),
+      `a file whose ${label} was changed does not open`,
+    );
+
+    expectEqual(encryptionReason(failure), "authentication_failed", `${label} fails authentication`);
+  }
+
+  const withoutLastByte = envelope.subarray(0, envelope.byteLength - 1);
+
+  expectThrows(
+    () => decryptFile(encryptionKeyring, withoutLastByte, encryptionFileContext),
+    "a truncated file does not open",
+  );
+  expectThrows(
+    () => decryptFile(encryptionKeyring, envelope.subarray(0, header + ENCRYPTION_TAG_BYTES + ENCRYPTION_CHUNK_BYTES), encryptionFileContext),
+    "and neither does one whose last chunk was dropped",
+  );
+  expectThrows(
+    () => decryptFile(encryptionKeyring, Uint8Array.from([...envelope, 0]), encryptionFileContext),
+    "nor one with a byte appended",
+  );
+
+  const recordBytes = ENCRYPTION_TAG_BYTES + ENCRYPTION_CHUNK_BYTES;
+  const swapped = Uint8Array.from(envelope);
+  const firstRecord = Uint8Array.from(envelope.subarray(header, header + recordBytes));
+  const secondRecord = Uint8Array.from(envelope.subarray(header + recordBytes, header + 2 * recordBytes));
+
+  // Whole records move, not bodies: a body moved without its tag fails for a reason that has nothing
+  // to do with position, so only a whole record swap tests what the nonce is carrying.
+  secondRecord.forEach((value, index) => {
+    swapped[header + index] = value;
+  });
+  firstRecord.forEach((value, index) => {
+    swapped[header + recordBytes + index] = value;
+  });
+
+  expect(
+    sameBytes(decryptFile(encryptionKeyring, envelope, encryptionFileContext), plaintext),
+    "the untouched envelope still opens after the swap was built from it",
+  );
+
+  const promoted = Buffer.from(
+    Uint8Array.from(envelope.subarray(0, header + ENCRYPTION_TAG_BYTES + ENCRYPTION_CHUNK_BYTES)),
+  );
+
+  promoted.writeUInt32BE(ENCRYPTION_CHUNK_BYTES, 12);
+
+  const promotedFailure = expectThrows(
+    () => decryptFile(encryptionKeyring, promoted, encryptionFileContext),
+    "a file whose last chunk was dropped and whose size was edited to match does not open",
+  );
+
+  expectEqual(
+    encryptionReason(promotedFailure),
+    "authentication_failed",
+    "because the chunk that is now last never said it was",
+  );
+
+  const giant = new Uint8Array(ENCRYPTION_MAXIMUM_ENVELOPE_BYTES + 1);
+
+  expectEqual(isFileEnvelope(giant), false, "a buffer of the largest size this module could produce is still not an envelope without a header");
+  expect(
+    giant.byteLength > ENCRYPTION_MAXIMUM_PLAINTEXT_BYTES,
+    "and that bound is larger than the plaintext ceiling, because it carries the tags",
+  );
+
+  const reordered = expectThrows(
+    () => decryptFile(encryptionKeyring, swapped, encryptionFileContext),
+    "two whole records in the wrong order do not open, because the nonce carries the position",
+  );
+
+  expectEqual(encryptionReason(reordered), "authentication_failed", "as an authentication failure");
+
+  expectThrows(
+    () => decryptFile(encryptionKeyring, envelope, { purpose: "file", scope: "company:other:file:1" }),
+    "a file envelope moved to another scope does not open",
+  );
+
+  const unknownKey = expectThrows(
+    () => decryptFile({ primary: encryptionKeyTwo }, envelope, encryptionFileContext),
+    "and one sealed with a key the ring does not hold reports the missing key",
+  );
+
+  expectEqual(encryptionReason(unknownKey), "key_unknown", "rather than pretending the bytes are wrong");
+
+  const declaredTooLarge = Uint8Array.from(encryptFile(encryptionKeyring, encryptionBytes(4), encryptionFileContext));
+
+  // The stated size lives four bytes after the key id (10 + 2), and 0x04000000 is above the ceiling.
+  declaredTooLarge[12] = 0x04;
+  declaredTooLarge[13] = 0x00;
+  declaredTooLarge[14] = 0x00;
+  declaredTooLarge[15] = 0x00;
+
+  expectEqual(isFileEnvelope(declaredTooLarge), false, "a file that claims more bytes than the ceiling allows is not an envelope");
+
+  expectEqual(
+    readFileEnvelopeInfo(encryptFile({ primary: encryptionKeyTwo, previous: [encryptionKeyOne] }, encryptionBytes(10), encryptionFileContext))?.keyId,
+    "k2",
+    "a file sealed during a rotation names the new key",
+  );
+  expect(
+    sameBytes(
+      decryptFile({ primary: encryptionKeyTwo, previous: [encryptionKeyOne] }, envelope, encryptionFileContext),
+      plaintext,
+    ),
+    "and the old file still opens through the previous key",
+  );
+}
+
+async function checkEncryptionWiring(): Promise<void> {
+  const source = await readFile(new URL("./encryption.ts", import.meta.url), "utf8");
+  const authSecrets = await readFile(new URL("../auth/secrets.ts", import.meta.url), "utf8");
+  const manifest = await readFile(new URL("../env/manifest.ts", import.meta.url), "utf8");
+  const files = await readFile(new URL("../../migrations/0057_files.sql", import.meta.url), "utf8");
+
+  expect(source.includes('"aes-256-gcm"'), "the module uses AES-256-GCM and nothing else");
+  expectEqual(source.split('"aes-256-gcm"').length - 1, 4, "in exactly the four places it must: a cipher and a decipher for each half");
+  expect(source.includes('from "node:crypto"'), "the primitive comes from the platform");
+  expectEqual(source.includes("process.env"), false, "and the key never comes from the environment here");
+  expectEqual(source.includes("console."), false, "nothing is logged, so no plaintext is");
+  expectEqual(source.includes("createHash"), false, "this is encryption, not hashing");
+  expectEqual(source.includes("export ") && source.includes("decryptFile"), true, "the file half is exported");
+  expect(source.split(".fill(0)").length - 1 >= 5, "and every key buffer is zeroed on the way out");
+  expectEqual(source.includes("node:fs"), false, "the module touches no file system: it is given bytes");
+  expectEqual(source.includes("fetch("), false, "and makes no request");
+
+  expect(authSecrets.includes('"aes-256-gcm"'), "the STEP 045 module still uses the same primitive");
+  expect(authSecrets.includes('`v1.'), "with its own prefix");
+  expectEqual(source.includes('"v1.'), false, "which this module never writes");
+  expectEqual(
+    isSecretEnvelope("v1.AAAAAAAAAAAAAAAA.AAAAAAAAAAAAAAAAAAAAAA.AAAA"),
+    false,
+    "and never reads as its own",
+  );
+
+  const encryptionKey = manifest.slice(manifest.indexOf('name: "ENCRYPTION_MASTER_KEY"'));
+
+  expect(encryptionKey.startsWith('name: "ENCRYPTION_MASTER_KEY"'), "the environment declares the master key");
+  expect(encryptionKey.includes('format: "base64Key"'), "as base64");
+  expect(encryptionKey.includes("bytes: 32"), "of thirty-two bytes");
+  expectEqual(ENCRYPTION_KEY_BYTES, 32, "which is the length this module decodes");
+  expect(manifest.includes("Custodian is the CEO"), "and says in one sentence who holds it");
+
+  expect(
+    files.includes(`byte_size between 1 and ${ENCRYPTION_MAXIMUM_PLAINTEXT_BYTES}`),
+    "the file ceiling is the one the files table states",
+  );
+
+  const roots = [new URL("../../lib/", import.meta.url), new URL("../../app/", import.meta.url)];
+  const cryptoUsers: string[] = [];
+
+  for (const root of roots) {
+    const prefix = root.pathname.endsWith("/lib/") ? "lib/" : "app/";
+    const entries = (await readdir(root, { recursive: true }))
+      .map((entry) => entry.replaceAll("\\", "/"))
+      .filter((entry) => entry.endsWith(".ts") || entry.endsWith(".tsx"));
+
+    for (const entry of entries) {
+      const text = await readFile(new URL(entry, root), "utf8");
+
+      if (!entry.endsWith("verify.ts") && text.includes("aes-256-gcm")) {
+        cryptoUsers.push(`${prefix}${entry}`);
+      }
+    }
+  }
+
+  expectEqual(
+    cryptoUsers.sort().join(","),
+    "lib/auth/secrets.ts,lib/security/encryption.ts",
+    "exactly two modules encrypt anything in this repository",
+  );
+}
+
 async function checkTree(): Promise<void> {
   const securityRoot = new URL("./", import.meta.url);
   const securityFiles = (await readdir(securityRoot)).filter((name) => name.endsWith(".ts"));
@@ -2921,6 +3443,9 @@ async function main(): Promise<void> {
   checkAuditPolicy();
   checkAuditRedaction();
   checkAuditEntry();
+  checkEncryptionKeys();
+  checkEncryptionSecrets();
+  checkEncryptionFiles();
   await checkCspWiring();
   await checkSecurityHeaderWiring();
   await checkUploadWiring();
@@ -2929,6 +3454,7 @@ async function main(): Promise<void> {
   await checkAuditWriter();
   await checkAuditIntegrity();
   await checkAuditWiring();
+  await checkEncryptionWiring();
   await checkTree();
 
   if (failures.length > 0) {

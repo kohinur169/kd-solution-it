@@ -3,10 +3,11 @@
 
 Owner: STEP 056 (input sanitiser for text, rich text and URLs), STEP 057 (the double submit token),
 STEP 058 (the destination rule), STEP 059 (the Content Security Policy), STEP 060 (the security headers),
-STEP 061 (the upload validator), STEP 062 (the rate limiter) and STEP 063 (the audit writer). Later STEPs
-call these functions; they do not write a second escape, a second URL check, a second allowlist, a second
-CSRF token, a second DNS check, a second policy header, a second header table, a second file type check, a
-second counter or a second way to append to an audit chain.
+STEP 061 (the upload validator), STEP 062 (the rate limiter), STEP 063 (the audit writer) and STEP 064
+(the encryption service). Later STEPs call these functions; they do not write a second escape, a second
+URL check, a second allowlist, a second CSRF token, a second DNS check, a second policy header, a second
+header table, a second file type check, a second counter, a second way to append to an audit chain or a
+second cipher.
 
 | File | Purpose |
 | --- | --- |
@@ -22,6 +23,7 @@ second counter or a second way to append to an audit chain.
 | upload.ts | What a file must be before it is stored: purpose, size, magic bytes, and the quarantine verdict |
 | rate-limit.ts | How often one address, one account and one route may ask: three buckets, one counter, one decision |
 | audit.ts | How an entry enters the chain: the policy, the redaction, the link, and the proof the chain still verifies |
+| encryption.ts | AES-256-GCM for secrets and files: a keyring with rotation, a bound context, and a chunked file envelope |
 | verify.ts | The gate behind `npm run check:security`, and the attack corpus it runs |
 
 ## The four rules
@@ -153,6 +155,47 @@ response was a 500. Serving it is what found it, and the fix is the rule this fi
 `/_next/static/` and `/_next/image` are build output, because those are the paths the framework itself
 serves as files. Everything else is a document, and pays one nonce for the guarantee that a page can
 never be rendered without a policy.
+
+## What is encrypted, and with what
+
+`encryption.ts` is AES-256-GCM for two shapes: a **secret**, which is one value in a text column, and a
+**file**, which is up to 50 MB going to object storage. Both use the same keyring, and the keyring is the
+point.
+
+**A key id travels with the data.** The envelope names the key that sealed it - `kd1.<keyId>.<iv>.<tag>.
+<ciphertext>` for a secret, a four byte magic and a key id in the header for a file - so a rotation is
+"make the new key primary, keep the old one as `previous`, re-seal on the next write" rather than a
+deploy that makes every stored value unopenable. A ring with two keys of one id is refused at use time,
+because which of them wins would decide whether the data is readable afterwards.
+
+**The context is authenticated, not just the bytes.** The additional data is
+`kd-aad-v1|<purpose>|<scope>`, so a provider key sealed for one tenant's TaxCloud settings cannot be
+opened as another tenant's, and a file sealed for one invoice cannot be read under another. A copied
+ciphertext fails instead of returning one tenant's secret in another tenant's screen. A failure says
+only `authentication_failed`: telling a caller whether the key or the bytes were wrong tells an attacker
+whether a guessed key was the right one.
+
+**A file is a header and 64 KiB records.** Each record is its own AEAD value whose nonce carries its
+position and whose association data carries the whole header, including the plaintext size. So a file
+whose chunks were reordered fails, a file cut short fails the length comparison, and a file cut short
+*and* re-labelled with a smaller size fails because the header every remaining chunk was sealed under is
+no longer the one in front of it. The size in the header is what makes truncation visible at all.
+
+**Every character of an envelope means something.** A base64url decoder ignores the spare bits of a final
+character, so sixteen bytes travel in twenty-two characters of which the last carries two useful bits:
+without a canonical check, four different envelopes decode to the same tag. Each part is decoded and
+re-encoded, and a spelling that does not match is not an envelope. The same rule applies to keys - a
+32 byte key has a second base64 spelling, and "almost the right key" must be a boot time failure rather
+than a warehouse of values that cannot be opened.
+
+**Nothing secret leaves the function.** The key is decoded, used and zeroed in a `finally`; it is never
+read from the environment here, never cached in module state, and never appears in an error, and neither
+does the plaintext.
+
+The seam with STEP 045: `lib/auth/secrets.ts` still seals the Turnstile secret and the TOTP seeds in its
+older `v1.<iv>.<tag>.<ciphertext>` shape, which names no key. Nothing in this module reads or writes that
+shape, the gate asserts both, and a later STEP can move those values across by opening with the auth
+function and re-sealing here.
 
 ## How an entry enters the audit chain
 
