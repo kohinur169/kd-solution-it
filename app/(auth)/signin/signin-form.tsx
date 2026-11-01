@@ -9,6 +9,7 @@ import {
   readStoredDeviceProofKey,
 } from "@/lib/auth/device-proof-store";
 import { formatMessage, getMessage } from "@/lib/i18n/messages";
+import { rateLimitSentence } from "@/lib/auth/refusal-message";
 
 /**
  * The sign in form.
@@ -295,9 +296,11 @@ export function SigninForm({ siteKey, afterSigninPath }: SigninFormProperties): 
         // for a while, so the sentence names the lock and how long it lasts rather than asking for
         // the password again.
         setMessage(
-          response.status === 423
-            ? formatMessage("signin.locked", { minutes: String(lockedMinutes(payload)) })
-            : (readErrorMessage(payload) ?? getMessage("signin.unreadableResponse")),
+          response.status === 429
+            ? rateLimitSentence(payload)
+            : response.status === 423
+              ? formatMessage("signin.locked", { minutes: String(lockedMinutes(payload)) })
+              : (readErrorMessage(payload) ?? getMessage("signin.unreadableResponse")),
         );
         setSubmitting(false);
         resetChallenge();
@@ -362,11 +365,13 @@ export function SigninForm({ siteKey, afterSigninPath }: SigninFormProperties): 
         const payload: unknown = await response.json().catch(() => null);
 
         setMessage(
-          response.status === 423
-            ? formatMessage("signin.secondFactorLocked", { minutes: String(lockedMinutes(payload)) })
-            : response.status === 401
-              ? getMessage("signin.secondFactorRejected")
-              : (readErrorMessage(payload) ?? getMessage("signin.unreadableResponse")),
+          response.status === 429
+            ? rateLimitSentence(payload)
+            : response.status === 423
+              ? formatMessage("signin.secondFactorLocked", { minutes: String(lockedMinutes(payload)) })
+              : response.status === 401
+                ? getMessage("signin.secondFactorRejected")
+                : (readErrorMessage(payload) ?? getMessage("signin.unreadableResponse")),
         );
         setCode("");
         setVerifying(false);

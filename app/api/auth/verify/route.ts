@@ -5,6 +5,7 @@ import { withErrorResponse } from "@/lib/errors/respond";
 import { readClientAddress, readUserAgent } from "@/lib/auth/client-address";
 import { completeEmailVerification } from "@/lib/auth/email-verification";
 import { getAuthRuntime } from "@/lib/auth/runtime";
+import { enforceRateLimit } from "@/lib/auth/rate-limit";
 import { logger } from "@/lib/logger/logger";
 
 export const dynamic = "force-dynamic";
@@ -37,6 +38,10 @@ function statusUrl(request: Request, status: string): URL {
  * envelope and the structured log of STEP 008 apply to it.
  */
 export const GET = withErrorResponse(async (request: Request): Promise<Response> => {
+  // STEP 055: section 22 line 242. Counted first, so a burst costs one statement and
+  // never reaches the body, the session or the work behind them.
+  await enforceRateLimit({ request, scope: "verify" }, getAuthRuntime());
+
   const url = new URL(request.url);
   const runtime = getAuthRuntime();
 

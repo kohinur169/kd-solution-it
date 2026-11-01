@@ -86,6 +86,7 @@ import {
   anonymousRejection,
   anonymousSurfaceCodes,
   classifiedPaths,
+  isAllowedOnSurface,
   isCatalogCode,
   isDisclosingDetail,
 } from "./disclosure.ts";
@@ -98,6 +99,18 @@ import {
   SESSION_LIST_LIMIT,
   SESSION_MANAGEMENT_OFFICE_ROLES,
 } from "./session-list.ts";
+import {
+  canonicalClientAddress,
+  consumeRateLimit,
+  enforceRateLimit,
+  isRateLimitKeyHash,
+  RATE_LIMIT_AUDIT_ACTION,
+  RATE_LIMIT_POLICIES,
+  RATE_LIMIT_SCOPES,
+  RATE_LIMITED_PATHS,
+  rateLimitKeyHash,
+  rateLimitScopeForPath,
+} from "./rate-limit.ts";
 import { getMessage } from "../i18n/messages.ts";
 import type { Logger } from "../logger/logger.ts";
 import {
@@ -11911,19 +11924,8 @@ async function checkSessionList(): Promise<void> {
   }
 
   // ---- the routes and the pages, on disk
-  const appRoot = new URL("../../app/", import.meta.url);
-  const appEntries = await readdir(appRoot, { recursive: true });
-  const appSources = await Promise.all(
-    appEntries
-      .map((entry) => entry.replaceAll("\\", "/"))
-      .filter((entry) => entry.endsWith(".tsx") || entry.endsWith(".ts"))
-      .map(async (entry) => ({
-        path: `/${entry}`,
-        source: await readFile(new URL(entry, appRoot), "utf8"),
-      })),
-  );
-  const readApp = (path: string): string =>
-    appSources.find((file) => file.path === path)?.source ?? "";
+  const appSources = await readAppTree();
+  const readApp = (path: string): string => appSourceOf(appSources, path);
 
   const ownerRevokeRoute = readApp("/api/auth/sessions/revoke/route.ts");
   const officeRevokeRoute = readApp("/api/office/sessions/revoke/route.ts");
@@ -11987,6 +11989,401 @@ async function checkSessionList(): Promise<void> {
   );
 }
 
+/** Every `.ts` and `.tsx` file under `app/`, read once and keyed by its path from the app root. */
+async function readAppTree(): Promise<readonly { readonly path: string; readonly source: string }[]> {
+  const root = new URL("../../app/", import.meta.url);
+  const entries = await readdir(root, { recursive: true });
+
+  return Promise.all(
+    entries
+      .map((entry) => entry.replaceAll("\\", "/"))
+      .filter((entry) => entry.endsWith(".tsx") || entry.endsWith(".ts"))
+      .map(async (entry) => ({
+        path: `/${entry}`,
+        source: await readFile(new URL(entry, root), "utf8"),
+      })),
+  );
+}
+
+/** The source of one app file, or an empty string so a missing file fails its own assertion. */
+function appSourceOf(
+  sources: readonly { readonly path: string; readonly source: string }[],
+  path: string,
+): string {
+  return sources.find((file) => file.path === path)?.source ?? "";
+}
+
+/** The one statement `consume_rate_limit` answers with, as the REST client can return it. */
+function rateLimitAnswer(options: {
+  readonly allowed: boolean;
+  readonly remaining: number;
+  readonly retryAfterSeconds: number;
+  readonly firstRefusal: boolean;
+}): readonly Readonly<Record<string, unknown>>[] {
+  return [
+    {
+      allowed: options.allowed,
+      remaining: options.remaining,
+      retry_after_seconds: options.retryAfterSeconds,
+      first_refusal: options.firstRefusal,
+    },
+  ];
+}
+
+/**
+ * STEP 055: IP based rate limiting on the authentication endpoints.
+ *
+ * Two things are proved here, and they are the two a limiter can get wrong. The **policy** half is a
+ * statement about the tree: every auth route must name its scope, must call the limiter before it
+ * reads a body or a session, and no scope may exist without an endpoint. The **counting** half is a
+ * statement about the service: the address is canonicalised before it is hashed, a refusal is a `429`
+ * that carries the wait, an address-less request is refused rather than allowed, and the audit entry
+ * is written once per window rather than once per request.
+ *
+ * The database half - that `consume_rate_limit` increments and answers in one statement - cannot be
+ * proved by an in-memory double, which is why this check also reads `0092` and why the STEP carries a
+ * PGlite replay of the function beside it.
+ */
+async function checkRateLimit(): Promise<void> {
+  // ---- the catalog entry the screens and the headers depend on
+  expectEqual(ERROR_CODES.RATE_LIMITED.status, 429, "a limited request answers 429");
+  expectEqual(ERROR_CODES.RATE_LIMITED.retryable, true, "and is retryable, so the answer carries a wait");
+  expect(
+    isAllowedOnSurface("/api/auth/signin", "RATE_LIMITED"),
+    "an anonymous surface may already answer the code, so no disclosure rule changes",
+  );
+  expectEqual(
+    /^[a-z][a-z0-9]*(\.[a-z0-9_]+)+$/.test(RATE_LIMIT_AUDIT_ACTION),
+    true,
+    "the audit action matches the catalog pattern",
+  );
+  expect(RATE_LIMIT_AUDIT_ACTION.length <= 64, "and fits the audit action ceiling");
+
+  // ---- the policy: one scope per auth route, and no scope without a route
+  const authRoot = new URL("../../app/api/auth/", import.meta.url);
+  const authEntries = (await readdir(authRoot, { recursive: true }))
+    .map((entry) => entry.replaceAll("\\", "/"))
+    .filter((entry) => entry.endsWith("/route.ts"))
+    .sort();
+
+  expectEqual(authEntries.length, 14, "fourteen authentication routes exist");
+  expectEqual(
+    authEntries.length,
+    Object.keys(RATE_LIMITED_PATHS).length,
+    "and every one of them has a scope",
+  );
+  expectEqual(
+    RATE_LIMIT_SCOPES.length,
+    Object.keys(RATE_LIMITED_PATHS).length,
+    "no policy is written for an endpoint that does not exist",
+  );
+
+  for (const scope of RATE_LIMIT_SCOPES) {
+    const policy = RATE_LIMIT_POLICIES[scope];
+
+    expect(policy !== undefined, `the scope ${scope} has a policy`);
+    expect(Number.isInteger(policy.limit) && policy.limit >= 1, `the limit of ${scope} is a positive integer`);
+    expect(
+      Number.isInteger(policy.windowSeconds) && policy.windowSeconds >= 1 && policy.windowSeconds <= 86_400,
+      `the window of ${scope} is between a second and a day`,
+    );
+    expect(
+      RATE_LIMIT_SCOPES.includes(scope),
+      `the policy key ${scope} is a scope, so the two lists cannot drift`,
+    );
+  }
+
+  // Session rotation is the loosest because every open tab rotates; the reset request is the
+  // tightest because each one is a message to the office.
+  expectEqual(
+    RATE_LIMIT_POLICIES.session_rotate.limit,
+    Math.max(...RATE_LIMIT_SCOPES.map((scope) => RATE_LIMIT_POLICIES[scope].limit)),
+    "session rotation carries the loosest limit",
+  );
+  expectEqual(
+    RATE_LIMIT_POLICIES.two_factor_reset.limit,
+    Math.min(...RATE_LIMIT_SCOPES.map((scope) => RATE_LIMIT_POLICIES[scope].limit)),
+    "the second factor reset carries the tightest",
+  );
+
+  // ---- the routes, on disk
+  for (const [path, scope] of Object.entries(RATE_LIMITED_PATHS)) {
+    const routePath = `${path.replace("/api/auth/", "").slice(0)}/route.ts`;
+    const source = await readFile(new URL(routePath, authRoot), "utf8");
+
+    expectEqual(
+      source.split("enforceRateLimit(").length - 1,
+      1,
+      `${path} calls the limiter exactly once`,
+    );
+    expect(
+      source.includes(`scope: "${scope}"`),
+      `${path} is counted under its own scope`,
+    );
+    expect(
+      source.indexOf("enforceRateLimit(") < source.indexOf("request.text()") ||
+        !source.includes("request.text()"),
+      `${path} is counted before the body is read`,
+    );
+    expect(
+      source.indexOf("enforceRateLimit(") < source.indexOf("JSON.parse(") ||
+        !source.includes("JSON.parse("),
+      `${path} is counted before the body is parsed`,
+    );
+    expectEqual(
+      rateLimitScopeForPath(path),
+      scope,
+      `the scope lookup answers ${scope} for ${path}`,
+    );
+  }
+
+  expectEqual(rateLimitScopeForPath("/api/office/sessions"), null, "an office route is not an auth route");
+
+  // ---- one address, one key
+  expectEqual(
+    canonicalClientAddress("2001:0db8:0000:0000:0000:0000:0000:0001"),
+    "2001:db8::1",
+    "an IPv6 address is canonicalised before it is counted",
+  );
+  expectEqual(
+    canonicalClientAddress("::1"),
+    "::1",
+    "the loopback keeps its one spelling",
+  );
+  expectEqual(canonicalClientAddress("203.0.113.7"), "203.0.113.7", "an IPv4 address is unchanged");
+  expectEqual(
+    rateLimitKeyHash("2001:0db8::1"),
+    rateLimitKeyHash("2001:0db8:0000:0000:0000:0000:0000:0001"),
+    "two spellings of one address share one counter",
+  );
+  expectEqual(
+    rateLimitKeyHash("203.0.113.7").length,
+    64,
+    "the key is a sha256 in hex, so it fits the column check",
+  );
+  expect(
+    isRateLimitKeyHash(rateLimitKeyHash("203.0.113.7")),
+    "and is recognisable as one",
+  );
+  expectEqual(
+    rateLimitKeyHash("203.0.113.7").includes("203"),
+    false,
+    "the address itself is not in the key",
+  );
+
+  // ---- the count, as the service performs it
+  const calls: { readonly fn: string; readonly args: Readonly<Record<string, unknown>> }[] = [];
+  const allowedBody = rateLimitAnswer({ allowed: true, remaining: 2, retryAfterSeconds: 0, firstRefusal: false });
+  const refusedBody = rateLimitAnswer({ allowed: false, remaining: 0, retryAfterSeconds: 42, firstRefusal: true });
+  const counterRest: RestClient = {
+    async select<TRow>(): Promise<readonly TRow[]> {
+      throw new AppError("INTERNAL_ERROR");
+    },
+    async insert(): Promise<void> {
+      throw new AppError("INTERNAL_ERROR");
+    },
+    async insertReturning<TRow>(): Promise<readonly TRow[]> {
+      throw new AppError("INTERNAL_ERROR");
+    },
+    async update(): Promise<void> {
+      throw new AppError("INTERNAL_ERROR");
+    },
+    async rpc(functionName: string, arguments_: Readonly<Record<string, unknown>>): Promise<unknown> {
+      calls.push({ fn: functionName, args: arguments_ });
+
+      return arguments_["p_scope"] === "signin" ? refusedBody : allowedBody;
+    },
+  };
+
+  const allowedDecision = await consumeRateLimit(
+    { scope: "signup", address: "203.0.113.7" },
+    { rest: counterRest, audit: createInMemoryAuditTrail(), now: () => NOW },
+  );
+
+  expectEqual(allowedDecision.allowed, true, "an allowed answer is passed through");
+  expectEqual(allowedDecision.remaining, 2, "with what is left of the window");
+  expectEqual(allowedDecision.retryAfterSeconds, 0, "and no wait");
+  expectEqual(calls.at(-1)?.fn, "consume_rate_limit", "the decision is the function's, not the service's");
+  expectEqual(calls.at(-1)?.args["p_scope"], "signup", "the scope is the endpoint's name");
+  expectEqual(
+    calls.at(-1)?.args["p_limit"],
+    RATE_LIMIT_POLICIES.signup.limit,
+    "the limit sent is the policy's",
+  );
+  expectEqual(
+    calls.at(-1)?.args["p_window_seconds"],
+    RATE_LIMIT_POLICIES.signup.windowSeconds,
+    "the window sent is the policy's",
+  );
+  expectEqual(
+    calls.at(-1)?.args["p_now"],
+    new Date(NOW).toISOString(),
+    "the instant is the injected clock, so the window is testable",
+  );
+  expectEqual(
+    calls.at(-1)?.args["p_key_hash"],
+    rateLimitKeyHash("203.0.113.7"),
+    "the key sent is the hash of the address, never the address",
+  );
+
+  const wrongShape: RestClient = {
+    ...counterRest,
+    async rpc(): Promise<unknown> {
+      return { allowed: true };
+    },
+  };
+
+  await expectRejects(
+    () =>
+      consumeRateLimit(
+        { scope: "signin", address: "203.0.113.7" },
+        { rest: wrongShape, audit: createInMemoryAuditTrail() },
+      ),
+    "DEPENDENCY_FAILED",
+    "an answer the service cannot read is a dependency failure, not an allow",
+  );
+
+  // ---- the guard a route calls
+  const refusedAudit = createInMemoryAuditTrail();
+  const refusedRequest = new Request("https://example.test/api/auth/signin", {
+    method: "POST",
+    headers: { "x-forwarded-for": "203.0.113.7" },
+  });
+  const refusal = await captureRejection(
+    () => enforceRateLimit({ request: refusedRequest, scope: "signin" }, { rest: counterRest, audit: refusedAudit, now: () => NOW }),
+    "a limited request is refused",
+  );
+
+  expectEqual(refusal.code, "RATE_LIMITED", "with the code the catalog gives 429");
+  expectEqual(refusal.retryAfterSeconds, 42, "and the wait the counter answered");
+  expectEqual(refusedAudit.entries.length, 1, "the first refusal of a window is audited once");
+  expectEqual(refusedAudit.entries[0]?.action, RATE_LIMIT_AUDIT_ACTION, "under the rate limit action");
+  expectEqual(refusedAudit.entries[0]?.ipAddress, "203.0.113.7", "the audit entry names the address");
+  expectEqual(
+    (refusedAudit.entries[0]?.payload as { readonly scope?: unknown } | undefined)?.scope,
+    "signin",
+    "and the endpoint it was refused on",
+  );
+  expectEqual(refusedAudit.entries[0]?.actorUserId, null, "no account is named, because none was read");
+
+  const allowedAudit = createInMemoryAuditTrail();
+  await enforceRateLimit(
+    { request: refusedRequest, scope: "signup" },
+    { rest: counterRest, audit: allowedAudit, now: () => NOW },
+  );
+
+  expectEqual(allowedAudit.entries.length, 0, "an allowed request writes no audit entry");
+
+  const repeatRefusal = createInMemoryAuditTrail();
+  const repeatRest: RestClient = {
+    ...counterRest,
+    async rpc(): Promise<unknown> {
+      return rateLimitAnswer({ allowed: false, remaining: 0, retryAfterSeconds: 42, firstRefusal: false });
+    },
+  };
+
+  await expectRejects(
+    () =>
+      enforceRateLimit(
+        { request: refusedRequest, scope: "signin" },
+        { rest: repeatRest, audit: repeatRefusal, now: () => NOW },
+      ),
+    "RATE_LIMITED",
+    "a later refusal in the same window is refused too",
+  );
+  expectEqual(repeatRefusal.entries.length, 0, "and is not audited again, so an attack is one entry per window");
+
+  const addressless = new Request("https://example.test/api/auth/signin", { method: "POST" });
+
+  await expectRejects(
+    () =>
+      enforceRateLimit(
+        { request: addressless, scope: "signin" },
+        { rest: counterRest, audit: createInMemoryAuditTrail(), now: () => NOW },
+      ),
+    "SERVICE_UNAVAILABLE",
+    "a request that carries no address is refused rather than allowed unlimited",
+  );
+  expectEqual(
+    calls.filter((call) => call.args["p_scope"] === "signin" && call.args["p_now"] === undefined).length,
+    0,
+    "and the counter is not asked about an address that does not exist",
+  );
+
+  // ---- the sentence a screen shows for a refusal
+  const refusalSource = await readFile(new URL("./refusal-message.ts", import.meta.url), "utf8");
+
+  expectEqual(
+    refusalSource.includes('from "node:'),
+    false,
+    "the refusal sentence is client safe: it imports nothing from Node",
+  );
+  expect(
+    refusalSource.includes('formatMessage("rateLimit.waitWithMinutes"'),
+    "a long wait is said in minutes",
+  );
+  expect(
+    refusalSource.includes('formatMessage("rateLimit.wait"'),
+    "a short one in seconds",
+  );
+
+  const clientSources = await readAppTree();
+
+  for (const [path, file] of [
+    ["/api/auth/signin", "/(auth)/signin/signin-form.tsx"],
+    ["/api/auth/signup", "/(auth)/signup/signup-form.tsx"],
+    ["/api/auth/devices/confirm", "/(auth)/devices/confirm/device-confirm-form.tsx"],
+    ["/api/auth/sessions/revoke", "/(auth)/sessions/session-list.tsx"],
+    ["/api/office/sessions/revoke", "/office/sessions/office-session-list.tsx"],
+  ] as const) {
+    const source = appSourceOf(clientSources, file);
+
+    expect(
+      source.includes("rateLimitSentence("),
+      `the screen of ${path} says how long the wait is`,
+    );
+  }
+
+  expect(
+    appSourceOf(clientSources, "/office/2fa-reset-requests/office-reset-queue.tsx").includes(
+      "rateLimitSentence(",
+    ),
+    "the office decision screen says how long the wait is too",
+  );
+
+  // ---- the migration, on disk
+  const migration = await readFile(new URL("../../migrations/0092_rate_limit_windows.sql", import.meta.url), "utf8");
+  const rollback = await readFile(
+    new URL("../../migrations/0092_rate_limit_windows.down.sql", import.meta.url),
+    "utf8",
+  );
+
+  expect(migration.includes("create table public.rate_limit_windows"), "0092 creates the counter table");
+  expect(migration.includes("create function public.consume_rate_limit("), "and the one statement that moves it");
+  expect(
+    migration.includes("on conflict on constraint rate_limit_windows_scope_key_unique do update"),
+    "the increment is an upsert, so two simultaneous attempts serialise on the row",
+  );
+  expect(migration.includes("where counter_row.window_started_at < window_start"), "a lapsed window is reset in place");
+  expectEqual(
+    migration.split("set search_path = ''").length - 1,
+    1,
+    "the function pins its search path, so no caller can redirect it",
+  );
+  expectEqual(
+    migration.includes("security definer"),
+    false,
+    "it runs with the caller's rights, like every other function of this schema",
+  );
+  expectEqual(
+    migration.includes("delete from"),
+    false,
+    "a forward migration removes no rows; retention belongs to the cleanup job",
+  );
+  expect(rollback.includes("drop function if exists public.consume_rate_limit("), "the rollback drops the function");
+  expect(rollback.includes("drop table if exists public.rate_limit_windows;"), "and then the table");
+}
+
 async function main(): Promise<void> {
   checkConfig();
   checkClaims();
@@ -12027,6 +12424,7 @@ async function main(): Promise<void> {
   await checkDeviceTrust();
   await checkStepUp();
   await checkSessionList();
+  await checkRateLimit();
 
   if (failures.length > 0) {
     process.stderr.write(`auth gate failed with ${failures.length} problem(s):\n`);

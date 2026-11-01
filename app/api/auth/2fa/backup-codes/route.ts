@@ -6,6 +6,7 @@ import { readRequestActor } from "@/lib/auth/request-actor";
 import { regenerateBackupCodes } from "@/lib/auth/backup-codes";
 import { requireTrustedDevice, verifySensitiveRequest } from "@/lib/auth/request-proof";
 import { getAuthRuntime } from "@/lib/auth/runtime";
+import { enforceRateLimit } from "@/lib/auth/rate-limit";
 import { logger } from "@/lib/logger/logger";
 
 export const dynamic = "force-dynamic";
@@ -31,6 +32,10 @@ interface RegenerateResponseBody {
  */
 export const POST = withErrorResponse(
   async (request: Request): Promise<NextResponse<RegenerateResponseBody>> => {
+    // STEP 055: section 22 line 242. Counted first, so a burst costs one statement and
+    // never reaches the body, the session or the work behind them.
+    await enforceRateLimit({ request, scope: "backup_codes" }, getAuthRuntime());
+
     const declaredLength = request.headers.get("content-length");
 
     if (declaredLength !== null) {

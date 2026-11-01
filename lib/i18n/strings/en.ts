@@ -330,6 +330,11 @@ const catalog = {
     cancel: "Cancel",
     home: "Go to the home page",
   },
+  rateLimit: {
+    wait: "Too many attempts from this network. Try again in {seconds} seconds.",
+    waitWithMinutes: "Too many attempts from this network. Try again in {minutes} minutes.",
+    unavailable: "The platform could not count this attempt, so it was not performed. Try again in a moment.",
+  },
   sessions: {
     eyebrow: "Your account",
     title: "Signed in sessions",

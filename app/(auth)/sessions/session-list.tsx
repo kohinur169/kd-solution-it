@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { useState, type FormEvent, type ReactNode } from "react";
 import type { SessionView } from "@/lib/auth/session-list";
 import { deviceProofHeaders } from "@/lib/auth/device-proof-store";
+import { rateLimitSentence } from "@/lib/auth/refusal-message";
 import { formatMessage, getMessage } from "@/lib/i18n/messages";
 
 /**
@@ -35,7 +36,11 @@ function formatInstant(epochMs: number): string {
 }
 
 /** The refusal one status earns on this screen. */
-function messageForStatus(status: number): string {
+function messageForStatus(status: number, payload: unknown): string {
+  if (status === 429) {
+    return rateLimitSentence(payload);
+  }
+
   if (status === 403) {
     return getMessage("sessions.reauthRequired");
   }
@@ -113,7 +118,9 @@ export function SessionList({ sessions }: SessionListProperties): ReactNode {
       }
 
       if (!response.ok) {
-        setMessage(messageForStatus(response.status));
+        const refusal: unknown = await response.json().catch(() => null);
+
+        setMessage(messageForStatus(response.status, refusal));
         setBusyId(null);
 
         return;
@@ -150,7 +157,9 @@ export function SessionList({ sessions }: SessionListProperties): ReactNode {
       }
 
       if (!response.ok) {
-        setMessage(messageForStatus(response.status));
+        const refusal: unknown = await response.json().catch(() => null);
+
+        setMessage(messageForStatus(response.status, refusal));
         setBusyAll(false);
 
         return;

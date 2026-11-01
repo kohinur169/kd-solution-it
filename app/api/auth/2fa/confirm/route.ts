@@ -5,6 +5,7 @@ import { withErrorResponse } from "@/lib/errors/respond";
 import { getMessage } from "@/lib/i18n/messages";
 import { readRequestActor } from "@/lib/auth/request-actor";
 import { getAuthRuntime } from "@/lib/auth/runtime";
+import { enforceRateLimit } from "@/lib/auth/rate-limit";
 import { confirmTotpEnrolment } from "@/lib/auth/two-factor";
 import { logger } from "@/lib/logger/logger";
 
@@ -33,6 +34,10 @@ interface ConfirmResponseBody {
  */
 export const POST = withErrorResponse(
   async (request: Request): Promise<NextResponse<ConfirmResponseBody>> => {
+    // STEP 055: section 22 line 242. Counted first, so a burst costs one statement and
+    // never reaches the body, the session or the work behind them.
+    await enforceRateLimit({ request, scope: "two_factor_confirm" }, getAuthRuntime());
+
     const declaredLength = request.headers.get("content-length");
 
     if (declaredLength !== null) {

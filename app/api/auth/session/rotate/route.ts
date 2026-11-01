@@ -8,6 +8,7 @@ import { encodeSessionCookies } from "@/lib/auth/cookies";
 import { challengeDeviceTrust } from "@/lib/auth/device-trust";
 import { readBoundSession } from "@/lib/auth/request-actor";
 import { getAuthRuntime } from "@/lib/auth/runtime";
+import { enforceRateLimit } from "@/lib/auth/rate-limit";
 import { issueSessionToken } from "@/lib/auth/session-rotation";
 import { logger } from "@/lib/logger/logger";
 
@@ -65,6 +66,10 @@ interface RotationResponseBody {
  */
 export const POST = withErrorResponse(
   async (request: Request): Promise<NextResponse<RotationResponseBody>> => {
+    // STEP 055: section 22 line 242. Counted first, so a burst costs one statement and
+    // never reaches the body, the session or the work behind them.
+    await enforceRateLimit({ request, scope: "session_rotate" }, getAuthRuntime());
+
     const declaredLength = request.headers.get("content-length");
 
     if (declaredLength !== null) {

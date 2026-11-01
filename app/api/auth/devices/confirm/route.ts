@@ -7,6 +7,7 @@ import { readClientAddress, readUserAgent } from "@/lib/auth/client-address";
 import { confirmDeviceTrust } from "@/lib/auth/device-trust";
 import { readRequestActor } from "@/lib/auth/request-actor";
 import { getAuthRuntime } from "@/lib/auth/runtime";
+import { enforceRateLimit } from "@/lib/auth/rate-limit";
 import { logger } from "@/lib/logger/logger";
 
 export const dynamic = "force-dynamic";
@@ -61,6 +62,10 @@ interface ConfirmDeviceResponseBody {
  */
 export const POST = withErrorResponse(
   async (request: Request): Promise<NextResponse<ConfirmDeviceResponseBody>> => {
+    // STEP 055: section 22 line 242. Counted first, so a burst costs one statement and
+    // never reaches the body, the session or the work behind them.
+    await enforceRateLimit({ request, scope: "device_confirm" }, getAuthRuntime());
+
     const declaredLength = request.headers.get("content-length");
 
     if (declaredLength !== null) {

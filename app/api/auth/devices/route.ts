@@ -6,6 +6,7 @@ import { readClientAddress, readUserAgent } from "@/lib/auth/client-address";
 import { enrolDeviceProofKey } from "@/lib/auth/device-enrolment";
 import { readRequestActor } from "@/lib/auth/request-actor";
 import { getAuthRuntime } from "@/lib/auth/runtime";
+import { enforceRateLimit } from "@/lib/auth/rate-limit";
 import type { ProofKeyAlgorithm } from "@/lib/auth/proof-key";
 import { logger } from "@/lib/logger/logger";
 
@@ -46,6 +47,10 @@ interface EnrolledDeviceBody {
  */
 export const POST = withErrorResponse(
   async (request: Request): Promise<NextResponse<EnrolledDeviceBody>> => {
+    // STEP 055: section 22 line 242. Counted first, so a burst costs one statement and
+    // never reaches the body, the session or the work behind them.
+    await enforceRateLimit({ request, scope: "device_enroll" }, getAuthRuntime());
+
     const declaredLength = request.headers.get("content-length");
 
     if (declaredLength !== null) {

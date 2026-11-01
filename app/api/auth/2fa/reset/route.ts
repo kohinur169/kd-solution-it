@@ -5,6 +5,7 @@ import { withErrorResponse } from "@/lib/errors/respond";
 import { readClientAddress, readUserAgent } from "@/lib/auth/client-address";
 import { TWO_FACTOR_RESET_ACCEPTANCE, type TwoFactorResetAcceptance } from "@/lib/auth/disclosure";
 import { getAuthRuntime } from "@/lib/auth/runtime";
+import { enforceRateLimit } from "@/lib/auth/rate-limit";
 import { requestTwoFactorReset } from "@/lib/auth/two-factor-reset";
 import { logger } from "@/lib/logger/logger";
 
@@ -25,6 +26,10 @@ const maximumBodyBytes = 4_096;
  */
 export const POST = withErrorResponse(
   async (request: Request): Promise<NextResponse<TwoFactorResetAcceptance>> => {
+    // STEP 055: section 22 line 242. Counted first, so a burst costs one statement and
+    // never reaches the body, the session or the work behind them.
+    await enforceRateLimit({ request, scope: "two_factor_reset" }, getAuthRuntime());
+
     const declaredLength = request.headers.get("content-length");
 
     if (declaredLength !== null) {

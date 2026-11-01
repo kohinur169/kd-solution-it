@@ -4,6 +4,7 @@
 import { useState, type FormEvent, type ReactNode } from "react";
 import { getMessage } from "@/lib/i18n/messages";
 import { readStoredDeviceProofKey } from "@/lib/auth/device-proof-store";
+import { rateLimitSentence } from "@/lib/auth/refusal-message";
 
 /**
  * The merchant's side of a confirmation: one code from the authenticator app.
@@ -54,7 +55,11 @@ function readRule(payload: unknown): string | null {
 }
 
 /** The sentence one refusal earns, or the general one. */
-function messageForStatus(status: number, rule: string | null): string {
+function messageForStatus(status: number, rule: string | null, payload: unknown): string {
+  if (status === 429) {
+    return rateLimitSentence(payload);
+  }
+
   if (status === 403) {
     return getMessage("deviceConfirm.unknownDevice");
   }
@@ -122,7 +127,7 @@ export function DeviceConfirmForm({ label }: DeviceConfirmFormProperties): React
 
       const payload: unknown = await response.json().catch(() => null);
 
-      setMessage(messageForStatus(response.status, readRule(payload)));
+      setMessage(messageForStatus(response.status, readRule(payload), payload));
       setCode("");
       setBusy(false);
     } catch {

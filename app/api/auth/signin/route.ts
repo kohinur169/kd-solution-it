@@ -5,6 +5,7 @@ import { withErrorResponse } from "@/lib/errors/respond";
 import { readClientAddress, readUserAgent } from "@/lib/auth/client-address";
 import { signInMerchant } from "@/lib/auth/signin";
 import { getAuthRuntime } from "@/lib/auth/runtime";
+import { enforceRateLimit } from "@/lib/auth/rate-limit";
 import { logger } from "@/lib/logger/logger";
 
 export const dynamic = "force-dynamic";
@@ -51,6 +52,10 @@ function readDeclaredLength(request: Request): number | null {
  * records and a route that forgets would make the lock of STEP 045 depend on which handler answered.
  */
 export const POST = withErrorResponse(async (request: Request): Promise<NextResponse<SigninResponseBody>> => {
+  // STEP 055: section 22 line 242. Counted first, so a burst costs one statement and
+  // never reaches the body, the session or the work behind them.
+  await enforceRateLimit({ request, scope: "signin" }, getAuthRuntime());
+
   const declaredLength = readDeclaredLength(request);
 
   if (declaredLength !== null && declaredLength > maximumBodyBytes) {

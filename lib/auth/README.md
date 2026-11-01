@@ -473,6 +473,23 @@ the authority. A permission check uses the record, never a claim.
     that session without fetching an authenticator first. The office half -
     `POST /api/office/sessions/revoke` - does call it, because signing a merchant out of every device is
     an act on somebody else's account, which is the case section 22 names.
+87. The rate limit is a row, and one statement moves it. Section 22 line 242 limits the
+    authentication endpoints by address, and line 238 requires the counters to survive a restart, so
+    `public.rate_limit_windows` holds one row per `(scope, address hash)` and
+    `public.consume_rate_limit` increments it with a single `insert ... on conflict ... do update ...
+    where hits < limit`. A service that read the counter and wrote it back would lose increments under
+    exactly the burst the limit exists for. A lapsed window rewrites the same row, so a window costs
+    no rows.
+88. The address is hashed, canonicalised and never stored. The key is `sha256` of the address in the
+    one spelling the URL parser produces, because `2001:0db8::1` and `2001:0db8:0000::0001` are the
+    same machine and must share one counter. The address itself still reaches the audit entry, where
+    an operator needs it; the table stays a set of counters.
+89. A limiter that cannot count refuses. `enforceRateLimit` answers `SERVICE_UNAVAILABLE` when a
+    request carries no address and `DEPENDENCY_FAILED` when the function cannot be read, because
+    "the counter was unavailable, so the request was allowed" is the one behaviour that turns an
+    outage into permission. The refusal is `429` with `retry-after`, `RATE_LIMITED` is already in
+    `TRANSPORT_CODES`, and the audit entry `auth.rate_limited` is written once per window - the
+    counter is exact, so the record of an attack is one line rather than a copy of it.
 
 ## Adding an operation
 

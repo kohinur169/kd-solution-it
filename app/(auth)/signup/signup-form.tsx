@@ -3,6 +3,7 @@
 
 import Script from "next/script";
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { rateLimitSentence } from "@/lib/auth/refusal-message";
 import { formatMessage, getMessage } from "@/lib/i18n/messages";
 
 /**
@@ -182,11 +183,13 @@ export function SignupForm({ siteKey, policies }: SignupFormProperties): ReactNo
         const rule = readPasswordRule(payload);
 
         setMessage(
-          rule === "breached"
-            ? getMessage("signup.passwordBreached")
-            : rule !== null
-              ? getMessage("signup.passwordTooWeak")
-              : readErrorMessage(payload) ?? getMessage("signup.unreadableResponse"),
+          response.status === 429
+            ? rateLimitSentence(payload)
+            : rule === "breached"
+              ? getMessage("signup.passwordBreached")
+              : rule !== null
+                ? getMessage("signup.passwordTooWeak")
+                : readErrorMessage(payload) ?? getMessage("signup.unreadableResponse"),
         );
         setState("idle");
         resetChallenge();

@@ -4,6 +4,7 @@ import { AppError } from "@/lib/errors/app-error";
 import { withErrorResponse } from "@/lib/errors/respond";
 import { readClientAddress, readUserAgent } from "@/lib/auth/client-address";
 import { getAuthRuntime } from "@/lib/auth/runtime";
+import { enforceRateLimit } from "@/lib/auth/rate-limit";
 import { completeTwoFactorChallenge } from "@/lib/auth/two-factor-login";
 import { logger } from "@/lib/logger/logger";
 
@@ -43,6 +44,10 @@ function readString(body: unknown, key: string): string | null {
  */
 export const POST = withErrorResponse(
   async (request: Request): Promise<NextResponse<VerifyResponseBody>> => {
+    // STEP 055: section 22 line 242. Counted first, so a burst costs one statement and
+    // never reaches the body, the session or the work behind them.
+    await enforceRateLimit({ request, scope: "two_factor_verify" }, getAuthRuntime());
+
     const declaredLength = request.headers.get("content-length");
 
     if (declaredLength !== null) {

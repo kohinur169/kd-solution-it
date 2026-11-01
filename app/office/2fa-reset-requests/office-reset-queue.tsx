@@ -4,6 +4,7 @@
 import { useRouter } from "next/navigation";
 import { useState, type FormEvent, type ReactNode } from "react";
 import { deviceProofHeaders } from "@/lib/auth/device-proof-store";
+import { rateLimitSentence } from "@/lib/auth/refusal-message";
 import { formatMessage, getMessage } from "@/lib/i18n/messages";
 import type { TwoFactorResetRequestView } from "@/lib/auth/two-factor-reset";
 
@@ -37,7 +38,11 @@ const dangerButtonClassName =
   "mt-3 inline-flex items-center justify-center rounded-lg border border-destructive px-4 py-2 text-sm font-semibold text-destructive transition-opacity hover:opacity-80 disabled:opacity-60";
 
 /** The sentence a caller sees for a status code, in this screen's vocabulary. */
-function messageForStatus(status: number): string {
+function messageForStatus(status: number, payload: unknown): string {
+  if (status === 429) {
+    return rateLimitSentence(payload);
+  }
+
   if (status === 401) {
     return getMessage("officeReset.signedOut");
   }
@@ -100,7 +105,9 @@ function RequestCard({ request }: { readonly request: TwoFactorResetRequestView 
         body,
       });
       if (!response.ok) {
-        setMessage(messageForStatus(response.status));
+        const refusal: unknown = await response.json().catch(() => null);
+
+        setMessage(messageForStatus(response.status, refusal));
         setBusy(false);
 
         return;

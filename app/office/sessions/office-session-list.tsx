@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { useState, type ReactNode } from "react";
 import type { SessionView } from "@/lib/auth/session-list";
 import { deviceProofHeaders } from "@/lib/auth/device-proof-store";
+import { rateLimitSentence } from "@/lib/auth/refusal-message";
 import { getMessage } from "@/lib/i18n/messages";
 
 /**
@@ -51,6 +52,10 @@ function namesReauthentication(payload: unknown): boolean {
 }
 
 function messageForStatus(status: number, payload: unknown): string {
+  if (status === 429) {
+    return rateLimitSentence(payload);
+  }
+
   if (status === 403) {
     return namesReauthentication(payload)
       ? getMessage("officeSessions.reauthRequired")
