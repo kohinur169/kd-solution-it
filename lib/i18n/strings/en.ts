@@ -171,6 +171,8 @@ const catalog = {
     done: "I have saved the codes",
     enrolledTitle: "Two factor authentication is on",
     home: "Go to the home page",
+    settingsLink: "Backup code settings",
+    enrolLink: "Set up two factor authentication",
     settingsTitle: "Two factor settings",
     settingsDescription:
       "Backup codes are the way in when the authenticator app is lost. Each one works once, and a fresh set replaces every code you already have, so the old ones stop working the moment the new ones are shown.",

@@ -95,11 +95,14 @@ export default async function TwoFactorSettingsPage(): Promise<ReactNode> {
           </p>
         )}
 
-        <p className="mt-8 border-t border-border pt-4 text-sm">
+        <nav className="mt-8 flex flex-wrap gap-x-6 gap-y-2 border-t border-border pt-4 text-sm">
+          <Link className="font-semibold text-primary underline-offset-4 hover:underline" href="/2fa">
+            {getMessage("twoFactor.enrolLink")}
+          </Link>
           <Link className="font-semibold text-primary underline-offset-4 hover:underline" href="/">
             {getMessage("twoFactor.home")}
           </Link>
-        </p>
+        </nav>
       </section>
     </main>
   );
