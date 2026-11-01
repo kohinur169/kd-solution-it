@@ -1,9 +1,9 @@
 // path: lib/security/README.md
 # lib/security/
 
-Owner: STEP 056 (input sanitiser for text, rich text and URLs) and STEP 057 (the double submit
-token). Later STEPs call these functions; they do not write a second escape, a second URL check, a
-second allowlist or a second CSRF token.
+Owner: STEP 056 (input sanitiser for text, rich text and URLs), STEP 057 (the double submit token)
+and STEP 058 (the destination rule). Later STEPs call these functions; they do not write a second
+escape, a second URL check, a second allowlist, a second CSRF token or a second DNS check.
 
 | File | Purpose |
 | --- | --- |
@@ -13,6 +13,7 @@ second allowlist or a second CSRF token.
 | html.ts | The rich text allowlist: tokenise, filter, **rebuild**, escape |
 | csrf.ts | The server half of the double submit token: mint, cookie, compare, `requireCsrfToken` |
 | csrf-client.ts | The browser half: read the cookie, add the header, ask `/api/auth/csrf` when absent |
+| ssrf.ts | The destination rule: the allowlist, the resolver, and the three checks a URL must pass |
 | verify.ts | The gate behind `npm run check:security`, and the attack corpus it runs |
 
 ## The four rules
@@ -34,17 +35,39 @@ second allowlist or a second CSRF token.
    database, and it imports only `lib/errors` (inward). That is what lets the gate call it a thousand
    times without a fixture.
 
-## The SSRF rule has two halves
+## The SSRF rule has two halves, and both are here
 
 `host.ts` decides from the string: an IP literal outside the public ranges, or a name under a private
 suffix, or a single-label name, is refused. That is the half that is decidable before a connection.
 
-The half it cannot decide is DNS: a public name can resolve to `10.0.0.5`. **A caller that actually
-opens a connection must resolve the host first and pass the resolved address to `isPublicAddress`
-before dialling**, and must not follow a redirect to a host it has not checked. Any STEP that adds an
-outbound call to a URL a merchant supplied - webhooks, a KYC document link, a return URL - owns that
-second check; this module cannot do it from the string alone, and pretending otherwise is how SSRF
-gets through a library that looks complete.
+The half it cannot decide is DNS: a public name can resolve to `10.0.0.5`. STEP 058 is that half, in
+`ssrf.ts`, and its rule has three parts that must all hold:
+
+1. **The string** - `sanitizeHttpUrl` and `host.ts` doing what they already own. No range is listed a
+   second time in `ssrf.ts`; the gate asserts that it is not.
+2. **The allowlist** - a name that resolves publicly is not thereby a legitimate destination. The
+   policy names the hosts one process may reach: the project origin from the environment, the two
+   provider endpoints, and whatever a deployment adds. A wildcard, a CIDR, a bare address or a private
+   suffix is refused when the policy is *built*, because a policy is code and that is the only moment
+   anyone is watching.
+3. **The addresses** - the host is resolved and every address it answers with must be public. Every
+   one: the runtime picks one of them, and "the first answer was public" says nothing about the second.
+
+The answer is cached for one minute, and the cache holds the addresses rather than the verdict, so a
+cached answer is re-judged on every use. A destination that fails is not dialled: `lib/auth/http.ts`
+asks the guard before it builds a request, `redirect: "error"` means no hop is followed
+unguarded, and the auth gate asserts that a refused URL never reaches `fetch`.
+
+**What is still open** is the window between the lookup and the connection: a rebinding zone can answer
+public and connect private. Closing it needs the socket pinned to the checked address, which `fetch`
+does not expose without a dispatcher package; it is a package request in the STEP 058 handoff. The
+window is narrowed - a one-minute cache means a zone has to change its answer and keep it changed - and
+no caller of this transport follows redirects, which removes the hop that made the window famous.
+
+**The one exception** is a development deployment whose project origin is loopback: `allowLoopback` is
+true only when the environment is not production and the configured origin is on the machine itself,
+which is the same condition `lib/auth/config.ts` already uses for plain http. It does not widen the
+allowlist, and in production the sanitiser refuses a loopback host before this file is consulted.
 
 ## Why the CSRF module is split in two
 

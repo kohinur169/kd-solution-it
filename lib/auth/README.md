@@ -507,6 +507,21 @@ the authority. A permission check uses the record, never a claim.
     `lib/security/csrf-client.ts`, which imports nothing - `csrf.ts` would pull `node:crypto` into the
     bundle.
 
+93. Every call this module makes leaves through one door, and the door asks before it dials.
+    `createAuthHttp` takes an `outbound` policy with no default, checks the URL against it and resolves
+    the host through STEP 058's guard, and only then builds the request - so a poisoned
+    `SUPABASE_URL`, an edited provider endpoint or a name that resolves to the metadata service is a
+    `blocked` failure with no socket opened. `redirect: "error"` and `credentials: "omit"` stay: a hop
+    is never followed unguarded and the process's cookie jar never travels.
+94. The policy is the configuration's, never the caller's. `AuthConfig.outbound` is built in
+    `buildAuthConfig` from the project origin plus the two provider hosts, and
+    `createAuthHttpForConfig` takes its options without `outbound` so no caller can widen it. An
+    allowlist a caller can edit is a comment.
+95. A blocked destination is `DEPENDENCY_FAILED`, which is also what an unreachable provider answers.
+    The caller does not learn which rule refused the URL; `failure.code` carries the reason for the log,
+    the way an upstream code always has, and the sources of that kind - `registration.ts`,
+    `signin.ts`, `email-verification.ts`, `failures.ts` - each state it beside the network failure.
+
 ## Adding an operation
 
 1. Add the method to the `AuthClient` or `AdminAuthClient` interface and its implementation,

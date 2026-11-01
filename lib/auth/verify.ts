@@ -208,7 +208,19 @@ import {
   readUpstreamCode,
   toAuthAppError,
 } from "./failures.ts";
-import { createAuthHttp, type AuthAnswer, type AuthFetch, type AuthHttp } from "./http.ts";
+import {
+  createAuthHttp,
+  type AuthAnswer,
+  type AuthFetch,
+  type AuthHttp,
+  type AuthHttpOptions,
+} from "./http.ts";
+import {
+  createOutboundResolver,
+  OUTBOUND_PROVIDER_HOSTS,
+  outboundPolicy,
+  policyAllowsHost,
+} from "../security/ssrf.ts";
 import {
   claimsAreCurrent,
   decodeSessionClaims,
@@ -228,6 +240,7 @@ import {
 } from "./session.ts";
 import {
   BREACH_CHECK_ENABLED_SETTING,
+  BREACH_RANGE_ENDPOINT,
   breachHashParts,
   createBreachCheck,
   createFixedBreachCheck,
@@ -280,6 +293,7 @@ import {
   createTurnstileGuard,
   TURNSTILE_ENABLED_SETTING,
   TURNSTILE_SECRET_SETTING,
+  TURNSTILE_SITEVERIFY_URL,
 } from "./turnstile.ts";
 import type {
   ActorRecord,
@@ -1125,6 +1139,19 @@ function jsonResponse(body: unknown, status = 200, headers: Record<string, strin
   });
 }
 
+/**
+ * The transport the gate builds, with the options the production transport is required to state.
+ *
+ * Every proof below sends its request to a real configured endpoint on an allowlisted host, resolved
+ * by a stub: the SSRF guard of STEP 058 is part of the transport, so a test that skipped it would be
+ * testing a different object.
+ */
+const gateResolver = createOutboundResolver({ lookup: () => Promise.resolve(["1.1.1.1"]) });
+
+function gateHttp(options: Omit<AuthHttpOptions, "outbound" | "resolve">): AuthHttp {
+  return createAuthHttp({ ...options, outbound: config.outbound, resolve: gateResolver });
+}
+
 async function checkTransport(): Promise<void> {
   const seen: { url: string; init: RequestInit }[] = [];
   const fetchStub: AuthFetch = (url, init) => {
@@ -1132,7 +1159,7 @@ async function checkTransport(): Promise<void> {
 
     return Promise.resolve(jsonResponse({ ok: true }, 200, { "retry-after": "30" }));
   };
-  const http = createAuthHttp({ fetch: fetchStub });
+  const http = gateHttp({ fetch: fetchStub });
 
   const answer = await http.send({
     method: "POST",
@@ -1166,26 +1193,26 @@ async function checkTransport(): Promise<void> {
   expect(!call.url.includes("anon-key"), "no key is placed in a URL");
   expectEqual(answer.value.retryAfterSeconds, 30, "the retry-after header is read");
 
-  const emptyBody = await createAuthHttp({
+  const emptyBody = await gateHttp({
     fetch: () => Promise.resolve(new Response(null, { status: 204 })),
   }).send({ method: "POST", url: config.endpoints.logout, apiKey: config.anonymousKey });
 
   expect(emptyBody.ok && emptyBody.value.body === null, "an answer without a body is null");
 
-  const timeout = await createAuthHttp({
+  const timeout = await gateHttp({
     fetch: () => Promise.reject(new DOMException("timed out", "TimeoutError")),
   }).send({ method: "GET", url: config.endpoints.user, apiKey: config.anonymousKey });
 
   expect(!timeout.ok && timeout.failure.kind === "timeout", "a timeout is a timeout failure");
 
-  const network = await createAuthHttp({
+  const network = await gateHttp({
     fetch: () => Promise.reject(new TypeError("fetch failed")),
   }).send({ method: "GET", url: config.endpoints.user, apiKey: config.anonymousKey });
 
   expect(!network.ok && network.failure.kind === "network", "a socket failure is a network failure");
 
   const controller = new AbortController();
-  const cancelled = await createAuthHttp({
+  const cancelled = await gateHttp({
     fetch: () => {
       controller.abort();
 
@@ -1203,7 +1230,7 @@ async function checkTransport(): Promise<void> {
     "a call the caller cancelled is not reported as a timeout",
   );
 
-  const malformed = await createAuthHttp({
+  const malformed = await gateHttp({
     fetch: () => Promise.resolve(new Response("<html>gateway</html>", { status: 200 })),
   }).send({ method: "GET", url: config.endpoints.user, apiKey: config.anonymousKey });
 
@@ -1212,7 +1239,7 @@ async function checkTransport(): Promise<void> {
     "a body that is not JSON is a malformed answer",
   );
 
-  const oversizedDeclared = await createAuthHttp({
+  const oversizedDeclared = await gateHttp({
     fetch: () =>
       Promise.resolve(
         new Response("{}", { status: 200, headers: { "content-length": "70000" } }),
@@ -1224,7 +1251,7 @@ async function checkTransport(): Promise<void> {
     "a declared length over the ceiling is refused before reading",
   );
 
-  const oversizedBody = await createAuthHttp({
+  const oversizedBody = await gateHttp({
     maximumResponseBytes: 16,
     fetch: () => Promise.resolve(new Response(JSON.stringify({ value: "x".repeat(64) }))),
   }).send({ method: "GET", url: config.endpoints.user, apiKey: config.anonymousKey });
@@ -1234,7 +1261,7 @@ async function checkTransport(): Promise<void> {
     "a body over the ceiling is refused after reading",
   );
 
-  const noBody = await createAuthHttp({
+  const noBody = await gateHttp({
     fetch: (_url, init) => {
       expect(new Headers(init.headers).get("content-type") === null, "no body means no content type");
 
@@ -12665,6 +12692,166 @@ async function checkCsrfProtection(): Promise<void> {
   expect(browserSource.includes(CSRF_TOKEN_PATH), "and asks the one endpoint that issues a token");
 }
 
+/**
+ * STEP 058: the transport may only reach a decided destination.
+ *
+ * The library half lives in `lib/security/ssrf.ts` and is proved there. What this check adds is the
+ * wiring: that the configuration builds the allowlist, that the transport consults it before it dials,
+ * that a refused destination never reaches `fetch`, and that the two provider constants of earlier
+ * STEPs are on the list - because a guard that blocks the challenge endpoint is an outage, and a guard
+ * nobody wired is a comment.
+ */
+async function checkOutboundGuard(): Promise<void> {
+  const projectHost = new URL(config.projectUrl).hostname;
+
+  expect(config.outbound.allowedHosts.includes(projectHost), "the project host is on the transport allowlist");
+  expect(
+    config.outbound.allowedHosts.includes(OUTBOUND_PROVIDER_HOSTS.challenge[0] ?? ""),
+    "the challenge provider is on it",
+  );
+  expect(
+    config.outbound.allowedHosts.includes(OUTBOUND_PROVIDER_HOSTS.breach[0] ?? ""),
+    "and the breach corpus",
+  );
+  expectEqual(policyAllowsHost(config.outbound, "evil.gate"), false, "and a name nobody configured is not");
+  expectEqual(config.outbound.allowLoopback, false, "the test deployment is not a loopback one");
+  expect(
+    policyAllowsHost(config.outbound, new URL(TURNSTILE_SITEVERIFY_URL).hostname),
+    "the siteverify constant of STEP 041 passes the policy it is called with",
+  );
+  expect(
+    policyAllowsHost(config.outbound, new URL(BREACH_RANGE_ENDPOINT).hostname),
+    "and the breach constant of STEP 040",
+  );
+
+  const sent: string[] = [];
+  const record = (url: string): Promise<Response> => {
+    sent.push(url);
+
+    return Promise.resolve(jsonResponse({ ok: true }));
+  };
+
+  const guarded = createAuthHttp({
+    fetch: (url) => record(url),
+    outbound: config.outbound,
+    resolve: gateResolver,
+  });
+
+  const metadata = await guarded.send({
+    method: "GET",
+    url: "https://169.254.169.254/latest/meta-data/iam/security-credentials/",
+    apiKey: config.anonymousKey,
+  });
+
+  expect(!metadata.ok && metadata.failure.kind === "blocked", "a metadata URL is a blocked failure");
+  expect(!metadata.ok && metadata.failure.code === "private_host", "carrying the rule that refused it");
+  expectEqual(sent.length, 0, "and no request is sent at all");
+  expect(
+    !metadata.ok && toAuthAppError(metadata.failure).code === "DEPENDENCY_FAILED",
+    "the refusal answers the caller as a dependency failure",
+  );
+
+  const offList = await guarded.send({
+    method: "GET",
+    url: "https://evil.gate/rest/v1/users",
+    apiKey: config.anonymousKey,
+  });
+
+  expect(!offList.ok && offList.failure.kind === "blocked", "a host off the allowlist is blocked");
+  expect(!offList.ok && offList.failure.code === "host_not_allowed", "for the allowlist rule");
+  expectEqual(sent.length, 0, "and still no request is sent");
+
+  const plainHttp = await guarded.send({
+    method: "GET",
+    url: "http://project-ref.supabase.co/rest/v1/users",
+    apiKey: config.anonymousKey,
+  });
+
+  expect(!plainHttp.ok && plainHttp.failure.code === "unsupported_scheme", "plain http is blocked outside development");
+  expectEqual(sent.length, 0, "with no request sent");
+
+  const privateAnswer = createAuthHttp({
+    fetch: (url) => record(url),
+    outbound: config.outbound,
+    resolve: createOutboundResolver({ lookup: () => Promise.resolve(["10.0.0.5"]) }),
+  });
+
+  const rebound = await privateAnswer.send({
+    method: "GET",
+    url: config.endpoints.usersTable,
+    apiKey: config.serviceRoleKey,
+  });
+
+  expect(!rebound.ok && rebound.failure.kind === "blocked", "a name that answers with a private address is blocked");
+  expect(!rebound.ok && rebound.failure.code === "private_address", "for the address rule");
+  expectEqual(sent.length, 0, "and the socket is never opened");
+
+  const canonical = createAuthHttp({
+    fetch: (url) => record(url),
+    outbound: config.outbound,
+    resolve: gateResolver,
+  });
+
+  const answer = await canonical.send({
+    method: "GET",
+    url: "HTTPS://PROJECT-REF.SUPABASE.CO/rest/v1/users",
+    apiKey: config.anonymousKey,
+  });
+
+  expect(answer.ok, "an allowlisted host is reached whatever its spelling");
+  expectEqual(
+    sent[0],
+    "https://project-ref.supabase.co/rest/v1/users",
+    "and the transport dials the canonical form the guard decided on, not the string it was given",
+  );
+
+  const loopback = await createAuthHttp({
+    fetch: (url) => record(url),
+    outbound: outboundPolicy({ projectUrl: "http://127.0.0.1:54321", allowLoopback: true }),
+    resolve: gateResolver,
+  }).send({ method: "GET", url: "http://127.0.0.1:54321/auth/v1/token", apiKey: config.anonymousKey });
+
+  expect(loopback.ok, "a development transport reaches its container on loopback");
+
+  // ---- the source: the guard is before the socket, and there is one door
+  const httpSource = await readFile(new URL("./http.ts", import.meta.url), "utf8");
+  const configSource = await readFile(new URL("./config.ts", import.meta.url), "utf8");
+
+  expect(httpSource.includes("assertOutboundUrl(request.url"), "the transport asks the guard about the request URL");
+  expect(
+    httpSource.indexOf("assertOutboundUrl(") < httpSource.indexOf("doFetch("),
+    "before it builds the request, so a refused destination costs no socket",
+  );
+  expect(httpSource.includes('redirect: "error"'), "a redirect is an error: no hop is followed unguarded");
+  expect(httpSource.includes('credentials: "omit"'), "and no cookie jar of the process travels");
+  expect(httpSource.includes("outbound: config.outbound"), "the configured policy is the one the transport uses");
+  expect(configSource.includes("outboundPolicy("), "the policy is built beside the URL it belongs to");
+  expect(configSource.includes("allowLoopback: loopbackDevelopment"), "with the one development exception, stated once");
+
+  const libRoot = new URL("../../lib/", import.meta.url);
+  // The gates themselves are excluded: a certificate may write the word `fetch(` in an assertion
+  // about a certificate, and none of them is ever loaded by the application.
+  const libEntries = (await readdir(libRoot, { recursive: true }))
+    .map((entry) => entry.replaceAll("\\", "/"))
+    .filter((entry) => entry.endsWith(".ts") && !entry.endsWith("verify.ts"));
+
+  const dialling: string[] = [];
+
+  for (const entry of libEntries) {
+    const source = await readFile(new URL(entry, libRoot), "utf8");
+
+    if (/\bfetch\(/u.test(source)) {
+      dialling.push(entry);
+    }
+  }
+
+  expectEqual(
+    dialling.sort().join(","),
+    ["auth/device-proof-store.ts", "auth/http.ts", "security/csrf-client.ts"].join(","),
+    "the server has one door and the browser has its own, and no third module dials",
+  );
+}
+
 async function main(): Promise<void> {
   checkConfig();
   checkClaims();
@@ -12708,6 +12895,7 @@ async function main(): Promise<void> {
   await checkRateLimit();
   await checkSanitizerWiring();
   await checkCsrfProtection();
+  await checkOutboundGuard();
 
   if (failures.length > 0) {
     process.stderr.write(`auth gate failed with ${failures.length} problem(s):\n`);

@@ -135,6 +135,9 @@ export function toAuthAppError(failure: AuthFailure, context: AuthErrorContext =
     case "network":
     case "upstream":
     case "malformed-response":
+    case "blocked":
+      // A blocked destination is answered like an unreachable one: the caller is told the platform
+      // could not complete the call, and the reason the guard refused it stays in the log.
       return new AppError("DEPENDENCY_FAILED");
     case "rate-limited":
       return failure.retryAfterSeconds === null

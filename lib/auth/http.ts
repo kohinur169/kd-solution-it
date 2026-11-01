@@ -1,6 +1,12 @@
 // path: lib/auth/http.ts
 import { PLATFORM_SERVICE_SLUG } from "../constants/platform.ts";
 import {
+  assertOutboundUrl,
+  defaultOutboundResolver,
+  type OutboundPolicy,
+  type OutboundResolver,
+} from "../security/ssrf.ts";
+import {
   AUTH_MAXIMUM_RESPONSE_BYTES,
   AUTH_REQUEST_TIMEOUT_MS,
   type AuthConfig,
@@ -21,7 +27,11 @@ import type { AuthFailure, AuthOutcome } from "./types.ts";
  *   3. a response is bounded. The declared length is refused before the body is read and the
  *      actual length is checked after, so a hostile or broken endpoint cannot exhaust memory;
  *   4. a body that is not JSON is a typed failure, never an exception in a request handler,
- *      unless the caller asked for `text` because the endpoint answers plain text.
+ *      unless the caller asked for `text` because the endpoint answers plain text;
+ *   5. the destination is a decided one. STEP 058's guard checks the URL against the transport's
+ *      allowlist and resolves the host before any socket is opened, so a poisoned `SUPABASE_URL`, a
+ *      provider endpoint edited to a private address, or a name that resolves to the metadata service
+ *      is a `blocked` failure with no request sent - not a connection the platform regrets.
  *
  * The result carries the status and the parsed body, and nothing else. Deciding what a status
  * means is `failures.ts`, and the split matters: this file cannot accidentally decide that a
@@ -80,6 +90,15 @@ export interface AuthHttpOptions {
    * name keeps the platform's calls distinguishable from a browser's in the project log.
    */
   readonly clientInfo?: string;
+  /**
+   * The destinations this transport may reach.
+   *
+   * Required rather than defaulted: a transport with no stated allowlist is a transport that reaches
+   * anything, and the one way to make that impossible is to make it unrepresentable.
+   */
+  readonly outbound: OutboundPolicy;
+  /** DNS resolution, injected by the gate so no proof reaches the network. Defaults to the process. */
+  readonly resolve?: OutboundResolver;
 }
 
 /** An HTTP date is a legal `retry-after` value; a delay in seconds is what this module returns. */
@@ -204,16 +223,27 @@ async function readBoundedText(
  * Build the transport.
  *
  * The timeout and the ceiling default to the configured values, and both are injectable so the
- * gate can prove the behaviour without waiting ten seconds or building a megabyte body.
+ * gate can prove the behaviour without waiting ten seconds or building a megabyte body. The
+ * destination policy has no default: it is the one option a transport may not leave out.
  */
-export function createAuthHttp(options: AuthHttpOptions = {}): AuthHttp {
+export function createAuthHttp(options: AuthHttpOptions): AuthHttp {
   const timeoutMs = options.timeoutMs ?? AUTH_REQUEST_TIMEOUT_MS;
   const maximumResponseBytes = options.maximumResponseBytes ?? AUTH_MAXIMUM_RESPONSE_BYTES;
   const clientInfo = options.clientInfo ?? PLATFORM_SERVICE_SLUG;
   const doFetch: AuthFetch = options.fetch ?? ((url, init) => fetch(url, init));
+  const resolver = options.resolve ?? defaultOutboundResolver;
+  const outboundPolicy = options.outbound;
 
   return {
     async send(request: AuthRequest): Promise<AuthOutcome<AuthAnswer>> {
+      // Before the clock, before the body and before the headers: a destination that is not allowed is
+      // not worth a timeout, and a refused URL must never reach `fetch`.
+      const destination = await assertOutboundUrl(request.url, outboundPolicy, resolver);
+
+      if (!destination.ok) {
+        return { ok: false, failure: failureOf("blocked", null, destination.reason) };
+      }
+
       const timeoutSignal = AbortSignal.timeout(timeoutMs);
       const signal =
         request.signal === undefined
@@ -224,7 +254,7 @@ export function createAuthHttp(options: AuthHttpOptions = {}): AuthHttp {
       let response: Response;
 
       try {
-        response = await doFetch(request.url, {
+        response = await doFetch(destination.target.url, {
           method: request.method,
           headers: buildHeaders(request, clientInfo),
           // A redirect is a configuration error, and following one would send the key onward.
@@ -292,8 +322,14 @@ export function createAuthHttp(options: AuthHttpOptions = {}): AuthHttp {
 }
 
 /** The transport of a configured project. */
-export function createAuthHttpForConfig(config: AuthConfig, options: AuthHttpOptions = {}): AuthHttp {
+export function createAuthHttpForConfig(
+  config: AuthConfig,
+  options: Omit<AuthHttpOptions, "outbound" | "resolve"> = {},
+): AuthHttp {
   return createAuthHttp({
+    // The policy is the configuration's, never the caller's: an options object must not be able to
+    // widen the destinations of the process that built it.
+    outbound: config.outbound,
     timeoutMs: options.timeoutMs ?? config.requestTimeoutMs,
     maximumResponseBytes: options.maximumResponseBytes ?? config.maximumResponseBytes,
     ...(options.fetch === undefined ? {} : { fetch: options.fetch }),

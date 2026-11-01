@@ -153,6 +153,7 @@ function turnstileError(failure: AuthFailure): AppError {
     case "network":
     case "upstream":
     case "malformed-response":
+    case "blocked":
       return new AppError("DEPENDENCY_FAILED");
   }
 }
@@ -177,6 +178,7 @@ function providerError(failure: AuthFailure): AppError {
     case "network":
     case "upstream":
     case "malformed-response":
+    case "blocked":
       return new AppError("DEPENDENCY_FAILED");
   }
 }

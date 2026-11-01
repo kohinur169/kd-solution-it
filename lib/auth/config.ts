@@ -1,5 +1,6 @@
 // path: lib/auth/config.ts
 import { serverEnv } from "../env/server.ts";
+import { outboundPolicy, type OutboundPolicy } from "../security/ssrf.ts";
 import { deepFreeze } from "../utils/freeze.ts";
 
 /**
@@ -74,6 +75,13 @@ export interface AuthConfig {
   readonly requestTimeoutMs: number;
   readonly maximumResponseBytes: number;
   readonly endpoints: AuthEndpoints;
+  /**
+   * The destinations this process may reach with its identity and provider calls.
+   *
+   * Built here, with the URL it belongs to, because an allowlist that a caller can widen is not one.
+   * The transport reads it and refuses everything else; STEP 058's guard is what compares it.
+   */
+  readonly outbound: OutboundPolicy;
 }
 
 function isLoopbackHost(hostname: string): boolean {
@@ -162,6 +170,11 @@ export function buildAuthConfig(environment: AuthEnvironment): AuthConfig {
     throw new Error("SUPABASE_SERVICE_ROLE_KEY must not hold a publishable key");
   }
 
+  // The one exception the SSRF rule makes, and it is the same condition the plain http allowance
+  // above already uses: a development deployment whose identity provider is a container on loopback.
+  const loopbackDevelopment =
+    environment.NODE_ENV !== "production" && isLoopbackHost(new URL(projectUrl).hostname);
+
   const authBase = `${projectUrl}/auth/v1`;
   const restBase = `${projectUrl}/rest/v1`;
 
@@ -172,6 +185,7 @@ export function buildAuthConfig(environment: AuthEnvironment): AuthConfig {
     secureCookies: environment.NODE_ENV !== "development",
     requestTimeoutMs: AUTH_REQUEST_TIMEOUT_MS,
     maximumResponseBytes: AUTH_MAXIMUM_RESPONSE_BYTES,
+    outbound: outboundPolicy({ projectUrl, allowLoopback: loopbackDevelopment }),
     endpoints: {
       token: `${authBase}/token`,
       signUp: `${authBase}/signup`,

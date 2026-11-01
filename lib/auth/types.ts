@@ -231,6 +231,15 @@ export type SessionState =
 export type AuthFailureKind =
   | "timeout"
   | "network"
+  /**
+   * The destination was refused before a socket was opened: the SSRF guard of STEP 058 said no.
+   *
+   * It is a kind of its own rather than `network`, because the two facts are different and only one of
+   * them is worth waking someone for. A network failure is a provider having a bad day; a blocked
+   * destination is this platform's own allowlist saying the URL was never legitimate, which is a
+   * configuration fault, an attack, or both.
+   */
+  | "blocked"
   | "rate-limited"
   | "rejected"
   | "upstream"

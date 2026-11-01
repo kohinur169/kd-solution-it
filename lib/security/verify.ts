@@ -12,6 +12,20 @@ import {
 } from "./html.ts";
 import { BLOCKED_HOST_SUFFIXES, isIpLiteral, isPublicAddress, isPublicHost, isPublicHostname } from "./host.ts";
 import { escapeHtml, hasUnsafeCharacters, describeTextIssues, sanitizeFileName, sanitizeHeaderValue, sanitizeMultilineText, sanitizeSingleLineText, sanitizeSlug, TEXT_LIMITS } from "./text.ts";
+import {
+  assertOutboundUrl,
+  checkOutboundUrl,
+  createOutboundResolver,
+  isLoopbackHost,
+  OUTBOUND_PROVIDER_HOSTS,
+  OUTBOUND_RULE,
+  outboundPolicy,
+  outboundRefusal,
+  policyAllowsHost,
+  requireOutboundUrl,
+  type OutboundPolicy,
+  type OutboundRejectionReason,
+} from "./ssrf.ts";
 import { isSafeRedirect, requireHttpUrl, sanitizeHttpUrl, sanitizeRelativePath } from "./url.ts";
 
 /**
@@ -45,6 +59,18 @@ function expectEqual<T>(actual: T, expected: T, description: string): void {
   if (actual !== expected) {
     failures.push(`${description} (expected ${JSON.stringify(expected)}, received ${JSON.stringify(actual)})`);
   }
+}
+
+function expectRejects(action: () => void, description: string): void {
+  checks += 1;
+
+  try {
+    action();
+  } catch {
+    return;
+  }
+
+  failures.push(description);
 }
 
 function expectThrows(action: () => void, description: string): AppError | null {
@@ -322,6 +348,285 @@ function checkRichText(): void {
 }
 
 /** ---- The tree: one escaping function, one place that trusts markup. */
+
+
+/* ------------------------------------------------------------------ 6. the destination rule */
+
+/**
+ * The SSRF corpus of STEP 058.
+ *
+ * The first half is the string: every address and every spelling that has been used to reach a
+ * metadata service, a private range or the machine itself, plus the allowlist boundary that a suffix
+ * comparison gets wrong. The second half is the half that matters - a name that is public as a string
+ * and private as an address - because that is the case a sanitiser cannot see and this STEP exists to
+ * decide.
+ */
+function checkOutboundStrings(): OutboundPolicy {
+  const production = outboundPolicy({ projectUrl: "https://ref.supabase.co" });
+  const development = outboundPolicy({ projectUrl: "http://127.0.0.1:54321", allowLoopback: true });
+
+  expectEqual(production.allowLoopback, false, "a production policy allows no loopback");
+  expectEqual(production.allowedPorts.length, 0, "and no port beside the scheme default");
+  expect(production.allowedHosts.includes("ref.supabase.co"), "the project host is on the allowlist");
+  expect(
+    production.allowedHosts.includes(OUTBOUND_PROVIDER_HOSTS.challenge[0] ?? ""),
+    "the challenge provider is on it",
+  );
+  expect(
+    production.allowedHosts.includes(OUTBOUND_PROVIDER_HOSTS.breach[0] ?? ""),
+    "and so is the breach corpus",
+  );
+  expectEqual(development.allowLoopback, true, "a development policy on loopback allows it");
+  expect(
+    development.allowedHosts.includes("127.0.0.1") === false,
+    "and does not turn the address into an allowlist entry",
+  );
+  expectEqual(
+    development.allowedHosts.length,
+    production.allowedHosts.length - 1,
+    "so its list holds the two providers and no project host",
+  );
+  expectEqual(development.allowedPorts[0], "54321", "the development port comes from the project URL");
+
+  for (const entry of ["10.0.0.5", "169.254.169.254", "::1", "*.supabase.co", ".supabase.co", "localhost", "redis.internal", "payments", "ref.supabase.co:443", "ref.supabase.co/rest"]) {
+    expectRejects(
+      () => outboundPolicy({ projectUrl: "https://ref.supabase.co", extraHosts: [entry] }),
+      `the allowlist refuses ${JSON.stringify(entry)} as an entry`,
+    );
+  }
+
+  expectRejects(
+    () => outboundPolicy({ projectUrl: "http://127.0.0.1:54321" }),
+    "a loopback project URL is refused unless the policy says it is a development one",
+  );
+
+  expect(policyAllowsHost(production, "ref.supabase.co"), "a host matches itself");
+  expect(policyAllowsHost(production, "a.challenges.cloudflare.com"), "and a name under it, on a dot boundary");
+  expect(
+    policyAllowsHost(production, "challenges.cloudflare.com.evil.gate") === false,
+    "a name that merely ends with it does not",
+  );
+  expect(policyAllowsHost(production, "evilcloudflare.com") === false, "and neither does a name that runs into it");
+
+  const refusals: readonly (readonly [string, OutboundRejectionReason, OutboundPolicy])[] = [
+    ["http://ref.supabase.co/auth/v1/token", "unsupported_scheme", production],
+    ["javascript:alert(1)", "unsupported_scheme", production],
+    ["file:///etc/passwd", "unsupported_scheme", production],
+    ["gopher://ref.supabase.co/", "unsupported_scheme", production],
+    ["https://user:pass@ref.supabase.co/", "credentials", production],
+    ["https://ref.supabase.co:8080/", "unsupported_port", production],
+    ["https://127.0.0.1:5432/", "private_host", production],
+    ["https://[::1]/", "private_host", production],
+    ["https://[::ffff:127.0.0.1]/", "private_host", production],
+    ["https://169.254.169.254/latest/meta-data/iam/security-credentials/", "private_host", production],
+    ["https://10.0.0.5/", "private_host", production],
+    ["https://192.168.1.1/", "private_host", production],
+    ["https://172.16.0.1/", "private_host", production],
+    ["https://redis.internal/", "private_host", production],
+    ["https://metadata.google.internal/computeMetadata/v1/", "private_host", production],
+    ["https://localhost/", "private_host", production],
+    ["https://ref.supabase.co./rest/v1/", "private_host", production],
+    ["https://evil.gate/", "host_not_allowed", production],
+    ["https://ref.supabase.co.evil.gate/", "host_not_allowed", production],
+    ["https://xn--80ak6aa92e.com/", "host_not_allowed", production],
+    ["https://ref.supabase.co\\@evil.gate/", "backslash", production],
+    ["//ref.supabase.co/rest/v1/", "invalid_format", production],
+    ["not a url", "invalid_format", production],
+    ["http://127.0.0.1:54321/auth/v1/token", "unsupported_scheme", production],
+  ];
+
+  for (const [value, reason, policy] of refusals) {
+    const decision = checkOutboundUrl(value, policy);
+
+    expect(decision.ok === false, `${JSON.stringify(value)} is not a destination`);
+
+    if (!decision.ok) {
+      expectEqual(decision.reason, reason, `and is refused as ${reason}`);
+    }
+  }
+
+  const allowed: readonly (readonly [string, OutboundPolicy])[] = [
+    ["https://ref.supabase.co/auth/v1/token", production],
+    ["https://ref.supabase.co/rest/v1/users?select=id", production],
+    ["https://sub.ref.supabase.co/rest/v1/users", production],
+    ["https://challenges.cloudflare.com/turnstile/v0/siteverify", production],
+    ["https://api.pwnedpasswords.com/range/ABCDE", production],
+    ["http://127.0.0.1:54321/auth/v1/token", development],
+    ["http://localhost:54321/rest/v1/users", development],
+  ];
+
+  for (const [value, policy] of allowed) {
+    expect(checkOutboundUrl(value, policy).ok, `${JSON.stringify(value)} is a destination this policy allows`);
+  }
+
+  expect(
+    checkOutboundUrl("HTTPS://REF.SUPABASE.CO/auth/v1/token", production).ok,
+    "the host is compared lower cased",
+  );
+  expect(
+    checkOutboundUrl("http://redis.internal/", development).ok === false,
+    "a development policy still refuses a private name",
+  );
+  expect(
+    checkOutboundUrl("https://10.0.0.5/", development).ok === false,
+    "and still refuses a private address",
+  );
+  expect(
+    checkOutboundUrl("http://127.0.0.1:6379/", development).ok === false,
+    "and a loopback host on a port the project URL does not use",
+  );
+  expectEqual(isLoopbackHost("127.0.0.1"), true, "loopback is recognised as an address");
+  expectEqual(isLoopbackHost("localhost"), true, "as a name");
+  expectEqual(isLoopbackHost("::1"), true, "and as IPv6");
+  expectEqual(isLoopbackHost("128.0.0.1"), false, "and a near miss is not loopback");
+
+  return production;
+}
+
+/** The half that needs a resolver: a public name that answers with a private address. */
+async function checkOutboundAddresses(policy: OutboundPolicy): Promise<void> {
+  const answer = (addresses: readonly string[]) => () => Promise.resolve(addresses);
+
+  const resolved = await assertOutboundUrl(
+    "https://ref.supabase.co/auth/v1/token",
+    policy,
+    createOutboundResolver({ lookup: answer(["1.1.1.1", "93.184.216.34"]) }),
+  );
+
+  expect(resolved.ok, "a host whose every address is public is allowed");
+
+  const metadata = await assertOutboundUrl(
+    "https://ref.supabase.co/latest/meta-data/",
+    policy,
+    createOutboundResolver({ lookup: answer(["169.254.169.254"]) }),
+  );
+
+  expect(
+    metadata.ok === false && metadata.reason === "private_address",
+    "a name that resolves to the metadata service is refused",
+  );
+
+  const privateAddress = await assertOutboundUrl(
+    "https://ref.supabase.co/",
+    policy,
+    createOutboundResolver({ lookup: answer(["10.0.0.5"]) }),
+  );
+
+  expect(
+    privateAddress.ok === false && privateAddress.reason === "private_address",
+    "and one that resolves into a private range",
+  );
+
+  const mixed = await assertOutboundUrl(
+    "https://ref.supabase.co/",
+    policy,
+    createOutboundResolver({ lookup: answer(["1.1.1.1", "10.0.0.5"]) }),
+  );
+
+  expect(
+    mixed.ok === false && mixed.reason === "private_address",
+    "and so is a name that answers with one private address beside a public one",
+  );
+
+  const empty = await assertOutboundUrl(
+    "https://ref.supabase.co/",
+    policy,
+    createOutboundResolver({ lookup: answer([]) }),
+  );
+
+  expect(
+    empty.ok === false && empty.reason === "unresolvable",
+    "a name with no address is not resolved by assumption",
+  );
+
+  const failing = await assertOutboundUrl(
+    "https://ref.supabase.co/",
+    policy,
+    createOutboundResolver({ lookup: () => Promise.reject(new Error("ENOTFOUND")) }),
+  );
+
+  expect(failing.ok === false && failing.reason === "unresolvable", "a lookup that throws is a refusal, not a pass");
+
+  let asked = 0;
+  const unasked = await assertOutboundUrl(
+    "https://evil.gate/",
+    policy,
+    createOutboundResolver({
+      lookup: () => {
+        asked += 1;
+
+        return Promise.resolve(["1.1.1.1"]);
+      },
+    }),
+  );
+
+  expect(unasked.ok === false && unasked.reason === "host_not_allowed", "a host off the allowlist is refused");
+  expectEqual(asked, 0, "before a lookup is made, because the query is a leak of its own");
+
+  const cached = createOutboundResolver({ lookup: answer(["1.1.1.1"]) });
+
+  await assertOutboundUrl("https://ref.supabase.co/one", policy, cached);
+  await assertOutboundUrl("https://ref.supabase.co/two", policy, cached);
+
+  expectEqual(cached.lookups(), 1, "one host is looked up once inside the cache window");
+
+  let rebound = 0;
+  const rebinding = createOutboundResolver({
+    ttlMs: 0,
+    lookup: () => {
+      rebound += 1;
+
+      return Promise.resolve(rebound === 1 ? ["1.1.1.1"] : ["10.0.0.5"]);
+    },
+  });
+
+  expect(
+    (await assertOutboundUrl("https://ref.supabase.co/", policy, rebinding)).ok,
+    "the first answer of a rebinding zone is public",
+  );
+
+  const second = await assertOutboundUrl("https://ref.supabase.co/", policy, rebinding);
+
+  expect(
+    second.ok === false && second.reason === "private_address",
+    "and the answer that changed to a private address is refused",
+  );
+  expectEqual(rebinding.lookups(), 2, "because the cache expired, not because the first verdict was kept");
+
+  const bounded = createOutboundResolver({ limit: 1, lookup: answer(["1.1.1.1"]) });
+
+  await assertOutboundUrl("https://ref.supabase.co/one", policy, bounded);
+  await assertOutboundUrl("https://auth.ref.supabase.co/two", policy, bounded);
+
+  expectEqual(bounded.lookups(), 2, "the cache is bounded, so a policy with many hosts cannot grow it without limit");
+
+  const refusal = expectThrows(
+    () => {
+      throw outboundRefusal("private_host");
+    },
+    "a refusal is an application error",
+  );
+
+  expectEqual(refusal?.code, "VALIDATION_FAILED", "with the validation code");
+  expectEqual(refusal?.details[0]?.field, "url", "naming the url field");
+  expectEqual(refusal?.details[0]?.rule, OUTBOUND_RULE, "and the destination rule");
+
+  let thrown: AppError | null = null;
+
+  try {
+    await requireOutboundUrl("https://169.254.169.254/", policy);
+  } catch (error) {
+    thrown = error as AppError;
+  }
+
+  expectEqual(thrown?.code, "VALIDATION_FAILED", "the throwing wrapper refuses a metadata URL with the validation code");
+  expectEqual(
+    (thrown?.cause as { reason?: string } | undefined)?.reason,
+    "private_host",
+    "and keeps the reason as evidence for the log, which the response never serialises",
+  );
+}
+
 async function checkTree(): Promise<void> {
   const securityRoot = new URL("./", import.meta.url);
   const securityFiles = (await readdir(securityRoot)).filter((name) => name.endsWith(".ts"));
@@ -330,6 +635,7 @@ async function checkTree(): Promise<void> {
   expectEqual(securityFiles.includes("host.ts"), true, "the host rules are one file");
   expectEqual(securityFiles.includes("url.ts"), true, "the URL rules are one file");
   expectEqual(securityFiles.includes("html.ts"), true, "the rich text rules are one file");
+  expectEqual(securityFiles.includes("ssrf.ts"), true, "the destination rule is one file");
 
   const htmlSource = await readFile(new URL("./html.ts", import.meta.url), "utf8");
   const urlSource = await readFile(new URL("./url.ts", import.meta.url), "utf8");
@@ -339,6 +645,14 @@ async function checkTree(): Promise<void> {
   expect(urlSource.includes('from "./host.ts"'), "the URL module asks the host module about destinations");
   expect(urlSource.includes("node:crypto") === false, "the URL module needs no hashing");
   expectEqual(htmlSource.includes("dangerouslySetInnerHTML"), false, "the sanitiser never writes markup into a component");
+
+  const ssrfSource = await readFile(new URL("./ssrf.ts", import.meta.url), "utf8");
+
+  expect(ssrfSource.includes('from "node:dns/promises"'), "the destination rule resolves, because the string is not the answer");
+  expect(ssrfSource.includes('from "./url.ts"'), "it asks the URL module what the string is");
+  expect(ssrfSource.includes('from "./host.ts"'), "and the host module what an address is");
+  expectEqual(ssrfSource.includes("network: ["), false, "so no address range is written a second time here");
+  expectEqual(ssrfSource.includes("fetch("), false, "and it never dials: it decides, and the transport dials");
 
   const appRoot = new URL("../../", import.meta.url);
   const appEntries = (await readdir(appRoot, { recursive: true }))
@@ -378,6 +692,9 @@ async function main(): Promise<void> {
   checkHosts();
   checkUrls();
   checkRichText();
+  const outbound = checkOutboundStrings();
+
+  await checkOutboundAddresses(outbound);
   await checkTree();
 
   if (failures.length > 0) {
