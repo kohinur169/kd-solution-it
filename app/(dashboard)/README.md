@@ -24,6 +24,10 @@ Every read is scoped to the caller company and every write is audit logged.
   code list of `0077_mcc_codes.sql`; `services/kyc/merchant-category.ts`,
   `POST /api/onboarding/merchant-category`). The code is stored once on the business profile row, so
   onboarding and profile settings share the one field.
+- `onboarding/address/` - STEP 082: the registered address and contact person form
+  (`0105_business_address.sql` adds the nine address columns to `business_profiles`, with the
+  country pointed at `0076`'s enabled countries; `services/kyc/business-address.ts`,
+  `POST /api/onboarding/business-address`).
 
 ## The reader
 

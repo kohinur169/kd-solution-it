@@ -43,6 +43,24 @@ import {
   MERCHANT_CATEGORY_ONBOARDING_STEP,
   type MerchantCategorySnapshot,
 } from "./merchant-category.ts";
+import {
+  parseBusinessAddressInput,
+  readBusinessAddress,
+  saveBusinessAddress,
+  BUSINESS_ADDRESS_AUDIT_ACTION,
+  BUSINESS_ADDRESS_AUDIT_ENTITY,
+  BUSINESS_ADDRESS_FIELDS,
+  BUSINESS_ADDRESS_ONBOARDING_STEP,
+  COUNTRIES_TABLE,
+  OPTIONAL_ADDRESS_FIELDS,
+  REQUIRED_ADDRESS_FIELDS,
+  ADDRESS_FIELD_LIMITS,
+  COUNTRY_CODE_PATTERN,
+  EMAIL_PATTERN,
+  PHONE_PATTERN,
+  POSTAL_CODE_PATTERN,
+  type BusinessAddressSnapshot,
+} from "./business-address.ts";
 import { PLATFORM_PROVIDERS } from "../../lib/gateways/registry.ts";
 import {
   ONBOARDING_AUDIT_ACTION,
@@ -813,8 +831,9 @@ async function checkMigrationSet(): Promise<void> {
   expectEqual(numbers.includes("0102"), true, "STEP 079's migration is in the set");
   expectEqual(numbers.includes("0103"), true, "STEP 080's is too");
   expectEqual(numbers.includes("0104"), true, "STEP 081's is too");
-  expectEqual(numbers.includes("0105"), false, "and nothing beyond them");
-  expectEqual(Math.max(...numbers.map((number) => Number.parseInt(number, 10))), 104, "the set ends at 0104");
+  expectEqual(numbers.includes("0105"), true, "STEP 082's is too");
+  expectEqual(numbers.includes("0106"), false, "and nothing beyond them");
+  expectEqual(Math.max(...numbers.map((number) => Number.parseInt(number, 10))), 105, "the set ends at 0105");
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -831,6 +850,16 @@ interface BusinessRowShape {
   website: string | null;
   business_description: string | null;
   mcc_code: string | null;
+  address_line1: string | null;
+  address_line2: string | null;
+  city: string | null;
+  state_province: string | null;
+  postal_code: string | null;
+  country_code: string | null;
+  contact_name: string | null;
+  contact_email: string | null;
+  contact_phone: string | null;
+  address_completed_at: string | null;
   completed_at: string | null;
   updated_at: string;
 }
@@ -856,6 +885,7 @@ interface BusinessDatabase {
   readonly profileRows: BusinessRowShape[];
   readonly onboardingRows: ProgressRowShape[];
   readonly mccRows: MccRowShape[];
+  readonly countryRows: CountryRowShape[];
   readonly queries: string[];
   readonly inserts: { readonly table: string; readonly row: Readonly<Record<string, unknown>> }[];
   readonly updates: {
@@ -877,6 +907,16 @@ function businessRow(overrides: Partial<BusinessRowShape> = {}): BusinessRowShap
     website: null,
     business_description: null,
     mcc_code: null,
+    address_line1: null,
+    address_line2: null,
+    city: null,
+    state_province: null,
+    postal_code: null,
+    country_code: null,
+    contact_name: null,
+    contact_email: null,
+    contact_phone: null,
+    address_completed_at: null,
     completed_at: null,
     updated_at: "2026-11-01T09:30:00.000Z",
     ...overrides,
@@ -887,11 +927,13 @@ function createBusinessDatabase(
   profileRows: readonly BusinessRowShape[] = [],
   onboardingRows: readonly ProgressRowShape[] = [],
   mccRows: readonly MccRowShape[] = defaultMccRows(),
+  countryRows: readonly CountryRowShape[] = defaultCountryRows(),
 ): BusinessDatabase {
   return {
     profileRows: [...profileRows],
     onboardingRows: [...onboardingRows],
     mccRows: [...mccRows],
+    countryRows: [...countryRows],
     queries: [],
     inserts: [],
     updates: [],
@@ -909,6 +951,35 @@ const EMPTY_PROFILE_COLUMNS = [
   "business_description",
 ] as const;
 
+/** The address and contact columns of `0105`, which the address service patches. */
+const ADDRESS_PROFILE_COLUMNS = [
+  "address_line1",
+  "address_line2",
+  "city",
+  "state_province",
+  "postal_code",
+  "country_code",
+  "contact_name",
+  "contact_email",
+  "contact_phone",
+] as const;
+
+/** One row of the `0076` country list, as the fake store holds it. `deleted_at` is always null. */
+interface CountryRowShape {
+  code: string;
+  name: string;
+  is_enabled: boolean;
+}
+
+/** The country list the address gate works against: two enabled and one switched off. */
+function defaultCountryRows(): CountryRowShape[] {
+  return [
+    { code: "BD", name: "Bangladesh", is_enabled: true },
+    { code: "US", name: "United States", is_enabled: true },
+    { code: "AQ", name: "Antarctica", is_enabled: false },
+  ];
+}
+
 function profileRowFrom(companyId: string, values: Readonly<Record<string, unknown>>): BusinessRowShape {
   const stored = businessRow({ company_id: companyId, updated_at: new Date(NOW).toISOString() });
 
@@ -922,6 +993,20 @@ function profileRowFrom(companyId: string, values: Readonly<Record<string, unkno
 
   const mcc = values["mcc_code"];
   stored.mcc_code = typeof mcc === "string" ? mcc : null;
+
+  for (const column of ADDRESS_PROFILE_COLUMNS) {
+    if (!(column in values)) {
+      continue;
+    }
+
+    const value = values[column];
+    stored[column] = typeof value === "string" ? value : null;
+  }
+
+  if ("address_completed_at" in values) {
+    const completed = values["address_completed_at"];
+    stored.address_completed_at = typeof completed === "string" ? completed : null;
+  }
 
   return stored;
 }
@@ -963,6 +1048,38 @@ function createBusinessStore(database: BusinessDatabase): RestClient {
         if (codeFilter !== undefined) {
           const wanted = decodeURIComponent(codeFilter.slice("code=eq.".length));
           matched = matched.filter((row) => row.code === wanted);
+        }
+
+        if (ordered) {
+          matched = [...matched].sort((left, right) => left.code.localeCompare(right.code));
+        }
+
+        const capped =
+          limit === undefined
+            ? matched
+            : matched.slice(0, Number.parseInt(limit.slice("limit=".length), 10));
+
+        return Promise.resolve(capped.map((row) => schema.parse(row)));
+      }
+
+      // The country list of `0076` is a platform table, scoped by its own filters like the codes.
+      if (table === COUNTRIES_TABLE) {
+        const parts = query.split("&");
+
+        if (!parts.includes("deleted_at=is.null")) {
+          return Promise.reject(new Error(`the country read is not over live rows: ${query}`));
+        }
+
+        const codeFilter = parts.find((part) => part.startsWith("code=eq."));
+        const enabledOnly = parts.includes("is_enabled=is.true");
+        const limit = parts.find((part) => part.startsWith("limit="));
+        const ordered = parts.includes("order=code.asc");
+
+        let matched = database.countryRows.filter((row) => (enabledOnly ? row.is_enabled : true));
+
+        if (codeFilter !== undefined) {
+          const wantedCode = decodeURIComponent(codeFilter.slice("code=eq.".length));
+          matched = matched.filter((row) => row.code === wantedCode);
         }
 
         if (ordered) {
@@ -1065,6 +1182,20 @@ function createBusinessStore(database: BusinessDatabase): RestClient {
             if ("mcc_code" in values) {
               const mcc = values["mcc_code"];
               row.mcc_code = typeof mcc === "string" ? mcc : null;
+            }
+
+            for (const column of ADDRESS_PROFILE_COLUMNS) {
+              if (!(column in values)) {
+                continue;
+              }
+
+              const value = values[column];
+              row[column] = typeof value === "string" ? value : null;
+            }
+
+            if ("address_completed_at" in values) {
+              const completed = values["address_completed_at"];
+              row.address_completed_at = typeof completed === "string" ? completed : null;
             }
 
             row.updated_at = new Date(NOW).toISOString();
@@ -2184,6 +2315,630 @@ async function checkCategoryCatalog(): Promise<void> {
   );
 }
 
+
+/* -------------------------------------------------------------------------------------------------
+ * STEP 082: the address and contact section on the business profile, its country list and its save.
+ * ---------------------------------------------------------------------------------------------- */
+
+const COMPLETE_ADDRESS: Readonly<Record<string, string>> = Object.freeze({
+  address_line1: "12 Main Street",
+  city: "Dhaka",
+  postal_code: "1207",
+  country_code: "BD",
+  contact_name: "Karim Rahman",
+  contact_email: "Owner@Acme.COM",
+  contact_phone: "+880 1712-345678",
+});
+
+function saveAddress(
+  actor: RequestActor,
+  input: unknown,
+  database: BusinessDatabase,
+  audit: InMemoryAuditTrail,
+  nowOverride?: () => number,
+): Promise<BusinessAddressSnapshot> {
+  const dependencies = nowOverride === undefined
+    ? dependenciesOf(database, audit)
+    : { rest: createBusinessStore(database), audit, now: nowOverride };
+
+  return saveBusinessAddress(
+    { actor, input, ipAddress: "203.0.113.9", userAgent: "gate" },
+    dependencies,
+  );
+}
+
+/** ---- The vocabulary: nine fields, seven required, the patterns, and the address step. */
+function checkAddressVocabulary(): void {
+  expectEqual(COUNTRIES_TABLE, "countries", "the country list is the table of 0076");
+  expectDeepEqual(
+    [...BUSINESS_ADDRESS_FIELDS],
+    [
+      "address_line1",
+      "address_line2",
+      "city",
+      "state_province",
+      "postal_code",
+      "country_code",
+      "contact_name",
+      "contact_email",
+      "contact_phone",
+    ],
+    "the section stores the nine address and contact fields, in the form's order",
+  );
+  expectDeepEqual(
+    [...REQUIRED_ADDRESS_FIELDS],
+    [
+      "address_line1",
+      "city",
+      "postal_code",
+      "country_code",
+      "contact_name",
+      "contact_email",
+      "contact_phone",
+    ],
+    "seven of them are required for the step to finish",
+  );
+  expectDeepEqual(
+    [...OPTIONAL_ADDRESS_FIELDS],
+    ["address_line2", "state_province"],
+    "the second line and the state or province are optional",
+  );
+  expectEqual(BUSINESS_ADDRESS_AUDIT_ACTION, "business_address.saved", "a save is audited under one name");
+  expectEqual(BUSINESS_ADDRESS_AUDIT_ENTITY, "business_address", "against its own entity");
+  expectEqual(BUSINESS_ADDRESS_ONBOARDING_STEP, "address", "and it finishes the address step");
+
+  for (const code of ["SW1A 1AA", "10001", "1207", "DHAKA-1207"]) {
+    expect(POSTAL_CODE_PATTERN.test(code), `"${code}" is a postal code`);
+  }
+
+  for (const code of ["", "AB", "A", "1 2 3 4 5 6 7 8 9 0 1", "12!34"]) {
+    expectEqual(POSTAL_CODE_PATTERN.test(code), false, `"${code}" is not a postal code`);
+  }
+
+  expect(COUNTRY_CODE_PATTERN.test("BD"), "an upper case alpha-2 code is a country code");
+  expectEqual(COUNTRY_CODE_PATTERN.test("bd"), false, "lower case is normalised before the check");
+  expectEqual(COUNTRY_CODE_PATTERN.test("B1"), false, "a digit is not a country code");
+
+  expect(EMAIL_PATTERN.test("owner@acme.com"), "a plain address is an email");
+  expectEqual(EMAIL_PATTERN.test("Owner@Acme.COM"), false, "the parser lower cases first");
+  expectEqual(EMAIL_PATTERN.test("a@b"), false, "a bare host is not an email");
+
+  expect(PHONE_PATTERN.test("+880 1712-345678"), "a spaced international number is a phone");
+  expectEqual(PHONE_PATTERN.test("01712"), false, "too short to be a phone");
+  expectEqual(PHONE_PATTERN.test("call me"), false, "letters are not a phone");
+
+  expectEqual(ADDRESS_FIELD_LIMITS.contact_email, 254, "the email ceiling matches the signup's");
+  expectEqual(ADDRESS_FIELD_LIMITS.postal_code, 12, "and the postal ceiling matches 0105's check");
+}
+
+/** ---- The parse: nine fields, their rules, and a key nobody knows refused rather than dropped. */
+function checkAddressParse(): void {
+  const clean = parseBusinessAddressInput({ ...COMPLETE_ADDRESS });
+
+  expectEqual(clean.problems.length, 0, "a complete body parses");
+  expectEqual(Object.keys(clean.values).length, 7, "with the seven values it sent");
+  expectEqual(clean.values.country_code, "BD", "the country is upper cased");
+  expectEqual(clean.values.contact_email, "owner@acme.com", "and the email is lower cased");
+
+  const padded = parseBusinessAddressInput({ address_line1: "  12   Main Street  " });
+
+  expectEqual(padded.values.address_line1, "12 Main Street", "whitespace is collapsed and trimmed");
+
+  const cleared = parseBusinessAddressInput({ city: "" });
+
+  expectEqual(cleared.problems.length, 0, "an empty string is a deliberate clear");
+  expectEqual(cleared.values.city, null, "and answers null");
+
+  const unknown = parseBusinessAddressInput({ city: "Dhaka", turnover: "1000" });
+
+  expectDeepEqual(
+    unknown.problems,
+    [{ field: "turnover", rule: "unknown_key" }],
+    "a key outside the nine is named as unknown",
+  );
+
+  const notAnObject = parseBusinessAddressInput(["city"]);
+
+  expectDeepEqual(
+    notAnObject.problems,
+    [{ field: "address", rule: "invalid_format" }],
+    "a body that is not an object is refused whole",
+  );
+
+  const wrongType = parseBusinessAddressInput({ postal_code: 1207 });
+
+  expectDeepEqual(
+    wrongType.problems,
+    [{ field: "postal_code", rule: "invalid_format" }],
+    "a number where text belongs is a format problem",
+  );
+
+  const tooShort = parseBusinessAddressInput({ address_line1: "A" });
+
+  expectDeepEqual(
+    tooShort.problems,
+    [{ field: "address_line1", rule: "too_short" }],
+    "a one character street line is too short",
+  );
+
+  const tooLong = parseBusinessAddressInput({ city: "C".repeat(ADDRESS_FIELD_LIMITS.city + 1) });
+
+  expectDeepEqual(
+    tooLong.problems,
+    [{ field: "city", rule: "too_long" }],
+    "an over-long city is refused rather than shortened",
+  );
+
+  for (const [field, bad] of [
+    ["postal_code", "AB"],
+    ["country_code", "B1"],
+    ["contact_email", "not-an-email"],
+    ["contact_phone", "call me"],
+  ] as const) {
+    const parsed = parseBusinessAddressInput({ [field]: bad });
+
+    expectDeepEqual(
+      parsed.problems,
+      [{ field, rule: "invalid_format" }],
+      `${JSON.stringify(bad)} is refused on ${field}`,
+    );
+  }
+
+  const several = parseBusinessAddressInput({ city: "D", contact_email: "nope", contact_phone: 5 });
+
+  expectEqual(several.problems.length, 3, "three bad fields are collected in one parse");
+}
+
+/** ---- The read: the caller's own company, the enabled countries, and an honest draft. */
+async function checkAddressRead(): Promise<void> {
+  for (const [description, actor] of refusedActors) {
+    const database = createBusinessDatabase([businessRow({ address_line1: "12 Main Street" })]);
+    const refusal = await rejectionOf(() =>
+      readBusinessAddress({ actor }, dependenciesOf(database, createInMemoryAuditTrail())),
+    );
+
+    expectEqual(refusal?.code, "PERMISSION_DENIED", `the address refuses ${description}`);
+    expectEqual(database.queries.length, 0, `and reads no row for ${description}`);
+  }
+
+  const empty = await readBusinessAddress(
+    { actor: owner },
+    dependenciesOf(createBusinessDatabase(), createInMemoryAuditTrail()),
+  );
+
+  expectEqual(empty.saved, false, "a merchant with no row is answered, not refused");
+  expectEqual(empty.complete, false, "with an empty section");
+  expectEqual(empty.missing.length, 7, "and all seven required fields missing");
+  expectDeepEqual(
+    empty.countries.map((country) => country.code),
+    ["BD", "US"],
+    "the dropdown is the enabled countries of 0076, in code order",
+  );
+  expect(
+    empty.countries.every((country) => country.name.length > 0),
+    "and every option carries its name",
+  );
+  expectEqual(
+    empty.values.address_line1,
+    null,
+    "and every value is null",
+  );
+
+  const stored = await readBusinessAddress(
+    { actor: owner },
+    dependenciesOf(
+      createBusinessDatabase([
+        businessRow({
+          address_line1: "12 Main Street",
+          city: "Dhaka",
+          postal_code: "1207",
+          country_code: "BD",
+          contact_name: "Karim Rahman",
+          contact_email: "owner@acme.com",
+          contact_phone: "+880 1712-345678",
+          address_completed_at: "2026-11-01T09:00:00.000Z",
+        }),
+      ]),
+      createInMemoryAuditTrail(),
+    ),
+  );
+
+  expectEqual(stored.saved, true, "a stored address is read back");
+  expectEqual(stored.complete, true, "complete when every required field is present");
+  expectEqual(stored.missing.length, 0, "with nothing missing");
+  expectEqual(stored.values.country_code, "BD", "the country is the stored code");
+  expectEqual(
+    stored.completedAtEpochMs,
+    Date.parse("2026-11-01T09:00:00.000Z"),
+    "the completion instant is the row's",
+  );
+  expectEqual(
+    stored.savedAtEpochMs,
+    Date.parse("2026-11-01T09:30:00.000Z"),
+    "and the save instant is the row's",
+  );
+
+  const partial = await readBusinessAddress(
+    { actor: owner },
+    dependenciesOf(
+      createBusinessDatabase([businessRow({ address_line1: "12 Main Street", city: "Dhaka" })]),
+      createInMemoryAuditTrail(),
+    ),
+  );
+
+  expectEqual(partial.complete, false, "two fields are not a complete address");
+  expectDeepEqual(
+    [...partial.missing],
+    ["postal_code", "country_code", "contact_name", "contact_email", "contact_phone"],
+    "the missing list names the five still empty required fields, in form order",
+  );
+
+  // The same database, read by the owner of another company: the row of A is not B's to see.
+  const otherTenant = createBusinessDatabase([businessRow({ address_line1: "12 Main Street" })]);
+  const refusedRow = await readBusinessAddress(
+    { actor: otherOwner },
+    dependenciesOf(otherTenant, createInMemoryAuditTrail()),
+  );
+
+  expectEqual(refusedRow.saved, false, "another merchant's row is not this merchant's address");
+  expectEqual(refusedRow.companyId, COMPANY_B, "the other owner reads their own company");
+  expect(
+    (otherTenant.queries[0] ?? "").includes(encodeURIComponent(COMPANY_B)),
+    "and the query names their company, never the row's",
+  );
+
+  const brokenRow = createBusinessDatabase([businessRow({ updated_at: "not a date" })]);
+
+  expectEqual(
+    await failureOf(() =>
+      readBusinessAddress({ actor: owner }, dependenciesOf(brokenRow, createInMemoryAuditTrail())),
+    ),
+    "INTERNAL_ERROR",
+    "a row with an unreadable instant is a defect, not an empty form",
+  );
+}
+
+/** ---- The save: a patch, the country checked, the completion stamped, the wizard in step. */
+async function checkAddressSave(): Promise<void> {
+  const database = createBusinessDatabase();
+  const audit = createInMemoryAuditTrail();
+  const first = await saveAddress(owner, { ...COMPLETE_ADDRESS }, database, audit);
+
+  expectEqual(first.companyId, COMPANY_A, "the row is written for the actor's own company");
+  expectEqual(database.inserts.length, 2, "the first save inserts the profile row and the wizard row");
+  expectEqual(database.inserts[0]?.table, BUSINESS_PROFILE_TABLE, "into the business profile table");
+  expectEqual(database.inserts[0]?.row["company_id"], COMPANY_A, "with the company from the session");
+  expectEqual(database.inserts[0]?.row["address_line1"], "12 Main Street", "and the field that was sent");
+  expectEqual(database.inserts[0]?.row["contact_email"], "owner@acme.com", "the email lower cased");
+  expectEqual(database.inserts[0]?.row["address_line2"], null, "the optional field nobody sent stays null");
+  expectEqual(
+    database.inserts[0]?.row["address_completed_at"],
+    new Date(NOW).toISOString(),
+    "and the completion instant is stamped, because all seven required fields are present",
+  );
+  expectEqual(
+    "mcc_code" in (database.inserts[0]?.row ?? {}),
+    false,
+    "and no column another section owns is written by this save",
+  );
+  expectEqual(first.complete, true, "the answer says the section is complete");
+  expectEqual(first.missing.length, 0, "with nothing missing");
+  expectEqual(first.completedAtEpochMs, NOW, "on the save's own clock");
+  expectEqual(first.countries.length, 2, "and the country dropdown comes back with the answer");
+  expectEqual(database.inserts[1]?.table, ONBOARDING_PROGRESS_TABLE, "the wizard gets a row it never had");
+  expectEqual(
+    database.inserts[1]?.row["current_step"],
+    "category",
+    "opening on the step after address",
+  );
+  expectDeepEqual(
+    database.inserts[1]?.row["completed_steps"],
+    ["address"],
+    "with the address step finished",
+  );
+
+  expectEqual(audit.entries.length, 1, "the save appends exactly one audit entry");
+  expectEqual(audit.entries[0]?.action, BUSINESS_ADDRESS_AUDIT_ACTION, "named business_address.saved");
+  expectEqual(audit.entries[0]?.entityType, BUSINESS_ADDRESS_AUDIT_ENTITY, "on its own entity");
+  expectEqual(audit.entries[0]?.entityId, COMPANY_A, "naming the company");
+  expectEqual(audit.entries[0]?.ipAddress, "203.0.113.9", "with the address it came from");
+  expectDeepEqual(
+    audit.entries[0]?.payload?.["fields"],
+    [
+      "address_line1",
+      "city",
+      "contact_email",
+      "contact_name",
+      "contact_phone",
+      "country_code",
+      "postal_code",
+    ],
+    "listing the fields the save named, sorted",
+  );
+  expectEqual(audit.entries[0]?.payload?.["completed_now"], true, "recorded as a first completion");
+  expectDeepEqual(audit.entries[0]?.payload?.["missing"], [], "with nothing missing");
+
+  const later = NOW + 60_000;
+  const second = await saveAddress(
+    owner,
+    { address_line2: "Floor 3" },
+    database,
+    audit,
+    () => later,
+  );
+
+  expectEqual(database.inserts.length, 2, "a second save inserts nothing");
+  expectEqual(database.updates.length, 1, "it updates the one row");
+  expectDeepEqual(
+    Object.keys(database.updates[0]?.values ?? {}).sort(),
+    ["address_completed_at", "address_line2"],
+    "the patch carries the one field this save named and the derived instant, and nothing else",
+  );
+  expectEqual(
+    database.updates[0]?.values["address_completed_at"],
+    new Date(NOW).toISOString(),
+    "and a completion that already exists is not re-stamped",
+  );
+  expectEqual(database.profileRows[0]?.address_line1, "12 Main Street", "the field another tab may have changed is never put back");
+  expectEqual(second.values.address_line2, "Floor 3", "the optional field is stored");
+  expectEqual(second.complete, true, "and the section is still complete");
+  expectEqual(second.savedAtEpochMs, later, "on the second save's clock");
+  expectEqual(
+    database.updates.filter((update) => update.table === ONBOARDING_PROGRESS_TABLE).length,
+    0,
+    "the wizard row is already finished, so it is not written again",
+  );
+  expectEqual(audit.entries.length, 2, "and a second audit entry is appended");
+  expectEqual(audit.entries[1]?.payload?.["completed_now"], false, "not recorded as a completion");
+
+  const cleared = await saveAddress(owner, { contact_phone: "" }, database, audit);
+
+  expectEqual(cleared.complete, false, "clearing a required field uncompletes the section");
+  expectEqual(
+    database.updates[1]?.values["address_completed_at"],
+    null,
+    "and removes the completion stamp",
+  );
+  expectDeepEqual(
+    database.updates[1]?.values["contact_phone"],
+    null,
+    "and stores the clear",
+  );
+  const wizardUpdate = database.updates.find((update) => update.table === ONBOARDING_PROGRESS_TABLE);
+
+  expectDeepEqual(
+    wizardUpdate?.values["completed_steps"],
+    [],
+    "and the wizard's finished list drops the address step",
+  );
+  expectDeepEqual(
+    audit.entries[2]?.payload?.["missing"],
+    ["contact_phone"],
+    "the audit entry names the field that went",
+  );
+}
+
+/** ---- The save's refusals: the country list, the shape, the roles, and the two racing tabs. */
+async function checkAddressSaveRefusals(): Promise<void> {
+  for (const [description, actor] of refusedActors) {
+    const database = createBusinessDatabase();
+    const audit = createInMemoryAuditTrail();
+    const refusal = await rejectionOf(() =>
+      saveAddress(actor, { ...COMPLETE_ADDRESS }, database, audit),
+    );
+
+    expectEqual(refusal?.code, "PERMISSION_DENIED", `the save refuses ${description}`);
+    expectEqual(database.queries.length, 0, `and reads nothing for ${description}`);
+    expectEqual(database.inserts.length + database.updates.length, 0, `and writes nothing for ${description}`);
+    expectEqual(audit.entries.length, 0, `and audits nothing for ${description}`);
+  }
+
+  const shape = createBusinessDatabase();
+
+  for (const [label, body, field, rule] of [
+    ["an empty body", {}, "address", "required"],
+    ["a short postal code", { postal_code: "AB" }, "postal_code", "invalid_format"],
+    ["a bad email", { contact_email: "nope" }, "contact_email", "invalid_format"],
+    ["an unknown key", { city: "Dhaka", turnover: "1" }, "turnover", "unknown_key"],
+  ] as const) {
+    const refusal = await rejectionOf(() => saveAddress(owner, body, shape, createInMemoryAuditTrail()));
+
+    expectEqual(refusal?.code, "VALIDATION_FAILED", `${label} is a validation failure`);
+    expectDeepEqual(refusal?.details, [{ field, rule }], `naming ${field} and ${rule}`);
+  }
+
+  expectEqual(shape.queries.length, 0, "a shape refusal happens before any query");
+  expectEqual(shape.inserts.length + shape.updates.length, 0, "and writes nothing");
+
+  const unknownCountry = createBusinessDatabase();
+  const unknown = await rejectionOf(() =>
+    saveAddress(owner, { country_code: "ZZ" }, unknownCountry, createInMemoryAuditTrail()),
+  );
+
+  expectDeepEqual(
+    unknown?.details,
+    [{ field: "country_code", rule: "unknown_country" }],
+    "a code the country list does not carry is unknown_country",
+  );
+  expectEqual(unknownCountry.inserts.length + unknownCountry.updates.length, 0, "with nothing written");
+
+  const disabledCountry = createBusinessDatabase();
+  const disabled = await rejectionOf(() =>
+    saveAddress(owner, { country_code: "AQ" }, disabledCountry, createInMemoryAuditTrail()),
+  );
+
+  expectDeepEqual(
+    disabled?.details,
+    [{ field: "country_code", rule: "disabled_country" }],
+    "a switched off or sanctioned country is disabled_country, not unknown",
+  );
+  expectEqual(disabledCountry.inserts.length + disabledCountry.updates.length, 0, "with nothing written");
+
+  const racing = createBusinessDatabase();
+  racing.conflictOnInsert = true;
+  const accounted = createInMemoryAuditTrail();
+  const rescued = await saveAddress(owner, { address_line1: "12 Main Street" }, racing, accounted);
+
+  expectEqual(rescued.saved, true, "a save that loses the insert race still saves");
+  expectEqual(
+    racing.updates.filter((update) => update.table === BUSINESS_PROFILE_TABLE).length,
+    1,
+    "by becoming the update it would have been",
+  );
+  expectEqual(accounted.entries.length, 1, "and is audited once");
+
+  const throwingAudit = {
+    append(): Promise<void> {
+      return Promise.reject(new Error("the audit sink is down"));
+    },
+  };
+  const stored = await saveBusinessAddress(
+    { actor: owner, input: { address_line1: "12 Main Street" }, ipAddress: null, userAgent: null },
+    { rest: createBusinessStore(createBusinessDatabase()), audit: throwingAudit, now: () => NOW },
+  );
+
+  expectEqual(stored.saved, true, "a save whose audit sink fails is still stored");
+}
+
+/** ---- The sources: the route, the screen, the form and the migration say what this STEP promised. */
+async function checkAddressSources(): Promise<void> {
+  const route = await readRepositoryFile("app/api/onboarding/business-address/route.ts");
+  const page = await readRepositoryFile("app/(dashboard)/onboarding/address/page.tsx");
+  const form = await readRepositoryFile("app/(dashboard)/onboarding/address/address-form.tsx");
+  const copy = await readRepositoryFile("app/(dashboard)/onboarding/step-copy.ts");
+  const csrf = await readRepositoryFile("lib/security/csrf.ts");
+  const up = await readRepositoryFile("migrations/0105_business_address.sql");
+  const down = await readRepositoryFile("migrations/0105_business_address.down.sql");
+
+  for (const [path, source] of [
+    ["app/api/onboarding/business-address/route.ts", route],
+    ["app/(dashboard)/onboarding/address/page.tsx", page],
+    ["app/(dashboard)/onboarding/address/address-form.tsx", form],
+  ] as const) {
+    expectEqual(source.split("\n")[0], `// path: ${path}`, `${path} states its own path on its first line`);
+    expectEqual(/[^\t\n\r\x20-\x7E]/u.test(source), false, `${path} is ASCII only`);
+  }
+
+  expectEqual(up.split("\n")[0], "-- path: migrations/0105_business_address.sql", "the migration states its path");
+  expectEqual(down.split("\n")[0], "-- path: migrations/0105_business_address.down.sql", "and so does its rollback");
+
+  // ---- the route: token, session, body, service, in that order
+  expect(route.includes("requireCsrfToken(request"), "the route checks the token first");
+  expect(
+    route.indexOf("requireCsrfToken(") < route.indexOf("readRequestActor("),
+    "before it looks the session up",
+  );
+  expect(route.indexOf("readRequestActor(") < route.indexOf("JSON.parse("), "which is before the body is parsed");
+  expect(route.indexOf("JSON.parse(") < route.indexOf("saveBusinessAddress("), "and the service runs last");
+  expect(route.includes("maximumBodyBytes = 8_192"), "the body is bounded");
+  expect(route.includes("saveBusinessAddress("), "and saves through the service");
+  expectEqual(route.includes("export const GET"), false, "the route answers POST only");
+  expectEqual(route.includes('"cache-control": "no-store"'), true, "the answer is not cached");
+  expectEqual(route.includes("company_id"), false, "and never takes a company from the caller");
+
+  // ---- the screen and the form
+  expect(page.includes("readOwnerActor()"), "the page reads the account through the cached reader");
+  expect(page.includes("readBusinessAddress("), "and the address through the service");
+  expect(page.includes("<SessionKeeper"), "and keeps the session rotating while it is read");
+  expect(page.includes("AddressForm"), "and renders the form");
+  expectEqual(/(super_admin|compliance_kyc|finance_ops)/u.test(page), false, "the page names no office role");
+
+  expectEqual(form.includes('"use client"'), true, "the form is a client component");
+  expect(form.includes("BUSINESS_ADDRESS_FIELDS"), "and draws its fields from the one list");
+  expect(form.includes('SAVE_PATH = "/api/onboarding/business-address"'), "posting to one path");
+  expectEqual((form.match(/fetch\(/gu) ?? []).length, 1, "with one fetch site");
+  expectEqual((form.match(/fetch\(SAVE_PATH/gu) ?? []).length, 1, "to that path");
+  expect(form.includes("csrfHeaders("), "carrying the CSRF token");
+  expect(form.includes("JSON.stringify(values)"), "sending only the values it was given");
+  expectEqual(form.includes("companyId:"), false, "and no company in the body");
+  expectEqual(form.includes("process.env"), false, "reading no environment");
+
+  // ---- the registry and the map
+  expect(csrf.includes('"/api/onboarding/business-address",'), "the save route is on the CSRF-protected list");
+  expect(copy.includes('address: "/onboarding/address"'), "the address step links to its form");
+
+  // ---- the migration pair
+  expect(up.includes("add column address_line1 text"), "0105 adds the address columns to the profile");
+  expect(up.includes("add column address_completed_at timestamptz"), "and the completion instant");
+  expect(up.includes("countries_code_unique unique (code)"), "with the unique constraint a foreign key can reference");
+  expect(up.includes("references public.countries (code)"), "the country pointed at the 0076 list");
+  expect(up.includes("business_profiles_address_completed_check"), "and the completion rule a row cannot claim without the facts");
+  expect(up.includes("create index business_profiles_country_idx"), "and the country index");
+  expect(down.includes("drop column if exists address_line1"), "the rollback removes the columns");
+  expect(down.includes("drop constraint if exists countries_code_unique"), "and the constraint it added to the list");
+  expectEqual(down.includes("create table"), false, "and creates nothing");
+  expectEqual(down.includes("drop table"), false, "and removes no table another STEP owns");
+
+  // ---- the files exist where the ownership rules put them
+  expect(
+    (await readdir(new URL("app/(dashboard)/onboarding/address/", repositoryRoot))).includes("page.tsx"),
+    "the screen lives in the merchant dashboard area",
+  );
+  expect(
+    (await readdir(new URL("app/api/onboarding/business-address/", repositoryRoot))).includes("route.ts"),
+    "and its handler is a route handler of its own",
+  );
+  expect(
+    (await readdir(new URL("services/kyc/", repositoryRoot))).includes("business-address.ts"),
+    "the service lives in services/kyc",
+  );
+}
+
+/** ---- The catalog: every sentence of the form is used, and every key it names exists. */
+async function checkAddressCatalog(): Promise<void> {
+  const block = en.onboardingAddress as unknown as Record<string, unknown>;
+  const page = await readRepositoryFile("app/(dashboard)/onboarding/address/page.tsx");
+  const form = await readRepositoryFile("app/(dashboard)/onboarding/address/address-form.tsx");
+  const sources = `${page}\n${form}`;
+
+  const flat: string[] = [];
+
+  const walk = (node: Record<string, unknown>, prefix: string): void => {
+    for (const [key, value] of Object.entries(node)) {
+      const path = `${prefix}.${key}`;
+
+      if (typeof value === "string") {
+        flat.push(path);
+      } else if (typeof value === "object" && value !== null) {
+        walk(value as Record<string, unknown>, path);
+      }
+    }
+  };
+
+  walk(block, "onboardingAddress");
+
+  expect(flat.length > 40, "the address form has its own block of copy");
+
+  for (const path of flat) {
+    expect(sources.includes(`"${path}"`), `the copy key ${path} is used by the screen`);
+  }
+
+  const referenced = [...sources.matchAll(/"(onboardingAddress\.[A-Za-z.]+)"/gu)].map((match) => match[1]);
+
+  for (const path of new Set(referenced)) {
+    expect(path !== undefined && flat.includes(path), `the screen names no missing key (${String(path)})`);
+  }
+
+  for (const field of BUSINESS_ADDRESS_FIELDS) {
+    expect(flat.includes(`onboardingAddress.${camelOf(field)}`), `the ${field} field has a label`);
+    expect(flat.includes(`onboardingAddress.${camelOf(field)}Hint`), `and a hint`);
+  }
+
+  expectEqual(
+    sources.includes('getMessage("onboardingAddress.missingLine")'),
+    false,
+    "the templated missing line is never rendered without its values",
+  );
+  expect(
+    sources.includes('formatMessage("onboardingAddress.missingLine"'),
+    "and is rendered through formatMessage",
+  );
+  expect(
+    sources.includes('formatMessage("onboardingAddress.savedLine"'),
+    "and so is the saved line",
+  );
+}
+
 async function main(): Promise<void> {
   checkVocabulary();
   await checkRefusals();
@@ -2211,6 +2966,13 @@ async function main(): Promise<void> {
   await checkCategorySaveRefusals();
   await checkCategorySources();
   await checkCategoryCatalog();
+  checkAddressVocabulary();
+  checkAddressParse();
+  await checkAddressRead();
+  await checkAddressSave();
+  await checkAddressSaveRefusals();
+  await checkAddressSources();
+  await checkAddressCatalog();
 
   if (failures.length > 0) {
     process.stderr.write(`onboarding gate failed with ${failures.length} problem(s):\n`);
@@ -2228,7 +2990,7 @@ async function main(): Promise<void> {
     `onboarding gate passed: ${checks} checks, ${ONBOARDING_STEPS.length} steps, ` +
       `${ONBOARDING_OWNER_ROLES.length} role, ${BUSINESS_PROFILE_FIELDS.length} business fields, ` +
       `${PROCESSOR_REQUIREMENT_LIST.length} processors, ${BUSINESS_PROFILE_TABLE} table, ` +
-      `${MCC_CODES_TABLE} vocabulary\n`,
+      `${MCC_CODES_TABLE} vocabulary, ${COUNTRIES_TABLE} list\n`,
   );
 }
 

@@ -613,7 +613,7 @@ handoff file.
   default from the shared function, RLS plus a default-deny policy, and no forward file that
   drops or deletes.
 
-### The migrations from `0080` to `0104`
+### The migrations from `0080` to `0105`
 
 The bullets above describe the tenant foundation, the money tables and the reference data of STEPs
 012-036 in the order those STEPs built them. The migrations after them are listed here, in order, so
@@ -647,6 +647,7 @@ handoff of the STEP named beside it.
 | `0102_onboarding_progress.sql` | 079 | where a merchant is in the onboarding wizard, so the wizard can be left and resumed |
 | `0103_business_profiles.sql` | 080 | the business information every processor on this platform is sent, filled once |
 | `0104_merchant_category_code.sql` | 081 | the merchant category code on the business profile, pointed at the published code list of `0077` |
+| `0105_business_address.sql` | 082 | the registered address and the contact person on the business profile, with the country pointed at the enabled list of `0076` |
 
 ## Background jobs
 

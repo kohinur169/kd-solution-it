@@ -71,6 +71,7 @@ export const ONBOARDING_STEP_COPY: Readonly<Record<OnboardingStep, OnboardingSte
  */
 export const ONBOARDING_STEP_FORMS: Partial<Readonly<Record<OnboardingStep, string>>> = Object.freeze({
   business: "/onboarding/business",
+  address: "/onboarding/address",
   category: "/onboarding/category",
 });
 
