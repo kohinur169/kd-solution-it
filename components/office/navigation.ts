@@ -3,6 +3,7 @@ import { SESSION_MANAGEMENT_OFFICE_ROLES } from "../../lib/auth/session-list.ts"
 import { TWO_FACTOR_RESET_OFFICE_ROLES } from "../../lib/auth/two-factor-reset.ts";
 import { PLATFORM_ROLES, type PlatformRole, type RequestActor } from "../../lib/auth/types.ts";
 import { ANNOUNCEMENT_SCREEN_ROLES } from "../../lib/announcements/registry.ts";
+import { AUDIT_LOG_SCREEN_ROLES } from "../../lib/audit-log/registry.ts";
 import { APPROVAL_QUEUE_ROLES } from "../../lib/approvals/registry.ts";
 import { COUNTRY_SWITCH_ROLES } from "../../lib/countries/registry.ts";
 import { GATEWAY_MANAGEMENT_ROLES, OFFICE_DASHBOARD_ROLES } from "../../lib/gateways/registry.ts";
@@ -91,15 +92,16 @@ export type OfficeSectionKey =
   | "sessions"
   | "twoFactorResets"
   | "settings"
-  | "announcements";
+  | "announcements"
+  | "auditLog";
 
 /**
  * Every office screen that exists today, in the order the sidebar shows them.
  *
  * The first entry is the workspace index of STEP 068; the dashboard and the gateway page are STEP
  * 069's two screens, the CEO's home is STEP 070's, the delegation screen is STEP 071's, the country
- * switch is STEP 073's, the general settings screen is STEP 074's and the announcements screen is
- * STEP 075's, all inside the admin group like the workspace;
+ * switch is STEP 073's, the general settings screen is STEP 074's, the announcements screen is STEP
+ * 075's and the audit log viewer is STEP 076's, all inside the admin group like the workspace;
  * the last two are the office screens the authentication block built (`app/office/`), which is why
  * their hrefs sit outside the group. A link to a page that exists is the only kind this shell offers,
  * which is why an entry arrives in the same commit as its `page.tsx`.
@@ -174,6 +176,13 @@ export const OFFICE_NAVIGATION: readonly OfficeSection[] = deepFreeze([
     labelKey: "office.sectionAnnouncements",
     descriptionKey: "office.sectionAnnouncementsDescription",
     roles: ANNOUNCEMENT_SCREEN_ROLES,
+  },
+  {
+    key: "auditLog",
+    href: "/audit-log",
+    labelKey: "office.sectionAuditLog",
+    descriptionKey: "office.sectionAuditLogDescription",
+    roles: AUDIT_LOG_SCREEN_ROLES,
   },
 ]);
 

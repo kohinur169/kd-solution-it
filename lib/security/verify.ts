@@ -2915,10 +2915,15 @@ async function checkAuditWiring(): Promise<void> {
   for (const entry of entries) {
     const text = await readFile(new URL(entry, appRoot), "utf8");
 
-    if (
-      !entry.endsWith("verify.ts") &&
-      (text.includes(`insert("${AUDIT_TABLE}"`) || text.includes("insert(AUDIT_TABLE"))
-    ) {
+    // A gate is not a writer, and its fixtures are not names the column must accept: a scenario that
+    // deliberately spells a refused action - a bare family like the audit log viewer's prefix filter -
+    // is a case the gate is proving, not a name the tree records. The writers below are the only files
+    // that append, and no gate is one of them.
+    if (entry.endsWith("verify.ts")) {
+      continue;
+    }
+
+    if (text.includes(`insert("${AUDIT_TABLE}"`) || text.includes("insert(AUDIT_TABLE")) {
       writers.push(entry);
     }
 
