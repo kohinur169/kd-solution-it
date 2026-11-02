@@ -1,4 +1,6 @@
 // path: docs/planning/MASTER_PLAN.md
+> HISTORICAL REFERENCE ONLY — Do not use this file as active implementation instructions.
+> The current scope, coding rules and step sequence are defined in `docs/final/`.
 # KD SOLUTION IT - Master Execution Plan (Planning Only, No Code in This Chat)
 
 > REVISION V2 (current authority): docs/planning/REVISED_FEATURE_LIST_V2.md supersedes every
