@@ -81,10 +81,12 @@ export const CSRF_PROTECTED_PATHS: readonly string[] = Object.freeze([
   "/api/office/2fa-reset-requests/decision",
   "/api/office/account-locks/unlock",
   "/api/office/approvals",
+  "/api/office/compliance-calendar",
   "/api/office/countries",
   "/api/office/delegations",
   "/api/office/gateways",
   "/api/office/sessions/revoke",
+  "/api/office/settings",
 ]);
 
 /** Why a request was refused, for the log and the gate - never for the response. */

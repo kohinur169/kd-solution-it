@@ -118,6 +118,11 @@ export const SENSITIVE_ENDPOINTS: readonly SensitiveEndpoint[] = [
   },
   {
     method: "POST",
+    path: "/api/office/settings",
+    note: "Section 24's platform information (STEP 074): the name, the logo and the contact details every merchant sees, so the browser that changes them is the one that signs.",
+  },
+  {
+    method: "POST",
     path: "/api/office/sessions/revoke",
     note: "Section 22's instant revocation (STEP 054) for an office role: the request that signs a merchant out is signed, so a copied office cookie cannot spend it.",
   },
@@ -130,6 +135,11 @@ export const SENSITIVE_ENDPOINTS: readonly SensitiveEndpoint[] = [
     method: "POST",
     path: "/api/office/delegations",
     note: "Section 2's delegation lever (STEP 071): handing a permission to a colleague grants an authority, so the browser that hands it out is the one that signs.",
+  },
+  {
+    method: "POST",
+    path: "/api/office/compliance-calendar",
+    note: "Section 3's compliance calendar (STEP 074): filing, renewing or archiving a certificate moves what the platform's own compliance rests on, so the browser that files it is the one that signs.",
   },
   {
     method: "POST",

@@ -6,6 +6,7 @@ import { APPROVAL_QUEUE_ROLES } from "../../lib/approvals/registry.ts";
 import { COUNTRY_SWITCH_ROLES } from "../../lib/countries/registry.ts";
 import { GATEWAY_MANAGEMENT_ROLES, OFFICE_DASHBOARD_ROLES } from "../../lib/gateways/registry.ts";
 import { PERMISSION_DELEGATION_ROLES } from "../../lib/permissions/registry.ts";
+import { PLATFORM_SETTINGS_SCREEN_ROLES } from "../../lib/settings/registry.ts";
 import type { MessagePath } from "../../lib/i18n/messages.ts";
 import { deepFreeze } from "../../lib/utils/freeze.ts";
 
@@ -87,14 +88,16 @@ export type OfficeSectionKey =
   | "gateways"
   | "delegations"
   | "sessions"
-  | "twoFactorResets";
+  | "twoFactorResets"
+  | "settings";
 
 /**
  * Every office screen that exists today, in the order the sidebar shows them.
  *
  * The first entry is the workspace index of STEP 068; the dashboard and the gateway page are STEP
- * 069's two screens, the CEO's home is STEP 070's and the delegation screen is STEP 071's, all inside
- * the admin group like the workspace;
+ * 069's two screens, the CEO's home is STEP 070's, the delegation screen is STEP 071's, the country
+ * switch is STEP 073's and the general settings screen is STEP 074's, all inside the admin group like
+ * the workspace;
  * the last two are the office screens the authentication block built (`app/office/`), which is why
  * their hrefs sit outside the group. A link to a page that exists is the only kind this shell offers,
  * which is why an entry arrives in the same commit as its `page.tsx`.
@@ -155,6 +158,13 @@ export const OFFICE_NAVIGATION: readonly OfficeSection[] = deepFreeze([
     labelKey: "office.sectionTwoFactorResets",
     descriptionKey: "office.sectionTwoFactorResetsDescription",
     roles: TWO_FACTOR_RESET_OFFICE_ROLES,
+  },
+  {
+    key: "settings",
+    href: "/settings",
+    labelKey: "office.sectionSettings",
+    descriptionKey: "office.sectionSettingsDescription",
+    roles: PLATFORM_SETTINGS_SCREEN_ROLES,
   },
 ]);
 
