@@ -92,6 +92,9 @@ export const CSRF_PROTECTED_PATHS: readonly string[] = Object.freeze([
   "/api/onboarding/business-profile",
   "/api/onboarding/merchant-category",
   "/api/onboarding/business-address",
+  "/api/onboarding/kyc-document",
+  "/api/onboarding/kyc-ubo",
+  "/api/onboarding/kyc-screening",
 ]);
 
 /** Why a request was refused, for the log and the gate - never for the response. */

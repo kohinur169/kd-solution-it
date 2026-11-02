@@ -62,6 +62,28 @@ import {
   type BusinessAddressSnapshot,
 } from "./business-address.ts";
 import { PLATFORM_PROVIDERS } from "../../lib/gateways/registry.ts";
+import { UPLOAD_DATABASE_MAXIMUM_BYTES } from "../../lib/security/upload.ts";
+import {
+  KYC_AUDIT_ENTITY,
+  KYC_DOCUMENTS_ONBOARDING_STEP,
+  KYC_DOCUMENTS_TABLE,
+  KYC_DOCUMENT_AUDIT_ACTION,
+  KYC_DOCUMENT_MAXIMUM_BYTES,
+  KYC_DOCUMENT_TYPES,
+  KYC_SCREENING_AUDIT_ACTION,
+  KYC_SUBMISSIONS_TABLE,
+  KYC_UPLOAD_PURPOSE,
+  parseKycDocumentInput,
+  parseUboInput,
+  readKycPack,
+  runKycScreening,
+  saveKycDocument,
+  saveUbo,
+  SIGNIFICANT_OWNER_BPS,
+  SANCTIONS_SCREENINGS_TABLE,
+  UBO_AUDIT_ACTION,
+  UBO_RECORDS_TABLE,
+} from "./kyc-capture.ts";
 import {
   assertProvisionable,
   PROCESSOR_PROFILE_AUDIT_ACTION,
@@ -890,8 +912,71 @@ function defaultMccRows(): MccRowShape[] {
   ];
 }
 
+/** One row of `0048`, as the fake store holds it. */
+interface SubmissionRowShape {
+  id: string;
+  company_id: string;
+  status: string;
+  verification_method: string;
+  created_at: string;
+}
+
+/** One row of `0049`. */
+interface DocumentRowShape {
+  id: string;
+  company_id: string;
+  submission_id: string;
+  document_type: string;
+  storage_key: string;
+  content_sha256: string;
+  content_type: string;
+  byte_size: number;
+  issued_at: string | null;
+  expires_at: string | null;
+  status: string;
+  created_at: string;
+}
+
+/** One row of `0050`. */
+interface UboRowShape {
+  id: string;
+  company_id: string;
+  submission_id: string;
+  full_name: string;
+  date_of_birth: string;
+  country: string;
+  ownership_bps: number;
+  is_significant: boolean;
+  id_document_sha256: string;
+  is_pep: boolean;
+  screened_at: string | null;
+  created_at: string;
+}
+
+/** One row of `0051`. */
+interface ScreeningRowShape {
+  id: string;
+  company_id: string;
+  subject_kind: string;
+  subject_id: string;
+  ofac_checked: boolean;
+  un_checked: boolean;
+  eu_checked: boolean;
+  us_checked: boolean;
+  result: string;
+  provider: string;
+  screened_at: string;
+  note: string | null;
+  sar_case: boolean;
+  created_at: string;
+}
+
 interface BusinessDatabase {
   readonly profileRows: BusinessRowShape[];
+  readonly submissionRows: SubmissionRowShape[];
+  readonly documentRows: DocumentRowShape[];
+  readonly uboRows: UboRowShape[];
+  readonly screeningRows: ScreeningRowShape[];
   readonly onboardingRows: ProgressRowShape[];
   readonly mccRows: MccRowShape[];
   readonly countryRows: CountryRowShape[];
@@ -937,9 +1022,17 @@ function createBusinessDatabase(
   onboardingRows: readonly ProgressRowShape[] = [],
   mccRows: readonly MccRowShape[] = defaultMccRows(),
   countryRows: readonly CountryRowShape[] = defaultCountryRows(),
+  submissionRows: readonly SubmissionRowShape[] = [],
+  documentRows: readonly DocumentRowShape[] = [],
+  uboRows: readonly UboRowShape[] = [],
+  screeningRows: readonly ScreeningRowShape[] = [],
 ): BusinessDatabase {
   return {
     profileRows: [...profileRows],
+    submissionRows: [...submissionRows],
+    documentRows: [...documentRows],
+    uboRows: [...uboRows],
+    screeningRows: [...screeningRows],
     onboardingRows: [...onboardingRows],
     mccRows: [...mccRows],
     countryRows: [...countryRows],
@@ -978,14 +1071,15 @@ interface CountryRowShape {
   code: string;
   name: string;
   is_enabled: boolean;
+  is_sanctioned: boolean;
 }
 
 /** The country list the address gate works against: two enabled and one switched off. */
 function defaultCountryRows(): CountryRowShape[] {
   return [
-    { code: "BD", name: "Bangladesh", is_enabled: true },
-    { code: "US", name: "United States", is_enabled: true },
-    { code: "AQ", name: "Antarctica", is_enabled: false },
+    { code: "BD", name: "Bangladesh", is_enabled: true, is_sanctioned: false },
+    { code: "US", name: "United States", is_enabled: true, is_sanctioned: false },
+    { code: "AQ", name: "Antarctica", is_enabled: false, is_sanctioned: true },
   ];
 }
 
@@ -1105,6 +1199,58 @@ function createBusinessStore(database: BusinessDatabase): RestClient {
 
       const wanted = scopedCompany(query);
 
+      // The KYC tables of 0048-0051: company-scoped like the profile, with their own eq filters.
+      if (
+        table === KYC_SUBMISSIONS_TABLE ||
+        table === KYC_DOCUMENTS_TABLE ||
+        table === UBO_RECORDS_TABLE ||
+        table === SANCTIONS_SCREENINGS_TABLE
+      ) {
+        const parts = query.split("&");
+        const allRows = (
+          table === KYC_SUBMISSIONS_TABLE
+            ? database.submissionRows
+            : table === KYC_DOCUMENTS_TABLE
+              ? database.documentRows
+              : table === UBO_RECORDS_TABLE
+                ? database.uboRows
+                : database.screeningRows
+        ) as unknown as readonly Record<string, unknown>[];
+
+        let matched = allRows.filter((row) => row["company_id"] === wanted);
+
+        for (const part of parts) {
+          for (const column of ["status", "submission_id", "id", "subject_id"] as const) {
+            if (part.startsWith(`${column}=eq.`)) {
+              const value = decodeURIComponent(part.slice(column.length + 4));
+              matched = matched.filter((row) => row[column] === value);
+            }
+          }
+        }
+
+        const ordered = parts.find((part) => part.startsWith("order="));
+
+        if (ordered === "order=created_at.asc") {
+          matched = [...matched].sort((left, right) =>
+            String(left["created_at"]).localeCompare(String(right["created_at"])),
+          );
+        }
+
+        if (ordered === "order=created_at.desc") {
+          matched = [...matched].sort((left, right) =>
+            String(right["created_at"]).localeCompare(String(left["created_at"])),
+          );
+        }
+
+        const limit = parts.find((part) => part.startsWith("limit="));
+        const capped =
+          limit === undefined
+            ? matched
+            : matched.slice(0, Number.parseInt(limit.slice("limit=".length), 10));
+
+        return Promise.resolve(capped.map((row) => schema.parse(row)));
+      }
+
       if (table === BUSINESS_PROFILE_TABLE) {
         const limit = query.split("&").find((part) => part.startsWith("limit="));
 
@@ -1126,6 +1272,99 @@ function createBusinessStore(database: BusinessDatabase): RestClient {
       return Promise.reject(new Error(`the form reads no other table: ${table}`));
     },
     insert(table: string, rows: readonly Readonly<Record<string, unknown>>[]): Promise<void> {
+      // The KYC tables of 0048-0051: recorded, and materialised with the defaults the migration gives.
+      if (
+        table === KYC_SUBMISSIONS_TABLE ||
+        table === KYC_DOCUMENTS_TABLE ||
+        table === UBO_RECORDS_TABLE ||
+        table === SANCTIONS_SCREENINGS_TABLE
+      ) {
+        if (table === KYC_SUBMISSIONS_TABLE && database.conflictOnInsert) {
+          database.conflictOnInsert = false;
+
+          return Promise.reject(new AppError("CONFLICT", { cause: { code: UNIQUE_VIOLATION } }));
+        }
+
+        for (const row of rows) {
+          database.inserts.push({ table, row: { ...row } });
+
+          // Real rows get a uuid v7 from the database default; the fake keeps the same shape.
+          const id = `018f2b8a-0000-4c2d-9c3e-${String(database.inserts.length).padStart(12, "0")}`;
+          const created = new Date(NOW).toISOString();
+          const text = (key: string): string => String(row[key] ?? "");
+          const nullable = (key: string): string | null => {
+            const value = row[key];
+
+            return typeof value === "string" ? value : null;
+          };
+
+          if (table === KYC_SUBMISSIONS_TABLE) {
+            database.submissionRows.push({
+              id,
+              company_id: text("company_id"),
+              status: text("status") || "draft",
+              verification_method: text("verification_method") || "manual",
+              created_at: created,
+            });
+          }
+
+          if (table === KYC_DOCUMENTS_TABLE) {
+            database.documentRows.push({
+              id,
+              company_id: text("company_id"),
+              submission_id: text("submission_id"),
+              document_type: text("document_type"),
+              storage_key: text("storage_key"),
+              content_sha256: text("content_sha256"),
+              content_type: text("content_type"),
+              byte_size: Number(row["byte_size"] ?? 0),
+              issued_at: nullable("issued_at"),
+              expires_at: nullable("expires_at"),
+              status: text("status") || "uploaded",
+              created_at: created,
+            });
+          }
+
+          if (table === UBO_RECORDS_TABLE) {
+            database.uboRows.push({
+              id,
+              company_id: text("company_id"),
+              submission_id: text("submission_id"),
+              full_name: text("full_name"),
+              date_of_birth: text("date_of_birth"),
+              country: text("country"),
+              ownership_bps: Number(row["ownership_bps"] ?? 0),
+              is_significant: Boolean(row["is_significant"]),
+              id_document_sha256: text("id_document_sha256"),
+              is_pep: false,
+              screened_at: nullable("screened_at"),
+              created_at: created,
+            });
+          }
+
+          if (table === SANCTIONS_SCREENINGS_TABLE) {
+            database.screeningRows.push({
+              id,
+              company_id: text("company_id"),
+              subject_kind: text("subject_kind"),
+              subject_id: text("subject_id"),
+              ofac_checked: Boolean(row["ofac_checked"]),
+              un_checked: Boolean(row["un_checked"]),
+              eu_checked: Boolean(row["eu_checked"]),
+              us_checked: Boolean(row["us_checked"]),
+              result: text("result"),
+              provider: text("provider") || "manual",
+              screened_at: text("screened_at") || created,
+              note: nullable("note"),
+              sar_case: Boolean(row["sar_case"]),
+              created_at: created,
+            });
+          }
+        }
+
+        return Promise.resolve();
+      }
+
       for (const row of rows) {
         if (table === BUSINESS_PROFILE_TABLE) {
           if (database.conflictOnInsert) {
@@ -1219,6 +1458,21 @@ function createBusinessStore(database: BusinessDatabase): RestClient {
           if (row.company_id === wanted) {
             row.completed_steps = values["completed_steps"] ?? row.completed_steps;
             row.current_step = String(values["current_step"] ?? row.current_step);
+          }
+        }
+
+        return Promise.resolve();
+      }
+
+      if (table === UBO_RECORDS_TABLE) {
+        const idPart = query.split("&").find((part) => part.startsWith("id=eq."));
+        const wantedId = idPart === undefined ? null : decodeURIComponent(idPart.slice("id=eq.".length));
+
+        for (const row of database.uboRows) {
+          if (row.company_id === wanted && (wantedId === null || row.id === wantedId)) {
+            for (const [key, value] of Object.entries(values)) {
+              (row as unknown as Record<string, unknown>)[key] = value;
+            }
           }
         }
 
@@ -3324,6 +3578,662 @@ async function checkProfileCatalog(): Promise<void> {
   expect(page.includes('formatMessage("onboardingReview.savedLine"'), "and the saved line");
 }
 
+
+/* -------------------------------------------------------------------------------------------------
+ * STEP 084: the KYC pack - document upload, UBO capture, screening execution and result record.
+ * ---------------------------------------------------------------------------------------------- */
+
+const PNG_BYTES: Uint8Array = (() => {
+  const bytes = new Uint8Array(8 + 64);
+  bytes.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+  for (let index = 8; index < bytes.length; index += 1) {
+    bytes[index] = 0x61;
+  }
+
+  return bytes;
+})();
+
+const PDF_BYTES: Uint8Array = Uint8Array.from([...Buffer.from("%PDF-1.7\n", "latin1"), 1, 2, 3, 4]);
+
+const VALID_UBO = {
+  full_name: "Karim Rahman",
+  date_of_birth: "1985-04-12",
+  country: "bd",
+  ownership_bps: 4000,
+  id_document_sha256: "a".repeat(64),
+};
+
+function pngDocumentInput(overrides: Record<string, unknown> = {}) {
+  return {
+    document_type: "identity_document",
+    file_name: "passport.png",
+    declared_content_type: "image/png",
+    bytes: PNG_BYTES,
+    ...overrides,
+  };
+}
+
+/** ---- The vocabulary: the four tables, the six document types, the audit names. */
+function checkKycVocabulary(): void {
+  expectEqual(KYC_SUBMISSIONS_TABLE, "kyc_submissions", "the submission table of 0048");
+  expectEqual(KYC_DOCUMENTS_TABLE, "kyc_documents", "the document table of 0049");
+  expectEqual(UBO_RECORDS_TABLE, "ubo_records", "the owner table of 0050");
+  expectEqual(SANCTIONS_SCREENINGS_TABLE, "sanctions_screenings", "the screening table of 0051");
+  expectDeepEqual(
+    [...KYC_DOCUMENT_TYPES],
+    [
+      "identity_document",
+      "business_registration",
+      "utility_bill",
+      "bank_statement",
+      "source_of_funds",
+      "processor_request",
+    ],
+    "the six document types of 0049's check, in its order",
+  );
+  expectEqual(KYC_DOCUMENTS_ONBOARDING_STEP, "documents", "the pack completes the documents step");
+  expectEqual(KYC_DOCUMENT_AUDIT_ACTION, "kyc_document.uploaded", "an upload is audited");
+  expectEqual(UBO_AUDIT_ACTION, "ubo.captured", "a captured owner is audited");
+  expectEqual(KYC_SCREENING_AUDIT_ACTION, "kyc_screening.ran", "a screening run is audited");
+  expectEqual(KYC_AUDIT_ENTITY, "kyc_submission", "all three against the submission");
+  expectEqual(KYC_UPLOAD_PURPOSE, "kyc_document", "the upload purpose of 0058");
+  expectEqual(KYC_DOCUMENT_MAXIMUM_BYTES, UPLOAD_DATABASE_MAXIMUM_BYTES, "the ceiling is the row ceiling of 0057");
+  expectEqual(SIGNIFICANT_OWNER_BPS, 2_500, "25 percent in basis points, as 0050's check ties it");
+}
+
+/** ---- The parses: the upload's rules and the UBO's, collected before any query. */
+function checkKycParse(): void {
+  const ok = parseKycDocumentInput(pngDocumentInput());
+
+  expectEqual(ok.problems.length, 0, "a real PNG declared as image/png parses");
+  expectEqual(ok.record?.contentType, "image/png", "the detected type wins");
+  expectEqual(ok.record?.byteSize, PNG_BYTES.length, "the counted size is stored");
+  expect(/^[0-9a-f]{64}$/u.test(ok.record?.contentSha256 ?? ""), "the hash is 64 lower case hex");
+
+  const lying = parseKycDocumentInput(pngDocumentInput({ declared_content_type: "application/pdf" }));
+
+  expectDeepEqual(
+    lying.problems,
+    [{ field: "file", rule: "file_not_acceptable" }],
+    "bytes that disagree with the declared type are refused (a quarantine belongs to the storage STEP)",
+  );
+
+  expectDeepEqual(
+    parseKycDocumentInput(pngDocumentInput({ bytes: new Uint8Array(0), declared_content_type: "image/png" })).problems,
+    [{ field: "file", rule: "file_not_acceptable" }],
+    "an empty file is refused",
+  );
+  expectDeepEqual(
+    parseKycDocumentInput(pngDocumentInput({ declared_content_type: "text/html" })).problems,
+    [{ field: "file", rule: "file_not_acceptable" }],
+    "a type the purpose does not accept is refused",
+  );
+  expectDeepEqual(
+    parseKycDocumentInput(pngDocumentInput({ document_type: "diploma" })).problems,
+    [{ field: "document_type", rule: "invalid_format" }],
+    "a type outside the six is refused",
+  );
+  expectDeepEqual(
+    parseKycDocumentInput(pngDocumentInput({ document_type: "utility_bill" })).problems,
+    [{ field: "issued_at", rule: "required" }],
+    "a utility bill without its issue date is refused, as 0049's check would",
+  );
+  expectDeepEqual(
+    parseKycDocumentInput(
+      pngDocumentInput({ document_type: "utility_bill", issued_at: "2026-10-01", expires_at: "2026-09-01" }),
+    ).problems,
+    [{ field: "expires_at", rule: "invalid_format" }],
+    "an expiry before the issue date is refused",
+  );
+  expectDeepEqual(
+    parseKycDocumentInput(pngDocumentInput({ document_type: "bank_statement", issued_at: "2026-13-99" })).problems,
+    [{ field: "issued_at", rule: "invalid_format" }],
+    "a date that does not exist is refused",
+  );
+
+  const ubo = parseUboInput(VALID_UBO);
+
+  expectEqual(ubo.problems.length, 0, "a complete owner parses");
+  expectEqual(ubo.values?.country, "BD", "the country is upper cased");
+  expectEqual(ubo.values?.isSignificant, true, "4000 bps is significant, derived not posted");
+  expectEqual(parseUboInput({ ...VALID_UBO, ownership_bps: 2499 }).values?.isSignificant, false, "2499 bps is not");
+
+  for (const [label, input, field, rule] of [
+    ["a one character name", { ...VALID_UBO, full_name: "A" }, "full_name", "too_short"],
+    ["a birth before 1900", { ...VALID_UBO, date_of_birth: "1899-12-31" }, "date_of_birth", "invalid_format"],
+    ["a birth in the future", { ...VALID_UBO, date_of_birth: "2999-01-01" }, "date_of_birth", "invalid_format"],
+    ["a one letter country", { ...VALID_UBO, country: "B" }, "country", "invalid_format"],
+    ["a zero share", { ...VALID_UBO, ownership_bps: 0 }, "ownership_bps", "invalid_format"],
+    ["a share above 100 percent", { ...VALID_UBO, ownership_bps: 10_001 }, "ownership_bps", "invalid_format"],
+    ["a short hash", { ...VALID_UBO, id_document_sha256: "abc" }, "id_document_sha256", "invalid_format"],
+    ["a malformed id", { ...VALID_UBO, ubo_id: "nope" }, "ubo_id", "invalid_format"],
+  ] as const) {
+    const parsed = parseUboInput(input);
+
+    expectDeepEqual(parsed.problems, [{ field, rule }], `${label} is refused on ${field}`);
+  }
+}
+
+/** ---- The read: roles, scope, and a pack that never carries a screening result. */
+async function checkKycRead(): Promise<void> {
+  for (const [description, actor] of refusedActors) {
+    const database = createBusinessDatabase();
+    const refusal = await rejectionOf(() =>
+      readKycPack({ actor }, dependenciesOf(database, createInMemoryAuditTrail())),
+    );
+
+    expectEqual(refusal?.code, "PERMISSION_DENIED", `the pack refuses ${description}`);
+    expectEqual(database.queries.length, 0, `and reads nothing for ${description}`);
+  }
+
+  const empty = await readKycPack(
+    { actor: owner },
+    dependenciesOf(createBusinessDatabase(), createInMemoryAuditTrail()),
+  );
+
+  expectEqual(empty.submissionId, null, "a merchant with no draft gets an empty pack, not a refusal");
+  expectEqual(empty.documents.length, 0, "no documents");
+  expectEqual(empty.ubos.length, 0, "no owners");
+  expectEqual(empty.screenedCount, 0, "nothing screened");
+  expectEqual(empty.documentsComplete, false, "and the documents step is open");
+  expectEqual(empty.countries.length, 3, "the UBO country list is every live country, enabled or not");
+  expect(empty.countries.some((country) => country.code === "AQ"), "including a switched off one: a nationality can be any country");
+
+  const seeded = createBusinessDatabase(
+    [FULL_PROFILE],
+    [],
+    defaultMccRows(),
+    defaultCountryRows(),
+    [
+      {
+        id: "sub-1",
+        company_id: COMPANY_A,
+        status: "draft",
+        verification_method: "manual",
+        created_at: "2026-11-01T08:00:00.000Z",
+      },
+    ],
+    [
+      {
+        id: "doc-1",
+        company_id: COMPANY_A,
+        submission_id: "sub-1",
+        document_type: "identity_document",
+        storage_key: `${COMPANY_A}/kyc/doc-1`,
+        content_sha256: "b".repeat(64),
+        content_type: "image/png",
+        byte_size: 72,
+        issued_at: null,
+        expires_at: null,
+        status: "uploaded",
+        created_at: "2026-11-01T08:05:00.000Z",
+      },
+    ],
+    [
+      {
+        id: "ubo-1",
+        company_id: COMPANY_A,
+        submission_id: "sub-1",
+        full_name: "Karim Rahman",
+        date_of_birth: "1985-04-12",
+        country: "BD",
+        ownership_bps: 4000,
+        is_significant: true,
+        id_document_sha256: "a".repeat(64),
+        is_pep: false,
+        screened_at: null,
+        created_at: "2026-11-01T08:10:00.000Z",
+      },
+    ],
+    [
+      {
+        id: "scr-1",
+        company_id: COMPANY_A,
+        subject_kind: "company",
+        subject_id: COMPANY_A,
+        ofac_checked: true,
+        un_checked: true,
+        eu_checked: true,
+        us_checked: true,
+        result: "clear",
+        provider: "manual",
+        screened_at: "2026-11-01T08:20:00.000Z",
+        note: null,
+        sar_case: false,
+        created_at: "2026-11-01T08:20:00.000Z",
+      },
+    ],
+  );
+  const pack = await readKycPack({ actor: owner }, dependenciesOf(seeded, createInMemoryAuditTrail()));
+
+  expectEqual(pack.submissionId, "sub-1", "the draft submission is found");
+  expectEqual(pack.status, "draft", "with its status");
+  expectEqual(pack.method, "manual", "and its method");
+  expectEqual(pack.documents.length, 1, "the document is listed");
+  expectEqual(pack.documents[0]?.documentType, "identity_document", "with its type");
+  expectEqual(pack.documents[0]?.byteSize, 72, "its size");
+  expectEqual(pack.documentsComplete, true, "one document finishes the documents step");
+  expectEqual(pack.ubos.length, 1, "the owner is listed");
+  expectEqual(pack.ubos[0]?.isSignificant, true, "with the significant flag");
+  expectEqual(pack.screenedCount, 1, "the screening count is the only screening fact the pack carries");
+  expectEqual(
+    JSON.stringify(pack).includes("clear"),
+    false,
+    "no result, provider or note of any screening appears in the merchant's answer",
+  );
+  expect(
+    seeded.queries.every(
+      (query) => query.includes(encodeURIComponent(COMPANY_A)) || query.startsWith("countries?"),
+    ),
+    "every query is either scoped to the session's company or a platform-table read (the country list)",
+  );
+
+  const otherTenant = createBusinessDatabase();
+  const own = await readKycPack({ actor: otherOwner }, dependenciesOf(otherTenant, createInMemoryAuditTrail()));
+
+  expectEqual(own.companyId, COMPANY_B, "another owner reads their own company's empty pack");
+  expect(
+    otherTenant.queries.every(
+      (query) => query.includes(encodeURIComponent(COMPANY_B)) || query.startsWith("countries?"),
+    ),
+    "scoped to their own company, never the row's",
+  );
+}
+
+/** ---- The upload: validated bytes, one record, the audit, the wizard step. */
+async function checkKycDocumentSave(): Promise<void> {
+  const database = createBusinessDatabase();
+  const audit = createInMemoryAuditTrail();
+  const pack = await saveKycDocument(
+    { actor: owner, input: pngDocumentInput() },
+    dependenciesOf(database, audit),
+  );
+
+  const submissionInsert = database.inserts.find((insert) => insert.table === KYC_SUBMISSIONS_TABLE);
+  const documentInsert = database.inserts.find((insert) => insert.table === KYC_DOCUMENTS_TABLE);
+
+  expectEqual(submissionInsert?.row["status"], "draft", "the first save creates the draft submission");
+  expectEqual(submissionInsert?.row["verification_method"], "manual", "in manual mode, no provider being connected");
+  expectEqual(documentInsert?.row["company_id"], COMPANY_A, "the document belongs to the session's company");
+  expectEqual(documentInsert?.row["submission_id"], submissionInsert && database.submissionRows[0]?.id, "and to that submission");
+  expectEqual(documentInsert?.row["document_type"], "identity_document", "with the type the form sent");
+  expect(
+    typeof documentInsert?.row["storage_key"] === "string" &&
+      (documentInsert.row["storage_key"] as string).startsWith(`${COMPANY_A}/kyc/`),
+    "the storage key sits under the company's own tenant path",
+  );
+  expect(/^[0-9a-f]{64}$/u.test(String(documentInsert?.row["content_sha256"])), "the hash is recorded");
+  expectEqual(documentInsert?.row["content_type"], "image/png", "the detected type, not the claim");
+  expectEqual(documentInsert?.row["byte_size"], PNG_BYTES.length, "and the counted size");
+  expectEqual(database.documentRows[0]?.status, "uploaded", "the row waits as uploaded");
+  expectEqual(pack.documents.length, 1, "the answer lists it");
+  expectEqual(pack.documentsComplete, true, "and the documents step is finished");
+  expectEqual(pack.submissionId, database.submissionRows[0]?.id, "the answer names the submission");
+
+  const progressInsert = database.inserts.find((insert) => insert.table === ONBOARDING_PROGRESS_TABLE);
+
+  expectEqual(progressInsert?.row["current_step"], "review", "the wizard opens on the step after documents");
+  expectDeepEqual(progressInsert?.row["completed_steps"], ["documents"], "with documents finished");
+
+  expectEqual(audit.entries.length, 1, "one audit entry for the upload");
+  expectEqual(audit.entries[0]?.action, KYC_DOCUMENT_AUDIT_ACTION, "under kyc_document.uploaded");
+  expectEqual(audit.entries[0]?.entityType, KYC_AUDIT_ENTITY, "on the submission entity");
+  expectEqual(audit.entries[0]?.entityId, database.submissionRows[0]?.id, "naming the submission");
+  expectEqual(audit.entries[0]?.payload?.["document_type"], "identity_document", "recording the type, never the bytes");
+
+  const second = await saveKycDocument(
+    { actor: owner, input: pngDocumentInput({ document_type: "bank_statement", declared_content_type: "application/pdf", bytes: PDF_BYTES, file_name: "statement.pdf" }) },
+    dependenciesOf(database, audit),
+  );
+
+  expectEqual(
+    database.inserts.filter((insert) => insert.table === KYC_SUBMISSIONS_TABLE).length,
+    1,
+    "the second save reuses the draft, it does not create another",
+  );
+  expectEqual(second.documents.length, 2, "both documents are listed");
+  expectEqual(
+    database.updates.filter((update) => update.table === ONBOARDING_PROGRESS_TABLE).length,
+    0,
+    "and the wizard row is already finished, so it is not written again",
+  );
+  expectEqual(database.documentRows[1]?.content_type, "application/pdf", "a real PDF is recorded as pdf");
+
+  const refusals = createBusinessDatabase();
+  const refusalAudit = createInMemoryAuditTrail();
+
+  for (const [label, input, details] of [
+    ["a utility bill without its issue date", pngDocumentInput({ document_type: "utility_bill" }), [{ field: "issued_at", rule: "required" }]],
+    ["bytes that lie about their type", pngDocumentInput({ declared_content_type: "application/pdf" }), [{ field: "file", rule: "file_not_acceptable" }]],
+    ["an empty file", pngDocumentInput({ bytes: new Uint8Array(0) }), [{ field: "file", rule: "file_not_acceptable" }]],
+    ["a type outside the six", pngDocumentInput({ document_type: "diploma" }), [{ field: "document_type", rule: "invalid_format" }]],
+  ] as const) {
+    const refusal = await rejectionOf(() =>
+      saveKycDocument({ actor: owner, input }, dependenciesOf(refusals, refusalAudit)),
+    );
+
+    expectEqual(refusal?.code, "VALIDATION_FAILED", `${label} is a validation failure`);
+    expectDeepEqual(refusal?.details, details, `naming ${JSON.stringify(details)}`);
+  }
+
+  expectEqual(refusals.inserts.length, 0, "a refused upload writes nothing");
+  expectEqual(refusals.queries.length, 0, "and queries nothing: the parse runs before any read");
+  expectEqual(refusalAudit.entries.length, 0, "and audits nothing");
+
+  const tooLarge = new Uint8Array(UPLOAD_DATABASE_MAXIMUM_BYTES + 1);
+  const bigRefusal = await rejectionOf(() =>
+    saveKycDocument(
+      { actor: owner, input: pngDocumentInput({ bytes: tooLarge }) },
+      dependenciesOf(createBusinessDatabase(), createInMemoryAuditTrail()),
+    ),
+  );
+
+  expectDeepEqual(
+    bigRefusal?.details,
+    [{ field: "file", rule: "file_not_acceptable" }],
+    "a file above the 0057 row ceiling is refused",
+  );
+
+  // The lost race on the draft submission: the insert collides, the re-read finds the other tab's row.
+  const racing = createBusinessDatabase(
+    [],
+    [],
+    defaultMccRows(),
+    defaultCountryRows(),
+    [{ id: "sub-race", company_id: COMPANY_A, status: "draft", verification_method: "manual", created_at: "2026-11-01T07:00:00.000Z" }],
+  );
+  racing.conflictOnInsert = true;
+  const rescued = await saveKycDocument({ actor: owner, input: pngDocumentInput() }, dependenciesOf(racing, createInMemoryAuditTrail()));
+
+  expectEqual(rescued.submissionId, "sub-race", "a save that loses the draft-insert race still records against the existing draft");
+  expectEqual(racing.documentRows[0]?.submission_id, "sub-race", "the document points at the row that won");
+}
+
+/** ---- The UBO capture: derived significance, the 100 percent ceiling, update by id. */
+async function checkKycUboSave(): Promise<void> {
+  const database = createBusinessDatabase();
+  const audit = createInMemoryAuditTrail();
+  const pack = await saveUbo({ actor: owner, input: VALID_UBO }, dependenciesOf(database, audit));
+
+  expectEqual(database.uboRows.length, 1, "the owner is recorded");
+  expectEqual(database.uboRows[0]?.is_significant, true, "significance is derived from the share");
+  expectEqual(database.uboRows[0]?.country, "BD", "the country is upper cased");
+  expectEqual(database.uboRows[0]?.submission_id, database.submissionRows[0]?.id, "against the draft submission");
+  expectEqual(pack.ubos.length, 1, "and listed in the answer");
+  expectEqual(audit.entries[0]?.action, UBO_AUDIT_ACTION, "audited as ubo.captured");
+  expectEqual(audit.entries[0]?.payload?.["ownership_bps"], 4000, "the share in the audit, not the name or the hash");
+
+  const small = await saveUbo(
+    { actor: owner, input: { ...VALID_UBO, full_name: "Other Person", ownership_bps: 2499 } },
+    dependenciesOf(database, audit),
+  );
+
+  expectEqual(small.ubos.length, 2, "a second owner is added");
+  expectEqual(database.uboRows[1]?.is_significant, false, "2499 bps is stored as not significant");
+
+  const over = await rejectionOf(() =>
+    saveUbo(
+      { actor: owner, input: { ...VALID_UBO, full_name: "Third Person", ownership_bps: 10_000 - 4000 - 2499 + 1 } },
+      dependenciesOf(database, createInMemoryAuditTrail()),
+    ),
+  );
+
+  expectDeepEqual(
+    over?.details,
+    [{ field: "ownership_bps", rule: "ownership_total_exceeded" }],
+    "a share that would take the total above 100 percent is refused before the 0050 guard has to",
+  );
+  expectEqual(database.uboRows.length, 2, "and nothing was written");
+
+  const updated = await saveUbo(
+    { actor: owner, input: { ...VALID_UBO, ubo_id: database.uboRows[0]?.id, ownership_bps: 3000 } },
+    dependenciesOf(database, audit),
+  );
+
+  expectEqual(database.uboRows.length, 2, "an update by id inserts nothing new");
+  expectEqual(database.uboRows[0]?.ownership_bps, 3000, "the share is corrected");
+  expectEqual(database.uboRows[0]?.is_significant, true, "and significance follows the new share");
+  expectEqual(updated.ubos[0]?.ownershipBps, 3000, "the answer shows the correction");
+  expect(
+    database.updates.some((update) => update.table === UBO_RECORDS_TABLE && update.values["ownership_bps"] === 3000),
+    "the update carried the share",
+  );
+
+  const unknown = await rejectionOf(() =>
+    saveUbo(
+      { actor: owner, input: { ...VALID_UBO, ubo_id: "018f2b8a-9999-4c2d-9c3e-000000000009" } },
+      dependenciesOf(database, createInMemoryAuditTrail()),
+    ),
+  );
+
+  expectDeepEqual(unknown?.details, [{ field: "ubo_id", rule: "not_found" }], "an id not on this submission is not found");
+
+  const invalid = createBusinessDatabase();
+  const invalidRefusal = await rejectionOf(() =>
+    saveUbo({ actor: owner, input: { ...VALID_UBO, full_name: "A", ownership_bps: 0 } }, dependenciesOf(invalid, createInMemoryAuditTrail())),
+  );
+
+  expectEqual(invalidRefusal?.details?.length, 2, "both bad fields are collected in one parse");
+  expectEqual(invalid.queries.length, 0, "a bad body queries nothing");
+}
+
+/** ---- The screening: one row per subject, the local signal, the audit, and no result to the merchant. */
+async function checkKycScreening(): Promise<void> {
+  const database = createBusinessDatabase(
+    [businessRow({ country_code: "BD" })],
+    [],
+    defaultMccRows(),
+    defaultCountryRows(),
+    [{ id: "sub-1", company_id: COMPANY_A, status: "draft", verification_method: "manual", created_at: "2026-11-01T08:00:00.000Z" }],
+    [],
+    [
+      {
+        id: "ubo-1",
+        company_id: COMPANY_A,
+        submission_id: "sub-1",
+        full_name: "Karim Rahman",
+        date_of_birth: "1985-04-12",
+        country: "AQ",
+        ownership_bps: 4000,
+        is_significant: true,
+        id_document_sha256: "a".repeat(64),
+        is_pep: false,
+        screened_at: null,
+        created_at: "2026-11-01T08:10:00.000Z",
+      },
+    ],
+  );
+  const audit = createInMemoryAuditTrail();
+  const pack = await runKycScreening({ actor: owner }, dependenciesOf(database, audit));
+
+  expectEqual(database.screeningRows.length, 2, "one row for the company and one for the UBO");
+  const companyRow = database.screeningRows.find((row) => row.subject_kind === "company");
+  const uboRow = database.screeningRows.find((row) => row.subject_kind === "ubo");
+
+  expectEqual(companyRow?.subject_id, COMPANY_A, "the company subject is the merchant itself, as 0051's check requires");
+  expectEqual(companyRow?.result, "clear", "BD is not sanctioned, so the company screens clear");
+  expectEqual(uboRow?.result, "possible_match", "a UBO whose country of record is sanctioned is a possible match");
+  expect((uboRow?.note ?? "").length > 0, "with the reason in the note");
+  expectEqual(uboRow?.provider, "manual", "the provider says manual: no adapter is connected");
+  expect(
+    [uboRow?.ofac_checked, uboRow?.un_checked, uboRow?.eu_checked, uboRow?.us_checked].every(Boolean),
+    "all four lists are recorded as covered",
+  );
+  expectEqual(uboRow?.sar_case ?? false, false, "this service never raises a SAR flag; only the office can");
+  expectEqual(database.uboRows[0]?.screened_at, new Date(NOW).toISOString(), "the UBO's screened_at is stamped");
+  expect(
+    database.updates.some((update) => update.table === UBO_RECORDS_TABLE && "screened_at" in update.values),
+    "by an update to the owner row",
+  );
+  expectEqual(pack.screenedCount, 2, "the answer carries the count");
+  expectEqual(JSON.stringify(pack).includes("possible_match"), false, "and never a result");
+  expectEqual(audit.entries[0]?.action, KYC_SCREENING_AUDIT_ACTION, "the run is audited");
+  expectDeepEqual(
+    audit.entries[0]?.payload && { subjects: audit.entries[0].payload["subjects"], clear: audit.entries[0].payload["clear"], possible_match: audit.entries[0].payload["possible_match"] },
+    { subjects: 2, clear: 1, possible_match: 1 },
+    "the audit records how many of each",
+  );
+
+  const rerun = await runKycScreening({ actor: owner }, dependenciesOf(database, audit));
+
+  expectEqual(database.screeningRows.length, 2, "a rerun does not screen the same subjects twice");
+  expectEqual(rerun.screenedCount, 2, "the count is unchanged");
+
+  const empty = createBusinessDatabase();
+  const emptyPack = await runKycScreening({ actor: owner }, dependenciesOf(empty, createInMemoryAuditTrail()));
+
+  expectEqual(empty.screeningRows.length, 1, "with no UBO captured, only the company is screened");
+  expectEqual(empty.screeningRows[0]?.result, "clear", "no country on the profile, no local signal, clear");
+  expectEqual(emptyPack.submissionId !== null, true, "and the run creates the draft submission it screened against");
+}
+
+/** ---- The sources: three POST routes, the page, the form, the wizard map and the CSRF list. */
+async function checkKycSources(): Promise<void> {
+  const documentRoute = await readRepositoryFile("app/api/onboarding/kyc-document/route.ts");
+  const uboRoute = await readRepositoryFile("app/api/onboarding/kyc-ubo/route.ts");
+  const screeningRoute = await readRepositoryFile("app/api/onboarding/kyc-screening/route.ts");
+  const page = await readRepositoryFile("app/(dashboard)/onboarding/documents/page.tsx");
+  const form = await readRepositoryFile("app/(dashboard)/onboarding/documents/documents-form.tsx");
+  const copy = await readRepositoryFile("app/(dashboard)/onboarding/step-copy.ts");
+  const csrf = await readRepositoryFile("lib/security/csrf.ts");
+  const types = await readRepositoryFile("services/kyc/kyc-document-types.ts");
+
+  for (const [path, source] of [
+    ["app/api/onboarding/kyc-document/route.ts", documentRoute],
+    ["app/api/onboarding/kyc-ubo/route.ts", uboRoute],
+    ["app/api/onboarding/kyc-screening/route.ts", screeningRoute],
+    ["app/(dashboard)/onboarding/documents/page.tsx", page],
+    ["app/(dashboard)/onboarding/documents/documents-form.tsx", form],
+  ] as const) {
+    expectEqual(source.split("\n")[0], `// path: ${path}`, `${path} states its own path on its first line`);
+    expectEqual(/[^\t\n\r\x20-\x7E]/u.test(source), false, `${path} is ASCII only`);
+  }
+
+  for (const [path, route] of [
+    ["app/api/onboarding/kyc-document/route.ts", documentRoute],
+    ["app/api/onboarding/kyc-ubo/route.ts", uboRoute],
+    ["app/api/onboarding/kyc-screening/route.ts", screeningRoute],
+  ] as const) {
+    expect(route.includes("export const POST"), `${path} answers POST`);
+    expectEqual(route.includes("export const GET"), false, `${path} answers no GET`);
+    expect(route.includes("requireCsrfToken("), "the token is checked first");
+    expect(route.indexOf("requireCsrfToken(") < route.indexOf("readRequestActor("), "before the session is read");
+    expect(route.includes("maximumBodyBytes"), "the body is bounded");
+    expect(route.includes('"cache-control": "no-store"'), "the answer is not cached");
+    expect(
+      csrf.includes(`"${path.replace("app/api", "/api").replace("/route.ts", "")}",`),
+      `and the path is on the CSRF-protected list`,
+    );
+  }
+
+  expect(documentRoute.includes("request.formData()"), "the document route reads multipart");
+  expect(documentRoute.includes("instanceof File"), "and requires a real file");
+  expect(documentRoute.includes("arrayBuffer()"), "reads the bytes once");
+  expect(documentRoute.includes("saveKycDocument("), "and hands them to the service");
+  expect(documentRoute.includes("KYC_DOCUMENT_MAXIMUM_BYTES"), "with the 0057 row ceiling plus form overhead as the declared limit");
+  expect(uboRoute.includes("saveUbo("), "the UBO route saves through the service");
+  expect(screeningRoute.includes("runKycScreening("), "the screening route runs through the service");
+  for (const route of [uboRoute, screeningRoute]) {
+    expectEqual(route.includes("searchParams"), false, "no route takes a company from the query string");
+    expectEqual(route.includes('"company_id"'), false, "and none reads a company field from the body");
+  }
+
+  expect(page.includes("readOwnerActor()"), "the page reads the account through the cached reader");
+  expect(page.includes("readKycPack("), "and the pack through the service");
+  expect(page.includes("<SessionKeeper"), "and keeps the session rotating");
+  expect(page.includes("DocumentsForm"), "and renders the form");
+  for (const state of ["signed-out", "forbidden", "unavailable", "ready"]) {
+    expect(page.includes(`"${state}"`), `the page keeps the ${state} answer apart`);
+  }
+
+  expectEqual(form.includes('"use client"'), true, "the form is a client component");
+  expectEqual((form.match(/method: "POST"/gu) ?? []).length, 2, "it posts through two fetch sites, one shared by two actions");
+  expectEqual((form.match(/\.\.\.\(await csrfHeaders\(\)\)/gu) ?? []).length, 2, "each fetch site spreads the awaited token once");
+  for (const pathConst of ["UPLOAD_PATH", "UBO_PATH", "SCREENING_PATH"]) {
+    expect(form.includes(pathConst), `the form posts to ${pathConst}`);
+  }
+  expect(form.includes('fetch(UPLOAD_PATH'), "the upload posts multipart");
+  expect(form.includes("new FormData()"), "the upload body is a FormData, so the browser sets the boundary");
+  expect(form.includes('fetch(UBO_PATH') || form.includes("postJson(UBO_PATH"), "the UBO save posts JSON");
+  expect(form.includes("postJson(SCREENING_PATH"), "the screening run posts an empty body");
+  expect(form.includes("KYC_DOCUMENT_TYPES"), "the type select is drawn from the shared list");
+  expect(form.includes("@/services/kyc/kyc-document-types"), "imported from the client-safe module, not the service");
+  expectEqual(form.includes("process.env"), false, "the form reads no environment");
+  expectEqual(form.includes("companyId"), false, "and sends no company in any body");
+
+  expect(types.includes("KYC_DOCUMENT_TYPES"), "the type list lives in its own client-safe module");
+  expectEqual(/^import .*node:/mu.test(types), false, "with no server imports, so no node builtin reaches the browser bundle");
+  expect(copy.includes('documents: "/onboarding/documents"'), "the documents step links to its page");
+
+  expect(
+    (await readdir(new URL("app/(dashboard)/onboarding/documents/", repositoryRoot))).includes("page.tsx"),
+    "the screen lives in the merchant dashboard area",
+  );
+  expect(
+    (await readdir(new URL("app/(dashboard)/onboarding/documents/", repositoryRoot))).includes("documents-form.tsx"),
+    "with its form beside it",
+  );
+  for (const folder of ["kyc-document", "kyc-ubo", "kyc-screening"]) {
+    expect(
+      (await readdir(new URL(`app/api/onboarding/${folder}/`, repositoryRoot))).includes("route.ts"),
+      `${folder} is a route handler of its own`,
+    );
+  }
+  expect(
+    (await readdir(new URL("services/kyc/", repositoryRoot))).includes("kyc-capture.ts"),
+    "the capture service lives in services/kyc",
+  );
+}
+
+/** ---- The catalog: every sentence of the documents step is used, and every key it names exists. */
+async function checkKycCatalog(): Promise<void> {
+  const block = en.onboardingDocuments as unknown as Record<string, unknown>;
+  const page = await readRepositoryFile("app/(dashboard)/onboarding/documents/page.tsx");
+  const form = await readRepositoryFile("app/(dashboard)/onboarding/documents/documents-form.tsx");
+  const sources = `${page}\n${form}`;
+
+  const flat: string[] = [];
+
+  const walk = (node: Record<string, unknown>, prefix: string): void => {
+    for (const [key, value] of Object.entries(node)) {
+      const path = `${prefix}.${key}`;
+
+      if (typeof value === "string") {
+        flat.push(path);
+      } else if (typeof value === "object" && value !== null) {
+        walk(value as Record<string, unknown>, path);
+      }
+    }
+  };
+
+  walk(block, "onboardingDocuments");
+
+  expect(flat.length >= 50, "the documents step has its own block of copy");
+
+  for (const path of flat) {
+    expect(sources.includes(`"${path}"`), `the copy key ${path} is used by the screen`);
+  }
+
+  const referenced = [...sources.matchAll(/"(onboardingDocuments\.[A-Za-z.]+)"/gu)].map((match) => match[1]);
+
+  for (const path of new Set(referenced)) {
+    expect(path !== undefined && flat.includes(path), `the screen names no missing key (${String(path)})`);
+  }
+
+  for (const templated of ["docSizeLine", "uboShareLine", "uboScreenedLine", "screeningDone"]) {
+    expectEqual(
+      sources.includes(`getMessage("onboardingDocuments.${templated}")`),
+      false,
+      `${templated} is never rendered without its values`,
+    );
+    expect(
+      sources.includes(`formatMessage("onboardingDocuments.${templated}"`),
+      `and is rendered through formatMessage`,
+    );
+  }
+}
+
 async function main(): Promise<void> {
   checkVocabulary();
   await checkRefusals();
@@ -3363,6 +4273,14 @@ async function main(): Promise<void> {
   await checkProfilePayload();
   await checkProfileSources();
   await checkProfileCatalog();
+  checkKycVocabulary();
+  checkKycParse();
+  await checkKycRead();
+  await checkKycDocumentSave();
+  await checkKycUboSave();
+  await checkKycScreening();
+  await checkKycSources();
+  await checkKycCatalog();
 
   if (failures.length > 0) {
     process.stderr.write(`onboarding gate failed with ${failures.length} problem(s):\n`);
@@ -3380,7 +4298,7 @@ async function main(): Promise<void> {
     `onboarding gate passed: ${checks} checks, ${ONBOARDING_STEPS.length} steps, ` +
       `${ONBOARDING_OWNER_ROLES.length} role, ${BUSINESS_PROFILE_FIELDS.length} business fields, ` +
       `${PROCESSOR_REQUIREMENT_LIST.length} processors, ${BUSINESS_PROFILE_TABLE} table, ` +
-      `${MCC_CODES_TABLE} vocabulary, ${COUNTRIES_TABLE} list, submerchant profile\n`,
+      `${MCC_CODES_TABLE} vocabulary, ${COUNTRIES_TABLE} list, submerchant profile, kyc pack\n`,
   );
 }
 

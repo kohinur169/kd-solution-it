@@ -34,6 +34,11 @@ Every read is scoped to the caller company and every write is audit logged.
   resolves the code title from `0077` and the country name from `0076`, and computes the payload and
   the readiness per processor; `GET /api/onboarding/processor-profile` for the office roles, which
   audit each read). No migration: the facts were already stored on the profile row by STEPs 080-082.
+- `onboarding/documents/` - STEP 084: the KYC documents step - upload, beneficial owners and the
+  manual screening run (`services/kyc/kyc-capture.ts` over the `0048`-`0051` tables and the
+  `kyc_document` upload policy of `lib/security/upload.ts`; `POST /api/onboarding/kyc-document`,
+  `/kyc-ubo`, `/kyc-screening`; the document type list is shared with the browser through
+  `services/kyc/kyc-document-types.ts`). No migration either: STEP 028 built the tables.
 
 ## The reader
 

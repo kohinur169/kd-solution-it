@@ -73,6 +73,7 @@ export const ONBOARDING_STEP_FORMS: Partial<Readonly<Record<OnboardingStep, stri
   business: "/onboarding/business",
   address: "/onboarding/address",
   category: "/onboarding/category",
+  documents: "/onboarding/documents",
   review: "/onboarding/review",
 });
 
