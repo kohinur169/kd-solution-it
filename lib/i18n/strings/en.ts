@@ -1392,6 +1392,44 @@ const catalog = {
     unavailable: "The business information could not be read just now. Try again in a moment.",
     backLink: "Back to the onboarding wizard",
   },
+  onboardingCategory: {
+    eyebrow: "Merchant onboarding",
+    title: "Merchant category code",
+    description:
+      "The four digit merchant category code for what your business sells. It is stored once on your business profile, sent to every connected processor, and it sets the risk tier your account starts on.",
+    guardNote:
+      "Only the owner of a merchant account can choose this code, and the company it belongs to comes from your session rather than from the address.",
+    formHeading: "The category",
+    formDescription:
+      "Choose the code that matches what the business sells. The list is the published code list of the card networks; a code that is no longer offered cannot be chosen.",
+    codeLabel: "Merchant category code",
+    codeHint: "Exactly four digits. The list shows the code and what it covers.",
+    filterLabel: "Filter the list",
+    filterHint: "Type part of the code or the description to narrow the list below.",
+    placeholderOption: "Choose a category",
+    requiredMark: "Required",
+    completeLine: "A category code is chosen, so the category step of the wizard is finished.",
+    unsavedLine: "No category is chosen yet. A save stores the one you choose.",
+    selectedLine: "Chosen: {code} - {title}",
+    savedLine: "Last saved at {at} UTC.",
+    saveSubmit: "Save the category code",
+    saveBusy: "Saving",
+    saveDone: "Saved. The category code is stored on your business profile.",
+    saveDoneComplete: "Saved. The category step of the wizard is finished.",
+    saveFailed:
+      "The category code was not saved just now. Nothing changed; try again in a moment.",
+    ruleInvalidFormat: "A category code is exactly four digits.",
+    ruleUnknownKey: "That field is not part of this form.",
+    ruleRequired: "Choose one of the listed codes, or clear the field to remove the choice.",
+    ruleUnknownCode: "That code is not one of the published merchant category codes.",
+    ruleRetiredCode: "That code is retired and can no longer be chosen.",
+    fieldInvalid: "This value was not accepted.",
+    signedOut: "Sign in with a merchant account to choose the category code.",
+    forbidden:
+      "This form belongs to a merchant owner account. An office account reads merchant categories from the office screens.",
+    unavailable: "The category code could not be read just now. Try again in a moment.",
+    backLink: "Back to the onboarding wizard",
+  },
   email: {
     lockAlert: {
       /** Subject of the section 23 alert of section 22: the owner is told their account locked. */

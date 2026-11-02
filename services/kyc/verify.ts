@@ -31,6 +31,18 @@ import {
   REQUIRED_BUSINESS_FIELDS,
   type BusinessProfileField,
 } from "./processor-fields.ts";
+import {
+  parseMerchantCategoryInput,
+  readMerchantCategory,
+  saveMerchantCategory,
+  MCC_CODES_TABLE,
+  MCC_CODE_PATTERN,
+  MERCHANT_CATEGORY_AUDIT_ACTION,
+  MERCHANT_CATEGORY_AUDIT_ENTITY,
+  MERCHANT_CATEGORY_FIELD,
+  MERCHANT_CATEGORY_ONBOARDING_STEP,
+  type MerchantCategorySnapshot,
+} from "./merchant-category.ts";
 import { PLATFORM_PROVIDERS } from "../../lib/gateways/registry.ts";
 import {
   ONBOARDING_AUDIT_ACTION,
@@ -800,8 +812,9 @@ async function checkMigrationSet(): Promise<void> {
 
   expectEqual(numbers.includes("0102"), true, "STEP 079's migration is in the set");
   expectEqual(numbers.includes("0103"), true, "STEP 080's is too");
-  expectEqual(numbers.includes("0104"), false, "and nothing beyond them");
-  expectEqual(Math.max(...numbers.map((number) => Number.parseInt(number, 10))), 103, "the set ends at 0103");
+  expectEqual(numbers.includes("0104"), true, "STEP 081's is too");
+  expectEqual(numbers.includes("0105"), false, "and nothing beyond them");
+  expectEqual(Math.max(...numbers.map((number) => Number.parseInt(number, 10))), 104, "the set ends at 0104");
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -817,13 +830,32 @@ interface BusinessRowShape {
   tax_id: string | null;
   website: string | null;
   business_description: string | null;
+  mcc_code: string | null;
   completed_at: string | null;
   updated_at: string;
+}
+
+/** One row of the `0077` vocabulary, as the fake store holds it. `deleted_at` is always null. */
+interface MccRowShape {
+  code: string;
+  title: string;
+  is_active: boolean;
+}
+
+/** The vocabulary the category gate works against: three active codes and one retired one. */
+function defaultMccRows(): MccRowShape[] {
+  return [
+    { code: "0742", title: "Veterinary Services", is_active: true },
+    { code: "5411", title: "Grocery Stores, Supermarkets", is_active: true },
+    { code: "5812", title: "Eating places and Restaurants", is_active: true },
+    { code: "0001", title: "Retired Example Code", is_active: false },
+  ];
 }
 
 interface BusinessDatabase {
   readonly profileRows: BusinessRowShape[];
   readonly onboardingRows: ProgressRowShape[];
+  readonly mccRows: MccRowShape[];
   readonly queries: string[];
   readonly inserts: { readonly table: string; readonly row: Readonly<Record<string, unknown>> }[];
   readonly updates: {
@@ -844,6 +876,7 @@ function businessRow(overrides: Partial<BusinessRowShape> = {}): BusinessRowShap
     tax_id: null,
     website: null,
     business_description: null,
+    mcc_code: null,
     completed_at: null,
     updated_at: "2026-11-01T09:30:00.000Z",
     ...overrides,
@@ -853,10 +886,12 @@ function businessRow(overrides: Partial<BusinessRowShape> = {}): BusinessRowShap
 function createBusinessDatabase(
   profileRows: readonly BusinessRowShape[] = [],
   onboardingRows: readonly ProgressRowShape[] = [],
+  mccRows: readonly MccRowShape[] = defaultMccRows(),
 ): BusinessDatabase {
   return {
     profileRows: [...profileRows],
     onboardingRows: [...onboardingRows],
+    mccRows: [...mccRows],
     queries: [],
     inserts: [],
     updates: [],
@@ -885,6 +920,9 @@ function profileRowFrom(companyId: string, values: Readonly<Record<string, unkno
   const completed = values["completed_at"];
   stored.completed_at = typeof completed === "string" ? completed : null;
 
+  const mcc = values["mcc_code"];
+  stored.mcc_code = typeof mcc === "string" ? mcc : null;
+
   return stored;
 }
 
@@ -905,6 +943,39 @@ function createBusinessStore(database: BusinessDatabase): RestClient {
   return {
     select<TRow>(table: string, query: string, schema: z.ZodType<TRow>): Promise<readonly TRow[]> {
       database.queries.push(`${table}?${query}`);
+
+      // The vocabulary of `0077` is a platform table: company_id is always null there, so it is
+      // scoped by its own filters instead of by a company.
+      if (table === MCC_CODES_TABLE) {
+        const parts = query.split("&");
+
+        if (!parts.includes("deleted_at=is.null")) {
+          return Promise.reject(new Error(`the vocabulary read is not over live rows: ${query}`));
+        }
+
+        const codeFilter = parts.find((part) => part.startsWith("code=eq."));
+        const activeOnly = parts.includes("is_active=is.true");
+        const limit = parts.find((part) => part.startsWith("limit="));
+        const ordered = parts.includes("order=code.asc");
+
+        let matched = database.mccRows.filter((row) => (activeOnly ? row.is_active : true));
+
+        if (codeFilter !== undefined) {
+          const wanted = decodeURIComponent(codeFilter.slice("code=eq.".length));
+          matched = matched.filter((row) => row.code === wanted);
+        }
+
+        if (ordered) {
+          matched = [...matched].sort((left, right) => left.code.localeCompare(right.code));
+        }
+
+        const capped =
+          limit === undefined
+            ? matched
+            : matched.slice(0, Number.parseInt(limit.slice("limit=".length), 10));
+
+        return Promise.resolve(capped.map((row) => schema.parse(row)));
+      }
 
       const wanted = scopedCompany(query);
 
@@ -989,6 +1060,11 @@ function createBusinessStore(database: BusinessDatabase): RestClient {
             if ("completed_at" in values) {
               const completed = values["completed_at"];
               row.completed_at = typeof completed === "string" ? completed : null;
+            }
+
+            if ("mcc_code" in values) {
+              const mcc = values["mcc_code"];
+              row.mcc_code = typeof mcc === "string" ? mcc : null;
             }
 
             row.updated_at = new Date(NOW).toISOString();
@@ -1627,6 +1703,487 @@ function camelOf(field: string): string {
   return field.replace(/_([a-z])/gu, (_match, letter: string) => letter.toUpperCase());
 }
 
+/* -------------------------------------------------------------------------------------------------
+ * STEP 081: the merchant category code on the business profile, its vocabulary and its save.
+ * ---------------------------------------------------------------------------------------------- */
+
+function saveCategory(
+  actor: RequestActor,
+  input: unknown,
+  database: BusinessDatabase,
+  audit: InMemoryAuditTrail,
+): Promise<MerchantCategorySnapshot> {
+  return saveMerchantCategory(
+    { actor, input, ipAddress: "203.0.113.9", userAgent: "gate" },
+    dependenciesOf(database, audit),
+  );
+}
+
+/** ---- The vocabulary: one field, one pattern, one audit action, and the category step. */
+function checkCategoryVocabulary(): void {
+  expectEqual(MCC_CODES_TABLE, "mcc_codes", "the code list is the table of 0077");
+  expectEqual(MERCHANT_CATEGORY_FIELD, "mcc_code", "the save carries one field");
+  expectEqual(MERCHANT_CATEGORY_AUDIT_ACTION, "merchant_category.saved", "a save is audited under one name");
+  expectEqual(MERCHANT_CATEGORY_AUDIT_ENTITY, "merchant_category", "against its own entity");
+  expectEqual(MERCHANT_CATEGORY_ONBOARDING_STEP, "category", "and it finishes the category step");
+
+  for (const code of ["0742", "5411", "5812", "9999", "0000"]) {
+    expect(MCC_CODE_PATTERN.test(code), `"${code}" is a four digit code, leading zeros kept`);
+  }
+
+  for (const code of ["", "742", "54111", "54a1", " 5411", "5411 ", "5 11", "abcd"]) {
+    expectEqual(MCC_CODE_PATTERN.test(code), false, `"${code}" is not a code`);
+  }
+}
+
+/** ---- The parse: one field, its rules, and a key nobody knows refused rather than dropped. */
+function checkCategoryParse(): void {
+  const clean = parseMerchantCategoryInput({ mcc_code: "5411" });
+
+  expectEqual(clean.problems.length, 0, "a code parses");
+  expectEqual(clean.value, "5411", "unchanged");
+
+  const padded = parseMerchantCategoryInput({ mcc_code: "  5411  " });
+
+  expectEqual(padded.value, "5411", "whitespace is removed before the pattern is applied");
+
+  for (const clearing of [{ mcc_code: "" }, { mcc_code: "   " }, { mcc_code: null }]) {
+    const parsed = parseMerchantCategoryInput(clearing);
+
+    expectEqual(parsed.problems.length, 0, `${JSON.stringify(clearing)} is a deliberate clear`);
+    expectEqual(parsed.value, null, "and answers null");
+  }
+
+  const missing = parseMerchantCategoryInput({});
+
+  expectDeepEqual(
+    missing.problems,
+    [{ field: "mcc_code", rule: "required" }],
+    "a body without the field names it as required",
+  );
+  expectEqual(missing.value, undefined, "and carries no value");
+
+  for (const bad of ["541", "54111", "54a1", 5411, true, ["5411"]]) {
+    const parsed = parseMerchantCategoryInput({ mcc_code: bad });
+
+    expectDeepEqual(
+      parsed.problems,
+      [{ field: "mcc_code", rule: "invalid_format" }],
+      `${JSON.stringify(bad)} is a format problem`,
+    );
+  }
+
+  const notAnObject = parseMerchantCategoryInput("5411");
+
+  expectDeepEqual(
+    notAnObject.problems,
+    [{ field: "mcc_code", rule: "invalid_format" }],
+    "a body that is not an object is refused whole",
+  );
+
+  const unknown = parseMerchantCategoryInput({ mcc_code: "5411", turnover: "1000" });
+
+  expectDeepEqual(
+    unknown.problems,
+    [{ field: "turnover", rule: "unknown_key" }],
+    "a key beside the one field is named as unknown",
+  );
+}
+
+/** ---- The read: the caller's own company, the active vocabulary, and a retired choice still named. */
+async function checkCategoryRead(): Promise<void> {
+  for (const [description, actor] of refusedActors) {
+    const database = createBusinessDatabase([businessRow({ mcc_code: "5411" })]);
+    const refusal = await rejectionOf(() =>
+      readMerchantCategory({ actor }, dependenciesOf(database, createInMemoryAuditTrail())),
+    );
+
+    expectEqual(refusal?.code, "PERMISSION_DENIED", `the category refuses ${description}`);
+    expectEqual(database.queries.length, 0, `and reads no row for ${description}`);
+  }
+
+  const empty = await readMerchantCategory(
+    { actor: owner },
+    dependenciesOf(createBusinessDatabase(), createInMemoryAuditTrail()),
+  );
+
+  expectEqual(empty.saved, false, "a merchant with no row is answered, not refused");
+  expectEqual(empty.mccCode, null, "with no code chosen");
+  expectEqual(empty.mccTitle, null, "and no title");
+  expectEqual(empty.complete, false, "and the category step is not finished");
+  expectEqual(empty.savedAtEpochMs, null, "and nothing was ever saved");
+  expectDeepEqual(
+    empty.options.map((option) => option.code),
+    ["0742", "5411", "5812"],
+    "the dropdown is the active codes of the vocabulary, in code order",
+  );
+  expect(
+    empty.options.every((option) => option.title.length > 0),
+    "and every option carries its published title",
+  );
+
+  const stored = await readMerchantCategory(
+    { actor: owner },
+    dependenciesOf(createBusinessDatabase([businessRow({ mcc_code: "5411" })]), createInMemoryAuditTrail()),
+  );
+
+  expectEqual(stored.saved, true, "a stored code is read back");
+  expectEqual(stored.mccCode, "5411", "the code itself");
+  expectEqual(stored.mccTitle, "Grocery Stores, Supermarkets", "with its published title");
+  expectEqual(stored.complete, true, "and the category step is finished");
+  expectEqual(
+    stored.savedAtEpochMs,
+    Date.parse("2026-11-01T09:30:00.000Z"),
+    "with the row's save instant",
+  );
+
+  // A code that was retired after the merchant chose it still names itself, and leaves the dropdown.
+  const retired = await readMerchantCategory(
+    { actor: owner },
+    dependenciesOf(createBusinessDatabase([businessRow({ mcc_code: "0001" })]), createInMemoryAuditTrail()),
+  );
+
+  expectEqual(retired.mccCode, "0001", "the retired choice is still the stored code");
+  expectEqual(retired.mccTitle, "Retired Example Code", "resolved even though it is not offered");
+  expectEqual(
+    retired.options.some((option) => option.code === "0001"),
+    false,
+    "and it is not in the dropdown",
+  );
+  expectEqual(retired.complete, true, "the step stays finished: the stored code is valid history");
+
+  // The same database, read by the owner of another company: the row of A is not B's to see.
+  const otherTenant = createBusinessDatabase([businessRow({ mcc_code: "5411" })]);
+  const refusedRow = await readMerchantCategory(
+    { actor: otherOwner },
+    dependenciesOf(otherTenant, createInMemoryAuditTrail()),
+  );
+
+  expectEqual(refusedRow.saved, false, "another merchant's code is not this merchant's category");
+  expectEqual(refusedRow.companyId, COMPANY_B, "the other owner reads their own company");
+  expect(
+    (otherTenant.queries[0] ?? "").includes(encodeURIComponent(COMPANY_B)),
+    "and the query names their company, never the row's",
+  );
+
+  const brokenRow = createBusinessDatabase([businessRow({ mcc_code: "5411", updated_at: "not a date" })]);
+
+  expectEqual(
+    await failureOf(() =>
+      readMerchantCategory({ actor: owner }, dependenciesOf(brokenRow, createInMemoryAuditTrail())),
+    ),
+    "INTERNAL_ERROR",
+    "a row with an unreadable instant is a defect, not an empty category",
+  );
+}
+
+/** ---- The save: a patch of one column, the vocabulary checked first, the wizard kept in step. */
+async function checkCategorySave(): Promise<void> {
+  const database = createBusinessDatabase();
+  const audit = createInMemoryAuditTrail();
+  const first = await saveCategory(owner, { mcc_code: "5411" }, database, audit);
+
+  expectEqual(first.companyId, COMPANY_A, "the row is written for the actor's own company");
+  expectEqual(database.inserts.length, 2, "the first save inserts the profile row and the wizard row");
+  expectEqual(database.inserts[0]?.table, BUSINESS_PROFILE_TABLE, "into the business profile table");
+  expectDeepEqual(
+    database.inserts[0]?.row,
+    { company_id: COMPANY_A, mcc_code: "5411" },
+    "carrying the company from the session and the one field, and nothing else",
+  );
+  expectEqual(database.updates.length, 0, "and updating nothing yet");
+  expectEqual(first.mccCode, "5411", "the answer carries the code");
+  expectEqual(first.mccTitle, "Grocery Stores, Supermarkets", "and its title");
+  expectEqual(first.complete, true, "a chosen code finishes the category step");
+  expectEqual(first.saved, true, "and is saved");
+  expectEqual(first.savedAtEpochMs, NOW, "on the save's own clock");
+  expectEqual(first.options.length, 3, "and the dropdown comes back with the answer");
+  expectEqual(database.inserts[1]?.table, ONBOARDING_PROGRESS_TABLE, "the wizard gets a row it never had");
+  expectEqual(
+    database.inserts[1]?.row["current_step"],
+    "website",
+    "opening on the step after category",
+  );
+  expectDeepEqual(
+    database.inserts[1]?.row["completed_steps"],
+    ["category"],
+    "with the category step finished",
+  );
+
+  expectEqual(audit.entries.length, 1, "the save appends exactly one audit entry");
+  expectEqual(audit.entries[0]?.action, MERCHANT_CATEGORY_AUDIT_ACTION, "named merchant_category.saved");
+  expectEqual(audit.entries[0]?.entityType, MERCHANT_CATEGORY_AUDIT_ENTITY, "on its own entity");
+  expectEqual(audit.entries[0]?.entityId, COMPANY_A, "naming the company");
+  expectEqual(audit.entries[0]?.companyId, COMPANY_A, "scoped to the company");
+  expectEqual(audit.entries[0]?.ipAddress, "203.0.113.9", "with the address it came from");
+  expectDeepEqual(
+    audit.entries[0]?.payload,
+    { code: "5411", cleared: false, complete: true, saved_at: new Date(NOW).toISOString() },
+    "naming the code, that it was not a clear, the completion and the instant",
+  );
+
+  const second = await saveCategory(owner, { mcc_code: "5812" }, database, audit);
+
+  expectEqual(database.inserts.length, 2, "a second save inserts nothing");
+  expectEqual(database.updates.length, 1, "it updates the one row");
+  expectEqual(database.updates[0]?.table, BUSINESS_PROFILE_TABLE, "the profile table");
+  expectDeepEqual(
+    database.updates[0]?.values,
+    { mcc_code: "5812" },
+    "the patch carries the one column and nothing beside it",
+  );
+  expectEqual(database.profileRows[0]?.mcc_code, "5812", "stored");
+  expectEqual(second.mccCode, "5812", "and answered");
+  expectEqual(second.mccTitle, "Eating places and Restaurants", "with the new title");
+  expectEqual(
+    database.updates.filter((update) => update.table === ONBOARDING_PROGRESS_TABLE).length,
+    0,
+    "the wizard row is already finished, so it is not written again",
+  );
+  expectEqual(audit.entries.length, 2, "and a second audit entry is appended");
+
+  const cleared = await saveCategory(owner, { mcc_code: "" }, database, audit);
+
+  expectDeepEqual(
+    database.updates[1]?.values,
+    { mcc_code: null },
+    "clearing sends null for the one column",
+  );
+  expectEqual(cleared.mccCode, null, "the answer has no code");
+  expectEqual(cleared.mccTitle, null, "and no title");
+  expectEqual(cleared.complete, false, "and the category step is no longer finished");
+  const wizardUpdate = database.updates.find((update) => update.table === ONBOARDING_PROGRESS_TABLE);
+
+  expectDeepEqual(
+    wizardUpdate?.values["completed_steps"],
+    [],
+    "and the wizard's finished list drops the category step",
+  );
+  expectDeepEqual(
+    audit.entries[2]?.payload,
+    { code: null, cleared: true, complete: false, saved_at: new Date(NOW).toISOString() },
+    "the audit entry records the clear",
+  );
+}
+
+/** ---- The save's refusals: the vocabulary, the shape, the roles, and the two racing tabs. */
+async function checkCategorySaveRefusals(): Promise<void> {
+  for (const [description, actor] of refusedActors) {
+    const database = createBusinessDatabase();
+    const audit = createInMemoryAuditTrail();
+    const refusal = await rejectionOf(() => saveCategory(actor, { mcc_code: "5411" }, database, audit));
+
+    expectEqual(refusal?.code, "PERMISSION_DENIED", `the save refuses ${description}`);
+    expectEqual(database.queries.length, 0, `and reads nothing for ${description}`);
+    expectEqual(database.inserts.length + database.updates.length, 0, `and writes nothing for ${description}`);
+    expectEqual(audit.entries.length, 0, `and audits nothing for ${description}`);
+  }
+
+  const shape = createBusinessDatabase();
+
+  for (const [label, body, rule] of [
+    ["a short code", { mcc_code: "541" }, "invalid_format"],
+    ["a non digit code", { mcc_code: "54a1" }, "invalid_format"],
+    ["a number", { mcc_code: 5411 }, "invalid_format"],
+    ["an empty body", {}, "required"],
+    ["an unknown key", { mcc_code: "5411", turnover: "1" }, "unknown_key"],
+  ] as const) {
+    const refusal = await rejectionOf(() => saveCategory(owner, body, shape, createInMemoryAuditTrail()));
+
+    expectEqual(refusal?.code, "VALIDATION_FAILED", `${label} is a validation failure`);
+    expectEqual(refusal?.details?.[0]?.rule, rule, `with the rule ${rule}`);
+    expectEqual(refusal?.details?.[0]?.field, rule === "unknown_key" ? "turnover" : "mcc_code", "naming the field");
+  }
+
+  expectEqual(shape.queries.length, 0, "a shape refusal happens before any query");
+  expectEqual(shape.inserts.length + shape.updates.length, 0, "and writes nothing");
+
+  const unknown = createBusinessDatabase();
+  const unknownRefusal = await rejectionOf(() => saveCategory(owner, { mcc_code: "9999" }, unknown, createInMemoryAuditTrail()));
+
+  expectEqual(unknownRefusal?.code, "VALIDATION_FAILED", "a code the list does not carry is refused");
+  expectDeepEqual(
+    unknownRefusal?.details,
+    [{ field: "mcc_code", rule: "unknown_code" }],
+    "as unknown_code",
+  );
+  expectEqual(unknown.inserts.length + unknown.updates.length, 0, "with nothing written");
+  expectEqual(unknown.mccRows.length, 4, "and the vocabulary untouched");
+
+  const retired = createBusinessDatabase();
+  const retiredRefusal = await rejectionOf(() => saveCategory(owner, { mcc_code: "0001" }, retired, createInMemoryAuditTrail()));
+
+  expectDeepEqual(
+    retiredRefusal?.details,
+    [{ field: "mcc_code", rule: "retired_code" }],
+    "a retired code is refused as retired_code, not as unknown",
+  );
+  expectEqual(retired.inserts.length + retired.updates.length, 0, "with nothing written");
+
+  const racing = createBusinessDatabase();
+  racing.conflictOnInsert = true;
+  const accounted = createInMemoryAuditTrail();
+  const rescued = await saveCategory(owner, { mcc_code: "5411" }, racing, accounted);
+
+  expectEqual(rescued.saved, true, "a save that loses the insert race still saves");
+  expectEqual(
+    racing.updates.filter((update) => update.table === BUSINESS_PROFILE_TABLE).length,
+    1,
+    "by becoming the update it would have been",
+  );
+  expectDeepEqual(
+    racing.updates.find((update) => update.table === BUSINESS_PROFILE_TABLE)?.values,
+    { mcc_code: "5411" },
+    "carrying the one column",
+  );
+  expectEqual(accounted.entries.length, 1, "and is audited once");
+
+  const throwingAudit = {
+    append(): Promise<void> {
+      return Promise.reject(new Error("the audit sink is down"));
+    },
+  };
+  const stored = await saveMerchantCategory(
+    { actor: owner, input: { mcc_code: "5411" }, ipAddress: null, userAgent: null },
+    { rest: createBusinessStore(createBusinessDatabase()), audit: throwingAudit, now: () => NOW },
+  );
+
+  expectEqual(stored.saved, true, "a save whose audit sink fails is still stored");
+}
+
+/** ---- The sources: the route, the screen, the form and the migration say what this STEP promised. */
+async function checkCategorySources(): Promise<void> {
+  const route = await readRepositoryFile("app/api/onboarding/merchant-category/route.ts");
+  const page = await readRepositoryFile("app/(dashboard)/onboarding/category/page.tsx");
+  const form = await readRepositoryFile("app/(dashboard)/onboarding/category/category-form.tsx");
+  const copy = await readRepositoryFile("app/(dashboard)/onboarding/step-copy.ts");
+  const csrf = await readRepositoryFile("lib/security/csrf.ts");
+  const up = await readRepositoryFile("migrations/0104_merchant_category_code.sql");
+  const down = await readRepositoryFile("migrations/0104_merchant_category_code.down.sql");
+
+  for (const [path, source] of [
+    ["app/api/onboarding/merchant-category/route.ts", route],
+    ["app/(dashboard)/onboarding/category/page.tsx", page],
+    ["app/(dashboard)/onboarding/category/category-form.tsx", form],
+  ] as const) {
+    expectEqual(source.split("\n")[0], `// path: ${path}`, `${path} states its own path on its first line`);
+    expectEqual(/[^\t\n\r\x20-\x7E]/u.test(source), false, `${path} is ASCII only`);
+  }
+
+  expectEqual(up.split("\n")[0], "-- path: migrations/0104_merchant_category_code.sql", "the migration states its path");
+  expectEqual(down.split("\n")[0], "-- path: migrations/0104_merchant_category_code.down.sql", "and so does its rollback");
+
+  // ---- the route: token, session, body, service, in that order
+  expect(route.includes("requireCsrfToken(request"), "the route checks the token first");
+  expect(
+    route.indexOf("requireCsrfToken(") < route.indexOf("readRequestActor("),
+    "before it looks the session up",
+  );
+  expect(route.indexOf("readRequestActor(") < route.indexOf("JSON.parse("), "which is before the body is parsed");
+  expect(route.indexOf("JSON.parse(") < route.indexOf("saveMerchantCategory("), "and the service runs last");
+  expect(route.includes("maximumBodyBytes = 1_024"), "the body is bounded");
+  expect(route.includes("saveMerchantCategory("), "and saves through the service");
+  expectEqual(route.includes("export const GET"), false, "the route answers POST only");
+  expectEqual(route.includes('"cache-control": "no-store"'), true, "the answer is not cached");
+  expectEqual(route.includes("company_id"), false, "and never takes a company from the caller");
+
+  // ---- the screen and the form
+  expect(page.includes("readOwnerActor()"), "the page reads the account through the cached reader");
+  expect(page.includes("readMerchantCategory("), "and the category through the service");
+  expect(page.includes("<SessionKeeper"), "and keeps the session rotating while it is read");
+  expect(page.includes("CategoryForm"), "and renders the form");
+  expectEqual(/(super_admin|compliance_kyc|finance_ops)/u.test(page), false, "the page names no office role");
+
+  expectEqual(form.includes('"use client"'), true, "the form is a client component");
+  expect(form.includes('SAVE_PATH = "/api/onboarding/merchant-category"'), "posting to one path");
+  expectEqual((form.match(/fetch\(/gu) ?? []).length, 1, "with one fetch site");
+  expectEqual((form.match(/fetch\(SAVE_PATH/gu) ?? []).length, 1, "to that path");
+  expect(form.includes("csrfHeaders("), "carrying the CSRF token");
+  expect(form.includes("JSON.stringify({ mcc_code: selected })"), "sending the one field");
+  expectEqual(form.includes("companyId"), false, "and no company in the body");
+  expectEqual(form.includes("process.env"), false, "reading no environment");
+  expect(form.includes("initial.options"), "drawing the dropdown from the service's list");
+
+  // ---- the registry and the map
+  expect(csrf.includes('"/api/onboarding/merchant-category",'), "the save route is on the CSRF-protected list");
+  expect(copy.includes('category: "/onboarding/category"'), "the category step links to its form");
+
+  // ---- the migration pair
+  expect(up.includes("add column mcc_code text"), "0104 adds the column to the profile");
+  expect(up.includes("references public.mcc_codes (code)"), "pointed at the vocabulary through its code");
+  expect(up.includes("mcc_codes_code_unique unique (code)"), "with the unique constraint a foreign key can reference");
+  expect(up.includes("business_profiles_mcc_code_check"), "and the four digit check");
+  expect(up.includes("create index business_profiles_mcc_idx"), "and the underwriting index");
+  expect(down.includes("drop column if exists mcc_code"), "the rollback removes the column");
+  expect(down.includes("drop constraint if exists mcc_codes_code_unique"), "and the constraint it added to the list");
+  expectEqual(down.includes("create table"), false, "and creates nothing");
+  expectEqual(down.includes("drop table"), false, "and removes no table another STEP owns");
+
+  // ---- the files exist where the ownership rules put them
+  expect(
+    (await readdir(new URL("app/(dashboard)/onboarding/category/", repositoryRoot))).includes("page.tsx"),
+    "the screen lives in the merchant dashboard area",
+  );
+  expect(
+    (await readdir(new URL("app/api/onboarding/merchant-category/", repositoryRoot))).includes("route.ts"),
+    "and its handler is a route handler of its own",
+  );
+  expect(
+    (await readdir(new URL("services/kyc/", repositoryRoot))).includes("merchant-category.ts"),
+    "the service lives in services/kyc",
+  );
+}
+
+/** ---- The catalog: every sentence of the form is used, and every key it names exists. */
+async function checkCategoryCatalog(): Promise<void> {
+  const block = en.onboardingCategory as unknown as Record<string, unknown>;
+  const page = await readRepositoryFile("app/(dashboard)/onboarding/category/page.tsx");
+  const form = await readRepositoryFile("app/(dashboard)/onboarding/category/category-form.tsx");
+  const sources = `${page}\n${form}`;
+
+  const flat: string[] = [];
+
+  const walk = (node: Record<string, unknown>, prefix: string): void => {
+    for (const [key, value] of Object.entries(node)) {
+      const path = `${prefix}.${key}`;
+
+      if (typeof value === "string") {
+        flat.push(path);
+      } else if (typeof value === "object" && value !== null) {
+        walk(value as Record<string, unknown>, path);
+      }
+    }
+  };
+
+  walk(block, "onboardingCategory");
+
+  expect(flat.length > 20, "the category form has its own block of copy");
+
+  for (const path of flat) {
+    expect(sources.includes(`"${path}"`), `the copy key ${path} is used by the screen`);
+  }
+
+  const referenced = [...sources.matchAll(/"(onboardingCategory\.[A-Za-z.]+)"/gu)].map((match) => match[1]);
+
+  for (const path of new Set(referenced)) {
+    expect(path !== undefined && flat.includes(path), `the screen names no missing key (${String(path)})`);
+  }
+
+  expectEqual(
+    sources.includes('getMessage("onboardingCategory.selectedLine")'),
+    false,
+    "the templated chosen line is never rendered without its values",
+  );
+  expect(
+    sources.includes('formatMessage("onboardingCategory.selectedLine"'),
+    "and is rendered through formatMessage",
+  );
+  expect(
+    sources.includes('formatMessage("onboardingCategory.savedLine"'),
+    "and so is the saved line",
+  );
+}
+
 async function main(): Promise<void> {
   checkVocabulary();
   await checkRefusals();
@@ -1647,6 +2204,13 @@ async function main(): Promise<void> {
   await checkBusinessSaveRefusals();
   await checkBusinessSources();
   await checkBusinessCatalog();
+  checkCategoryVocabulary();
+  checkCategoryParse();
+  await checkCategoryRead();
+  await checkCategorySave();
+  await checkCategorySaveRefusals();
+  await checkCategorySources();
+  await checkCategoryCatalog();
 
   if (failures.length > 0) {
     process.stderr.write(`onboarding gate failed with ${failures.length} problem(s):\n`);
@@ -1663,7 +2227,8 @@ async function main(): Promise<void> {
   process.stdout.write(
     `onboarding gate passed: ${checks} checks, ${ONBOARDING_STEPS.length} steps, ` +
       `${ONBOARDING_OWNER_ROLES.length} role, ${BUSINESS_PROFILE_FIELDS.length} business fields, ` +
-      `${PROCESSOR_REQUIREMENT_LIST.length} processors, ${BUSINESS_PROFILE_TABLE} table\n`,
+      `${PROCESSOR_REQUIREMENT_LIST.length} processors, ${BUSINESS_PROFILE_TABLE} table, ` +
+      `${MCC_CODES_TABLE} vocabulary\n`,
   );
 }
 
