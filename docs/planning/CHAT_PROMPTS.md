@@ -1,4 +1,7 @@
 // path: docs/planning/CHAT_PROMPTS.md
+
+> HISTORICAL REFERENCE ONLY — Do not use this file as active implementation instructions.
+> The current scope, coding rules and step sequence are defined in `docs/final/`.
 # Copy-Paste Prompt For Every New Chat (English, use exactly this structure)
 
 ## A. Master Block - paste this FIRST in every new STEP chat, change only STEP number and title
