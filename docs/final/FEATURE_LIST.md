@@ -58,20 +58,15 @@
 - Merchant Category Code (MCC) dropdown or input in merchant onboarding and profile settings.
 - Merchant website verification step: website or store link review for business authenticity.
 - Merchant sets business information once on the platform. The same information is sent to every connected processor.
-- The processor-driven KYB packet must support business registration certificate/trade licence, registered address, formation date and registry lookup; ownership structure; identity and selfie/liveness status for every director and UBO at or above 25%; company tax ID or local equivalent; business address proof issued within 90 days; payout account in the registered business name with statement/bank verification; and website/storefront, goods/services descriptions, sample listings and supplier invoices when relevant. Collect only the data/documents required by the contracted processor, contract and applicable law; prefer processor-hosted collection and status APIs rather than duplicating raw identity documents.
-- Address verification supports a utility bill issued within 90 days, bank statement, source-of-funds document and additional documents requested by the processor.
+- Address verification uploads: utility bill issued within 3 months, bank statement, source of funds document, and any extra document a processor requests.
 - Underwriting criteria are set by the compliance team: starting monthly transaction limit for new merchants, MCC based risk tiers with extra reserve or longer hold, required bank statement period, and holding unusually large transactions for review.
-- A seller cannot activate offers/products for sale, accept payments or receive payouts until processor-required business verification and platform risk checks pass. Draft setup may be saved while review is pending. Reject or hold applications that are not registered businesses or whose legal business name does not match registration, tax and payout-bank records; send ambiguous mismatches to compliance for documented review rather than silently accepting them.
-- The payment processor or acquiring partner contracted for a sub-merchant performs its own required KYB/KYC and makes the provider-side verification decision. The platform must obtain and persist that provider's authoritative onboarding and account-capability status; a platform review or identity-vendor result never overrides a processor rejection, restriction or incomplete verification.
-- The platform separately owns its merchant-risk decision, sanctions/PEP/adverse-media screening, risk tier, transaction limits, payout eligibility, reserve and ongoing monitoring. Provider KYB is necessary for that provider's account but does not waive the platform's risk controls.
-- The platform supports optional identity-verification adapters for Jumio, Didit and Sumsub. super_admin may configure and activate one of these three at a time for supplementary identity/liveness checks or checks required by the platform's approved policy. The active identity-verification vendor is distinct from the payment processor that performs KYB.
-- If no identity-verification adapter is active, or a check is unavailable, incomplete or fails, the platform routes the case to Manual review where policy permits; it never treats an unknown result as a pass. Processor-required verification must still complete. The merchant sees only the verification status, not which internal review path was used.
-- Processor-specific required documents and status are tracked separately for each processor connected to the merchant. A verified status from one processor is not assumed to satisfy another processor's onboarding requirements.
-- Every provider and platform verification decision, status change, reviewer, reason and policy version is audit logged.
+- KYC runs in Manual mode while none of Jumio, Didit or Sumsub is connected.
+- Automatic KYC adapters for Jumio, Didit and Sumsub are part of the platform. super_admin selects one active KYC provider in settings. When one is connected and active it becomes the default verification method. When none is active, Manual KYC runs.
+- Automatic verification that is incomplete or unsuccessful moves to Manual review without telling the merchant which method was used. The merchant only sees verification status.
 - Large or high-risk merchants require two reviewers (four-eye review).
-- Platform approval occurs only after the relevant contracted processor reports its required KYB/KYC verification complete and platform risk review passes. CEO provides final approval; super_admin retains full authority. Approval triggers automatic sub-merchant provisioning under the connected master platform account.
-- Sub-merchant provisioning stores each provider name, provider submerchant id, provider verification status and capabilities (pending, action required, verified, restricted, rejected), synced by signature-verified idempotent webhooks.
-- Listing/offer activation, charges and payouts stay disabled until both the relevant processor verification and platform risk gates pass; any other processor connection has its own independent verification state.
+- Final approval by CEO or super_admin triggers automatic sub-merchant account creation under the connected master platform account.
+- Sub-merchant provisioning stores provider name, provider submerchant id, status (pending, action required, verified, restricted, rejected), charges enabled and payouts enabled, synced by verified webhooks.
+- Charges and payouts stay disabled until provider verification completes.
 - If no master platform account is connected, provisioning stays queued and the office is alerted.
 - Every KYC decision is audit logged.
 
@@ -132,18 +127,7 @@
 - When manual verification fails, the cooling period never starts and the previous bank stays active.
 - Minimum payout amount is 100 USD. Below that amount, funds are paid out as the accumulated remainder after the holding period.
 - Failed payouts are reported to the merchant by email.
-- Settlement is released automatically after the hold period only when all applicable provider, risk, fulfilment, dispute and reserve gates also permit it.
-- Merchant risk tiers and limits are Tier 1 (new): maximum USD 500 per transaction and USD 2,500 per month, 10% rolling reserve held 90 days, payout no earlier than 7 days after verified fulfilment; Tier 2: only after at least 60 active days, 20 completed orders, chargeback rate below 0.3% and no fraud flags; maximum USD 2,500 per transaction and USD 15,000 per month, 5% reserve held 60 days, payout no earlier than 3 days after verified fulfilment; Tier 3: only after at least 180 active days, 100 completed orders, chargeback rate below 0.3% and current re-KYC; maximum USD 10,000 per transaction and USD 50,000 per month, with a higher monthly limit only after manual approval; reserve is 0–5% case-by-case and payout no earlier than 2 days after verified fulfilment.
-- Every seller starts in Tier 1. Tier upgrades require automated eligibility checks and a documented manual review; no automatic upgrade occurs. compliance_kyc owns the review, CEO performs required final approval, and super_admin retains full authority under the approval chain.
-- A transaction over USD 5,000 requires a documented manual review before capture, regardless of tier. Until approval, capture is blocked; authorization must not be represented as capture or settlement. If a provider cannot safely separate authorization from capture, review must occur before submitting a charge or the transaction is rejected; never charge first and review afterward.
-- Payout eligibility requires recorded delivery confirmation or buyer acceptance of the service, plus the applicable tier delay, provider verification, verified payout account, available balance, holds/reserves and no blocking dispute or review. Missing fulfilment evidence keeps funds held. An exception requires documented evidence and an authorized compliance decision with the required CEO/super_admin approval; there is no silent or timer-only payout release.
-- Tier limits, reserve rates/durations, payout delays, eligibility thresholds and policy definitions are versioned and editable only by CEO and super_admin. Changes are proposed and approved through the approval workflow by distinct authorized actors, audit logged, effective-dated and applied prospectively; merchant notice/consent follows the signed contract and applicable law. A transaction retains the policy version applied at authorization. Where rules overlap, the stricter applicable cap, hold or review gate wins.
-- Monthly limits, chargeback-rate observation window/denominator, treatment of refunds and minimum sample size, completed-order definition, fulfilment evidence types, and manual exception authority are explicit versioned policy fields. Until configured and approved, the system uses the more restrictive decision and does not grant an upgrade or release payout.
-- Risk-based tier downgrades, added holds or increased reserves may be applied promptly when risk signals change, with reason, evidence, audit event, merchant notice where legally permitted, and a review/appeal route. CEO and super_admin can change policy values; support cannot.
-- Sanctions screening covers the seller, each director and every UBO at or above 25% ownership on onboarding and daily against current OFAC, UN, EU and UK HMT lists. The screening job records list/source version, completion time, result and errors; a missed or stale run alerts the office and blocks affected activation/payout decisions until resolved.
-- PEP matches trigger enhanced due diligence and management approval before activation; adverse media indicating fraud, scams or financial crime triggers manual review. Potential matches are not treated as confirmed matches without documented resolution. Comprehensively sanctioned-country sellers and buyers are blocked under the platform country policy.
-- Re-KYC is scheduled every 12 months for Tier 3 and every 24 months for Tiers 1 and 2, and is triggered by bank-account change, ownership change or a configured sudden-volume spike. A due or unresolved re-KYC restricts the affected activity under the approved policy until cleared.
-- All tier, screening, transaction-review, fulfilment, payout-gate and exception decisions are tenant-isolated, least-privilege protected, immutable-audited and linked to their policy version.
+- Settlement is released automatically after the hold period.
 
 ## 11. Double-Entry Payment Ledger and Reconciliation
 - Every merchant has a full payment ledger.
@@ -303,10 +287,6 @@
 - Expired token and session cleanup.
 - Audit log integrity hash generation.
 - Compliance calendar expiry alerts for annual renewals.
-- Daily sanctions/PEP/adverse-media rescreening, stale-feed/run detection and office alerts.
-- Scheduled Tier 3 annual and Tier 1/2 biennial re-KYC, plus event-triggered re-KYC and configured volume-spike review.
-- Tier eligibility recalculation, risk-limit monitoring and monthly-volume counters with idempotent period boundaries.
-- Fulfilment-gated settlement/payout eligibility checks and manual-review queue alerts; jobs never bypass a pending review or missing fulfilment proof.
 
 ## 28. Performance and Low Load Rules
 - Fast loading: Server Components by default, client JavaScript only where interactive, lazy loading of heavy parts, image and font optimization.
@@ -331,7 +311,7 @@
 - Email sending domain with SPF, DKIM and DMARC records published and verified, plus a separate subdomain for marketing sending when volume grows.
 - Master platform accounts with the five payment providers, with sandbox keys for staging and live keys for production, and webhook endpoints registered per provider.
 - TaxCloud account connection available for merchants who enable United States sales tax collection.
-- Optional supplementary identity-verification accounts (Jumio, Didit, Sumsub), with at most one activated by super_admin; processor-owned KYB/KYC remains independently required.
+- Automatic KYC provider accounts (Jumio, Didit, Sumsub) connectable from super admin settings when the business decides to activate one.
 - Shopify app created and approved so merchants can install it and connect with credentials. WooCommerce plugin package published for merchant stores.
 - Production domain with DNS, TLS certificates and HTTPS enforced on every page.
 
@@ -355,18 +335,4 @@
 - Provider integrations are complete only after a successful sandbox payment, refund and webhook cycle is recorded in the handoff file.
 - Database changes are complete only after the migration and its rollback both run cleanly on staging.
 - Security sensitive features are complete only after the audit log entries for their actions are verified in staging.
-- Go-live requires: production environment variables verified, provider live keys tested with the built-in connection test, email test received, Turnstile verified on the production domain, backup restore rehearsed, status page published, the first super_admin account created with 2FA enforced, and an independent security and compliance review completed with critical/high findings remediated and processor/card-scheme launch approvals confirmed.
-
-## 34. Merchant Risk Tiers, Screening and Fulfilment-Gated Payouts
-- This is an additive policy amendment intended for the uncompleted portion after the owner's reported STEP 080 checkpoint. Completed steps, commits, handoffs and migrations remain unchanged. Verify the selected branch's contiguous handoff sequence before resuming; proceed at STEP 081 only if STEP 080 is actually complete, and never skip a missing step.
-- This section defines platform-owned risk controls in addition to, never instead of, each contracted payment processor's own KYB/KYC and account approval.
-- The processor is the source of truth for its own sub-merchant verification and capabilities. Persist each provider's state independently and keep charges/payouts disabled for that provider until its required verification is complete.
-- Optional Jumio, Didit and Sumsub adapters support supplementary IDV/liveness checks. super_admin activates at most one; a selected IDV provider cannot override processor KYB or platform risk decisions. If no adapter is active or a result is unresolved, use manual review where permitted and fail closed for activation/payout.
-- Screen seller, directors and 25%-or-more UBOs at onboarding and daily against current official OFAC, UN, EU and UK HMT sanctions lists; record source/version, list-update time, screening time, decision and reviewer resolution. A daily job ingests/verifies the published lists and raises an office alert when a feed or screening run is stale or fails. Stale or failed screening blocks activation/payout. Potential matches require human resolution. PEP requires enhanced due diligence and management approval; relevant adverse-media research is recorded and triggers manual review. Block sellers and buyers in comprehensively sanctioned countries.
-- Re-KYC: every 12 months for Tier 3; every 24 months for Tiers 1 and 2; and on bank-account change, ownership change or configured sudden-volume spike.
-- All sellers start Tier 1. Tier 1: USD 500/transaction, USD 2,500/month, 10% reserve for 90 days, payout at least 7 days after fulfilment. Tier 2: eligibility after 60 active days, 20 completed orders, chargeback rate below 0.3%, no fraud flags; USD 2,500/transaction, USD 15,000/month, 5% reserve for 60 days, payout at least 3 days after fulfilment. Tier 3: eligibility after 180 active days, 100 completed orders, chargeback rate below 0.3% and current re-KYC; USD 10,000/transaction, USD 50,000/month (higher only with manual approval), 0–5% case-by-case reserve, payout at least 2 days after fulfilment.
-- Every tier upgrade requires automated eligibility checks and manual review. A transaction above USD 5,000 requires manual review before capture at every tier. Capture remains blocked until approval.
-- Payout requires verified delivery or buyer acceptance of service, the tier-specific post-fulfilment delay, provider verification, verified bank account, available balance and no applicable review/dispute/hold. Missing fulfilment proof keeps funds held; exceptions require evidence, a reason, authorized compliance decision and CEO/super_admin approval.
-- CEO and super_admin may change risk policy values through versioned, effective-dated, audited proposals and approvals by distinct authorized actors. Changes apply prospectively subject to merchant contract notice/consent and applicable law. Monthly-volume window, chargeback denominator/window, sample minimum, completed-order definition and evidence standards must be explicit configuration; unconfigured cases fail closed. Stricter overlapping restrictions prevail.
-- Policy changes, tier assignment/downgrade, screening resolutions, re-KYC, review decisions, fulfilment proof and payout exceptions are immutable-audited, RLS-protected and visible only to authorized roles. Support has no KYC, tier-policy or payout-release authority.
-
+- Go-live requires: production environment variables verified, provider live keys tested with the built-in connection test, email test received, Turnstile verified on the production domain, backup restore rehearsed, status page published and the first super_admin account created with 2FA enforced.
