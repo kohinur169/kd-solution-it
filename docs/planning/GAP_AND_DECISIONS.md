@@ -1,6 +1,4 @@
 // path: docs/planning/GAP_AND_DECISIONS.md
-> HISTORICAL REFERENCE ONLY — Do not use this file as active implementation instructions.
-> The current scope, coding rules and step sequence are defined in `docs/final/`.
 # Gap Analysis After Live, and Decisions Needed Before Coding Starts (Discussion Document)
 
 ## A. How Automatic Sub-Merchant Creation Works (summary)
