@@ -42,7 +42,7 @@ Since STEP 069 the group also serves:
 | --- | --- | --- |
 | `/dashboard` (`dashboard/page.tsx`) | super_admin | the office home: gateway readiness, the roles held, the freshness of the second factor, and the screens the roles open |
 | `/gateways` (`gateways/page.tsx`) | super_admin | section 6's provider panel: store, test, enable and disable, with only the last four characters of a key ever read back |
-| `/ceo` (`ceo/page.tsx`) | ceo and super_admin | section 2's approval queue at both desks, the form that raises a request, and the country and KYC counts the chain decides |
+| `/ceo` (`ceo/page.tsx`) | ceo and super_admin | section 2's approval queue at both desks, the two signatures that move a request through it, what was decided recently, the form that raises a request, and the country and KYC counts |
 | `/delegations` (`delegations/page.tsx`) | super_admin | section 2's delegation lever: what is delegated and until when, the form that hands one permission to one colleague, and the history of what ran out and what was withdrawn |
 
 Each reads through the service that owns the screen - `lib/gateways/service.ts`,
@@ -60,8 +60,8 @@ decides all seven roles. Run it with `node components/office/verify.ts`; the pac
 
 ## Later STEPs
 
-`072`-`078` build the remaining dashboards and the platform screens. Each one adds its page under this group,
+`073`-`078` build the remaining dashboards and the platform screens. Each one adds its page under this group,
 its entry to `OFFICE_NAVIGATION` in the same commit, and - where it adds a mutation - its own audit
 entry through `lib/security/audit.ts`. Step-up reauthentication for a sensitive action is STEP 053's
-`lib/auth/step-up.ts`, and the approval chain of `070` sits between the requester and the action, with the decisions
-of `072` on top of it.
+`lib/auth/step-up.ts`, and the approval chain of `070` - with the two signatures of `072` - sits between the requester and
+the action.

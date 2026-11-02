@@ -12637,11 +12637,11 @@ async function checkCsrfProtection(): Promise<void> {
     .map((file) => file.path)
     .sort();
 
-  expectEqual(browserMutations.length, 13, "thirteen browser files send a mutation");
+  expectEqual(browserMutations.length, 14, "fourteen browser files send a mutation");
   expectEqual(
     browserMutations.reduce((total, path) => total + (appSourceOf(appSources, path).split('method: "POST"').length - 1), 0),
-    15,
-    "across fifteen call sites",
+    16,
+    "across sixteen call sites",
   );
   const postCalls = (source: string): number => source.split('method: "POST"').length - 1;
   const tokenSpreads = (source: string): number =>

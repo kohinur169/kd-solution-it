@@ -9,20 +9,27 @@ import { isPlatformRole, type PlatformRole, type RequestActor } from "../auth/ty
 import {
   APPROVAL_CURRENCY_PATTERN,
   APPROVAL_EXPIRY_MS,
+  APPROVAL_HISTORY_LIMIT,
   APPROVAL_LABEL_MAXIMUM_LENGTH,
   APPROVAL_NOTE_MAXIMUM_LENGTH,
   APPROVAL_NOTE_MINIMUM_LENGTH,
   APPROVAL_QUEUE_LIMIT,
   APPROVAL_QUEUE_ROLES,
+  CLOSED_APPROVAL_STATUSES,
   amountProblemOf,
   canRequestApproval,
+  decisionAuditAction,
   isApprovalActionType,
+  isApprovalDecision,
   isApprovalStatus,
   requesterRolesOf,
   requestableActionsOf,
+  signatureProblemOf,
   stageOf,
+  statusAfterDecision,
   subjectTypeOf,
   type ApprovalActionType,
+  type ApprovalDecision,
   type ApprovalStatus,
   type ApprovalSubjectType,
 } from "./registry.ts";
@@ -88,6 +95,16 @@ export interface ApprovalRequestView {
   readonly status: ApprovalStatus;
   /** Whose desk the row is on. `closed` for anything no longer waiting. */
   readonly stage: "ceo" | "super_admin" | "closed";
+  /** The CEO's signature: who took it, when, and what they wrote. Nulls until it exists. */
+  readonly ceoDecidedById: string | null;
+  readonly ceoDecidedByName: string | null;
+  readonly ceoDecidedAtEpochMs: number | null;
+  readonly ceoNote: string | null;
+  /** The last signature, which is what makes a request approved. Nulls until it exists. */
+  readonly superAdminConfirmedById: string | null;
+  readonly superAdminConfirmedByName: string | null;
+  readonly superAdminConfirmedAtEpochMs: number | null;
+  readonly superAdminNote: string | null;
   readonly version: number;
 }
 
@@ -95,6 +112,8 @@ export interface ApprovalRequestView {
 export interface ApprovalQueueSnapshot {
   readonly awaitingCeo: readonly ApprovalRequestView[];
   readonly awaitingSuperAdmin: readonly ApprovalRequestView[];
+  /** The last closed requests, most recently closed first: the outcome of a signature already given. */
+  readonly recent: readonly ApprovalRequestView[];
   readonly requestable: readonly ApprovalActionType[];
   readonly readAtEpochMs: number;
 }
@@ -135,6 +154,12 @@ const requestRowSchema = z.object({
   requested_at: instantSchema,
   expires_at: instantSchema,
   status: z.string().min(1).max(20),
+  ceo_decided_by: z.string().min(1).max(64).nullable().optional(),
+  ceo_decided_at: instantSchema.nullable().optional(),
+  ceo_note: z.string().max(APPROVAL_NOTE_MAXIMUM_LENGTH).nullable().optional(),
+  super_admin_confirmed_by: z.string().min(1).max(64).nullable().optional(),
+  super_admin_confirmed_at: instantSchema.nullable().optional(),
+  super_admin_note: z.string().max(APPROVAL_NOTE_MAXIMUM_LENGTH).nullable().optional(),
   version: z.number().int().positive(),
 });
 
@@ -147,11 +172,14 @@ const accountRowSchema = z.object({
 
 const countRowSchema = z.object({ id: z.string().min(1).max(64) });
 
-const queueSelect =
+const queueColumns =
   "select=id,action_type,subject_type,subject_id,subject_label,amount_minor,currency," +
-  "request_note,requested_by,requested_by_role,requested_at,expires_at,status,version" +
-  "&deleted_at=is.null&order=requested_at.asc&limit=" +
-  String(APPROVAL_QUEUE_LIMIT);
+  "request_note,requested_by,requested_by_role,requested_at,expires_at,status," +
+  "ceo_decided_by,ceo_decided_at,ceo_note,super_admin_confirmed_by,super_admin_confirmed_at," +
+  "super_admin_note,version";
+
+const queueSelect =
+  `${queueColumns}&deleted_at=is.null&order=requested_at.asc&limit=` + String(APPROVAL_QUEUE_LIMIT);
 
 function nowOf(dependencies: ApprovalDependencies): number {
   return dependencies.now?.() ?? Date.now();
@@ -165,6 +193,11 @@ function epochOf(value: string): number {
   }
 
   return parsed;
+}
+
+/** An instant that may not be there yet: a signature that has not been given. */
+function epochOrNull(value: string | null): number | null {
+  return value === null ? null : epochOf(value);
 }
 
 /** A stored amount as a number, or null when the row moves no money. */
@@ -197,6 +230,8 @@ function viewOf(
   }
 
   const expiresAtEpochMs = epochOf(row.expires_at);
+  const ceoDecidedById = row.ceo_decided_by ?? null;
+  const confirmedById = row.super_admin_confirmed_by ?? null;
 
   return {
     id: row.id,
@@ -215,6 +250,14 @@ function viewOf(
     expired: expiresAtEpochMs <= instant,
     status: row.status,
     stage: stageOf(row.status),
+    ceoDecidedById,
+    ceoDecidedByName: ceoDecidedById === null ? null : (names.get(ceoDecidedById) ?? null),
+    ceoDecidedAtEpochMs: epochOrNull(row.ceo_decided_at ?? null),
+    ceoNote: row.ceo_note ?? null,
+    superAdminConfirmedById: confirmedById,
+    superAdminConfirmedByName: confirmedById === null ? null : (names.get(confirmedById) ?? null),
+    superAdminConfirmedAtEpochMs: epochOrNull(row.super_admin_confirmed_at ?? null),
+    superAdminNote: row.super_admin_note ?? null,
     version: row.version,
   };
 }
@@ -371,8 +414,61 @@ export async function requestApproval(
     expired: false,
     status: "pending_ceo",
     stage: "ceo",
+    ceoDecidedById: null,
+    ceoDecidedByName: null,
+    ceoDecidedAtEpochMs: null,
+    ceoNote: null,
+    superAdminConfirmedById: null,
+    superAdminConfirmedByName: null,
+    superAdminConfirmedAtEpochMs: null,
+    superAdminNote: null,
     version: 1,
   };
+}
+
+/**
+ * The names behind every account a page of rows names: the requester, the CEO and the last signer.
+ *
+ * One query for both lists, because a queue that resolved names per row would be a query per row, and
+ * an account that has since been deleted keeps a null name rather than making its row disappear.
+ */
+async function resolveNames(
+  pending: readonly z.infer<typeof requestRowSchema>[],
+  closed: readonly z.infer<typeof requestRowSchema>[],
+  dependencies: ApprovalDependencies,
+): Promise<ReadonlyMap<string, string>> {
+  const ids = new Set<string>();
+
+  for (const row of [...pending, ...closed]) {
+    ids.add(row.requested_by);
+
+    if (row.ceo_decided_by !== null && row.ceo_decided_by !== undefined) {
+      ids.add(row.ceo_decided_by);
+    }
+
+    if (row.super_admin_confirmed_by !== null && row.super_admin_confirmed_by !== undefined) {
+      ids.add(row.super_admin_confirmed_by);
+    }
+  }
+
+  const names = new Map<string, string>();
+
+  if (ids.size === 0) {
+    return names;
+  }
+
+  const accounts = await dependencies.store.select(
+    "users",
+    `select=id,full_name&id=in.(${[...ids].map((id) => encodeURIComponent(id)).join(",")})` +
+      `&limit=${String(APPROVAL_QUEUE_LIMIT)}`,
+    accountRowSchema,
+  );
+
+  for (const account of accounts) {
+    names.set(account.id, account.full_name);
+  }
+
+  return names;
 }
 
 /**
@@ -395,30 +491,299 @@ export async function listApprovalQueue(
     requestRowSchema,
   );
 
-  const requesterIds = [...new Set(rows.map((row) => row.requested_by))];
-  const names = new Map<string, string>();
+  const history = await dependencies.store.select(
+    "approval_requests",
+    `${queueColumns}&status=in.(${CLOSED_APPROVAL_STATUSES.join(",")})&deleted_at=is.null` +
+      `&order=updated_at.desc&limit=${String(APPROVAL_HISTORY_LIMIT)}`,
+    requestRowSchema,
+  );
 
-  if (requesterIds.length > 0) {
-    const accounts = await dependencies.store.select(
-      "users",
-      `select=id,full_name&id=in.(${requesterIds.map((id) => encodeURIComponent(id)).join(",")})` +
-        `&limit=${String(APPROVAL_QUEUE_LIMIT)}`,
-      accountRowSchema,
-    );
-
-    for (const account of accounts) {
-      names.set(account.id, account.full_name);
-    }
-  }
-
+  const names = await resolveNames(rows, history, dependencies);
   const views = rows.map((row) => viewOf(row, names, instant));
 
   return {
     awaitingCeo: views.filter((view) => view.stage === "ceo"),
     awaitingSuperAdmin: views.filter((view) => view.stage === "super_admin"),
+    recent: history.map((row) => viewOf(row, names, instant)),
     requestable: requestableActionsOf(input.actor.roles),
     readAtEpochMs: instant,
   };
+}
+
+/**
+ * Take one signature.
+ *
+ * ## What a decision is, and is not
+ *
+ * A decision moves the row from the desk it is on to the next one, or closes it for good: the CEO's
+ * approval hands the request to the last signature, the super administrator's approval makes it
+ * approved, and either desk may reject. What a decision does not do is the action itself - a released
+ * payout is a payment the payout module moves, and this row is the authority for it. That separation is
+ * why an approved row is a permission rather than a transaction.
+ *
+ * ## The checks, in the order a person meets them
+ *
+ *   1. the decision is one of the two verbs, and the id is shaped like a row;
+ *   2. the row exists and is still waiting - a closed row answers `CONFLICT` with `not_pending`, because
+ *      nothing is being refused, something already happened;
+ *   3. the desk: the row is signed by the role that owns the desk it is on (`signatureProblemOf`);
+ *   4. the people: the requester never takes the first signature, and the last signature is never the
+ *      account that took the first one;
+ *   5. the second factor, fresh inside ten minutes - a signature is the most sensitive thing an office
+ *      screen writes;
+ *   6. the clock: a row past its window is refused with `expired` rather than revived by a decision that
+ *      arrives late;
+ *   7. the note: a rejection must say why, in at least ten characters; an approval may carry one.
+ *
+ * The update is conditional on the version and the status the read returned, and it is read back after:
+ * two signers, or a signer and the expiry sweep, cannot both win, and the loser learns it moved rather
+ * than believing they signed. The payload never names `version`: `set_row_metadata` increments it in the
+ * trigger, so a caller that also wrote a counter would skip a version on every signature. The audit entry follows the row, uncaught, so a signature the platform
+ * cannot record is a failure the signer sees.
+ */
+export async function decideApproval(
+  input: {
+    readonly actor: RequestActor;
+    readonly approvalId: string;
+    readonly decision: string;
+    readonly note: string | null;
+  },
+  dependencies: ApprovalDependencies,
+): Promise<ApprovalRequestView> {
+  const instant = nowOf(dependencies);
+
+  if (!isApprovalDecision(input.decision)) {
+    throw new AppError("VALIDATION_FAILED", {
+      details: [{ field: "decision", rule: "invalid_format" }],
+    });
+  }
+
+  const decision: ApprovalDecision = input.decision;
+  const parsedId = identifierSchema.safeParse(input.approvalId);
+
+  if (!parsedId.success) {
+    throw new AppError("RESOURCE_NOT_FOUND");
+  }
+
+  const rows = await dependencies.store.select(
+    "approval_requests",
+    `${queueColumns}&id=eq.${encodeURIComponent(parsedId.data)}&deleted_at=is.null&limit=1`,
+    requestRowSchema,
+  );
+
+  const row = rows[0];
+
+  if (row === undefined || !isApprovalStatus(row.status)) {
+    throw new AppError("RESOURCE_NOT_FOUND");
+  }
+
+  const stage = stageOf(row.status);
+
+  if (stage === "closed") {
+    throw new AppError("CONFLICT", { details: [{ field: "approvalId", rule: "not_pending" }] });
+  }
+
+  const problem = signatureProblemOf({
+    roles: input.actor.roles,
+    stage,
+    actorId: input.actor.userId,
+    requesterId: row.requested_by,
+    ceoDeciderId: row.ceo_decided_by ?? null,
+  });
+
+  if (problem === "role") {
+    throw new AppError("PERMISSION_DENIED");
+  }
+
+  if (problem !== null) {
+    throw new AppError("VALIDATION_FAILED", { details: [{ field: "actor", rule: problem }] });
+  }
+
+  requireFreshReauthentication(input.actor, instant);
+
+  if (epochOf(row.expires_at) <= instant) {
+    throw new AppError("CONFLICT", { details: [{ field: "approvalId", rule: "expired" }] });
+  }
+
+  const note = input.note === null ? null : input.note.trim();
+  const usableNote = note !== null && note.length === 0 ? null : note;
+
+  if (
+    decision === "reject" &&
+    (usableNote === null ||
+      usableNote.length < APPROVAL_NOTE_MINIMUM_LENGTH ||
+      usableNote.length > APPROVAL_NOTE_MAXIMUM_LENGTH)
+  ) {
+    throw new AppError("VALIDATION_FAILED", {
+      details: [{ field: "note", rule: "invalid_length" }],
+    });
+  }
+
+  if (
+    usableNote !== null &&
+    (usableNote.length < APPROVAL_NOTE_MINIMUM_LENGTH ||
+      usableNote.length > APPROVAL_NOTE_MAXIMUM_LENGTH)
+  ) {
+    throw new AppError("VALIDATION_FAILED", {
+      details: [{ field: "note", rule: "invalid_length" }],
+    });
+  }
+
+  const statusBefore = row.status;
+  const statusAfter = statusAfterDecision(stage, decision);
+  const decidedAt = new Date(instant).toISOString();
+  const values =
+    stage === "ceo"
+      ? {
+          status: statusAfter,
+          ceo_decided_by: input.actor.userId,
+          ceo_decided_at: decidedAt,
+          ceo_note: usableNote,
+        }
+      : {
+          status: statusAfter,
+          super_admin_confirmed_by: input.actor.userId,
+          super_admin_confirmed_at: decidedAt,
+          super_admin_note: usableNote,
+        };
+
+  await dependencies.store.update(
+    "approval_requests",
+    `id=eq.${encodeURIComponent(row.id)}&version=eq.${String(row.version)}` +
+      `&status=eq.${statusBefore}&deleted_at=is.null`,
+    values,
+  );
+
+  const after = await dependencies.store.select(
+    "approval_requests",
+    `${queueColumns}&id=eq.${encodeURIComponent(row.id)}&limit=1`,
+    requestRowSchema,
+  );
+
+  const decided = after[0];
+
+  if (
+    decided === undefined ||
+    decided.status !== statusAfter ||
+    decided.version <= row.version
+  ) {
+    throw new AppError("CONFLICT", { details: [{ field: "approvalId", rule: "changed" }] });
+  }
+
+  await dependencies.audit.append({
+    action: decisionAuditAction(stage, decision),
+    actorUserId: input.actor.userId,
+    entityType: "approval_request",
+    entityId: decided.id,
+    companyId: null,
+    sessionId: input.actor.sessionId,
+    payload: {
+      action_type: decided.action_type,
+      subject_type: decided.subject_type,
+      subject_id: decided.subject_id,
+      decision,
+      stage,
+      status_before: statusBefore,
+      status_after: statusAfter,
+      note_length: usableNote?.length ?? 0,
+    },
+  });
+
+  const names = await resolveNames([decided], [], dependencies);
+
+  return viewOf(decided, names, instant);
+}
+
+/** What one expiry sweep did. A sweep that changes nothing is a normal, quiet answer. */
+export interface ApprovalExpirySweep {
+  /** How many pending rows were looked at, soonest deadline first. */
+  readonly examined: number;
+  /** How many were moved to `expired`. */
+  readonly expired: number;
+  /** How many had moved under the sweep's feet, and are therefore somebody else's answer. */
+  readonly skipped: number;
+  readonly sweptAtEpochMs: number;
+}
+
+/**
+ * Move the requests nobody decided inside their window to `expired`.
+ *
+ * Expiry is a status rather than a deletion (`0095`), so this is an ordinary conditional update and not
+ * a cleanup: the row keeps its requester, its subject, its note and the evidence that attention was
+ * missing, and the queue that shows it loses a live request.
+ *
+ * ## Why it is a function and not a timer
+ *
+ * The decision of *when* a sweep runs belongs to the deployment that owns background work, and the job
+ * runtime of STEP 011 has no database store yet, so a schedule here would be a timer over memory: it
+ * would run in one process, find nothing, and look healthy while doing it. This function is what that
+ * schedule will call, it is bounded and idempotent, and the handoff records the exact wiring it needs.
+ *
+ * ## Why each row is read back
+ *
+ * The sweep races the signers. If a CEO approves a request between the sweep's read and its update, the
+ * conditional update matches nothing and the sweep counts a skip - it never overwrites a signature with
+ * `expired`. That is why the update names the status it read, and why the answer counts skips instead of
+ * assuming every row it touched moved.
+ */
+export async function expireLapsedApprovals(
+  input: { readonly limit?: number },
+  dependencies: ApprovalDependencies,
+): Promise<ApprovalExpirySweep> {
+  const instant = nowOf(dependencies);
+  const requested = input.limit ?? APPROVAL_QUEUE_LIMIT;
+  const limit = Math.min(Math.max(1, Math.trunc(requested)), APPROVAL_QUEUE_LIMIT);
+
+  const rows = await dependencies.store.select(
+    "approval_requests",
+    `${queueColumns}&status=in.(pending_ceo,pending_super_admin)&deleted_at=is.null` +
+      `&order=expires_at.asc&limit=${String(limit)}`,
+    requestRowSchema,
+  );
+
+  const lapsed = rows.filter((row) => epochOf(row.expires_at) <= instant);
+  let expired = 0;
+  let skipped = 0;
+
+  for (const row of lapsed) {
+    await dependencies.store.update(
+      "approval_requests",
+      `id=eq.${encodeURIComponent(row.id)}&version=eq.${String(row.version)}` +
+        `&status=eq.${row.status}&deleted_at=is.null`,
+      { status: "expired" },
+    );
+
+    const after = await dependencies.store.select(
+      "approval_requests",
+      `select=id,status&id=eq.${encodeURIComponent(row.id)}&limit=1`,
+      z.object({ id: z.string().min(1).max(64), status: z.string().min(1).max(20) }),
+    );
+
+    if (after[0]?.status !== "expired") {
+      skipped += 1;
+
+      continue;
+    }
+
+    expired += 1;
+
+    await dependencies.audit.append({
+      action: "approval.expired",
+      actorUserId: null,
+      entityType: "approval_request",
+      entityId: row.id,
+      companyId: null,
+      payload: {
+        action_type: row.action_type,
+        subject_type: row.subject_type,
+        subject_id: row.subject_id,
+        status_before: row.status,
+        expires_at: row.expires_at,
+      },
+    });
+  }
+
+  return { examined: rows.length, expired, skipped, sweptAtEpochMs: instant };
 }
 
 /**

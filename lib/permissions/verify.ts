@@ -301,6 +301,8 @@ function createStore(database: FakeDatabase): PermissionStore {
           row[column] = value;
         }
 
+        // `set_row_metadata` owns the counter: an update increments it whatever the payload says.
+        row["version"] = Number(row["version"] ?? 1) + 1;
         row["updated_at"] = NOW_ISO;
       }
 
@@ -1021,7 +1023,7 @@ async function checkRevoke(): Promise<void> {
         const rows = racedDatabase.tables["office_permissions"] ?? [];
 
         for (const row of rows) {
-          row["version"] = 2;
+          row["version"] = Number(row["version"] ?? 1) + 1;
           row["updated_at"] = NOW_ISO;
         }
 

@@ -517,7 +517,7 @@ export async function revokePermission(
     "office_permissions",
     `id=eq.${encodeURIComponent(row.id)}&version=eq.${String(row.version)}` +
       "&revoked_at=is.null&deleted_at=is.null",
-    { revoked_at: revokedAt, revoked_by: input.actor.userId, version: row.version + 1 },
+    { revoked_at: revokedAt, revoked_by: input.actor.userId },
   );
 
   const after = await dependencies.store.select(

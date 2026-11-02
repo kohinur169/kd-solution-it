@@ -10,23 +10,35 @@ import { formatMessage, getMessage, type MessagePath } from "../i18n/messages.ts
 import {
   APPROVAL_ACTION_TYPES,
   APPROVAL_AMOUNT_MAXIMUM_MINOR,
+  APPROVAL_CEO_ROLES,
+  APPROVAL_DECISIONS,
   APPROVAL_EXPIRY_MS,
+  APPROVAL_FINAL_ROLES,
+  APPROVAL_HISTORY_LIMIT,
   APPROVAL_LABEL_MAXIMUM_LENGTH,
   APPROVAL_NOTE_MAXIMUM_LENGTH,
   APPROVAL_NOTE_MINIMUM_LENGTH,
   APPROVAL_QUEUE_ROLES,
   APPROVAL_STATUSES,
+  CLOSED_APPROVAL_STATUSES,
   amountProblemOf,
   approvalActionLabelKey,
   canRequestApproval,
+  decisionAuditAction,
+  decisionRolesOf,
   isApprovalActionType,
+  isApprovalDecision,
   isApprovalStatus,
   requestableActionsOf,
   requesterRolesOf,
+  signatureProblemOf,
   stageOf,
+  statusAfterDecision,
   subjectTypeOf,
 } from "./registry.ts";
 import {
+  decideApproval,
+  expireLapsedApprovals,
   listApprovalQueue,
   normalizeCurrency,
   readPlatformDecisions,
@@ -705,6 +717,584 @@ async function checkQueue(): Promise<void> {
   expectEqual(expiredQueue.awaitingCeo[0]?.requesterName, null, "and a missing account leaves the name empty");
 }
 
+/** The three accounts a signature test needs, with three different ids. */
+const CEO_ACTOR = actorOf(["ceo"], {
+  userId: "018f2b8a-aaaa-4c2d-9c3e-000000000001",
+});
+const ADMIN_ACTOR = actorOf(["super_admin"], {
+  userId: "018f2b8a-bbbb-4c2d-9c3e-000000000002",
+});
+const FINANCE_ACTOR = actorOf(["finance_ops"], {
+  userId: "018f2b8a-cccc-4c2d-9c3e-000000000003",
+});
+
+const REQUEST_ROW_ID = "018f2b8a-9999-4c2d-9c3e-000000000001";
+
+/** A database with the three signers' names, and the queue empty. */
+function createSignatureDatabase(): FakeDatabase {
+  const database = createDatabase();
+
+  database.tables["users"] = [
+    { id: CEO_ACTOR.userId, full_name: "Chief Executive" },
+    { id: ADMIN_ACTOR.userId, full_name: "Platform Owner" },
+    { id: FINANCE_ACTOR.userId, full_name: "Finance Officer" },
+  ];
+
+  return database;
+}
+
+/** One pending request in the queue, at the desk the caller names. */
+function seedRequest(database: FakeDatabase, overrides: Row = {}): Row {
+  const row: Row = {
+    id: REQUEST_ROW_ID,
+    action_type: "payout_release",
+    subject_type: "payout",
+    subject_id: SUBJECT_ID,
+    subject_label: "Payout week 44",
+    amount_minor: 250_000,
+    currency: "USD",
+    request_note: "The batch was reconciled against the processor bill on the fourteenth.",
+    requested_by: FINANCE_ACTOR.userId,
+    requested_by_role: "finance_ops",
+    requested_at: NOW_ISO,
+    expires_at: new Date(NOW + APPROVAL_EXPIRY_MS).toISOString(),
+    status: "pending_ceo",
+    ceo_decided_by: null,
+    ceo_decided_at: null,
+    ceo_note: null,
+    super_admin_confirmed_by: null,
+    super_admin_confirmed_at: null,
+    super_admin_note: null,
+    deleted_at: null,
+    version: 1,
+    ...overrides,
+  };
+
+  database.tables["approval_requests"]?.push(row);
+
+  return row;
+}
+
+/** ---- The decision vocabulary: two verbs, four outcomes, three people rules. */
+function checkDecisionRules(): void {
+  expectEqual(APPROVAL_DECISIONS.join(","), "approve,reject", "two decisions exist");
+  expect(Object.isFrozen(APPROVAL_DECISIONS), "and the list is frozen");
+  expectEqual(isApprovalDecision("approve"), true, "approve is one of them");
+  expectEqual(isApprovalDecision("reject"), true, "and reject is the other");
+  expectEqual(isApprovalDecision("confirm"), false, "confirm is a word, not a decision");
+  expectEqual(isApprovalDecision(""), false, "nor is the empty string");
+  expectEqual(isApprovalDecision(null), false, "nor is null");
+
+  expectEqual(decisionRolesOf("ceo").join(","), APPROVAL_CEO_ROLES.join(","), "the first desk is the CEO's");
+  expectEqual(decisionRolesOf("super_admin").join(","), APPROVAL_FINAL_ROLES.join(","), "the last desk is the super administrator's");
+  expectEqual(decisionRolesOf("ceo").includes("super_admin"), false, "the two desks are disjoint");
+
+  expectEqual(statusAfterDecision("ceo", "approve"), "pending_super_admin", "approval at the first desk hands the row on");
+  expectEqual(statusAfterDecision("ceo", "reject"), "rejected", "a rejection at the first desk closes it");
+  expectEqual(statusAfterDecision("super_admin", "approve"), "approved", "approval last makes the action allowed");
+  expectEqual(statusAfterDecision("super_admin", "reject"), "rejected", "and a rejection last closes it too");
+
+  expectEqual(CLOSED_APPROVAL_STATUSES.join(","), "approved,rejected,cancelled,expired", "four statuses are closed");
+  expectEqual(CLOSED_APPROVAL_STATUSES.some((status) => status.startsWith("pending")), false, "none of them is waiting");
+  expectEqual(APPROVAL_HISTORY_LIMIT, 10, "the history shows the last ten");
+
+  const auditNames = [
+    decisionAuditAction("ceo", "approve"),
+    decisionAuditAction("ceo", "reject"),
+    decisionAuditAction("super_admin", "approve"),
+    decisionAuditAction("super_admin", "reject"),
+    "approval.requested",
+    "approval.expired",
+  ];
+
+  expectEqual(new Set<string>(auditNames).size, auditNames.length, "every audit name is its own");
+  expectEqual(auditNames.join(","), "approval.ceo_approved,approval.ceo_rejected,approval.confirmed,approval.final_rejected,approval.requested,approval.expired", "and the six are the four signatures, the request and the lapse");
+
+  for (const name of auditNames) {
+    expect(/^[a-z][a-z0-9]*(\.[a-z0-9_]+)+$/u.test(name), `${name} matches the audit name rule`);
+    expect(name.length <= 64, `${name} fits the 64 character ceiling`);
+  }
+
+  // The three people rules, one at a time.
+  const base = {
+    stage: "ceo" as const,
+    requesterId: FINANCE_ACTOR.userId,
+    ceoDeciderId: null,
+  };
+
+  expectEqual(
+    signatureProblemOf({ ...base, roles: ["ceo"], actorId: CEO_ACTOR.userId }),
+    null,
+    "the CEO may sign a request a colleague raised",
+  );
+  expectEqual(
+    signatureProblemOf({ ...base, roles: ["super_admin"], actorId: ADMIN_ACTOR.userId }),
+    "role",
+    "the super administrator may not pre-empt the first signature",
+  );
+  expectEqual(
+    signatureProblemOf({ ...base, roles: ["ceo"], actorId: FINANCE_ACTOR.userId }),
+    "requester_signature",
+    "and the requester never signs their own request",
+  );
+  expectEqual(
+    signatureProblemOf({
+      roles: ["super_admin"],
+      stage: "super_admin",
+      actorId: ADMIN_ACTOR.userId,
+      requesterId: FINANCE_ACTOR.userId,
+      ceoDeciderId: CEO_ACTOR.userId,
+    }),
+    null,
+    "the super administrator takes the last signature",
+  );
+  expectEqual(
+    signatureProblemOf({
+      roles: ["super_admin"],
+      stage: "super_admin",
+      actorId: CEO_ACTOR.userId,
+      requesterId: FINANCE_ACTOR.userId,
+      ceoDeciderId: CEO_ACTOR.userId,
+    }),
+    "signer_signature",
+    "but the account that approved as the CEO cannot confirm its own approval",
+  );
+  expectEqual(
+    signatureProblemOf({
+      roles: ["super_admin", "ceo"],
+      stage: "super_admin",
+      actorId: ADMIN_ACTOR.userId,
+      requesterId: ADMIN_ACTOR.userId,
+      ceoDeciderId: CEO_ACTOR.userId,
+    }),
+    null,
+    "a requester may take the last signature once somebody else approved",
+  );
+  expectEqual(
+    signatureProblemOf({ ...base, roles: ["finance_ops"], actorId: "018f2b8a-dddd-4c2d-9c3e-000000000004" }),
+    "role",
+    "an unrelated office role signs nothing",
+  );
+}
+
+/** ---- The indexes: what the sweep and the history read by. */
+async function checkDecisionIndexes(): Promise<void> {
+  const forward = await readRepositoryFile("migrations/0097_approval_decision_indexes.sql");
+  const down = await readRepositoryFile("migrations/0097_approval_decision_indexes.down.sql");
+
+  expect(
+    forward.includes("create index approval_requests_expiry_idx"),
+    "0097 indexes the deadline the sweep reads",
+  );
+  expect(
+    forward.includes("where deleted_at is null and status in ('pending_ceo', 'pending_super_admin')"),
+    "over the two pending statuses only",
+  );
+  expect(
+    forward.includes("create index approval_requests_decided_idx"),
+    "and the instant the history reads",
+  );
+  expect(
+    forward.includes("where deleted_at is null and status in ('approved', 'rejected', 'expired', 'cancelled')"),
+    "over the closed statuses only",
+  );
+  expect(forward.includes("begin;"), "the forward file is transactional");
+  expectEqual(forward.trimEnd().endsWith("commit;"), true, "and commits");
+  expectEqual(forward.includes("create table"), false, "it creates no table: 0095 owns the row");
+  expect(down.includes("drop index if exists public.approval_requests_decided_idx"), "the rollback drops the history index");
+  expect(down.includes("drop index if exists public.approval_requests_expiry_idx"), "and the sweep index");
+  expectEqual(down.includes("drop table"), false, "while every decision stays in place");
+
+  // The status vocabulary the two indexes name is the registry's, not a second list.
+  const source = await readRepositoryFile("migrations/0095_approval_requests.sql");
+
+  for (const status of CLOSED_APPROVAL_STATUSES) {
+    expect(source.includes(`'${status}'`), `0095 knows the ${status} status the history reads`);
+  }
+}
+
+/** ---- The two signatures, and every way they are refused. */
+async function checkSignatures(): Promise<void> {
+  const database = createSignatureDatabase();
+
+  seedRequest(database);
+
+  const dependencies = createDependencies(database);
+
+  expectEqual(
+    await failureOf(() =>
+      decideApproval(
+        { actor: FINANCE_ACTOR, approvalId: REQUEST_ROW_ID, decision: "approve", note: null },
+        dependencies,
+      ),
+    ),
+    "PERMISSION_DENIED|",
+    "finance operations cannot sign the desk they raised the request into",
+  );
+  expectEqual(
+    await failureOf(() =>
+      decideApproval(
+        { actor: ADMIN_ACTOR, approvalId: REQUEST_ROW_ID, decision: "approve", note: null },
+        dependencies,
+      ),
+    ),
+    "PERMISSION_DENIED|",
+    "and the super administrator cannot sign first",
+  );
+  expectEqual(
+    await failureOf(() =>
+      decideApproval(
+        { actor: CEO_ACTOR, approvalId: "018f2b8a-9999-4c2d-9c3e-0000000000ff", decision: "approve", note: null },
+        dependencies,
+      ),
+    ),
+    "RESOURCE_NOT_FOUND|",
+    "an id the table does not hold is not found",
+  );
+  expectEqual(
+    await failureOf(() =>
+      decideApproval(
+        { actor: CEO_ACTOR, approvalId: REQUEST_ROW_ID, decision: "confirm", note: null },
+        dependencies,
+      ),
+    ),
+    "VALIDATION_FAILED|invalid_format",
+    "a third verb is refused",
+  );
+  expectEqual(
+    await failureOf(() =>
+      decideApproval(
+        {
+          actor: actorOf(["ceo"], {
+            userId: CEO_ACTOR.userId,
+            mfaVerifiedAtEpochMs: NOW - 30 * 60_000,
+            reauthenticatedAtEpochMs: NOW - 30 * 60_000,
+          }),
+          approvalId: REQUEST_ROW_ID,
+          decision: "approve",
+          note: null,
+        },
+        dependencies,
+      ),
+    ),
+    "PERMISSION_DENIED|reauth_required",
+    "a stale second factor cannot sign",
+  );
+  expectEqual(
+    await failureOf(() =>
+      decideApproval(
+        { actor: CEO_ACTOR, approvalId: REQUEST_ROW_ID, decision: "reject", note: null },
+        dependencies,
+      ),
+    ),
+    "VALIDATION_FAILED|invalid_length",
+    "a rejection without a reason is refused",
+  );
+  expectEqual(
+    await failureOf(() =>
+      decideApproval(
+        { actor: CEO_ACTOR, approvalId: REQUEST_ROW_ID, decision: "reject", note: "no" },
+        dependencies,
+      ),
+    ),
+    "VALIDATION_FAILED|invalid_length",
+    "and so is one too short to read",
+  );
+  expectEqual(
+    database.writes.filter((write) => write.startsWith("update approval_requests")).length,
+    0,
+    "none of those refusals wrote a row",
+  );
+
+  // The first signature, with a note an approval does not have to carry.
+  const approved = await decideApproval(
+    { actor: CEO_ACTOR, approvalId: REQUEST_ROW_ID, decision: "approve", note: null },
+    dependencies,
+  );
+
+  expectEqual(approved.status, "pending_super_admin", "the CEO's approval moves the row to the last desk");
+  expectEqual(approved.stage, "super_admin", "which is where the queue shows it now");
+  expectEqual(approved.ceoDecidedById, CEO_ACTOR.userId, "and records who signed");
+  expectEqual(approved.ceoDecidedByName, "Chief Executive", "with the name the history prints");
+  expectEqual(approved.ceoNote, null, "an approval may carry no note");
+  expectEqual(approved.version, 2, "the row moved on a version");
+  expectEqual(database.audits.entries.at(-1)?.action, "approval.ceo_approved", "the trail names the first signature");
+  expectEqual(database.audits.entries.at(-1)?.payload["status_after"], "pending_super_admin", "and the status it left");
+  expectEqual(database.audits.entries.at(-1)?.payload["stage"], "ceo", "taken at the first desk");
+
+  // The desk rule first: the CEO's role signs the first desk and not the last.
+  expectEqual(
+    await failureOf(() =>
+      decideApproval(
+        { actor: CEO_ACTOR, approvalId: REQUEST_ROW_ID, decision: "approve", note: null },
+        dependencies,
+      ),
+    ),
+    "PERMISSION_DENIED|",
+    "the CEO's role does not sign at the last desk",
+  );
+
+  // The identity rule next: an account that holds both roles still takes one signature per request.
+  const bothRoles = actorOf(["ceo", "super_admin"], { userId: CEO_ACTOR.userId });
+
+  expectEqual(
+    await failureOf(() =>
+      decideApproval(
+        { actor: bothRoles, approvalId: REQUEST_ROW_ID, decision: "approve", note: null },
+        dependencies,
+      ),
+    ),
+    "VALIDATION_FAILED|signer_signature",
+    "an account that approved as the CEO cannot take the last signature on the same request",
+  );
+  expectEqual(
+    await failureOf(() =>
+      decideApproval(
+        {
+          actor: bothRoles,
+          approvalId: REQUEST_ROW_ID,
+          decision: "reject",
+          note: "Changed my mind after the review.",
+        },
+        dependencies,
+      ),
+    ),
+    "VALIDATION_FAILED|signer_signature",
+    "and cannot withdraw its own signature by rejecting at the last desk",
+  );
+
+  const confirmed = await decideApproval(
+    { actor: ADMIN_ACTOR, approvalId: REQUEST_ROW_ID, decision: "approve", note: "Released after the bill was matched." },
+    dependencies,
+  );
+
+  expectEqual(confirmed.status, "approved", "the last signature approves the action");
+  expectEqual(confirmed.stage, "closed", "and closes the row");
+  expectEqual(confirmed.superAdminConfirmedById, ADMIN_ACTOR.userId, "recording the account that signed");
+  expectEqual(confirmed.superAdminNote, "Released after the bill was matched.", "and the note it left");
+  expectEqual(database.audits.entries.at(-1)?.action, "approval.confirmed", "the trail names the confirmation");
+  expectEqual(database.audits.entries.at(-1)?.payload["status_before"], "pending_super_admin", "with the status before it");
+  expectEqual(
+    await failureOf(() =>
+      decideApproval(
+        { actor: ADMIN_ACTOR, approvalId: REQUEST_ROW_ID, decision: "approve", note: null },
+        dependencies,
+      ),
+    ),
+    "CONFLICT|not_pending",
+    "a decided request is not decided twice",
+  );
+
+  const queue = await listApprovalQueue({ actor: CEO_ACTOR }, dependencies);
+
+  expectEqual(queue.awaitingCeo.length, 0, "nothing waits at the first desk any more");
+  expectEqual(queue.awaitingSuperAdmin.length, 0, "nor at the last");
+  expectEqual(queue.recent.length, 1, "and the decided row is in the history");
+  expectEqual(queue.recent[0]?.status, "approved", "as an approved request");
+  expectEqual(queue.recent[0]?.superAdminConfirmedByName, "Platform Owner", "with the signer named");
+
+  // A rejection at the first desk closes the request for good.
+  const rejectedDatabase = createSignatureDatabase();
+
+  seedRequest(rejectedDatabase);
+
+  const rejectedDependencies = createDependencies(rejectedDatabase);
+  const rejected = await decideApproval(
+    {
+      actor: CEO_ACTOR,
+      approvalId: REQUEST_ROW_ID,
+      decision: "reject",
+      note: "The processor bill for this batch is still unmatched.",
+    },
+    rejectedDependencies,
+  );
+
+  expectEqual(rejected.status, "rejected", "a rejection closes the row at the first desk");
+  expectEqual(rejected.ceoNote, "The processor bill for this batch is still unmatched.", "keeping the reason");
+  expectEqual(rejectedDatabase.audits.entries.at(-1)?.action, "approval.ceo_rejected", "and the trail says who closed it");
+  expectEqual(
+    rejectedDatabase.audits.entries.at(-1)?.payload["note_length"],
+    "The processor bill for this batch is still unmatched.".length,
+    "with the note's length rather than its text",
+  );
+  expectEqual(
+    JSON.stringify(rejectedDatabase.audits.entries.at(-1)?.payload).includes("processor bill"),
+    false,
+    "so the sentence stays out of the trail",
+  );
+
+  // A rejection at the last desk, and a lapsed request, both end the chain.
+  const finalRejectDatabase = createSignatureDatabase();
+
+  seedRequest(finalRejectDatabase, {
+    status: "pending_super_admin",
+    ceo_decided_by: CEO_ACTOR.userId,
+    ceo_decided_at: NOW_ISO,
+  });
+
+  const finalRejectDependencies = createDependencies(finalRejectDatabase);
+
+  expectEqual(
+    await failureOf(() =>
+      decideApproval(
+        {
+          actor: actorOf(["ceo", "super_admin"], { userId: CEO_ACTOR.userId }),
+          approvalId: REQUEST_ROW_ID,
+          decision: "reject",
+          note: "Closing this at the last desk.",
+        },
+        finalRejectDependencies,
+      ),
+    ),
+    "VALIDATION_FAILED|signer_signature",
+    "the first signer cannot close the request at the last desk either",
+  );
+
+  const finalRejected = await decideApproval(
+    { actor: ADMIN_ACTOR, approvalId: REQUEST_ROW_ID, decision: "reject", note: "The reserve is not funded for this release." },
+    finalRejectDependencies,
+  );
+
+  expectEqual(finalRejected.status, "rejected", "the super administrator may reject last");
+  expectEqual(finalRejectDatabase.audits.entries.at(-1)?.action, "approval.final_rejected", "and the trail names that rejection");
+
+  const lapsedDatabase = createSignatureDatabase();
+
+  seedRequest(lapsedDatabase, { expires_at: new Date(NOW - 1_000).toISOString() });
+
+  expectEqual(
+    await failureOf(() =>
+      decideApproval(
+        { actor: CEO_ACTOR, approvalId: REQUEST_ROW_ID, decision: "approve", note: null },
+        createDependencies(lapsedDatabase),
+      ),
+    ),
+    "CONFLICT|expired",
+    "a request past its window is not revived by a late signature",
+  );
+
+  // A row that moved between the read and the write answers conflict, not success.
+  const racedDatabase = createSignatureDatabase();
+
+  seedRequest(racedDatabase);
+
+  const racedDependencies = createDependencies(racedDatabase);
+  const raced: ApprovalDependencies = {
+    audit: racedDependencies.audit,
+    now: (): number => NOW,
+    store: {
+      ...racedDependencies.store,
+      update(_table: string, query: string, values: Readonly<Record<string, unknown>>) {
+        const rows = racedDatabase.tables["approval_requests"] ?? [];
+
+        for (const row of rows) {
+          row["version"] = 7;
+        }
+
+        return racedDependencies.store.update(_table, query, values);
+      },
+    },
+  };
+
+  expectEqual(
+    await failureOf(() =>
+      decideApproval(
+        { actor: CEO_ACTOR, approvalId: REQUEST_ROW_ID, decision: "approve", note: null },
+        raced,
+      ),
+    ),
+    "CONFLICT|changed",
+    "a signature whose update matched no row is a conflict rather than a success",
+  );
+}
+
+/** ---- The sweep: what lapsed is closed, what was decided is not touched. */
+async function checkExpirySweep(): Promise<void> {
+  const database = createSignatureDatabase();
+
+  seedRequest(database, { id: "018f2b8a-9999-4c2d-9c3e-00000000000a", expires_at: new Date(NOW - 3_600_000).toISOString() });
+  seedRequest(database, {
+    id: "018f2b8a-9999-4c2d-9c3e-00000000000b",
+    status: "pending_super_admin",
+    ceo_decided_by: CEO_ACTOR.userId,
+    ceo_decided_at: NOW_ISO,
+    expires_at: new Date(NOW - 60_000).toISOString(),
+  });
+  seedRequest(database, { id: "018f2b8a-9999-4c2d-9c3e-00000000000c" });
+
+  const dependencies = createDependencies(database);
+  const sweep = await expireLapsedApprovals({}, dependencies);
+
+  expectEqual(sweep.examined, 3, "the sweep looks at the pending rows");
+  expectEqual(sweep.expired, 2, "and closes the two whose window has passed");
+  expectEqual(sweep.skipped, 0, "with nothing moved under it");
+  expectEqual(sweep.sweptAtEpochMs, NOW, "at the instant the runtime gave it");
+  expectEqual(
+    database.audits.entries.filter((entry) => entry.action === "approval.expired").length,
+    2,
+    "each lapse is on the trail",
+  );
+  expectEqual(
+    database.tables["approval_requests"]?.find((row) => row["id"] === "018f2b8a-9999-4c2d-9c3e-00000000000c")?.["status"],
+    "pending_ceo",
+    "and a request inside its window is untouched",
+  );
+  expectEqual(
+    database.tables["approval_requests"]?.find((row) => row["id"] === "018f2b8a-9999-4c2d-9c3e-00000000000a")?.["ceo_decided_by"],
+    null,
+    "a lapsed row keeps no decision it never had",
+  );
+
+  const again = await expireLapsedApprovals({}, dependencies);
+
+  expectEqual(again.expired, 0, "a second sweep finds nothing to close");
+  expectEqual(
+    database.audits.entries.filter((entry) => entry.action === "approval.expired").length,
+    2,
+    "and writes no second entry for the same lapse",
+  );
+
+  // A sweep racing a signer never overwrites a signature with a lapse.
+  const racedDatabase = createSignatureDatabase();
+
+  seedRequest(racedDatabase, { expires_at: new Date(NOW - 3_600_000).toISOString() });
+
+  const racedDependencies = createDependencies(racedDatabase);
+  const raced: ApprovalDependencies = {
+    audit: racedDependencies.audit,
+    now: (): number => NOW,
+    store: {
+      ...racedDependencies.store,
+      update(_table: string, query: string, values: Readonly<Record<string, unknown>>) {
+        const rows = racedDatabase.tables["approval_requests"] ?? [];
+
+        for (const row of rows) {
+          row["status"] = "pending_super_admin";
+          row["version"] = 4;
+        }
+
+        return racedDependencies.store.update(_table, query, values);
+      },
+    },
+  };
+
+  const racedSweep = await expireLapsedApprovals({}, raced);
+
+  expectEqual(racedSweep.expired, 0, "a row that moved under the sweep is not closed");
+  expectEqual(racedSweep.skipped, 1, "it is counted as a skip");
+
+  // The bound is honoured.
+  const bounded = createSignatureDatabase();
+
+  seedRequest(bounded, { id: "018f2b8a-9999-4c2d-9c3e-00000000001a", expires_at: new Date(NOW - 3_600_000).toISOString() });
+  seedRequest(bounded, { id: "018f2b8a-9999-4c2d-9c3e-00000000001b", expires_at: new Date(NOW - 3_600_000).toISOString() });
+
+  const boundedSweep = await expireLapsedApprovals({ limit: 1 }, createDependencies(bounded));
+
+  expectEqual(boundedSweep.examined, 1, "a limit bounds one sweep");
+  expectEqual(boundedSweep.expired, 1, "which closes what it examined");
+}
+
 /** ---- The two platform summaries. */
 async function checkDecisions(): Promise<void> {
   const database = createDatabase();
@@ -755,9 +1345,12 @@ async function checkSources(): Promise<void> {
   expect(isSensitivePath("/api/office/approvals"), "the route is on the device proof list");
   expect(CSRF_PROTECTED_PATHS.includes("/api/office/approvals"), "and on the CSRF protected list");
 
+  const decisionForm = await readRepositoryFile("app/(admin)/ceo/approval-decision-form.tsx");
+
   for (const [path, source] of [
     ["app/(admin)/ceo/page.tsx", page],
     ["app/(admin)/ceo/approval-request-form.tsx", form],
+    ["app/(admin)/ceo/approval-decision-form.tsx", decisionForm],
   ] as const) {
     const body = source.split("\n").slice(1).join("\n");
 
@@ -769,10 +1362,33 @@ async function checkSources(): Promise<void> {
   expect(page.includes("listApprovalQueue("), "the page reads through the service");
   expect(page.includes("readPlatformDecisions("), "and its two summaries through the same module");
   expectEqual(page.includes("<main"), false, "the page renders no landmark: the shell owns it");
-  expect(form.includes("deviceProofHeaders("), "the form signs its post");
+  expect(form.includes("deviceProofHeaders("), "the request form signs its post");
   expect(form.includes('"/api/office/approvals"'), "to the one approval route");
   expect(form.includes("csrfHeaders("), "with the CSRF header");
   expectEqual(form.includes("note"), true, "and a note, which the CEO reads");
+
+  // ---- STEP 072: the decision, on the same route and the same row
+  expect(route.includes('action === "decide"'), "the route takes the decision action");
+  expect(route.includes("decideApproval("), "and hands it to the service");
+  expect(route.includes('readText(body, "approvalId")'), "reading the row it settles");
+  expect(route.includes('readText(body, "decision")'), "the decision");
+  expect(route.includes("readNote(body)"), "and an optional note");
+  expectEqual(route.includes("DELETE"), false, "a decision is never a delete");
+
+  expect(page.includes("ApprovalDecisionForm"), "the page renders a form only where a signature may be taken");
+  expect(page.includes("signatureProblemOf("), "asking the one rule the service refuses with");
+  expect(page.includes('id="ceo-recent"'), "and shows what was decided recently");
+  expect(page.includes("statusLabel("), "naming each closed status in words");
+  expectEqual(page.includes("super_admin"), false, "the page still writes no role name");
+
+  expect(decisionForm.includes("deviceProofHeaders("), "the decision form signs its post");
+  expect(decisionForm.includes('"/api/office/approvals"'), "to the same route as the request");
+  expect(decisionForm.includes("csrfHeaders("), "with the CSRF header");
+  expect(decisionForm.includes('"decide"'), "naming the decision action");
+  expect(decisionForm.includes('sign("approve")'), "offering the approval");
+  expect(decisionForm.includes('sign("reject")'), "and the rejection");
+  expectEqual(decisionForm.includes("console."), false, "the form logs nothing");
+  expectEqual(/:\s*any\b/u.test(decisionForm), false, "and writes no any");
 }
 
 /** ---- The copy: every path exists, and the two parameterised ones render. */
@@ -822,6 +1438,33 @@ function checkCopy(): void {
     "officeApprovals.countriesNote",
     "officeApprovals.kycHeading",
     "officeApprovals.kycNote",
+    "officeApprovals.recentHeading",
+    "officeApprovals.recentDescription",
+    "officeApprovals.recentEmpty",
+    "officeApprovals.statusApproved",
+    "officeApprovals.statusRejected",
+    "officeApprovals.statusExpired",
+    "officeApprovals.statusCancelled",
+    "officeApprovals.ceoDecisionLabel",
+    "officeApprovals.ceoNoteLabel",
+    "officeApprovals.finalSignatureLabel",
+    "officeApprovals.finalNoteLabel",
+    "officeApprovals.decidedAtLabel",
+    "officeApprovals.decisionNoteLabel",
+    "officeApprovals.decisionNoteHint",
+    "officeApprovals.approveLabel",
+    "officeApprovals.confirmLabel",
+    "officeApprovals.rejectLabel",
+    "officeApprovals.decisionBusy",
+    "officeApprovals.approvedDone",
+    "officeApprovals.rejectedDone",
+    "officeApprovals.confirmedDone",
+    "officeApprovals.rejectNeedsNote",
+    "officeApprovals.notPending",
+    "officeApprovals.expiredRequest",
+    "officeApprovals.requesterSignature",
+    "officeApprovals.signerSignature",
+    "officeApprovals.roleCannotSign",
     "officeApprovals.reauthRequired",
     "officeApprovals.forbidden",
     "officeApprovals.signedOut",
@@ -862,10 +1505,14 @@ function checkCopy(): void {
 
 async function main(): Promise<void> {
   checkRegistry();
+  checkDecisionRules();
   await checkMigration();
+  await checkDecisionIndexes();
   await checkRequest();
   await checkQueue();
   await checkDecisions();
+  await checkSignatures();
+  await checkExpirySweep();
   await checkSources();
   checkCopy();
 

@@ -164,8 +164,26 @@ export const PENDING_APPROVAL_STATUSES: readonly ApprovalStatus[] = deepFreeze([
   "pending_super_admin",
 ]);
 
+/**
+ * The two desks a request passes through, named as a type.
+ *
+ * The screen and the console take this type rather than spelling the two names, because a page that
+ * writes an office role's name is a page that can drift from the role list the services enforce.
+ */
+export type ApprovalStage = "ceo" | "super_admin";
+
+const stageLabelKeys: Readonly<Record<ApprovalStage, MessagePath>> = deepFreeze({
+  ceo: "officeApprovals.stageCeo",
+  super_admin: "officeApprovals.stageFinal",
+});
+
+/** The catalog key of the sentence that says whose desk a row is on. */
+export function stageLabelKey(stage: ApprovalStage): MessagePath {
+  return stageLabelKeys[stage];
+}
+
 /** The stage a status belongs to, so the screen can say whose desk a row is on. */
-export function stageOf(status: ApprovalStatus): "ceo" | "super_admin" | "closed" {
+export function stageOf(status: ApprovalStatus): ApprovalStage | "closed" {
   if (status === "pending_ceo") {
     return "ceo";
   }
@@ -175,6 +193,114 @@ export function stageOf(status: ApprovalStatus): "ceo" | "super_admin" | "closed
   }
 
   return "closed";
+}
+
+/**
+ * The two decisions a signer can take at the desk in front of them.
+ *
+ * One verb pair for both stages on purpose: the CEO's `approve` moves a request to the last signature
+ * and the super administrator's `approve` is that signature, so the difference between the two
+ * decisions is the stage the row is on, not a separate vocabulary for each desk.
+ */
+export type ApprovalDecision = "approve" | "reject";
+
+export const APPROVAL_DECISIONS: readonly ApprovalDecision[] = deepFreeze([
+  "approve",
+  "reject",
+] as const satisfies readonly ApprovalDecision[]);
+
+const decisionSet: ReadonlySet<string> = new Set<string>(APPROVAL_DECISIONS);
+
+/** True when a value is one of the two decisions. */
+export function isApprovalDecision(value: unknown): value is ApprovalDecision {
+  return typeof value === "string" && decisionSet.has(value);
+}
+
+/** The statuses a row no longer waiting on anybody may hold, which is what the history reads. */
+export const CLOSED_APPROVAL_STATUSES: readonly ApprovalStatus[] = deepFreeze([
+  "approved",
+  "rejected",
+  "cancelled",
+  "expired",
+] as const satisfies readonly ApprovalStatus[]);
+
+/** How many closed requests the home shows. Enough to see the outcome of a decision, not a ledger. */
+export const APPROVAL_HISTORY_LIMIT = 10;
+
+/** The roles that may sign at one stage: the CEO at the first desk, the super administrator last. */
+export function decisionRolesOf(stage: ApprovalStage): readonly PlatformRole[] {
+  return stage === "ceo" ? APPROVAL_CEO_ROLES : APPROVAL_FINAL_ROLES;
+}
+
+/**
+ * Why this account may not sign one row, or null when it may.
+ *
+ * Three rules, in the order a person meets them:
+ *
+ *   - **the desk.** A request waiting for the CEO is signed by the CEO and one waiting for the final
+ *     signature by the super administrator. An account holding both roles signs one row once, at the
+ *     desk the row is actually on.
+ *   - **the requester never signs the first signature.** A chain whose first two names are the same
+ *     person is one person deciding, however many columns the row has.
+ *   - **the last signature is not the first signer's.** The chain wants two people at the two desks,
+ *     so an account that approved as the CEO cannot also confirm, even when it holds both roles.
+ *
+ * A requester may take the *last* signature, and that is deliberate: the CEO's independent approval
+ * already stands between the request and the release. The property the chain protects is that no
+ * single person completes a large action alone, not that the accounts are four.
+ */
+export function signatureProblemOf(input: {
+  readonly roles: readonly PlatformRole[];
+  readonly stage: ApprovalStage;
+  readonly actorId: string;
+  readonly requesterId: string;
+  readonly ceoDeciderId: string | null;
+}): "role" | "requester_signature" | "signer_signature" | null {
+  const allowed = decisionRolesOf(input.stage);
+
+  if (!input.roles.some((role) => allowed.includes(role))) {
+    return "role";
+  }
+
+  if (input.stage === "ceo" && input.actorId === input.requesterId) {
+    return "requester_signature";
+  }
+
+  if (input.stage === "super_admin" && input.actorId === input.ceoDeciderId) {
+    return "signer_signature";
+  }
+
+  return null;
+}
+
+/**
+ * The audit name of one decision.
+ *
+ * Four names rather than one `approval.decided` with a payload, because the viewer of STEP 076 filters
+ * by action and "who signed as the CEO" and "who signed last" are different questions with different
+ * answers. All four satisfy the platform's dotted, lower case action rule.
+ */
+export function decisionAuditAction(
+  stage: ApprovalStage,
+  decision: ApprovalDecision,
+): string {
+  if (stage === "ceo") {
+    return decision === "approve" ? "approval.ceo_approved" : "approval.ceo_rejected";
+  }
+
+  return decision === "approve" ? "approval.confirmed" : "approval.final_rejected";
+}
+
+/** The status one decision leaves a row in, at the desk it was taken. */
+export function statusAfterDecision(
+  stage: ApprovalStage,
+  decision: ApprovalDecision,
+): ApprovalStatus {
+  if (decision === "reject") {
+    return "rejected";
+  }
+
+  return stage === "ceo" ? "pending_super_admin" : "approved";
 }
 
 /** What the CEO reads in a queue row. `approval_requests_label_check` allows 1 to 160. */
