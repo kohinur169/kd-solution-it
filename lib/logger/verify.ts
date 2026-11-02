@@ -431,7 +431,7 @@ function checkSerialization(): void {
 
   const longString = serializeValue("x".repeat(3000));
   expect(
-    typeof longString.value === "string" && longString.value.endsWith("…[+1000 chars]"),
+    typeof longString.value === "string" && longString.value.endsWith("...[+1000 chars]"),
     "a long string must be truncated with a count",
   );
   expect(longString.truncated, "a truncated string must flag the record as truncated");

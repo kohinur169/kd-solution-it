@@ -1,0 +1,76 @@
+// path: app/api/auth/2fa/reset/route.ts
+import { NextResponse } from "next/server";
+import { AppError } from "@/lib/errors/app-error";
+import { withErrorResponse } from "@/lib/errors/respond";
+import { readClientAddress, readUserAgent } from "@/lib/auth/client-address";
+import { TWO_FACTOR_RESET_ACCEPTANCE, type TwoFactorResetAcceptance } from "@/lib/auth/disclosure";
+import { getAuthRuntime } from "@/lib/auth/runtime";
+import { enforceRateLimit } from "@/lib/auth/rate-limit";
+import { requestTwoFactorReset } from "@/lib/auth/two-factor-reset";
+import { logger } from "@/lib/logger/logger";
+import { requireCsrfToken } from "@/lib/security/csrf";
+
+export const dynamic = "force-dynamic";
+
+/** An address and a reason. */
+const maximumBodyBytes = 4_096;
+
+/**
+ * A merchant asks the office to reset the second factor on their account.
+ *
+ * Anonymous by necessity: the person who cannot sign in is the person this route serves. The answer
+ * is one sentence and one status code, whatever the platform found, because the alternative - "no
+ * such account" beside "we will be in touch" - turns a recovery form into an account directory.
+ *
+ * The rate limit of STEP 055 sits in front of this route; until then the body bound, the bounded
+ * reason and the one-live-request index are what keep it from being a lever.
+ */
+export const POST = withErrorResponse(
+  async (request: Request): Promise<NextResponse<TwoFactorResetAcceptance>> => {
+    // STEP 055: section 22 line 242. Counted first, so a burst costs one statement and
+    // never reaches the body, the session or the work behind them.
+    await enforceRateLimit({ request, scope: "two_factor_reset" }, getAuthRuntime());
+
+    // STEP 057: a form post from another origin cannot read the token this compares.
+    requireCsrfToken(request, { secure: getAuthRuntime().cookiePolicy.secure });
+
+    const declaredLength = request.headers.get("content-length");
+
+    if (declaredLength !== null) {
+      const parsed = Number.parseInt(declaredLength, 10);
+
+      if (Number.isFinite(parsed) && parsed > maximumBodyBytes) {
+        throw new AppError("PAYLOAD_TOO_LARGE");
+      }
+    }
+
+    let body: unknown;
+
+    try {
+      body = await request.json();
+    } catch {
+      throw new AppError("VALIDATION_FAILED", {
+        details: [{ field: "reason", rule: "invalid_format" }],
+      });
+    }
+
+    const runtime = getAuthRuntime();
+    const result = await requestTwoFactorReset(
+      {
+        request: body,
+        remoteIp: readClientAddress(request.headers),
+        userAgent: readUserAgent(request.headers),
+      },
+      { rest: runtime.rest, audit: runtime.audit },
+    );
+
+    // The log line names no address: a recovery form that writes addresses to a log is a second
+    // place a stranger's data lives.
+    logger.info("two factor reset requested", { accepted: result.accepted });
+
+    return NextResponse.json(TWO_FACTOR_RESET_ACCEPTANCE, {
+      status: 202,
+      headers: { "cache-control": "no-store" },
+    });
+  },
+);

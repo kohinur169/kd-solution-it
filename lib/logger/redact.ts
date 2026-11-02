@@ -163,7 +163,7 @@ export function redactText(text: string): string {
  * Returns a redacted copy of JSON safe log data.
  *
  * A sensitive field name loses its whole value, whatever its type, so `cvv: 123` and
- * `token: {…}` cannot slip through as a number or an object. Every other string is scrubbed by
+ * `token: {...}` cannot slip through as a number or an object. Every other string is scrubbed by
  * the value patterns.
  */
 export function redactValue(value: JsonValue): JsonValue {

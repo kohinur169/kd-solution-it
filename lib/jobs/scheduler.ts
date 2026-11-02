@@ -13,7 +13,7 @@ import { JobNotRegisteredError } from "./types.ts";
  * twice, or two instances that tick at the same moment, still enqueue one job per slot.
  *
  * There is no cron parser on purpose. "Every N minutes, offset by M seconds" covers the recurring
- * work in FEATURE_LIST section 27 — invoice runs, reconciliation, cleanups — and it is a rule a
+ * work in FEATURE_LIST section 27 -- invoice runs, reconciliation, cleanups and it is a rule a
  * reader can verify without a library. A calendar schedule, if it is ever needed, arrives with the
  * deployment STEP that owns the clock, not with a hidden dependency here.
  *

@@ -78,6 +78,11 @@ export const ERROR_CODES = deepFreeze({
     messageKey: "errors.rateLimited",
     retryable: true,
   },
+  ACCOUNT_LOCKED: {
+    status: 423,
+    messageKey: "errors.accountLocked",
+    retryable: true,
+  },
   INTERNAL_ERROR: {
     status: 500,
     messageKey: "errors.internal",
