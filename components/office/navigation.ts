@@ -3,6 +3,7 @@ import { SESSION_MANAGEMENT_OFFICE_ROLES } from "../../lib/auth/session-list.ts"
 import { TWO_FACTOR_RESET_OFFICE_ROLES } from "../../lib/auth/two-factor-reset.ts";
 import { PLATFORM_ROLES, type PlatformRole, type RequestActor } from "../../lib/auth/types.ts";
 import { APPROVAL_QUEUE_ROLES } from "../../lib/approvals/registry.ts";
+import { COUNTRY_SWITCH_ROLES } from "../../lib/countries/registry.ts";
 import { GATEWAY_MANAGEMENT_ROLES, OFFICE_DASHBOARD_ROLES } from "../../lib/gateways/registry.ts";
 import { PERMISSION_DELEGATION_ROLES } from "../../lib/permissions/registry.ts";
 import type { MessagePath } from "../../lib/i18n/messages.ts";
@@ -82,6 +83,7 @@ export type OfficeSectionKey =
   | "workspace"
   | "dashboard"
   | "ceo"
+  | "countries"
   | "gateways"
   | "delegations"
   | "sessions"
@@ -118,6 +120,13 @@ export const OFFICE_NAVIGATION: readonly OfficeSection[] = deepFreeze([
     labelKey: "office.sectionCeo",
     descriptionKey: "office.sectionCeoDescription",
     roles: APPROVAL_QUEUE_ROLES,
+  },
+  {
+    key: "countries",
+    href: "/countries",
+    labelKey: "office.sectionCountries",
+    descriptionKey: "office.sectionCountriesDescription",
+    roles: COUNTRY_SWITCH_ROLES,
   },
   {
     key: "gateways",

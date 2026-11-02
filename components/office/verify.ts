@@ -6,6 +6,7 @@ import { TWO_FACTOR_RESET_OFFICE_ROLES } from "../../lib/auth/two-factor-reset.t
 import { PLATFORM_ROLES, isPlatformRole, type PlatformRole, type RequestActor } from "../../lib/auth/types.ts";
 import { getMessage, type MessagePath } from "../../lib/i18n/messages.ts";
 import { APPROVAL_QUEUE_ROLES } from "../../lib/approvals/registry.ts";
+import { COUNTRY_SWITCH_ROLES } from "../../lib/countries/registry.ts";
 import { GATEWAY_MANAGEMENT_ROLES, OFFICE_DASHBOARD_ROLES } from "../../lib/gateways/registry.ts";
 import { PERMISSION_DELEGATION_ROLES } from "../../lib/permissions/registry.ts";
 import {
@@ -141,13 +142,13 @@ function checkRoles(): void {
   expectEqual(isOfficeRole(42), false, "nor a number");
 }
 
-/** ---- The section catalog: seven screens, each with the roles its service enforces. */
+/** ---- The section catalog: eight screens, each with the roles its service enforces. */
 function checkCatalog(): void {
-  expectEqual(OFFICE_NAVIGATION.length, 7, "seven office screens exist");
+  expectEqual(OFFICE_NAVIGATION.length, 8, "eight office screens exist");
   expect(Object.isFrozen(OFFICE_NAVIGATION), "the catalog is frozen");
   expectEqual(
     OFFICE_NAVIGATION.map((section) => section.key).join(","),
-    "workspace,dashboard,ceo,gateways,delegations,sessions,twoFactorResets",
+    "workspace,dashboard,ceo,countries,gateways,delegations,sessions,twoFactorResets",
     "in the order the sidebar shows them",
   );
   expectEqual(
@@ -209,6 +210,16 @@ function checkCatalog(): void {
     "the CEO home carries the role list of the approval service",
   );
   expectEqual(
+    officeSectionByKey("countries")?.roles.join(","),
+    COUNTRY_SWITCH_ROLES.join(","),
+    "the country switch carries the role list of section 3's service",
+  );
+  expectEqual(
+    COUNTRY_SWITCH_ROLES.slice().sort().join(","),
+    APPROVAL_QUEUE_ROLES.slice().sort().join(","),
+    "and those are the two desks of the approval chain, which is where an opening is signed",
+  );
+  expectEqual(
     officeSectionByKey("gateways")?.roles.join(","),
     GATEWAY_MANAGEMENT_ROLES.join(","),
     "the gateway entry carries the role list of the gateway service",
@@ -243,8 +254,8 @@ function checkCatalog(): void {
 /** ---- Which roles see which screen. */
 function checkRoleFiltering(): void {
   const expected: Readonly<Record<PlatformRole, string>> = {
-    super_admin: "workspace,dashboard,ceo,gateways,delegations,sessions,twoFactorResets",
-    ceo: "workspace,ceo,sessions,twoFactorResets",
+    super_admin: "workspace,dashboard,ceo,countries,gateways,delegations,sessions,twoFactorResets",
+    ceo: "workspace,ceo,countries,sessions,twoFactorResets",
     compliance_kyc: "workspace,sessions,twoFactorResets",
     finance_ops: "workspace",
     support: "workspace,sessions,twoFactorResets",
@@ -266,10 +277,10 @@ function checkRoleFiltering(): void {
   );
   expectEqual(
     sectionsOf(["support", "super_admin"]),
-    "workspace,dashboard,ceo,gateways,delegations,sessions,twoFactorResets",
+    "workspace,dashboard,ceo,countries,gateways,delegations,sessions,twoFactorResets",
     "and the union is not counted twice",
   );
-  expectEqual(sectionKeysOf(officeSectionsFor(["ceo"]).map((section) => section.key)), "workspace,ceo,sessions,twoFactorResets", "the catalog order is stable");
+  expectEqual(sectionKeysOf(officeSectionsFor(["ceo"]).map((section) => section.key)), "workspace,ceo,countries,sessions,twoFactorResets", "the catalog order is stable");
 
   expectEqual(officeRolesOf(["blogger", "super_admin"]).join(","), "super_admin,blogger", "the roles of an account come back in the migration's order");
   expectEqual(officeRolesOf(["owner"]).join(","), "", "and the merchant role is not one of them");
@@ -337,7 +348,7 @@ function checkAccessDecision(): void {
   expectEqual(multi.kind === "allowed" ? multi.roles.join(",") : "", "ceo,blogger", "the merchant grant is ignored and the two office roles are kept");
   expectEqual(
     multi.kind === "allowed" ? multi.sections.length : -1,
-    4,
+    5,
     "and the screens are the union of the two",
   );
 
@@ -360,7 +371,7 @@ function checkWorkspaceView(): void {
   expectEqual(view === null ? "" : view.roles[0]?.role, "ceo", "which is the role held");
   expectEqual(view === null ? "" : view.roles[0]?.labelKey, "office.roleCeo", "with its catalog label");
   expectEqual(view === null ? "" : view.roles[0]?.charterKey, "office.charterCeo", "and its charter");
-  expectEqual(view === null ? "" : view.sections.length, 4, "and the screens it opens");
+  expectEqual(view === null ? "" : view.sections.length, 5, "and the screens it opens");
 
   const two = officeWorkspaceOf(["support", "finance_ops"]);
 
@@ -649,6 +660,8 @@ async function checkCopy(): Promise<void> {
     "office.sectionSessionsDescription",
     "office.sectionTwoFactorResets",
     "office.sectionTwoFactorResetsDescription",
+    "office.sectionCountries",
+    "office.sectionCountriesDescription",
     "office.roleSuperAdmin",
     "office.roleCeo",
     "office.roleComplianceKyc",

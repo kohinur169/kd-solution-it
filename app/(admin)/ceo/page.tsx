@@ -356,6 +356,9 @@ export default async function CeoDashboardPage(): Promise<ReactNode> {
               })}
             </p>
             <p className={bodyClasses}>{getMessage("officeApprovals.countriesNote")}</p>
+            <Link className={linkClasses} href="/countries">
+              {getMessage("officeApprovals.countriesSwitchLink")}
+            </Link>
           </section>
 
           <section aria-labelledby="ceo-kyc" className={sectionClasses}>

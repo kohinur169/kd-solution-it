@@ -133,6 +133,11 @@ export const SENSITIVE_ENDPOINTS: readonly SensitiveEndpoint[] = [
   },
   {
     method: "POST",
+    path: "/api/office/countries",
+    note: "Section 3's country switch (STEP 073): opening a market spends a decision and closing one stops the platform selling there, so the browser that turns it is the one that signs.",
+  },
+  {
+    method: "POST",
     path: "/api/office/gateways",
     note: "Section 6's gateway page (STEP 069): storing a provider key or changing a provider's state is the request that decides where money is routed, so it is signed by the browser holding the key.",
   },
