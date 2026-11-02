@@ -1,4 +1,6 @@
 // path: docs/planning/REVISED_FEATURE_LIST_V2.md
+> HISTORICAL REFERENCE ONLY — Do not use this file as active implementation instructions.
+> The current scope, coding rules and step sequence are defined in `docs/final/`.
 # KD SOLUTION IT - Revised Feature List V2 (Supersedes Conflicting Parts of Earlier Plans)
 
 This document is the current scope authority. Where MASTER_PROMPT .md, FEATURE_LIST.md,
