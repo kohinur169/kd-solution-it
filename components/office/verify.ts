@@ -189,6 +189,11 @@ function checkCatalog(): void {
 
   // The one rule the shell must not restate: each screen's roles are the constant its service uses.
   expectEqual(
+    officeSectionByKey("sessions")?.href,
+    "/account-sessions",
+    "the sessions entry opens the account console of STEP 077",
+  );
+  expectEqual(
     officeSectionByKey("sessions")?.roles.join(","),
     SESSION_MANAGEMENT_OFFICE_ROLES.join(","),
     "the sessions entry carries the role list of the sessions service",

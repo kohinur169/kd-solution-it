@@ -406,7 +406,7 @@ const catalog = {
       "The roles this account holds, what each of them may do, and the office screens they open.",
     sectionSessions: "Account sessions",
     sectionSessionsDescription:
-      "Read the live sessions of one account and end any that should not be there.",
+      "Find an account by its identifier or the address it signs in with, read the sessions live on it, and end any that should not be there.",
     sectionTwoFactorResets: "Two factor reset queue",
     sectionTwoFactorResetsDescription:
       "Work the requests of merchants who lost the authenticator app and the backup codes with it.",
@@ -1133,6 +1133,75 @@ const catalog = {
       "This screen belongs to the super administrator, the chief executive and the compliance desk.",
     signedOut: "Sign in with an office account to open the audit log.",
     unavailable: "The audit log could not be read just now. Try again in a moment.",
+    home: "Go to the office workspace",
+  },
+  officeAccountSessions: {
+    eyebrow: "Platform office",
+    title: "Account sessions",
+    description:
+      "Find an account by its identifier or by the address it signs in with, read the sessions that are live on it, and end any of them. Every ending is written to the audit log against your name.",
+    guardNote:
+      "This screen belongs to the roles that manage sessions: the super administrator, the chief executive, the compliance desk and support. Ending a session also needs your second factor confirmed in the last few minutes.",
+    searchHeading: "Find the account",
+    searchLabel: "Account identifier or email address",
+    searchHint:
+      "An identifier names one account; an address is matched exactly against the address on the account, so a colleague's address will not find it.",
+    searchMaximumNote: "At most {count} characters, the longest an address may be.",
+    searchSubmit: "Find the account",
+    searchClear: "Clear the search",
+    idleHeading: "No account searched yet",
+    idleBody:
+      "Type the identifier of the account, or the address it signs in with, and press Find the account. Nothing is read until you do.",
+    invalidFormat:
+      "That is neither an account identifier nor an email address. A session manager finds accounts by their identifier or by the exact address on the account.",
+    missingAccount: "No account here carries {query}. Check the address with the person before trying again.",
+    subjectHeading: "The account",
+    subjectName: "Name",
+    subjectEmail: "Email",
+    subjectId: "Account",
+    subjectCompany: "Company",
+    subjectNoCompany: "No company is attached to this account",
+    countsLine:
+      "{live} live sessions: {trusted} on confirmed devices, {unconfirmed} on unconfirmed devices, {dropped} on devices that were dropped.",
+    sessionHeading: "Live sessions",
+    sessionDescription:
+      "One row per session the account can use right now. Ending a session signs that device out on the next request and keeps every other session open.",
+    sessionCount: "{count} live sessions.",
+    readAt: "Read at {at}.",
+    sessionEmpty: "This account has no live session. It is signed out everywhere already.",
+    columnDevice: "Device",
+    columnTrust: "Device standing",
+    columnIssued: "Started",
+    columnLastSeen: "Last seen",
+    columnExpires: "Expires",
+    columnAction: "Action",
+    deviceUnknown: "A device with no label",
+    trustTrusted: "Confirmed device",
+    trustUnconfirmed: "Not yet confirmed",
+    trustDropped: "The device was dropped",
+    revokeSubmit: "End this session",
+    revokeBusy: "Ending",
+    revokedDone:
+      "The session is ended. That device has to sign in again, and the audit log names you as the one who ended it.",
+    revokeAllHeading: "End every session",
+    revokeAllBody:
+      "Ends each live session above in turn, one audited act at a time. The account has to sign in again on every device. If one request fails, the sessions after it stay open and the count says how many were ended.",
+    revokeAllConfirm: "I have confirmed this request with the account holder.",
+    revokeAllSubmit: "End every session",
+    revokeAllBusy: "Ending {done} of {total}",
+    revokeAllDone: "Every session is ended. The account has to sign in again everywhere.",
+    revokeAllPartial: "{done} of {total} sessions were ended. The rest are still live, and the list above shows them.",
+    reauthRequired:
+      "Ending a session needs your second factor confirmed again. Confirm it and come back to this account.",
+    reauthenticate: "Confirm your second factor",
+    refusedForbidden:
+      "Your role may not end sessions on another account. The super administrator, the chief executive, the compliance desk and support may.",
+    conflict: "That session is no longer live. Somebody ended it, or the device did, so there is nothing left to end.",
+    failed: "The session was not ended just now. Nothing changed; try again in a moment.",
+    signedOut: "Sign in with an office account to manage sessions.",
+    forbidden:
+      "This screen belongs to the roles that manage sessions: the super administrator, the chief executive, the compliance desk and support.",
+    unavailable: "The sessions could not be read just now. Try again in a moment.",
     home: "Go to the office workspace",
   },
   officeUnlock: {

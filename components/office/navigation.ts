@@ -154,7 +154,7 @@ export const OFFICE_NAVIGATION: readonly OfficeSection[] = deepFreeze([
   },
   {
     key: "sessions",
-    href: "/office/sessions",
+    href: "/account-sessions",
     labelKey: "office.sectionSessions",
     descriptionKey: "office.sectionSessionsDescription",
     roles: SESSION_MANAGEMENT_OFFICE_ROLES,
