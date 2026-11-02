@@ -1487,6 +1487,32 @@ const catalog = {
     unavailable: "The address and contact could not be read just now. Try again in a moment.",
     backLink: "Back to the onboarding wizard",
   },
+  onboardingReview: {
+    eyebrow: "Merchant onboarding",
+    title: "Review: the one profile every processor is sent",
+    description:
+      "Section 5 stores your business information once and sends the same information to every connected processor. This page shows that profile assembled: the business, the category, the address and the contact person, and what each processor is sent from it.",
+    guardNote:
+      "Only the owner of a merchant account can read this page, and the company it shows comes from your session rather than from the address. Nothing on this page can be edited here; each field belongs to the form of its own step.",
+    readyLine:
+      "Every connected processor can be sent this profile, so a sub-merchant account can be opened for the business once the platform approves it.",
+    missingLine: "{count} facts are still missing before any processor can be opened: {fields}",
+    businessHeading: "The business",
+    categoryHeading: "The category",
+    addressHeading: "The address and the contact person",
+    processorsHeading: "What each connected processor is sent",
+    processorsDescription:
+      "Each processor asks for its own subset of the business facts, and all of them get the category, the address and the contact person. A processor is listed as still waiting until everything it insists on is filled in.",
+    fieldMissing: "not filled in yet",
+    countryValue: "{code} - {name}",
+    unsavedLine: "Nothing has been saved yet. The steps above each save their own section.",
+    savedLine: "Last saved at {at} UTC.",
+    signedOut: "Sign in with a merchant account to review your onboarding profile.",
+    forbidden:
+      "This page belongs to a merchant owner account. An office account reads merchant profiles from the office screens.",
+    unavailable: "Your onboarding profile could not be read just now. Try again in a moment.",
+    backLink: "Back to the onboarding wizard",
+  },
   email: {
     lockAlert: {
       /** Subject of the section 23 alert of section 22: the owner is told their account locked. */

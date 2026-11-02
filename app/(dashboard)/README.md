@@ -13,7 +13,8 @@ Every read is scoped to the caller company and every write is audit logged.
 
 - `onboarding/` - STEP 079: the section 5 wizard shell, its six steps and the saved position
   (`0102_onboarding_progress.sql`, `services/kyc/onboarding-progress.ts`,
-  `POST /api/onboarding/progress`). The forms each step collects are the STEPs that follow it.
+  `POST /api/onboarding/progress`). The forms each step collects are the STEPs that follow it;
+  `services/submerchant/` holds the read side of that one profile for the processors.
 - `onboarding/business/` - STEP 080: the business information form, the first of those forms
   (`0103_business_profiles.sql`, `services/kyc/processor-fields.ts`,
   `services/kyc/business-profile.ts`, `POST /api/onboarding/business-profile`). The wizard links to it
@@ -28,6 +29,11 @@ Every read is scoped to the caller company and every write is audit logged.
   (`0105_business_address.sql` adds the nine address columns to `business_profiles`, with the
   country pointed at `0076`'s enabled countries; `services/kyc/business-address.ts`,
   `POST /api/onboarding/business-address`).
+- `onboarding/review/` - STEP 083: the read-only review page of the one profile every processor is
+  sent (`services/submerchant/processor-profile.ts` reads the one `business_profiles` row once,
+  resolves the code title from `0077` and the country name from `0076`, and computes the payload and
+  the readiness per processor; `GET /api/onboarding/processor-profile` for the office roles, which
+  audit each read). No migration: the facts were already stored on the profile row by STEPs 080-082.
 
 ## The reader
 

@@ -63,6 +63,15 @@ import {
 } from "./business-address.ts";
 import { PLATFORM_PROVIDERS } from "../../lib/gateways/registry.ts";
 import {
+  assertProvisionable,
+  PROCESSOR_PROFILE_AUDIT_ACTION,
+  PROCESSOR_PROFILE_AUDIT_ENTITY,
+  PROCESSOR_PROFILE_OFFICE_ROLES,
+  PROCESSOR_PROFILE_READER_ROLES,
+  processorPayloadFor,
+  readProcessorProfile,
+} from "../submerchant/processor-profile.ts";
+import {
   ONBOARDING_AUDIT_ACTION,
   ONBOARDING_OWNER_ROLES,
   ONBOARDING_PROGRESS_TABLE,
@@ -2939,6 +2948,382 @@ async function checkAddressCatalog(): Promise<void> {
   );
 }
 
+
+/* -------------------------------------------------------------------------------------------------
+ * STEP 083: the one-time profile assembled for every processor, and its read.
+ * ---------------------------------------------------------------------------------------------- */
+
+const FULL_PROFILE = businessRow({
+  legal_name: "Acme Trading Ltd",
+  trading_name: "Acme",
+  business_type: "company",
+  registration_number: "C-123456",
+  tax_id: "TIN-9988",
+  website: "https://acme.example",
+  business_description: "Sells tools",
+  mcc_code: "5411",
+  address_line1: "12 Main Street",
+  address_line2: "Floor 3",
+  city: "Dhaka",
+  postal_code: "1207",
+  country_code: "BD",
+  contact_name: "Karim Rahman",
+  contact_email: "owner@acme.com",
+  contact_phone: "+880 1712-345678",
+  address_completed_at: "2026-11-01T09:00:00.000Z",
+  completed_at: "2026-11-01T08:00:00.000Z",
+});
+
+/** ---- The vocabulary: the reader roles, the reused table, the audit name. */
+function checkProfileVocabulary(): void {
+  expectDeepEqual(
+    [...PROCESSOR_PROFILE_READER_ROLES],
+    ["super_admin", "ceo", "compliance_kyc", "owner"],
+    "the owner reads their own profile; the three office roles may read any one merchant's",
+  );
+  expectDeepEqual(
+    [...PROCESSOR_PROFILE_OFFICE_ROLES],
+    ["super_admin", "ceo", "compliance_kyc"],
+    "and the office half is exactly the roles that approve or underwrite",
+  );
+  expectEqual(PROCESSOR_PROFILE_AUDIT_ACTION, "processor_profile.read_by_office", "an office read is audited under one name");
+  expectEqual(PROCESSOR_PROFILE_AUDIT_ENTITY, "business_profile", "against the profile it read");
+  expectEqual(BUSINESS_PROFILE_TABLE, "business_profiles", "the payload reads the one row of 0103, nothing new is stored");
+}
+
+/** ---- The read: roles, the company scope, the two reference names, and the audit of an office read. */
+async function checkProfileRead(): Promise<void> {
+  for (const [description, actor] of [
+    ["support", actorOf(["support"], null, { userId: OFFICE_ID })],
+    ["blogger", actorOf(["blogger"], null, { userId: OFFICE_ID })],
+    ["an owner with no company on the session", actorOf(["owner"], null)],
+    ["nobody", actorOf([], null)],
+  ] as const) {
+    const database = createBusinessDatabase([FULL_PROFILE]);
+    const refusal = await rejectionOf(() =>
+      readProcessorProfile({ actor, companyId: COMPANY_A }, dependenciesOf(database, createInMemoryAuditTrail())),
+    );
+
+    expectEqual(refusal?.code, "PERMISSION_DENIED", `the profile read refuses ${description}`);
+    expectEqual(database.queries.length, 0, `and reads nothing for ${description}`);
+  }
+
+  const database = createBusinessDatabase([FULL_PROFILE]);
+  const audit = createInMemoryAuditTrail();
+  const snapshot = await readProcessorProfile({ actor: owner }, dependenciesOf(database, audit));
+
+  expectEqual(snapshot.companyId, COMPANY_A, "the owner reads their own company's profile");
+  expectEqual(database.queries.length, 3, "one row read, plus the code title and the country name");
+  expect((database.queries[0] ?? "").startsWith("business_profiles?"), "the first query is the profile row");
+  expect(
+    (database.queries[0] ?? "").includes(encodeURIComponent(COMPANY_A)),
+    "scoped to the session's company",
+  );
+  expect((database.queries[1] ?? "").includes("code=eq.5411"), "the second resolves the code's title from 0077");
+  expect((database.queries[2] ?? "").includes("code=eq.BD"), "the third resolves the country's name from 0076");
+  expectEqual(snapshot.saved, true, "a stored profile is saved");
+  expectEqual(snapshot.ready, true, "and complete: every processor's fields, the code and the address are present");
+  expectEqual(snapshot.blocking.length, 0, "with nothing blocking");
+  expectEqual(snapshot.business.legal_name, "Acme Trading Ltd", "the business values are the row's");
+  expectEqual(snapshot.business.tax_id, "TIN-9988", "including the optional ones");
+  expectDeepEqual(snapshot.category, { code: "5411", title: "Grocery Stores, Supermarkets" }, "the category carries the published title");
+  expectEqual(snapshot.address.contact_email, "owner@acme.com", "the address block is the row's");
+  expectEqual(snapshot.countryName, "Bangladesh", "and the country shows its name beside the code");
+  expectEqual(snapshot.coverage.length, PLATFORM_PROVIDERS.length, "one coverage line per processor, in registry order");
+  expect(
+    snapshot.coverage.every((entry) => entry.missing.length === 0),
+    "and none of them is waiting for anything",
+  );
+  expectEqual(snapshot.coverage.map((entry) => entry.provider).join(","), PLATFORM_PROVIDERS.map((provider) => provider.key).join(","), "in the registry's own order");
+  expectEqual(snapshot.savedAtEpochMs, Date.parse("2026-11-01T09:30:00.000Z"), "the save instant is the row's");
+  expectEqual(snapshot.completedAtEpochMs, Date.parse("2026-11-01T08:00:00.000Z"), "0103's business completion is reported beside it");
+  expectEqual(snapshot.addressCompletedAtEpochMs, Date.parse("2026-11-01T09:00:00.000Z"), "and so is 0105's address completion");
+  expectEqual(audit.entries.length, 0, "an owner read of their own profile is not audit logged");
+
+  const otherTenant = createBusinessDatabase([businessRow({ company_id: COMPANY_B, legal_name: "Other Ltd" })]);
+  const own = await readProcessorProfile({ actor: otherOwner }, dependenciesOf(otherTenant, createInMemoryAuditTrail()));
+
+  expectEqual(own.companyId, COMPANY_B, "another owner reads their own company, not the row's");
+  expect((otherTenant.queries[0] ?? "").includes(encodeURIComponent(COMPANY_B)), "and the query names their company");
+  expectEqual(own.business.legal_name, "Other Ltd", "with their own values");
+
+  const foreignParam = createBusinessDatabase([FULL_PROFILE]);
+  const refusedParam = await rejectionOf(() =>
+    readProcessorProfile({ actor: owner, companyId: COMPANY_B }, dependenciesOf(foreignParam, createInMemoryAuditTrail())),
+  );
+
+  expectEqual(refusedParam?.code, "PERMISSION_DENIED", "an owner naming another company in the parameter is refused");
+  expectEqual(foreignParam.queries.length, 0, "before any query");
+
+  const officeActor = actorOf(["super_admin"], null, { userId: OFFICE_ID });
+  const officeDatabase = createBusinessDatabase([FULL_PROFILE]);
+  const officeAudit = createInMemoryAuditTrail();
+  const officeSnapshot = await readProcessorProfile(
+    { actor: officeActor, companyId: COMPANY_A },
+    dependenciesOf(officeDatabase, officeAudit),
+  );
+
+  expectEqual(officeSnapshot.companyId, COMPANY_A, "an office role reads the company they named");
+  expectEqual(officeSnapshot.ready, true, "with the same assembled answer");
+  expect((officeDatabase.queries[0] ?? "").includes(encodeURIComponent(COMPANY_A)), "scoped to the named company");
+  expectEqual(officeAudit.entries.length, 1, "and the office read appends exactly one audit entry");
+  expectEqual(officeAudit.entries[0]?.action, PROCESSOR_PROFILE_AUDIT_ACTION, "under the profile read action");
+  expectEqual(officeAudit.entries[0]?.entityType, PROCESSOR_PROFILE_AUDIT_ENTITY, "on the business profile entity");
+  expectEqual(officeAudit.entries[0]?.entityId, COMPANY_A, "naming the merchant read");
+  expectEqual(officeAudit.entries[0]?.actorUserId, OFFICE_ID, "and the officer who read it");
+  expectEqual(officeAudit.entries[0]?.companyId, COMPANY_A, "in the tenant chain of the merchant read");
+  expectEqual(officeAudit.entries[0]?.payload?.["ready"], true, "recording the readiness it saw");
+
+  for (const [label, companyId] of [
+    ["a missing parameter", undefined],
+    ["a parameter that is not a UUID", "not-a-uuid"],
+  ] as const) {
+    const noParam = createBusinessDatabase([FULL_PROFILE]);
+    const noParamAudit = createInMemoryAuditTrail();
+    const refusal = await rejectionOf(() =>
+      readProcessorProfile({ actor: officeActor, companyId }, dependenciesOf(noParam, noParamAudit)),
+    );
+
+    expectEqual(refusal?.code, "VALIDATION_FAILED", `an office read with ${label} is a validation failure`);
+    expectDeepEqual(refusal?.details, [{ field: "company_id", rule: "invalid_format" }], "naming the parameter");
+    expectEqual(noParam.queries.length, 0, "before any query");
+    expectEqual(noParamAudit.entries.length, 0, "and audits nothing");
+  }
+
+  const empty = await readProcessorProfile(
+    { actor: owner },
+    dependenciesOf(createBusinessDatabase(), createInMemoryAuditTrail()),
+  );
+
+  expectEqual(empty.saved, false, "a merchant with no row gets an empty profile, not a refusal");
+  expectEqual(empty.ready, false, "that is not ready");
+  expectEqual(empty.businessMissing.length, BUSINESS_PROFILE_FIELDS.length, "with every business field missing");
+  expectEqual(empty.addressMissing.length, 7, "the seven required address fields missing");
+  expectEqual(
+    empty.blocking.length,
+    BUSINESS_PROFILE_FIELDS.length + 1 + 7,
+    "blocking names all of them: business, the code and the address",
+  );
+  expectEqual(empty.blocking.includes("category.mcc_code"), true, "the category is named");
+  expectEqual(empty.blocking[0], "business.legal_name", "in the form's order, business first");
+  expect(empty.coverage.every((entry) => entry.missing.length === entry.required.length), "every processor is waiting for everything it requires");
+
+  const partialDatabase = createBusinessDatabase([businessRow({ legal_name: "Acme Trading Ltd" })]);
+  const partial = await readProcessorProfile({ actor: owner }, dependenciesOf(partialDatabase, createInMemoryAuditTrail()));
+
+  expectEqual(partial.ready, false, "a lone legal name is not a profile the processors can be sent");
+  expectDeepEqual(
+    [...partial.businessMissing].sort(),
+    ["business_description", "business_type", "registration_number", "tax_id", "trading_name", "website"],
+    "the six other business fields are named missing",
+  );
+  const payoneer = partial.coverage.find((entry) => entry.provider === "payoneer");
+
+  expectDeepEqual([...(payoneer?.missing ?? [])].sort(), ["business_type", "tax_id"], "payoneer waits for exactly the entity type and the tax id beyond the name");
+  expectEqual(partial.blocking.length, 6 + 1 + 7, "six business facts, the code, seven address facts");
+  expectEqual(partial.category, null, "no code stored");
+  expectEqual(partial.countryName, null, "and no country name resolved");
+  expectEqual(partialDatabase.queries.length, 1, "a row with no code and no country reads no reference rows");
+
+  const retired = await readProcessorProfile(
+    { actor: owner },
+    dependenciesOf(createBusinessDatabase([businessRow({ mcc_code: "0001", country_code: "AQ" })]), createInMemoryAuditTrail()),
+  );
+
+  expectDeepEqual(retired.category, { code: "0001", title: "Retired Example Code" }, "a stored retired code still resolves its title, like the category form");
+  expectEqual(retired.countryName, "Antarctica", "and a stored disabled country still resolves its name: the write side refuses those, the read names what is stored");
+
+  const throwingAudit = { append(): Promise<void> { return Promise.reject(new Error("down")); } };
+  const officeBrokenAudit = await readProcessorProfile(
+    { actor: officeActor, companyId: COMPANY_A },
+    { rest: createBusinessStore(createBusinessDatabase([FULL_PROFILE])), audit: throwingAudit, now: () => NOW },
+  );
+
+  expectEqual(officeBrokenAudit.ready, true, "an audit sink that is down does not fail an office read");
+
+  const brokenRow = createBusinessDatabase([businessRow({ updated_at: "not a date" })]);
+
+  expectEqual(
+    await failureOf(() => readProcessorProfile({ actor: owner }, dependenciesOf(brokenRow, createInMemoryAuditTrail()))),
+    "INTERNAL_ERROR",
+    "a row with an unreadable instant is a defect, not an empty profile",
+  );
+}
+
+/** ---- The payload: per processor, computed from the snapshot, and the provisioning refusal. */
+async function checkProfilePayload(): Promise<void> {
+  const full = await readProcessorProfile(
+    { actor: owner },
+    dependenciesOf(createBusinessDatabase([FULL_PROFILE]), createInMemoryAuditTrail()),
+  );
+
+  for (const provider of PLATFORM_PROVIDERS) {
+    const payload = processorPayloadFor(full, provider.key);
+
+    expectEqual(payload.provider, provider.key, `${provider.key} answers under its own key`);
+    expectEqual(payload.displayName, provider.displayName, "with the panel's display name");
+    expectEqual(payload.ready, true, "a complete profile is ready for every processor");
+    expectEqual(payload.missing.length, 0, "with nothing missing");
+    expectDeepEqual(
+      Object.keys(payload.address).sort(),
+      [...BUSINESS_ADDRESS_FIELDS].sort(),
+      `${provider.key} is sent all nine address and contact fields`,
+    );
+    expectDeepEqual(payload.category, { code: "5411", title: "Grocery Stores, Supermarkets" }, "and the category with its title");
+    expectEqual(payload.countryName, "Bangladesh", "and the country's name");
+  }
+
+  const nmi = processorPayloadFor(full, "nmi");
+
+  expectDeepEqual(
+    Object.keys(nmi.business).sort(),
+    ["business_description", "business_type", "legal_name", "trading_name", "website"],
+    "nmi is sent its four required fields plus the optional trading name, and not the tax id it does not ask for",
+  );
+  const airwallex = processorPayloadFor(full, "airwallex");
+
+  expectEqual("tax_id" in airwallex.business, true, "airwallex takes the tax id as an optional field when it is present");
+  expectEqual("business_description" in airwallex.business, true, "and the description");
+
+  const partial = await readProcessorProfile(
+    { actor: owner },
+    dependenciesOf(createBusinessDatabase([businessRow({ legal_name: "Acme Trading Ltd" })]), createInMemoryAuditTrail()),
+  );
+  const partialPayload = processorPayloadFor(partial, "payoneer");
+
+  expectEqual(partialPayload.ready, false, "a partial profile is not ready for any processor");
+  expectDeepEqual(
+    [...partialPayload.missing].sort(),
+    [
+      "address.address_line1",
+      "address.city",
+      "address.contact_email",
+      "address.contact_name",
+      "address.contact_phone",
+      "address.country_code",
+      "address.postal_code",
+      "business.business_type",
+      "business.tax_id",
+      "category.mcc_code",
+    ],
+    "payoneer's payload names exactly what it still needs: its two business fields, the code and the seven address fields",
+  );
+  expectDeepEqual(Object.keys(partialPayload.business), ["legal_name"], "and carries only the one fact that exists");
+
+  expectEqual(
+    await failureOf(() => Promise.resolve(assertProvisionable(full))),
+    "no-throw",
+    "a complete profile passes the provisioning check",
+  );
+
+  const blocked = await rejectionOf(() => Promise.resolve(assertProvisionable(partial)));
+
+  expectEqual(blocked?.code, "VALIDATION_FAILED", "a partial profile is refused for provisioning");
+  expectEqual(blocked?.details?.length, 14, "naming all fourteen missing facts");
+  expectDeepEqual(blocked?.details?.[0], { field: "business.trading_name", rule: "missing_required" }, "each as a field and the rule");
+
+  const empty = await readProcessorProfile(
+    { actor: owner },
+    dependenciesOf(createBusinessDatabase(), createInMemoryAuditTrail()),
+  );
+
+  expectEqual(
+    await failureOf(() => Promise.resolve(assertProvisionable(empty))),
+    "RESOURCE_NOT_FOUND",
+    "a merchant with no row at all is not found, not a validation failure",
+  );
+}
+
+/** ---- The sources: the GET route, the review page, the wizard map and the CSRF list say what this STEP promised. */
+async function checkProfileSources(): Promise<void> {
+  const route = await readRepositoryFile("app/api/onboarding/processor-profile/route.ts");
+  const page = await readRepositoryFile("app/(dashboard)/onboarding/review/page.tsx");
+  const copy = await readRepositoryFile("app/(dashboard)/onboarding/step-copy.ts");
+  const csrf = await readRepositoryFile("lib/security/csrf.ts");
+
+  for (const [path, source] of [
+    ["app/api/onboarding/processor-profile/route.ts", route],
+    ["app/(dashboard)/onboarding/review/page.tsx", page],
+  ] as const) {
+    expectEqual(source.split("\n")[0], `// path: ${path}`, `${path} states its own path on its first line`);
+    expectEqual(/[^\t\n\r\x20-\x7E]/u.test(source), false, `${path} is ASCII only`);
+  }
+
+  expect(route.includes("export const GET"), "the route answers GET");
+  expectEqual(route.includes("export const POST"), false, "and never POST: a read has no body to protect");
+  expect(route.includes("readRequestActor("), "the session is read from the cookie");
+  expect(route.indexOf("readRequestActor(") < route.indexOf("readProcessorProfile("), "before the service runs");
+  expect(route.includes('searchParams.get("companyId")'), "the office names the company in the query string");
+  expectEqual(route.includes("requireCsrfToken"), false, "a GET carries no CSRF check");
+  expect(route.includes('"cache-control": "no-store"'), "and the answer is not cached");
+  expect(route.includes("readProcessorProfile("), "through the one service");
+  expectEqual(csrf.includes("processor-profile"), false, "so the path is not on the CSRF-protected POST list");
+
+  expectEqual(page.includes('"use client"'), false, "the review page is a server component: it renders values, it has no inputs");
+  expect(page.includes("readOwnerActor()"), "the page reads the account through the cached reader");
+  expect(page.includes("readProcessorProfile("), "and the assembled profile through the service");
+  expect(page.includes("<SessionKeeper"), "and keeps the session rotating while it is read");
+  for (const state of ["signed-out", "forbidden", "unavailable", "ready"]) {
+    expect(page.includes(`"${state}"`), `the page keeps the ${state} answer apart`);
+  }
+  expect(page.includes("processorPayloadFor") || page.includes("coverage"), "the page draws the per-processor lines from the snapshot");
+  expectEqual(/[^\t\n\r\x20-\x7E]/u.test(page), false, "the page is ASCII only");
+
+  expect(copy.includes('review: "/onboarding/review"'), "the review step links to its page");
+
+  expect(
+    (await readdir(new URL("app/(dashboard)/onboarding/review/", repositoryRoot))).includes("page.tsx"),
+    "the review page lives in the merchant dashboard area",
+  );
+  expect(
+    (await readdir(new URL("app/api/onboarding/processor-profile/", repositoryRoot))).includes("route.ts"),
+    "and its handler is a route handler of its own",
+  );
+  expect(
+    (await readdir(new URL("services/submerchant/", repositoryRoot))).includes("processor-profile.ts"),
+    "the payload service lives in services/submerchant",
+  );
+}
+
+/** ---- The catalog: every sentence of the review page is used, and every key it names exists. */
+async function checkProfileCatalog(): Promise<void> {
+  const block = en.onboardingReview as unknown as Record<string, unknown>;
+  const page = await readRepositoryFile("app/(dashboard)/onboarding/review/page.tsx");
+
+  const flat: string[] = [];
+
+  const walk = (node: Record<string, unknown>, prefix: string): void => {
+    for (const [key, value] of Object.entries(node)) {
+      const path = `${prefix}.${key}`;
+
+      if (typeof value === "string") {
+        flat.push(path);
+      } else if (typeof value === "object" && value !== null) {
+        walk(value as Record<string, unknown>, path);
+      }
+    }
+  };
+
+  walk(block, "onboardingReview");
+
+  expect(flat.length >= 15, "the review page has its own block of copy");
+
+  for (const path of flat) {
+    expect(page.includes(`"${path}"`), `the copy key ${path} is used by the page`);
+  }
+
+  const referenced = [...page.matchAll(/"(onboardingReview\.[A-Za-z.]+)"/gu)].map((match) => match[1]);
+
+  for (const path of new Set(referenced)) {
+    expect(path !== undefined && flat.includes(path), `the page names no missing key (${String(path)})`);
+  }
+
+  expectEqual(page.includes('getMessage("onboardingReview.missingLine")'), false, "the templated missing line is never rendered without its values");
+  expect(page.includes('formatMessage("onboardingReview.missingLine"'), "and is rendered through formatMessage");
+  expect(page.includes('formatMessage("onboardingReview.countryValue"'), "and so is the country line");
+  expect(page.includes('formatMessage("onboardingReview.savedLine"'), "and the saved line");
+}
+
 async function main(): Promise<void> {
   checkVocabulary();
   await checkRefusals();
@@ -2973,6 +3358,11 @@ async function main(): Promise<void> {
   await checkAddressSaveRefusals();
   await checkAddressSources();
   await checkAddressCatalog();
+  checkProfileVocabulary();
+  await checkProfileRead();
+  await checkProfilePayload();
+  await checkProfileSources();
+  await checkProfileCatalog();
 
   if (failures.length > 0) {
     process.stderr.write(`onboarding gate failed with ${failures.length} problem(s):\n`);
@@ -2990,7 +3380,7 @@ async function main(): Promise<void> {
     `onboarding gate passed: ${checks} checks, ${ONBOARDING_STEPS.length} steps, ` +
       `${ONBOARDING_OWNER_ROLES.length} role, ${BUSINESS_PROFILE_FIELDS.length} business fields, ` +
       `${PROCESSOR_REQUIREMENT_LIST.length} processors, ${BUSINESS_PROFILE_TABLE} table, ` +
-      `${MCC_CODES_TABLE} vocabulary, ${COUNTRIES_TABLE} list\n`,
+      `${MCC_CODES_TABLE} vocabulary, ${COUNTRIES_TABLE} list, submerchant profile\n`,
   );
 }
 

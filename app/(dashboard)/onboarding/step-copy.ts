@@ -73,6 +73,7 @@ export const ONBOARDING_STEP_FORMS: Partial<Readonly<Record<OnboardingStep, stri
   business: "/onboarding/business",
   address: "/onboarding/address",
   category: "/onboarding/category",
+  review: "/onboarding/review",
 });
 
 /** Where one step's form lives, or `null` for a step that has none yet. */
