@@ -29,7 +29,7 @@ Branch `arena/1dc51ec3-kd-solution-it`. Commit `4bdacc0`. Previous handoff:
   `app/(dashboard)/onboarding/business/business-form.tsx`,
   `docs/planning/STEP_080_SUBSTEP_BREAKDOWN.md`, `docs/handoffs/STEP_080_COMPLETED.md`.
 - **Modified:** `services/kyc/verify.ts` (the onboarding gate grew the STEP 080 sections: matrix,
-  parse, read, save, refusals, sources and catalog; 345 -> 660 checks), `lib/i18n/strings/en.ts`
+  parse, read, save, refusals, sources and catalog; 345 -> 663 checks), `lib/i18n/strings/en.ts`
   (the `onboardingBusiness` block, 39 strings, plus `onboarding.actionOpenForm`),
   `lib/security/csrf.ts` (one path on the protected list: `/api/onboarding/business-profile`),
   `lib/auth/verify.ts` (session keeper count 7 -> 8, browser mutation files 21 -> 22, call sites
@@ -135,10 +135,10 @@ No package added or changed. `package.json` and `package-lock.json` are untouche
 
 ## Verification
 
-- `node services/kyc/verify.ts` -> **660 checks** (6 steps, 1 role, 7 business fields, 5 processors,
+- `node services/kyc/verify.ts` -> **663 checks** (6 steps, 1 role, 7 business fields, 5 processors,
   `business_profiles` table).
 - `node lib/auth/verify.ts` -> 2463 checks (8 session keepers, 22 browser mutation files, 25 call
-  sites). `node lib/i18n/verify.ts` -> 1137 messages, 107 placeholders. `node lib/security/verify.ts`
+  sites). `node lib/i18n/verify.ts` -> 1138 messages, 107 placeholders. `node lib/security/verify.ts`
   -> 2376 checks. `node lib/errors/verify.ts` -> 202 checks. `npm run -s check:shell` -> 409 checks.
   `npm run -s check:structure` -> 261 source files. `npm run -s check:migrations` -> 3006 / 103 / 78.
 - `npm run -s typecheck` clean; `npx eslint` on every file this STEP touched clean.
@@ -166,6 +166,11 @@ No package added or changed. `package.json` and `package-lock.json` are untouche
   harder for a merchant to fill.
 - The gate cannot prove PostgREST is reachable, that `0103` was applied to a particular project, or
   that a person can fill the form at two widths.
+- **Audit note (2026-11-02):** every save used to write all seven columns of the row it had read, so
+  two tabs saving at once could put back a field the other had just changed. The update now carries
+  only the columns the request named plus the derived `completed_at`, and `checkBusinessSave` asserts
+  the patch keys exactly. The promise in "What was built" - a save changes the fields you send - is
+  now true of the statement as well as of the intent.
 
 ## Deployment checks a person runs
 

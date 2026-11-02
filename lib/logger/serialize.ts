@@ -64,7 +64,7 @@ function normalizeString(value: string, state: NormalizationState): JsonValue {
 
   const omitted = value.length - state.limits.maxStringLength;
 
-  return marker(state, `${value.slice(0, state.limits.maxStringLength)}…[+${omitted} chars]`);
+  return marker(state, `${value.slice(0, state.limits.maxStringLength)}...[+${omitted} chars]`);
 }
 
 function normalizeNumber(value: number): JsonValue {

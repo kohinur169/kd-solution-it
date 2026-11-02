@@ -612,6 +612,40 @@ handoff file.
   default from the shared function, RLS plus a default-deny policy, and no forward file that
   drops or deletes.
 
+### The migrations from `0080` to `0103`
+
+The bullets above describe the tenant foundation, the money tables and the reference data of STEPs
+012-036 in the order those STEPs built them. The migrations after them are listed here, in order, so
+the whole set can be read from this file; each one's forward apply and rollback is proved in the
+handoff of the STEP named beside it.
+
+| Migration | STEP | What it adds |
+| --- | --- | --- |
+| `0080_platform_settings.sql` | 038 | the platform setting, and the one place a secret value is allowed to live |
+| `0081_password_breach_setting.sql` | 040 | the breached password check, and the switch that carries it |
+| `0082_auth_challenges.sql` | 042 | the challenge that stands between a password and a session |
+| `0083_auth_challenge_secret_size.sql` | 043 | widens the sealed challenge column to the size its own reader accepts |
+| `0084_two_factor_reset_requests.sql` | 044 | the reset a merchant asks for when the app and the codes are both gone |
+| `0085_login_attempt_factor_idx.sql` | 045 | the index behind the lock counter of section 22 |
+| `0086_account_lock_alert.sql` | 046 | the owner alert of section 22, joined to the send log row it produced |
+| `0087_account_lock_unlock_record.sql` | 047 | an office unlock has to say what was verified |
+| `0088_request_proof_nonces.sql` | 050 | a signed request cannot be played twice |
+| `0089_session_rotation.sql` | 051 | a rotation chain has a ceiling |
+| `0090_device_trust_challenges.sql` | 052 | a new device has to be confirmed, and the confirmation has a shelf life |
+| `0091_sessions_reauthenticated_at.sql` | 053 | the reauthentication instant gets its upper bound |
+| `0092_rate_limit_windows.sql` | 055 | the per address counter behind IP based rate limiting |
+| `0093_velocity_counter_consume.sql` | 067 | the atomic counter behind the card and IP velocity limits of section 18 |
+| `0094_seed_payment_providers.sql` | 069 | the five section 6 providers exist before the gateway page can show them |
+| `0095_approval_requests.sql` | 070 | the approval chain of section 2, as a queue the CEO can see |
+| `0096_office_permission_revoked_by.sql` | 071 | who withdrew a delegated permission, and when it lapses next |
+| `0097_approval_decision_indexes.sql` | 072 | the two questions the decision step asks of the queue, and the indexes they need |
+| `0098_country_switch_authority.sql` | 073 | the country switch of section 3, its reason, and the approval it spends |
+| `0099_compliance_calendar_super_admin.sql` | 074 | the compliance calendar's own policy for the super administrator |
+| `0100_audit_log_range_indexes.sql` | 076 | the two access paths the audit log viewer takes that 0013 did not index |
+| `0101_account_lock_queue_indexes.sql` | 078 | the two access paths the account unlock screen takes that 0012 did not index |
+| `0102_onboarding_progress.sql` | 079 | where a merchant is in the onboarding wizard, so the wizard can be left and resumed |
+| `0103_business_profiles.sql` | 080 | the business information every processor on this platform is sent, filled once |
+
 ## Background jobs
 
 `lib/jobs/` is the contract every later job is written against; STEP 011 builds the foundation and

@@ -10,7 +10,7 @@ import type { JobWorker } from "./worker.ts";
  * `/api/health` answers "is this process alive". This answers the different question an operator
  * asks during an incident: "is background work moving". The platform degrades when work is stuck
  * (a claim whose lease expired), when the oldest waiting job is older than the configured stall
- * window, or when a job has died after its last attempt — each of those means a merchant is
+ * window, or when a job has died after its last attempt -- each of those means a merchant is
  * waiting for something that will not happen.
  *
  * The snapshot is data with a `status` field, not an exception: the route turns `degraded` into

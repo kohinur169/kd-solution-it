@@ -84,7 +84,7 @@ export function isPublicKeyShape(value: unknown): value is string {
  *
  * `btoa` is fed in chunks because the spread form overflows the call stack on a large input, and
  * this helper is also the one a later STEP will use for a signature. The padding is stripped rather
- * than kept: base64url in a URL, a header and a `check (… ~ '^[A-Za-z0-9_-]+$')` all agree only
+ * than kept: base64url in a URL, a header and a `check (... ~ '^[A-Za-z0-9_-]+$')` all agree only
  * without it.
  */
 export function encodeBase64Url(bytes: Uint8Array): string {

@@ -976,13 +976,21 @@ function createBusinessStore(database: BusinessDatabase): RestClient {
       if (table === BUSINESS_PROFILE_TABLE) {
         for (const row of database.profileRows) {
           if (row.company_id === wanted) {
+            // A patch touches the columns it names, and only those: the rest keep what they held.
             for (const column of EMPTY_PROFILE_COLUMNS) {
+              if (!(column in values)) {
+                continue;
+              }
+
               const value = values[column];
               row[column] = typeof value === "string" ? value : null;
             }
 
-            const completed = values["completed_at"];
-            row.completed_at = typeof completed === "string" ? completed : null;
+            if ("completed_at" in values) {
+              const completed = values["completed_at"];
+              row.completed_at = typeof completed === "string" ? completed : null;
+            }
+
             row.updated_at = new Date(NOW).toISOString();
           }
         }
@@ -1327,9 +1335,19 @@ async function checkBusinessSave(): Promise<void> {
 
   expectEqual(database.inserts.length, 1, "a second save updates the row it found");
   expectEqual(database.updates.length, 1, "with one update");
-  expectEqual(database.updates[0]?.values["legal_name"], "Acme Trading Ltd", "keeping the earlier field");
+  expectEqual(
+    "legal_name" in (database.updates[0]?.values ?? {}),
+    false,
+    "naming only the columns the save carried",
+  );
   expectEqual(database.updates[0]?.values["tax_id"], "TIN-7654321", "and storing the new one");
-  expectEqual(second.values.trading_name, null, "a field nobody sent stays as it was");
+  expectEqual(
+    database.profileRows[0]?.legal_name,
+    "Acme Trading Ltd",
+    "so the field another tab may have changed is never put back",
+  );
+  expectEqual(second.values.legal_name, "Acme Trading Ltd", "the answer still holds the earlier field");
+  expectEqual(second.values.trading_name, null, "and a field nobody sent stays as it was");
   expectEqual(audit.entries.length, 2, "and a second audit entry is appended");
 
   const completed = await saveBusinessProfile(
@@ -1353,6 +1371,18 @@ async function checkBusinessSave(): Promise<void> {
     database.updates[1]?.values["completed_at"],
     new Date(NOW).toISOString(),
     "and stamps the completion instant",
+  );
+  expectDeepEqual(
+    Object.keys(database.updates[1]?.values ?? {}).sort(),
+    [
+      "business_description",
+      "business_type",
+      "completed_at",
+      "registration_number",
+      "trading_name",
+      "website",
+    ],
+    "the patch carries the five fields this save named and the derived instant, and nothing else",
   );
   expectEqual(completed.completedAtEpochMs, NOW, "which is the save's own clock");
   expectEqual(audit.entries[2]?.payload?.["completed_now"], true, "recorded as a first completion");
@@ -1465,11 +1495,8 @@ async function checkBusinessSaveRefusals(): Promise<void> {
   expectEqual(racing.updates.length, 1, "by becoming the update it would have been");
   expectEqual(accounted.entries.length, 1, "and is audited once");
 
-  const silentAudit = createInMemoryAuditTrail();
   const throwingAudit = {
     append(): Promise<void> {
-      silentAudit.entries;
-
       return Promise.reject(new Error("the audit sink is down"));
     },
   };

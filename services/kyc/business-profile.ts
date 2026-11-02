@@ -482,14 +482,21 @@ export async function saveBusinessProfile(
   const wasComplete = existing?.completed_at !== null && existing?.completed_at !== undefined;
   const completedAt = complete ? existing?.completed_at ?? instant : null;
 
-  const columns = {
+  // The row is created whole; an existing row is only ever touched in the columns this save
+  // named. Writing the merged object would send six columns the merchant did not change, and a
+  // second tab saving while this one was reading would have its field put back by this one.
+  const created = {
     ...merged,
+    completed_at: completedAt,
+  };
+  const changed = {
+    ...parsed.values,
     completed_at: completedAt,
   };
 
   if (existing === null) {
     try {
-      await dependencies.rest.insert(BUSINESS_PROFILE_TABLE, [{ company_id: companyId, ...columns }]);
+      await dependencies.rest.insert(BUSINESS_PROFILE_TABLE, [{ company_id: companyId, ...created }]);
     } catch (error) {
       // Two tabs saving their first draft at once: the unique index keeps one row, and the second
       // save becomes the update it would have been a moment later.
@@ -500,14 +507,14 @@ export async function saveBusinessProfile(
       await dependencies.rest.update(
         BUSINESS_PROFILE_TABLE,
         `company_id=eq.${encodeURIComponent(companyId)}&deleted_at=is.null`,
-        columns,
+        changed,
       );
     }
   } else {
     await dependencies.rest.update(
       BUSINESS_PROFILE_TABLE,
       `company_id=eq.${encodeURIComponent(companyId)}&deleted_at=is.null`,
-      columns,
+      changed,
     );
   }
 
