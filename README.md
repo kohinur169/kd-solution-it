@@ -1,4 +1,5 @@
 // path: README.md
+| `docs/planning/` | Historical decisions, audits and completed-step references; not active scope |
 # KD Solution IT
 
 Enterprise multi-tenant SaaS payment facilitator platform for Asian merchants with
