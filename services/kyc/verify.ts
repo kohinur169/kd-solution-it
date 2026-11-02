@@ -80,6 +80,8 @@ import {
   saveKycDocument,
   saveUbo,
   SIGNIFICANT_OWNER_BPS,
+  UTILITY_BILL_MAX_AGE_MONTHS,
+  utilityBillIssueWindow,
   SANCTIONS_SCREENINGS_TABLE,
   UBO_AUDIT_ACTION,
   UBO_RECORDS_TABLE,
@@ -3682,14 +3684,59 @@ function checkKycParse(): void {
   expectDeepEqual(
     parseKycDocumentInput(
       pngDocumentInput({ document_type: "utility_bill", issued_at: "2026-10-01", expires_at: "2026-09-01" }),
+      { now: NOW },
     ).problems,
     [{ field: "expires_at", rule: "invalid_format" }],
     "an expiry before the issue date is refused",
   );
   expectDeepEqual(
-    parseKycDocumentInput(pngDocumentInput({ document_type: "bank_statement", issued_at: "2026-13-99" })).problems,
+    parseKycDocumentInput(pngDocumentInput({ document_type: "utility_bill", issued_at: "2026-13-99" }), { now: NOW })
+      .problems,
     [{ field: "issued_at", rule: "invalid_format" }],
-    "a date that does not exist is refused",
+    "a date that does not exist is refused once, never as required as well",
+  );
+
+  // STEP 085: the three month issue rule on the utility bill.
+  expectEqual(UTILITY_BILL_MAX_AGE_MONTHS, 3, "the rule is three months, as section 5 writes it");
+  expectDeepEqual(
+    utilityBillIssueWindow(NOW),
+    { earliest: "2026-08-02", latest: "2026-11-02" },
+    "the window at 2026-11-02 runs from 2026-08-02 to today",
+  );
+  expectDeepEqual(
+    utilityBillIssueWindow(Date.parse("2026-01-15T09:00:00.000Z")),
+    { earliest: "2025-10-15", latest: "2026-01-15" },
+    "and it crosses the year boundary by calendar months",
+  );
+  expectEqual(
+    parseKycDocumentInput(pngDocumentInput({ document_type: "utility_bill", issued_at: "2026-08-02" }), { now: NOW })
+      .problems.length,
+    0,
+    "a bill issued exactly three months ago to the day is accepted",
+  );
+  expectDeepEqual(
+    parseKycDocumentInput(pngDocumentInput({ document_type: "utility_bill", issued_at: "2026-08-01" }), { now: NOW })
+      .problems,
+    [{ field: "issued_at", rule: "invalid_range" }],
+    "a bill one day older than three months is refused as out of range",
+  );
+  expectDeepEqual(
+    parseKycDocumentInput(pngDocumentInput({ document_type: "utility_bill", issued_at: "2026-11-03" }), { now: NOW })
+      .problems,
+    [{ field: "issued_at", rule: "invalid_date" }],
+    "a bill dated in the future is refused, as 0049's issued_at check would",
+  );
+  expectEqual(
+    parseKycDocumentInput(pngDocumentInput({ document_type: "bank_statement", issued_at: "2020-01-01" }), { now: NOW })
+      .problems.length,
+    0,
+    "the three month rule binds the utility bill only; an old bank statement date parses",
+  );
+  expectDeepEqual(
+    parseKycDocumentInput(pngDocumentInput({ document_type: "identity_document", issued_at: "2026-11-03" }), { now: NOW })
+      .problems,
+    [{ field: "issued_at", rule: "invalid_date" }],
+    "but a future issue date is refused for every type, as 0049's check requires",
   );
 
   const ubo = parseUboInput(VALID_UBO);
@@ -3900,11 +3947,28 @@ async function checkKycDocumentSave(): Promise<void> {
   );
   expectEqual(database.documentRows[1]?.content_type, "application/pdf", "a real PDF is recorded as pdf");
 
+  const third = await saveKycDocument(
+    {
+      actor: owner,
+      input: pngDocumentInput({ document_type: "utility_bill", issued_at: "2026-08-02", file_name: "bill.png" }),
+    },
+    dependenciesOf(database, audit),
+  );
+
+  expectEqual(third.documents.length, 3, "the boundary utility bill is the third document");
+  expectEqual(
+    database.documentRows[2]?.issued_at,
+    "2026-08-02",
+    "a bill issued exactly three months before NOW is recorded with its issue date",
+  );
+
   const refusals = createBusinessDatabase();
   const refusalAudit = createInMemoryAuditTrail();
 
   for (const [label, input, details] of [
     ["a utility bill without its issue date", pngDocumentInput({ document_type: "utility_bill" }), [{ field: "issued_at", rule: "required" }]],
+    ["a utility bill older than three months", pngDocumentInput({ document_type: "utility_bill", issued_at: "2026-08-01" }), [{ field: "issued_at", rule: "invalid_range" }]],
+    ["a utility bill dated in the future", pngDocumentInput({ document_type: "utility_bill", issued_at: "2026-11-03" }), [{ field: "issued_at", rule: "invalid_date" }]],
     ["bytes that lie about their type", pngDocumentInput({ declared_content_type: "application/pdf" }), [{ field: "file", rule: "file_not_acceptable" }]],
     ["an empty file", pngDocumentInput({ bytes: new Uint8Array(0) }), [{ field: "file", rule: "file_not_acceptable" }]],
     ["a type outside the six", pngDocumentInput({ document_type: "diploma" }), [{ field: "document_type", rule: "invalid_format" }]],
@@ -4098,6 +4162,7 @@ async function checkKycSources(): Promise<void> {
   const copy = await readRepositoryFile("app/(dashboard)/onboarding/step-copy.ts");
   const csrf = await readRepositoryFile("lib/security/csrf.ts");
   const types = await readRepositoryFile("services/kyc/kyc-document-types.ts");
+  const capture = await readRepositoryFile("services/kyc/kyc-capture.ts");
 
   for (const [path, source] of [
     ["app/api/onboarding/kyc-document/route.ts", documentRoute],
@@ -4164,6 +4229,17 @@ async function checkKycSources(): Promise<void> {
 
   expect(types.includes("KYC_DOCUMENT_TYPES"), "the type list lives in its own client-safe module");
   expectEqual(/^import .*node:/mu.test(types), false, "with no server imports, so no node builtin reaches the browser bundle");
+  expect(types.includes("UTILITY_BILL_MAX_AGE_MONTHS = 3"), "the three month rule lives in the client-safe module too");
+  expect(types.includes("function utilityBillIssueWindow"), "with the window helper the form and the service share");
+  expect(capture.includes("utilityBillIssueWindow"), "the service re-exports and uses the same window");
+  expect(capture.includes('rule: "invalid_range"'), "a stale bill is refused as out of range on the server");
+  expect(capture.includes('rule: "invalid_date"'), "a future issue date is refused on the server for every type");
+  expect(capture.includes("{ now: nowOf(dependencies) }"), "the save pins the parser's clock to the request's now");
+  expect(form.includes("issueWindow.earliest"), "the form pre-checks the issue date against the window it is given");
+  expect(page.includes("utilityBillIssueWindow(Date.now())"), "the page computes the window once, server side");
+  expect(form.includes("utilityBillRuleLine"), "and tells the merchant the rule in words");
+  expect(form.includes("invalid_range"), "mapping the out-of-range rule to its sentence");
+  expect(form.includes("max={issueWindow.latest}"), "and capping the date picker at today");
   expect(copy.includes('documents: "/onboarding/documents"'), "the documents step links to its page");
 
   expect(

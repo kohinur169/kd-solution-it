@@ -38,7 +38,9 @@ Every read is scoped to the caller company and every write is audit logged.
   manual screening run (`services/kyc/kyc-capture.ts` over the `0048`-`0051` tables and the
   `kyc_document` upload policy of `lib/security/upload.ts`; `POST /api/onboarding/kyc-document`,
   `/kyc-ubo`, `/kyc-screening`; the document type list is shared with the browser through
-  `services/kyc/kyc-document-types.ts`). No migration either: STEP 028 built the tables.
+  `services/kyc/kyc-document-types.ts`). No migration either: STEP 028 built the tables. The utility bill carries STEP 085's three month issue rule
+  (`utilityBillIssueWindow` in `services/kyc/kyc-document-types.ts`, enforced server-side in
+  `parseKycDocumentInput` and pre-checked in the form).
 
 ## The reader
 

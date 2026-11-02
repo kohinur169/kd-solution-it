@@ -10,7 +10,9 @@ import type { MessagePath } from "@/lib/i18n/messages";
 import { csrfHeaders } from "@/lib/security/csrf-client";
 import {
   KYC_DOCUMENT_TYPES,
+  UTILITY_BILL_MAX_AGE_MONTHS,
   type KycDocumentType,
+  type UtilityBillIssueWindow,
 } from "@/services/kyc/kyc-document-types";
 import type { KycPackSnapshot } from "@/services/kyc/kyc-capture";
 
@@ -49,6 +51,8 @@ const DOC_TYPE_LABELS: Readonly<Record<KycDocumentType, MessagePath>> = Object.f
 type RuleKey =
   | "file_not_acceptable"
   | "invalid_format"
+  | "invalid_date"
+  | "invalid_range"
   | "required"
   | "too_short"
   | "too_long"
@@ -58,6 +62,8 @@ type RuleKey =
 const RULE_MESSAGES: Readonly<Record<RuleKey, MessagePath>> = Object.freeze({
   file_not_acceptable: "onboardingDocuments.ruleFileNotAcceptable",
   invalid_format: "onboardingDocuments.ruleInvalidFormat",
+  invalid_date: "onboardingDocuments.ruleInvalidDate",
+  invalid_range: "onboardingDocuments.ruleInvalidRange",
   required: "onboardingDocuments.ruleRequired",
   too_short: "onboardingDocuments.ruleTooShort",
   too_long: "onboardingDocuments.ruleTooLong",
@@ -96,7 +102,13 @@ interface SectionMessage {
   readonly failed: boolean;
 }
 
-export function DocumentsForm({ initial }: { readonly initial: KycPackSnapshot }): ReactNode {
+export function DocumentsForm({
+  initial,
+  issueWindow,
+}: {
+  readonly initial: KycPackSnapshot;
+  readonly issueWindow: UtilityBillIssueWindow;
+}): ReactNode {
   const router = useRouter();
   const [pack, setPack] = useState<KycPackSnapshot>(initial);
 
@@ -105,7 +117,7 @@ export function DocumentsForm({ initial }: { readonly initial: KycPackSnapshot }
   const [documentType, setDocumentType] = useState<KycDocumentType | "">("");
   const [issuedAt, setIssuedAt] = useState("");
   const [expiresAt, setExpiresAt] = useState("");
-  const [uploadError, setUploadError] = useState<string | null>(null);
+  const [uploadFieldErrors, setUploadFieldErrors] = useState<Readonly<Record<string, string>>>({});
   const fileRef = useRef<HTMLInputElement | null>(null);
 
   const [uboMessage, setUboMessage] = useState<SectionMessage | null>(null);
@@ -120,6 +132,8 @@ export function DocumentsForm({ initial }: { readonly initial: KycPackSnapshot }
 
   const [screeningMessage, setScreeningMessage] = useState<SectionMessage | null>(null);
   const [screeningBusy, setScreeningBusy] = useState(false);
+
+
 
   const visibleCountries = useMemo(() => {
     const needle = uboCountryFilter.trim().toLowerCase();
@@ -173,13 +187,34 @@ export function DocumentsForm({ initial }: { readonly initial: KycPackSnapshot }
     event.preventDefault();
     setUploadBusy(true);
     setUploadMessage(null);
-    setUploadError(null);
+    setUploadFieldErrors({});
 
     try {
       const file = fileRef.current?.files?.[0];
 
       if (file === undefined) {
         setUploadMessage({ text: getMessage("onboardingDocuments.ruleFileNotAcceptable"), failed: true });
+
+        return;
+      }
+
+      // The three month rule, checked on the client before anything is sent: the server checks
+      // it again against its own clock, so this is only the picker's early answer.
+      const preflight: Record<string, string> = {};
+
+      if (documentType === "") {
+        preflight["document_type"] = ruleSentence("required");
+      } else if (documentType === "utility_bill" && issuedAt !== "") {
+        if (issuedAt > issueWindow.latest) {
+          preflight["issued_at"] = ruleSentence("invalid_date");
+        } else if (issuedAt < issueWindow.earliest) {
+          preflight["issued_at"] = ruleSentence("invalid_range");
+        }
+      }
+
+      if (Object.keys(preflight).length > 0) {
+        setUploadFieldErrors(preflight);
+        setUploadMessage({ text: getMessage("onboardingDocuments.uploadFailed"), failed: true });
 
         return;
       }
@@ -200,13 +235,15 @@ export function DocumentsForm({ initial }: { readonly initial: KycPackSnapshot }
 
       if (!response.ok) {
         const message = await handleRefusal(response, "onboardingDocuments.uploadFailed", (details) => {
-          const fileDetail = details.find((detail) => detail.field === "file");
+          const next: Record<string, string> = {};
 
-          setUploadError(
-            fileDetail === undefined
-              ? null
-              : ruleSentence(typeof fileDetail.rule === "string" ? fileDetail.rule : null),
-          );
+          for (const detail of details) {
+            if (typeof detail.field === "string") {
+              next[detail.field] = ruleSentence(typeof detail.rule === "string" ? detail.rule : null);
+            }
+          }
+
+          setUploadFieldErrors(next);
         });
 
         setUploadMessage(message);
@@ -342,6 +379,9 @@ export function DocumentsForm({ initial }: { readonly initial: KycPackSnapshot }
                 </option>
               ))}
             </select>
+            <span className={hintClasses}>
+              {uploadFieldErrors["document_type"] ?? getMessage("onboardingDocuments.docTypeHint")}
+            </span>
           </label>
           <label className={labelClasses}>
             <span>{getMessage("onboardingDocuments.fileLabel")}</span>
@@ -353,7 +393,7 @@ export function DocumentsForm({ initial }: { readonly initial: KycPackSnapshot }
               aria-describedby="documents-file-hint"
             />
             <span id="documents-file-hint" className={hintClasses}>
-              {uploadError ?? getMessage("onboardingDocuments.fileHint")}
+              {uploadFieldErrors["file"] ?? getMessage("onboardingDocuments.fileHint")}
             </span>
           </label>
           <div className="flex flex-col gap-3 sm:flex-row">
@@ -363,9 +403,17 @@ export function DocumentsForm({ initial }: { readonly initial: KycPackSnapshot }
                 className={inputClasses}
                 type="date"
                 value={issuedAt}
+                max={issueWindow.latest}
                 onChange={(event) => setIssuedAt(event.target.value)}
               />
-              <span className={hintClasses}>{getMessage("onboardingDocuments.issuedAtHint")}</span>
+              <span className={hintClasses}>
+                {uploadFieldErrors["issued_at"] ??
+                  (documentType === "utility_bill"
+                    ? formatMessage("onboardingDocuments.utilityBillRuleLine", {
+                        months: String(UTILITY_BILL_MAX_AGE_MONTHS),
+                      })
+                    : getMessage("onboardingDocuments.issuedAtHint"))}
+              </span>
             </label>
             <label className={labelClasses}>
               <span>{getMessage("onboardingDocuments.expiresAtLabel")}</span>
@@ -375,7 +423,9 @@ export function DocumentsForm({ initial }: { readonly initial: KycPackSnapshot }
                 value={expiresAt}
                 onChange={(event) => setExpiresAt(event.target.value)}
               />
-              <span className={hintClasses}>{getMessage("onboardingDocuments.expiresAtHint")}</span>
+              <span className={hintClasses}>
+                {uploadFieldErrors["expires_at"] ?? getMessage("onboardingDocuments.expiresAtHint")}
+              </span>
             </label>
           </div>
           <button className={buttonClasses} type="submit" disabled={uploadBusy}>

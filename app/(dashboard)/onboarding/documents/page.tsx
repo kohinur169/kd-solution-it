@@ -6,9 +6,14 @@ import { SessionKeeper } from "@/components/auth/session-keeper";
 import { getAuthRuntime } from "@/lib/auth/runtime";
 import { AppError } from "@/lib/errors/app-error";
 import { getMessage } from "@/lib/i18n/messages";
-import { readKycPack, type KycPackSnapshot } from "@/services/kyc/kyc-capture";
+import { readKycPack, utilityBillIssueWindow, type KycPackSnapshot } from "@/services/kyc/kyc-capture";
 import { DocumentsForm } from "./documents-form";
 import { readOwnerActor } from "../owner-actor";
+
+// The three month issue window, fixed once when the server module loads: the form caps its date
+// picker with it and pre-checks against it, and the service re-checks against the request's own
+// clock, which is the authoritative one.
+const ISSUE_WINDOW = utilityBillIssueWindow(Date.now());
 
 export const metadata: Metadata = {
   title: getMessage("onboardingDocuments.title"),
@@ -94,7 +99,7 @@ export default async function OnboardingDocumentsPage(): Promise<ReactNode> {
                 ? getMessage("onboardingDocuments.stepCompleteLine")
                 : getMessage("onboardingDocuments.stepTodoLine")}
             </p>
-            <DocumentsForm initial={state.snapshot} />
+            <DocumentsForm initial={state.snapshot} issueWindow={ISSUE_WINDOW} />
           </>
         ) : (
           <p className={alertClasses} role="alert">

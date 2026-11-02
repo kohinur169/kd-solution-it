@@ -11,7 +11,12 @@ import { requireValidUpload, sha256Hex, UPLOAD_DATABASE_MAXIMUM_BYTES, UPLOAD_FI
 import { sanitizeSingleLineText } from "../../lib/security/text.ts";
 import { BUSINESS_PROFILE_TABLE } from "./business-profile.ts";
 import { COUNTRIES_TABLE } from "./business-address.ts";
-import { KYC_DOCUMENT_TYPES, type KycDocumentType } from "./kyc-document-types.ts";
+import {
+  KYC_DOCUMENT_TYPES,
+  UTILITY_BILL_MAX_AGE_MONTHS,
+  utilityBillIssueWindow,
+  type KycDocumentType,
+} from "./kyc-document-types.ts";
 import {
   ONBOARDING_OWNER_ROLES,
   ONBOARDING_PROGRESS_TABLE,
@@ -78,7 +83,7 @@ export const SANCTIONS_SCREENINGS_TABLE = "sanctions_screenings";
 
 // The document types live in their own module so client components can import the list without
 // this file's server-only imports; they are re-exported here so server code has one import path.
-export { KYC_DOCUMENT_TYPES };
+export { KYC_DOCUMENT_TYPES, UTILITY_BILL_MAX_AGE_MONTHS, utilityBillIssueWindow };
 export type { KycDocumentType };
 
 /** The onboarding step this module completes when at least one document is recorded. */
@@ -326,8 +331,15 @@ export interface KycDocumentInput {
 const DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/u;
 const HASH_PATTERN = /^[0-9a-f]{64}$/u;
 
-/** Parse and validate one upload. A quarantined or rejected file is refused with one rule. */
-export function parseKycDocumentInput(input: KycDocumentInput): {
+/**
+ * Parse and validate one upload. A quarantined or rejected file is refused with one rule.
+ * `options.now` pins "today" for the issue-date rules so the gate can test the window; the
+ * routes leave it out and get `Date.now()`.
+ */
+export function parseKycDocumentInput(
+  input: KycDocumentInput,
+  options?: { readonly now?: number },
+): {
   readonly record: {
     readonly documentType: KycDocumentType;
     readonly fileName: string;
@@ -353,6 +365,7 @@ export function parseKycDocumentInput(input: KycDocumentInput): {
 
   let issuedAt: string | null = null;
   let expiresAt: string | null = null;
+  let issuedAtSent = false;
 
   for (const [field, raw] of [
     ["issued_at", input.issued_at],
@@ -360,6 +373,10 @@ export function parseKycDocumentInput(input: KycDocumentInput): {
   ] as const) {
     if (raw === undefined || raw === null || raw === "") {
       continue;
+    }
+
+    if (field === "issued_at") {
+      issuedAtSent = true;
     }
 
     if (typeof raw !== "string" || !DATE_PATTERN.test(raw) || Number.isNaN(Date.parse(raw))) {
@@ -374,9 +391,22 @@ export function parseKycDocumentInput(input: KycDocumentInput): {
     }
   }
 
-  if (documentType === "utility_bill" && issuedAt === null) {
+  if (documentType === "utility_bill" && !issuedAtSent) {
     // `0049`'s issue check refuses the row; the service refuses it earlier, with the field named.
+    // A date that was sent but did not parse is already named `invalid_format` - never both.
     problems.push({ field: "issued_at", rule: "required" });
+  }
+
+  if (issuedAt !== null) {
+    // `0049` refuses an issue date after the row's creation; the service refuses it earlier.
+    const window = utilityBillIssueWindow(options?.now ?? Date.now());
+
+    if (issuedAt > window.latest) {
+      problems.push({ field: "issued_at", rule: "invalid_date" });
+    } else if (documentType === "utility_bill" && issuedAt < window.earliest) {
+      // Section 5: a utility bill must be issued within the last three months.
+      problems.push({ field: "issued_at", rule: "invalid_range" });
+    }
   }
 
   if (issuedAt !== null && expiresAt !== null && expiresAt <= issuedAt) {
@@ -445,7 +475,7 @@ export async function saveKycDocument(
 ): Promise<KycPackSnapshot> {
   const companyId = requireOwnerCompany(input.actor);
   const rest = dependencies.rest;
-  const parsed = parseKycDocumentInput(input.input);
+  const parsed = parseKycDocumentInput(input.input, { now: nowOf(dependencies) });
 
   if (parsed.problems.length > 0 || parsed.record === null) {
     throw new AppError("VALIDATION_FAILED", { details: parsed.problems });

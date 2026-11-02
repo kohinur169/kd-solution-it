@@ -1382,6 +1382,7 @@ const catalog = {
     ruleTooShort: "This is too short to be accepted.",
     ruleTooLong: "This is too long to be accepted.",
     ruleInvalidFormat: "This does not look like the value that field asks for.",
+
     ruleUnknownValue: "Choose one of the offered answers.",
     ruleUnsupportedScheme: "This address has to start with https://, because a reviewer has to open it.",
     ruleInvalidHost: "This address is not one a reviewer can open.",
@@ -1476,6 +1477,7 @@ const catalog = {
     ruleTooShort: "This is too short to be accepted.",
     ruleTooLong: "This is too long to be accepted.",
     ruleInvalidFormat: "This does not look like the value that field asks for.",
+
     ruleUnknownKey: "That field is not part of this form.",
     ruleRequired: "Fill in at least one field to save.",
     ruleUnknownCountry: "That country is not on the platform's country list.",
@@ -1501,6 +1503,7 @@ const catalog = {
       "A PDF, a JPEG or a PNG, up to 50 MB. The first bytes of the file must match the type you declare; a file that does not is refused. The platform stores a key and a hash of the file, never the file in the open.",
     docTypeLabel: "Document type",
     docTypePlaceholder: "Choose a document type",
+    docTypeHint: "Every document the platform asks for starts with its type.",
     docTypeIdentityDocument: "Identity document",
     docTypeBusinessRegistration: "Business registration certificate",
     docTypeUtilityBill: "Utility bill",
@@ -1508,7 +1511,9 @@ const catalog = {
     docTypeSourceOfFunds: "Source of funds document",
     docTypeProcessorRequest: "Document a processor asked for",
     issuedAtLabel: "Issued on",
-    issuedAtHint: "Required for a utility bill, and checked against the three month rule.",
+    issuedAtHint: "Optional for other document types, and only when the document itself carries a date.",
+    utilityBillRuleLine:
+      "Required for a utility bill, and it must be issued within the last {months} months: an older bill, or a date in the future, is refused.",
     expiresAtLabel: "Expires on",
     expiresAtHint: "Optional, and only when the document itself carries a date.",
     fileLabel: "The file",
@@ -1556,6 +1561,9 @@ const catalog = {
     screeningFailed: "The screening did not run just now. Nothing changed; try again in a moment.",
     ruleFileNotAcceptable: "That file cannot be accepted: empty, too large, the wrong type, or the bytes do not match the declared type.",
     ruleInvalidFormat: "This does not look like the value that field asks for.",
+    ruleInvalidDate: "That date is in the future, and no document is issued ahead of today.",
+    ruleInvalidRange:
+      "That date is outside the range this document allows: a utility bill must be issued within the last three months.",
     ruleRequired: "This field is required for that document type.",
     ruleTooShort: "This is too short to be accepted.",
     ruleTooLong: "This is too long to be accepted.",

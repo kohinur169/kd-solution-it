@@ -19,3 +19,34 @@ export const KYC_DOCUMENT_TYPES = [
 
 /** One document type of `0049`. */
 export type KycDocumentType = (typeof KYC_DOCUMENT_TYPES)[number];
+
+/**
+ * Section 5's address verification rule: a utility bill must be issued within the last three
+ * months. Kept here, next to the type list, so the client form can pre-check the date picker
+ * without importing the capture service's server-only modules; the service re-exports both.
+ */
+export const UTILITY_BILL_MAX_AGE_MONTHS = 3;
+
+/**
+ * The issue dates a utility bill may carry at `nowMs`, as date-only strings (YYYY-MM-DD is
+ * order-preserving, so the parser and the form compare them lexically): `latest` is today UTC,
+ * because `0049` refuses an issue date after the row's creation, and `earliest` is today minus
+ * `UTILITY_BILL_MAX_AGE_MONTHS` calendar months.
+ */
+/** The return of {@link utilityBillIssueWindow}: the inclusive date bounds, as YYYY-MM-DD strings. */
+export interface UtilityBillIssueWindow {
+  readonly earliest: string;
+  readonly latest: string;
+}
+
+export function utilityBillIssueWindow(nowMs: number): UtilityBillIssueWindow {
+  const latest = new Date(nowMs);
+  const earliest = new Date(nowMs);
+
+  earliest.setUTCMonth(earliest.getUTCMonth() - UTILITY_BILL_MAX_AGE_MONTHS);
+
+  return {
+    earliest: earliest.toISOString().slice(0, 10),
+    latest: latest.toISOString().slice(0, 10),
+  };
+}
