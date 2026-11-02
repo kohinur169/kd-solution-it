@@ -9862,10 +9862,11 @@ async function checkSessionRotation(): Promise<void> {
     (file) => file.path.endsWith(".tsx") && file.source.includes("<SessionKeeper"),
   );
 
-  // The settings screen, the new device confirmation, the step-up screen and STEP 054's two session
-  // lists; each keeps the token rotating while the person reads it. The office half is one of them
-  // because reading another account's sessions must not leave the reader's own token unrotated.
-  expectEqual(keepers.length, 6, "every signed-in page keeps its session rotating");
+  // The settings screen, the new device confirmation, the step-up screen, STEP 054's two session
+  // lists and STEP 079's onboarding wizard; each keeps the token rotating while the person reads it.
+  // The office half is one of them because reading another account's sessions must not leave the
+  // reader's own token unrotated, and the wizard is one because a merchant may sit on it for a while.
+  expectEqual(keepers.length, 7, "every signed-in page keeps its session rotating");
 }
 
 /**
@@ -12608,7 +12609,9 @@ async function checkCsrfProtection(): Promise<void> {
     const routePath = `${path.replace("/api/", "")}/route.ts`;
     const source = routePath.startsWith("office/")
       ? appSourceOf(appSources, `/api/office/${routePath.slice("office/".length)}`)
-      : appSourceOf(appSources, `/api/auth/${routePath.slice("auth/".length)}`);
+      : routePath.startsWith("auth/")
+        ? appSourceOf(appSources, `/api/auth/${routePath.slice("auth/".length)}`)
+        : appSourceOf(appSources, `/api/${routePath}`);
 
     expect(source.length > 0, `${path} exists on disk`);
     expectEqual(source.split("requireCsrfToken(").length - 1, 1, `${path} checks the token exactly once`);
@@ -12637,11 +12640,11 @@ async function checkCsrfProtection(): Promise<void> {
     .map((file) => file.path)
     .sort();
 
-  expectEqual(browserMutations.length, 20, "twenty browser files send a mutation");
+  expectEqual(browserMutations.length, 21, "twenty one browser files send a mutation");
   expectEqual(
     browserMutations.reduce((total, path) => total + (appSourceOf(appSources, path).split('method: "POST"').length - 1), 0),
-    23,
-    "across twenty three call sites",
+    24,
+    "across twenty four call sites",
   );
   const postCalls = (source: string): number => source.split('method: "POST"').length - 1;
   const tokenSpreads = (source: string): number =>

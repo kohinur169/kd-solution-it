@@ -1271,6 +1271,69 @@ const catalog = {
     noteMissing: "No note recorded",
     home: "Go to the office workspace",
   },
+  onboarding: {
+    eyebrow: "Merchant onboarding",
+    title: "Business onboarding",
+    description:
+      "Section 5 asks for one business profile, filled once and sent to every connected processor. This wizard is that profile in six steps, and it remembers which step you were on.",
+    guardNote:
+      "Only the owner of a merchant account can open this wizard, and the company comes from your session rather than from the address: there is nothing here to point at another merchant.",
+    signedOut: "Sign in with a merchant account to continue your onboarding.",
+    forbidden:
+      "This wizard belongs to a merchant owner account. An office account works merchant onboarding from the office screens.",
+    unavailable: "Your onboarding progress could not be read just now. Try again in a moment.",
+    progressLine: "Step {current} of {total}, {done} finished.",
+    positionLine: "Step {position} of {total}",
+    unsavedLine:
+      "Nothing is saved yet. Choose the step you want to work on, and the wizard opens there next time.",
+    savedLine: "Last saved at {at} UTC.",
+    listHeading: "The six steps",
+    listDescription:
+      "The wizard saves where you are, not what you have filled in. Choosing a step here is remembered, so a merchant who has to find a document can close the browser and come back to the same place.",
+    stateCurrent: "You are here",
+    stateFinished: "Finished",
+    stateNotStarted: "Not started",
+    actionSubmit: "Work on this step",
+    actionBusy: "Saving",
+    actionDone: "Saved. Onboarding opens here next time you come back.",
+    actionFailed: "The position was not saved just now. Nothing changed; try again in a moment.",
+    actionUnknownStep: "That step is not part of the onboarding wizard.",
+    signInLink: "Sign in to continue",
+    sessionsLink: "Manage your account sessions",
+    homeLink: "Go to the home page",
+    step: {
+      business: {
+        label: "Business information",
+        description:
+          "Your legal business name, how the business is registered, its registration number, and what the business sells.",
+      },
+      address: {
+        label: "Address and contact",
+        description:
+          "The registered address of the business, and the name, email address and phone number of the person who owns the account.",
+      },
+      category: {
+        label: "Merchant category code",
+        description:
+          "The merchant category code for what you sell, which sets the risk tier your account starts on and the reserve or hold that comes with it.",
+      },
+      website: {
+        label: "Website and store",
+        description:
+          "The website or store link your business sells through, so the review can see that the business is real and sells what it says it sells.",
+      },
+      documents: {
+        label: "Address and funds documents",
+        description:
+          "A utility bill issued in the last three months, a bank statement covering the period underwriting asks for, and a document showing where the money in the business comes from.",
+      },
+      review: {
+        label: "Review and submit",
+        description:
+          "Everything above on one page, checked by you before it goes to the compliance desk of the platform.",
+      },
+    },
+  },
   email: {
     lockAlert: {
       /** Subject of the section 23 alert of section 22: the owner is told their account locked. */
