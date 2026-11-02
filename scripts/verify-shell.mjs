@@ -175,6 +175,13 @@ async function checkClientBoundary() {
       continue;
     }
 
+    // A gate is not a component. It runs under Node, never in a browser, and the two strings this
+    // check looks for - the client directive and the environment variable - are evidence a gate
+    // searches for in other files, not code that could reach a browser bundle.
+    if (file.endsWith("verify.ts")) {
+      continue;
+    }
+
     const content = await readFile(file, "utf8");
 
     if (!content.includes('"use client"')) {

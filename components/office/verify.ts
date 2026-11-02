@@ -9,6 +9,7 @@ import { APPROVAL_QUEUE_ROLES } from "../../lib/approvals/registry.ts";
 import { COUNTRY_SWITCH_ROLES } from "../../lib/countries/registry.ts";
 import { GATEWAY_MANAGEMENT_ROLES, OFFICE_DASHBOARD_ROLES } from "../../lib/gateways/registry.ts";
 import { ANNOUNCEMENT_SCREEN_ROLES } from "../../lib/announcements/registry.ts";
+import { ACCOUNT_UNLOCK_OFFICE_ROLES } from "../../lib/auth/account-unlock.ts";
 import { AUDIT_LOG_SCREEN_ROLES } from "../../lib/audit-log/registry.ts";
 import { PERMISSION_DELEGATION_ROLES } from "../../lib/permissions/registry.ts";
 import { PLATFORM_SETTINGS_SCREEN_ROLES } from "../../lib/settings/registry.ts";
@@ -145,13 +146,13 @@ function checkRoles(): void {
   expectEqual(isOfficeRole(42), false, "nor a number");
 }
 
-/** ---- The section catalog: eleven screens, each with the roles its service enforces. */
+/** ---- The section catalog: twelve screens, each with the roles its service enforces. */
 function checkCatalog(): void {
-  expectEqual(OFFICE_NAVIGATION.length, 11, "eleven office screens exist");
+  expectEqual(OFFICE_NAVIGATION.length, 12, "twelve office screens exist");
   expect(Object.isFrozen(OFFICE_NAVIGATION), "the catalog is frozen");
   expectEqual(
     OFFICE_NAVIGATION.map((section) => section.key).join(","),
-    "workspace,dashboard,ceo,countries,gateways,delegations,sessions,twoFactorResets,settings,announcements,auditLog",
+    "workspace,dashboard,ceo,countries,gateways,delegations,sessions,twoFactorResets,settings,announcements,auditLog,accountUnlocks",
     "in the order the sidebar shows them",
   );
   expectEqual(
@@ -298,6 +299,21 @@ function checkCatalog(): void {
     "office.sectionAuditLog",
     "with its own label",
   );
+  expectEqual(
+    officeSectionByKey("accountUnlocks")?.roles.join(","),
+    ACCOUNT_UNLOCK_OFFICE_ROLES.join(","),
+    "the unlock entry carries the role list of section 22's unlock service",
+  );
+  expectEqual(
+    ACCOUNT_UNLOCK_OFFICE_ROLES.slice().sort().join(","),
+    "ceo,compliance_kyc,super_admin,support",
+    "which is the four office roles that may end a lock",
+  );
+  expectEqual(
+    officeSectionByKey("accountUnlocks")?.href,
+    "/account-unlocks",
+    "and the unlock screen is served where its name says",
+  );
 
   expectEqual(officeSectionByKey("workspace")?.key, "workspace", "a section is found by key");
   expectEqual(officeSectionByKey("audit" as OfficeSectionKey), null, "and an unknown key is nothing");
@@ -309,11 +325,11 @@ function checkCatalog(): void {
 function checkRoleFiltering(): void {
   const expected: Readonly<Record<PlatformRole, string>> = {
     super_admin:
-      "workspace,dashboard,ceo,countries,gateways,delegations,sessions,twoFactorResets,settings,announcements,auditLog",
-    ceo: "workspace,ceo,countries,sessions,twoFactorResets,settings,announcements,auditLog",
-    compliance_kyc: "workspace,sessions,twoFactorResets,settings,auditLog",
+      "workspace,dashboard,ceo,countries,gateways,delegations,sessions,twoFactorResets,settings,announcements,auditLog,accountUnlocks",
+    ceo: "workspace,ceo,countries,sessions,twoFactorResets,settings,announcements,auditLog,accountUnlocks",
+    compliance_kyc: "workspace,sessions,twoFactorResets,settings,auditLog,accountUnlocks",
     finance_ops: "workspace",
-    support: "workspace,sessions,twoFactorResets,announcements",
+    support: "workspace,sessions,twoFactorResets,announcements,accountUnlocks",
     blogger: "workspace",
     owner: "",
   };
@@ -327,15 +343,15 @@ function checkRoleFiltering(): void {
   expectEqual(sectionsOf(["owner", "blogger"]), "workspace", "a second merchant role adds nothing");
   expectEqual(
     sectionsOf(["blogger", "support"]),
-    "workspace,sessions,twoFactorResets,announcements",
+    "workspace,sessions,twoFactorResets,announcements,accountUnlocks",
     "two roles are the union of what each may open",
   );
   expectEqual(
     sectionsOf(["support", "super_admin"]),
-    "workspace,dashboard,ceo,countries,gateways,delegations,sessions,twoFactorResets,settings,announcements,auditLog",
+    "workspace,dashboard,ceo,countries,gateways,delegations,sessions,twoFactorResets,settings,announcements,auditLog,accountUnlocks",
     "and the union is not counted twice",
   );
-  expectEqual(sectionKeysOf(officeSectionsFor(["ceo"]).map((section) => section.key)), "workspace,ceo,countries,sessions,twoFactorResets,settings,announcements,auditLog", "the catalog order is stable");
+  expectEqual(sectionKeysOf(officeSectionsFor(["ceo"]).map((section) => section.key)), "workspace,ceo,countries,sessions,twoFactorResets,settings,announcements,auditLog,accountUnlocks", "the catalog order is stable");
 
   expectEqual(officeRolesOf(["blogger", "super_admin"]).join(","), "super_admin,blogger", "the roles of an account come back in the migration's order");
   expectEqual(officeRolesOf(["owner"]).join(","), "", "and the merchant role is not one of them");
@@ -393,7 +409,7 @@ function checkAccessDecision(): void {
   );
   expectEqual(
     allowed.kind === "allowed" ? allowed.sections.map((section) => section.key).join(",") : "",
-    "workspace,sessions,twoFactorResets,announcements",
+    "workspace,sessions,twoFactorResets,announcements,accountUnlocks",
     "and the screens those roles open",
   );
   expectEqual(officeAccessRedirect(allowed), null, "the shell renders instead of redirecting");
@@ -403,7 +419,7 @@ function checkAccessDecision(): void {
   expectEqual(multi.kind === "allowed" ? multi.roles.join(",") : "", "ceo,blogger", "the merchant grant is ignored and the two office roles are kept");
   expectEqual(
     multi.kind === "allowed" ? multi.sections.length : -1,
-    8,
+    9,
     "and the screens are the union of the two",
   );
 
@@ -426,7 +442,7 @@ function checkWorkspaceView(): void {
   expectEqual(view === null ? "" : view.roles[0]?.role, "ceo", "which is the role held");
   expectEqual(view === null ? "" : view.roles[0]?.labelKey, "office.roleCeo", "with its catalog label");
   expectEqual(view === null ? "" : view.roles[0]?.charterKey, "office.charterCeo", "and its charter");
-  expectEqual(view === null ? "" : view.sections.length, 8, "and the screens it opens");
+  expectEqual(view === null ? "" : view.sections.length, 9, "and the screens it opens");
 
   const two = officeWorkspaceOf(["support", "finance_ops"]);
 
@@ -435,7 +451,7 @@ function checkWorkspaceView(): void {
     "finance_ops,support",
     "two roles are listed in the migration's order",
   );
-  expectEqual(two === null ? "" : two.sections.length, 4, "and the screens are the union");
+  expectEqual(two === null ? "" : two.sections.length, 5, "and the screens are the union");
 
   const expectedLabelKeys: Readonly<Record<PlatformRole, string>> = {
     super_admin: "office.roleSuperAdmin",
@@ -658,7 +674,10 @@ async function checkShellSource(): Promise<void> {
 
   for (const root of ["app", "components"]) {
     for (const file of await collectSources(new URL(`${root}/`, repositoryRoot), `${root}/`)) {
-      if (file === "components/office/verify.ts") {
+      // A gate is not the tree that names a role: its fixtures spell the roles to prove that the one
+      // file in the tree which may name them does, and a fixture that could not spell `super_admin`
+      // could not prove anything about it.
+      if (file.endsWith("verify.ts")) {
         continue;
       }
 
