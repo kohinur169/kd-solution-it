@@ -1514,6 +1514,10 @@ const catalog = {
     issuedAtHint: "Optional for other document types, and only when the document itself carries a date.",
     utilityBillRuleLine:
       "Required for a utility bill, and it must be issued within the last {months} months: an older bill, or a date in the future, is refused.",
+    statementFromLabel: "Statement covers from",
+    statementToLabel: "Statement covers to",
+    bankStatementRuleLine:
+      "Required for a bank statement: the two dates are the period it covers, and that period must end within the last month and cover at least {months} months.",
     expiresAtLabel: "Expires on",
     expiresAtHint: "Optional, and only when the document itself carries a date.",
     fileLabel: "The file",
@@ -1525,6 +1529,8 @@ const catalog = {
     documentsHeading: "Recorded documents",
     documentsEmpty: "No document recorded yet.",
     docSizeLine: "{bytes} bytes",
+    docIssuedLine: "Issued {date}",
+    docPeriodLine: "Covers {from} to {to}",
     docStatusUploaded: "Uploaded, waiting for review",
     uboHeading: "Beneficial owners",
     uboDescription:
@@ -1563,7 +1569,7 @@ const catalog = {
     ruleInvalidFormat: "This does not look like the value that field asks for.",
     ruleInvalidDate: "That date is in the future, and no document is issued ahead of today.",
     ruleInvalidRange:
-      "That date is outside the range this document allows: a utility bill must be issued within the last three months.",
+      "That date is outside the range this document allows: a utility bill is issued within the last three months, and a bank statement ends within the last month and covers the required period.",
     ruleRequired: "This field is required for that document type.",
     ruleTooShort: "This is too short to be accepted.",
     ruleTooLong: "This is too long to be accepted.",

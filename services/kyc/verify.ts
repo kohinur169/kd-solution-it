@@ -79,6 +79,10 @@ import {
   runKycScreening,
   saveKycDocument,
   saveUbo,
+  BANK_STATEMENT_DEFAULT_PERIOD_MONTHS,
+  BANK_STATEMENT_MAX_AGE_MONTHS,
+  dateStringMinusMonths,
+  monthsBetweenDates,
   SIGNIFICANT_OWNER_BPS,
   UTILITY_BILL_MAX_AGE_MONTHS,
   utilityBillIssueWindow,
@@ -3727,10 +3731,65 @@ function checkKycParse(): void {
     "a bill dated in the future is refused, as 0049's issued_at check would",
   );
   expectEqual(
-    parseKycDocumentInput(pngDocumentInput({ document_type: "bank_statement", issued_at: "2020-01-01" }), { now: NOW })
+    parseKycDocumentInput(pngDocumentInput({ document_type: "source_of_funds", issued_at: "2020-01-01" }), { now: NOW })
       .problems.length,
     0,
-    "the three month rule binds the utility bill only; an old bank statement date parses",
+    "the date rules bind the utility bill and the bank statement only; an old source of funds date parses",
+  );
+
+  // STEP 086: the bank statement is its covered period.
+  expectEqual(BANK_STATEMENT_DEFAULT_PERIOD_MONTHS, 3, "the default required period is three months");
+  expectEqual(BANK_STATEMENT_MAX_AGE_MONTHS, 1, "and a statement period must end within the last month");
+  expectEqual(dateStringMinusMonths("2026-11-02", 1), "2026-10-02", "the recency cutoff at NOW is 2026-10-02");
+  expectEqual(monthsBetweenDates("2026-08-01", "2026-11-01"), 3, "a period from the first to the first is whole months");
+  expectEqual(monthsBetweenDates("2026-08-02", "2026-11-01"), 2, "a day short of three months is two");
+  expectDeepEqual(
+    parseKycDocumentInput(pngDocumentInput({ document_type: "bank_statement" }), { now: NOW }).problems,
+    [
+      { field: "issued_at", rule: "required" },
+      { field: "expires_at", rule: "required" },
+    ],
+    "a bank statement without its period is refused on both dates",
+  );
+  expectEqual(
+    parseKycDocumentInput(
+      pngDocumentInput({ document_type: "bank_statement", issued_at: "2026-08-01", expires_at: "2026-11-01" }),
+      { now: NOW },
+    ).problems.length,
+    0,
+    "a statement covering exactly the last three months, ending this month, is accepted",
+  );
+  expectDeepEqual(
+    parseKycDocumentInput(
+      pngDocumentInput({ document_type: "bank_statement", issued_at: "2026-08-01", expires_at: "2026-10-31" }),
+      { now: NOW },
+    ).problems,
+    [{ field: "expires_at", rule: "invalid_range" }],
+    "a statement covering only two months is refused as short, even though it ends recently",
+  );
+  expectDeepEqual(
+    parseKycDocumentInput(
+      pngDocumentInput({ document_type: "bank_statement", issued_at: "2026-07-01", expires_at: "2026-10-01" }),
+      { now: NOW },
+    ).problems,
+    [{ field: "expires_at", rule: "invalid_range" }],
+    "a statement covering three months but ending more than a month ago is refused as stale",
+  );
+  expectDeepEqual(
+    parseKycDocumentInput(
+      pngDocumentInput({ document_type: "bank_statement", issued_at: "2026-08-01", expires_at: "2026-11-01" }),
+      { now: NOW, bankStatementPeriodMonths: 6 },
+    ).problems,
+    [{ field: "expires_at", rule: "invalid_range" }],
+    "the required period arrives as a parameter: six months required refuses a three month statement",
+  );
+  expectEqual(
+    parseKycDocumentInput(
+      pngDocumentInput({ document_type: "bank_statement", issued_at: "2026-05-01", expires_at: "2026-11-01" }),
+      { now: NOW, bankStatementPeriodMonths: 6 },
+    ).problems.length,
+    0,
+    "and accepts a six month statement when six are required",
   );
   expectDeepEqual(
     parseKycDocumentInput(pngDocumentInput({ document_type: "identity_document", issued_at: "2026-11-03" }), { now: NOW })
@@ -3930,7 +3989,17 @@ async function checkKycDocumentSave(): Promise<void> {
   expectEqual(audit.entries[0]?.payload?.["document_type"], "identity_document", "recording the type, never the bytes");
 
   const second = await saveKycDocument(
-    { actor: owner, input: pngDocumentInput({ document_type: "bank_statement", declared_content_type: "application/pdf", bytes: PDF_BYTES, file_name: "statement.pdf" }) },
+    {
+      actor: owner,
+      input: pngDocumentInput({
+        document_type: "bank_statement",
+        declared_content_type: "application/pdf",
+        bytes: PDF_BYTES,
+        file_name: "statement.pdf",
+        issued_at: "2026-08-01",
+        expires_at: "2026-11-01",
+      }),
+    },
     dependenciesOf(database, audit),
   );
 
@@ -3962,6 +4031,23 @@ async function checkKycDocumentSave(): Promise<void> {
     "a bill issued exactly three months before NOW is recorded with its issue date",
   );
 
+  const fourth = await saveKycDocument(
+    {
+      actor: owner,
+      input: pngDocumentInput({
+        document_type: "bank_statement",
+        issued_at: "2026-08-01",
+        expires_at: "2026-11-01",
+        file_name: "statement.png",
+      }),
+    },
+    dependenciesOf(database, audit),
+  );
+
+  expectEqual(fourth.documents.length, 4, "a statement covering the last three months is the fourth document");
+  expectEqual(database.documentRows[3]?.issued_at, "2026-08-01", "with its period start recorded");
+  expectEqual(database.documentRows[3]?.expires_at, "2026-11-01", "and its period end");
+
   const refusals = createBusinessDatabase();
   const refusalAudit = createInMemoryAuditTrail();
 
@@ -3969,6 +4055,9 @@ async function checkKycDocumentSave(): Promise<void> {
     ["a utility bill without its issue date", pngDocumentInput({ document_type: "utility_bill" }), [{ field: "issued_at", rule: "required" }]],
     ["a utility bill older than three months", pngDocumentInput({ document_type: "utility_bill", issued_at: "2026-08-01" }), [{ field: "issued_at", rule: "invalid_range" }]],
     ["a utility bill dated in the future", pngDocumentInput({ document_type: "utility_bill", issued_at: "2026-11-03" }), [{ field: "issued_at", rule: "invalid_date" }]],
+    ["a bank statement without its period", pngDocumentInput({ document_type: "bank_statement" }), [{ field: "issued_at", rule: "required" }, { field: "expires_at", rule: "required" }]],
+    ["a bank statement covering only two months", pngDocumentInput({ document_type: "bank_statement", issued_at: "2026-08-01", expires_at: "2026-10-31" }), [{ field: "expires_at", rule: "invalid_range" }]],
+    ["a bank statement whose period ended over a month ago", pngDocumentInput({ document_type: "bank_statement", issued_at: "2026-07-01", expires_at: "2026-10-01" }), [{ field: "expires_at", rule: "invalid_range" }]],
     ["bytes that lie about their type", pngDocumentInput({ declared_content_type: "application/pdf" }), [{ field: "file", rule: "file_not_acceptable" }]],
     ["an empty file", pngDocumentInput({ bytes: new Uint8Array(0) }), [{ field: "file", rule: "file_not_acceptable" }]],
     ["a type outside the six", pngDocumentInput({ document_type: "diploma" }), [{ field: "document_type", rule: "invalid_format" }]],
@@ -4234,12 +4323,21 @@ async function checkKycSources(): Promise<void> {
   expect(capture.includes("utilityBillIssueWindow"), "the service re-exports and uses the same window");
   expect(capture.includes('rule: "invalid_range"'), "a stale bill is refused as out of range on the server");
   expect(capture.includes('rule: "invalid_date"'), "a future issue date is refused on the server for every type");
-  expect(capture.includes("{ now: nowOf(dependencies) }"), "the save pins the parser's clock to the request's now");
+  expect(capture.includes("now: nowOf(dependencies)"), "the save pins the parser's clock to the request's now");
+  expect(capture.includes("bankStatementPeriodMonths: dependencies.bankStatementPeriodMonths"), "and hands the compliance-set statement period to the parser");
   expect(form.includes("issueWindow.earliest"), "the form pre-checks the issue date against the window it is given");
   expect(page.includes("utilityBillIssueWindow(Date.now())"), "the page computes the window once, server side");
   expect(form.includes("utilityBillRuleLine"), "and tells the merchant the rule in words");
   expect(form.includes("invalid_range"), "mapping the out-of-range rule to its sentence");
   expect(form.includes("max={issueWindow.latest}"), "and capping the date picker at today");
+  expect(types.includes("BANK_STATEMENT_DEFAULT_PERIOD_MONTHS = 3"), "the default statement period lives in the client-safe module");
+  expect(types.includes("function monthsBetweenDates"), "with the period-length helper the form and the service share");
+  expect(capture.includes("bankStatementPeriodMonths"), "the service takes the required period as a parameter, the compliance criterion of section 5");
+  expect(capture.includes("monthsBetweenDates(issuedAt, expiresAt)"), "the server checks the covered period length, not just the dates");
+  expect(capture.includes("dateStringMinusMonths(window.latest, BANK_STATEMENT_MAX_AGE_MONTHS)"), "and the period's recency cutoff");
+  expect(form.includes("bankStatementRuleLine"), "the form tells the merchant the statement rule in words");
+  expect(form.includes("statementFromLabel"), "and labels the two dates as the covered period");
+  expect(form.includes("docPeriodLine"), "and lists a recorded statement with its period");
   expect(copy.includes('documents: "/onboarding/documents"'), "the documents step links to its page");
 
   expect(

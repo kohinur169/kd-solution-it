@@ -12,7 +12,11 @@ import { sanitizeSingleLineText } from "../../lib/security/text.ts";
 import { BUSINESS_PROFILE_TABLE } from "./business-profile.ts";
 import { COUNTRIES_TABLE } from "./business-address.ts";
 import {
+  BANK_STATEMENT_DEFAULT_PERIOD_MONTHS,
+  BANK_STATEMENT_MAX_AGE_MONTHS,
+  dateStringMinusMonths,
   KYC_DOCUMENT_TYPES,
+  monthsBetweenDates,
   UTILITY_BILL_MAX_AGE_MONTHS,
   utilityBillIssueWindow,
   type KycDocumentType,
@@ -83,7 +87,15 @@ export const SANCTIONS_SCREENINGS_TABLE = "sanctions_screenings";
 
 // The document types live in their own module so client components can import the list without
 // this file's server-only imports; they are re-exported here so server code has one import path.
-export { KYC_DOCUMENT_TYPES, UTILITY_BILL_MAX_AGE_MONTHS, utilityBillIssueWindow };
+export {
+  BANK_STATEMENT_DEFAULT_PERIOD_MONTHS,
+  BANK_STATEMENT_MAX_AGE_MONTHS,
+  dateStringMinusMonths,
+  KYC_DOCUMENT_TYPES,
+  monthsBetweenDates,
+  UTILITY_BILL_MAX_AGE_MONTHS,
+  utilityBillIssueWindow,
+};
 export type { KycDocumentType };
 
 /** The onboarding step this module completes when at least one document is recorded. */
@@ -193,6 +205,12 @@ export interface KycCaptureDependencies {
   readonly rest: RestClient;
   readonly audit: AuditTrail;
   readonly now?: () => number;
+  /**
+   * The required bank statement period in months - section 5 gives this criterion to the
+   * compliance team. Until the office settings STEP stores it, the platform default of
+   * `BANK_STATEMENT_DEFAULT_PERIOD_MONTHS` applies.
+   */
+  readonly bankStatementPeriodMonths?: number | undefined;
 }
 
 function nowOf(dependencies: KycCaptureDependencies): number {
@@ -338,7 +356,7 @@ const HASH_PATTERN = /^[0-9a-f]{64}$/u;
  */
 export function parseKycDocumentInput(
   input: KycDocumentInput,
-  options?: { readonly now?: number },
+  options?: { readonly now?: number; readonly bankStatementPeriodMonths?: number | undefined },
 ): {
   readonly record: {
     readonly documentType: KycDocumentType;
@@ -366,6 +384,7 @@ export function parseKycDocumentInput(
   let issuedAt: string | null = null;
   let expiresAt: string | null = null;
   let issuedAtSent = false;
+  let expiresAtSent = false;
 
   for (const [field, raw] of [
     ["issued_at", input.issued_at],
@@ -377,6 +396,8 @@ export function parseKycDocumentInput(
 
     if (field === "issued_at") {
       issuedAtSent = true;
+    } else {
+      expiresAtSent = true;
     }
 
     if (typeof raw !== "string" || !DATE_PATTERN.test(raw) || Number.isNaN(Date.parse(raw))) {
@@ -397,10 +418,22 @@ export function parseKycDocumentInput(
     problems.push({ field: "issued_at", rule: "required" });
   }
 
+  if (documentType === "bank_statement") {
+    // A bank statement is its covered period: both ends are required, as section 5's
+    // "required bank statement period" implies - a statement without a period is not evidence.
+    if (!issuedAtSent) {
+      problems.push({ field: "issued_at", rule: "required" });
+    }
+
+    if (!expiresAtSent) {
+      problems.push({ field: "expires_at", rule: "required" });
+    }
+  }
+
+  const window = utilityBillIssueWindow(options?.now ?? Date.now());
+
   if (issuedAt !== null) {
     // `0049` refuses an issue date after the row's creation; the service refuses it earlier.
-    const window = utilityBillIssueWindow(options?.now ?? Date.now());
-
     if (issuedAt > window.latest) {
       problems.push({ field: "issued_at", rule: "invalid_date" });
     } else if (documentType === "utility_bill" && issuedAt < window.earliest) {
@@ -410,7 +443,18 @@ export function parseKycDocumentInput(
   }
 
   if (issuedAt !== null && expiresAt !== null && expiresAt <= issuedAt) {
+    // `0049`'s validity check refuses the row; the service refuses it earlier.
     problems.push({ field: "expires_at", rule: "invalid_format" });
+  } else if (documentType === "bank_statement" && issuedAt !== null && expiresAt !== null) {
+    // STEP 086: the period must end within the last month and cover the required period.
+    const requiredMonths = options?.bankStatementPeriodMonths ?? BANK_STATEMENT_DEFAULT_PERIOD_MONTHS;
+    const recencyCutoff = dateStringMinusMonths(window.latest, BANK_STATEMENT_MAX_AGE_MONTHS);
+
+    if (expiresAt < recencyCutoff) {
+      problems.push({ field: "expires_at", rule: "invalid_range" });
+    } else if (monthsBetweenDates(issuedAt, expiresAt) < requiredMonths) {
+      problems.push({ field: "expires_at", rule: "invalid_range" });
+    }
   }
 
   const fileName = typeof input.file_name === "string" ? input.file_name : "";
@@ -475,7 +519,10 @@ export async function saveKycDocument(
 ): Promise<KycPackSnapshot> {
   const companyId = requireOwnerCompany(input.actor);
   const rest = dependencies.rest;
-  const parsed = parseKycDocumentInput(input.input, { now: nowOf(dependencies) });
+  const parsed = parseKycDocumentInput(input.input, {
+    now: nowOf(dependencies),
+    bankStatementPeriodMonths: dependencies.bankStatementPeriodMonths,
+  });
 
   if (parsed.problems.length > 0 || parsed.record === null) {
     throw new AppError("VALIDATION_FAILED", { details: parsed.problems });

@@ -9,7 +9,11 @@ import { formatMessage, getMessage } from "@/lib/i18n/messages";
 import type { MessagePath } from "@/lib/i18n/messages";
 import { csrfHeaders } from "@/lib/security/csrf-client";
 import {
+  BANK_STATEMENT_DEFAULT_PERIOD_MONTHS,
+  BANK_STATEMENT_MAX_AGE_MONTHS,
+  dateStringMinusMonths,
   KYC_DOCUMENT_TYPES,
+  monthsBetweenDates,
   UTILITY_BILL_MAX_AGE_MONTHS,
   type KycDocumentType,
   type UtilityBillIssueWindow,
@@ -210,6 +214,26 @@ export function DocumentsForm({
         } else if (issuedAt < issueWindow.earliest) {
           preflight["issued_at"] = ruleSentence("invalid_range");
         }
+      } else if (documentType === "bank_statement") {
+        // STEP 086: the two dates are the statement's covered period; the server checks the
+        // same rules against its own clock, this is only the picker's early answer.
+        if (issuedAt === "") {
+          preflight["issued_at"] = ruleSentence("required");
+        }
+
+        if (expiresAt === "") {
+          preflight["expires_at"] = ruleSentence("required");
+        }
+
+        if (issuedAt !== "" && expiresAt !== "" && expiresAt > issuedAt) {
+          const recencyCutoff = dateStringMinusMonths(issueWindow.latest, BANK_STATEMENT_MAX_AGE_MONTHS);
+
+          if (expiresAt < recencyCutoff) {
+            preflight["expires_at"] = ruleSentence("invalid_range");
+          } else if (monthsBetweenDates(issuedAt, expiresAt) < BANK_STATEMENT_DEFAULT_PERIOD_MONTHS) {
+            preflight["expires_at"] = ruleSentence("invalid_range");
+          }
+        }
       }
 
       if (Object.keys(preflight).length > 0) {
@@ -398,7 +422,13 @@ export function DocumentsForm({
           </label>
           <div className="flex flex-col gap-3 sm:flex-row">
             <label className={labelClasses}>
-              <span>{getMessage("onboardingDocuments.issuedAtLabel")}</span>
+              <span>
+                {getMessage(
+                  documentType === "bank_statement"
+                    ? "onboardingDocuments.statementFromLabel"
+                    : "onboardingDocuments.issuedAtLabel",
+                )}
+              </span>
               <input
                 className={inputClasses}
                 type="date"
@@ -412,15 +442,26 @@ export function DocumentsForm({
                     ? formatMessage("onboardingDocuments.utilityBillRuleLine", {
                         months: String(UTILITY_BILL_MAX_AGE_MONTHS),
                       })
-                    : getMessage("onboardingDocuments.issuedAtHint"))}
+                    : documentType === "bank_statement"
+                      ? formatMessage("onboardingDocuments.bankStatementRuleLine", {
+                          months: String(BANK_STATEMENT_DEFAULT_PERIOD_MONTHS),
+                        })
+                      : getMessage("onboardingDocuments.issuedAtHint"))}
               </span>
             </label>
             <label className={labelClasses}>
-              <span>{getMessage("onboardingDocuments.expiresAtLabel")}</span>
+              <span>
+                {getMessage(
+                  documentType === "bank_statement"
+                    ? "onboardingDocuments.statementToLabel"
+                    : "onboardingDocuments.expiresAtLabel",
+                )}
+              </span>
               <input
                 className={inputClasses}
                 type="date"
                 value={expiresAt}
+                max={issueWindow.latest}
                 onChange={(event) => setExpiresAt(event.target.value)}
               />
               <span className={hintClasses}>
@@ -448,6 +489,16 @@ export function DocumentsForm({
                 <span className={noteClasses}>
                   {formatMessage("onboardingDocuments.docSizeLine", { bytes: document.byteSize })}
                 </span>
+                {document.issuedAt === null ? null : (
+                  <span className={noteClasses}>
+                    {document.documentType === "bank_statement" && document.expiresAt !== null
+                      ? formatMessage("onboardingDocuments.docPeriodLine", {
+                          from: document.issuedAt,
+                          to: document.expiresAt,
+                        })
+                      : formatMessage("onboardingDocuments.docIssuedLine", { date: document.issuedAt })}
+                  </span>
+                )}
                 <span className={noteClasses}>{getMessage("onboardingDocuments.docStatusUploaded")}</span>
               </li>
             ))}

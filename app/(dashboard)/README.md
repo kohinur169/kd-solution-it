@@ -40,7 +40,10 @@ Every read is scoped to the caller company and every write is audit logged.
   `/kyc-ubo`, `/kyc-screening`; the document type list is shared with the browser through
   `services/kyc/kyc-document-types.ts`). No migration either: STEP 028 built the tables. The utility bill carries STEP 085's three month issue rule
   (`utilityBillIssueWindow` in `services/kyc/kyc-document-types.ts`, enforced server-side in
-  `parseKycDocumentInput` and pre-checked in the form).
+  `parseKycDocumentInput` and pre-checked in the form). A bank statement carries STEP 086's
+  period rule: both dates are the covered period, which must end within the last month and span
+  the required period (a parameter, default three months, until the office sets the underwriting
+  criterion).
 
 ## The reader
 
