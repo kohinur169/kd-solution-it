@@ -58,6 +58,26 @@ export const ONBOARDING_STEP_COPY: Readonly<Record<OnboardingStep, OnboardingSte
   },
 });
 
+/**
+ * The steps whose own form exists on the platform, and where it lives.
+ *
+ * ## Why the shell links instead of rendering the form
+ *
+ * Each step's fields belong to the STEP that owns them - their rules, their table, their audit
+ * action - so the wizard cannot draw a form it does not own. A step that has one gets a link to it
+ * here; a step that does not yet has none, and the card says where the merchant is without pretending
+ * a form exists. The map grows as each STEP lands, and it is the only place a step's address is
+ * written, so the shell and the form's own page cannot disagree about it.
+ */
+export const ONBOARDING_STEP_FORMS: Partial<Readonly<Record<OnboardingStep, string>>> = Object.freeze({
+  business: "/onboarding/business",
+});
+
+/** Where one step's form lives, or `null` for a step that has none yet. */
+export function onboardingStepFormHref(step: OnboardingStep): string | null {
+  return ONBOARDING_STEP_FORMS[step] ?? null;
+}
+
 /** The label and the description of one step. */
 export function onboardingStepCopy(step: OnboardingStep): OnboardingStepCopy {
   return ONBOARDING_STEP_COPY[step];

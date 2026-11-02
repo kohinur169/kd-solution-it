@@ -1,6 +1,7 @@
 // path: app/(dashboard)/onboarding/onboarding-wizard.tsx
 "use client";
 
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useState, type ReactNode } from "react";
 import { rateLimitSentence } from "@/lib/auth/refusal-message";
@@ -13,7 +14,12 @@ import {
   onboardingStepIndex,
   type OnboardingStep,
 } from "@/services/kyc/onboarding-steps";
-import { onboardingStepCopy, onboardingStepStateKey, onboardingStepStateOf } from "./step-copy";
+import {
+  onboardingStepCopy,
+  onboardingStepFormHref,
+  onboardingStepStateKey,
+  onboardingStepStateOf,
+} from "./step-copy";
 
 /**
  * The six steps, and the one control the shell offers: where to work.
@@ -97,6 +103,9 @@ const cardClasses =
 
 const cardCurrentClasses = "border-primary";
 
+const formLinkClasses =
+  "inline-flex items-center rounded-md border border-border px-3 py-2 text-sm font-medium text-foreground underline-offset-4 hover:underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2";
+
 const headingClasses = "text-lg font-semibold tracking-tight";
 
 const positionClasses = "text-xs font-semibold uppercase tracking-wider text-muted-foreground";
@@ -165,6 +174,7 @@ export function OnboardingWizard({ progress }: OnboardingWizardProperties): Reac
           const copy = onboardingStepCopy(step);
           const state = onboardingStepStateOf(step, progress);
           const position = onboardingStepIndex(step) + 1;
+          const formHref = onboardingStepFormHref(step);
 
           return (
             <li
@@ -183,18 +193,25 @@ export function OnboardingWizard({ progress }: OnboardingWizardProperties): Reac
                 <span className={badgeClasses}>{getMessage(onboardingStepStateKey(state))}</span>
               </div>
               <p className={descriptionClasses}>{getMessage(copy.description)}</p>
-              <button
-                className={buttonClasses}
-                disabled={busy !== null || state === "current"}
-                onClick={() => {
-                  void savePosition(step);
-                }}
-                type="button"
-              >
-                {busy === step
-                  ? getMessage("onboarding.actionBusy")
-                  : getMessage("onboarding.actionSubmit")}
-              </button>
+              <div className="flex flex-wrap items-center gap-3">
+                <button
+                  className={buttonClasses}
+                  disabled={busy !== null || state === "current"}
+                  onClick={() => {
+                    void savePosition(step);
+                  }}
+                  type="button"
+                >
+                  {busy === step
+                    ? getMessage("onboarding.actionBusy")
+                    : getMessage("onboarding.actionSubmit")}
+                </button>
+                {formHref === null ? null : (
+                  <Link className={formLinkClasses} href={formHref}>
+                    {getMessage("onboarding.actionOpenForm")}
+                  </Link>
+                )}
+              </div>
             </li>
           );
         })}

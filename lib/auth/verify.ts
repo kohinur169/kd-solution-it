@@ -9866,7 +9866,7 @@ async function checkSessionRotation(): Promise<void> {
   // lists and STEP 079's onboarding wizard; each keeps the token rotating while the person reads it.
   // The office half is one of them because reading another account's sessions must not leave the
   // reader's own token unrotated, and the wizard is one because a merchant may sit on it for a while.
-  expectEqual(keepers.length, 7, "every signed-in page keeps its session rotating");
+  expectEqual(keepers.length, 8, "every signed-in page keeps its session rotating");
 }
 
 /**
@@ -12640,11 +12640,11 @@ async function checkCsrfProtection(): Promise<void> {
     .map((file) => file.path)
     .sort();
 
-  expectEqual(browserMutations.length, 21, "twenty one browser files send a mutation");
+  expectEqual(browserMutations.length, 22, "twenty two browser files send a mutation");
   expectEqual(
     browserMutations.reduce((total, path) => total + (appSourceOf(appSources, path).split('method: "POST"').length - 1), 0),
-    24,
-    "across twenty four call sites",
+    25,
+    "across twenty five call sites",
   );
   const postCalls = (source: string): number => source.split('method: "POST"').length - 1;
   const tokenSpreads = (source: string): number =>
