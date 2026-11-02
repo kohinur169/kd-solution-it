@@ -1,8 +1,10 @@
 // path: components/office/admin-shell.tsx
 import Link from "next/link";
 import type { ReactNode } from "react";
+import { AnnouncementPopup } from "@/components/announcements/announcement-popup";
 import { SessionKeeper } from "@/components/auth/session-keeper";
 import { ThemeToggle } from "@/components/ui/theme-toggle";
+import type { AnnouncementPopupView } from "@/lib/announcements/service";
 import { getMessage } from "@/lib/i18n/messages";
 import { OFFICE_HOME_PATH, officeRoleLabelKey, type OfficeRole, type OfficeSection } from "./navigation";
 import { OfficeNav, type OfficeNavItem } from "./office-nav";
@@ -37,6 +39,12 @@ import { OfficeNav, type OfficeNavItem } from "./office-nav";
  * `main` from pushing the sidebar off the screen. No width is fixed in pixels, so the same markup
  * serves a phone, a tablet and a desktop.
  *
+ * ## The banner
+ *
+ * Section 24's announcement popup is mounted here, once, because "everywhere" means every office
+ * screen rather than each one remembering to render it. The announcements arrive already filtered and
+ * already limited; the shell simply shows them.
+ *
  * ## The session keeps rotating
  *
  * `SessionKeeper` is mounted once, here, rather than on each screen: section 22's rotation is a
@@ -48,6 +56,8 @@ export interface AdminShellProperties {
   readonly roles: readonly OfficeRole[];
   /** The screens those roles open. Every one of them is a page the gate resolved. */
   readonly sections: readonly OfficeSection[];
+  /** The announcements this person has not dismissed, newest first. Empty on most page loads. */
+  readonly announcements: readonly AnnouncementPopupView[];
   readonly children: ReactNode;
 }
 
@@ -75,7 +85,12 @@ const sidebarClasses =
 
 const contentClasses = "min-w-0 flex-1 px-4 py-6 sm:px-6 lg:px-8";
 
-export function AdminShell({ roles, sections, children }: AdminShellProperties): ReactNode {
+export function AdminShell({
+  roles,
+  sections,
+  announcements,
+  children,
+}: AdminShellProperties): ReactNode {
   const items: readonly OfficeNavItem[] = sections.map((section) => ({
     key: section.key,
     href: section.href,
@@ -111,6 +126,7 @@ export function AdminShell({ roles, sections, children }: AdminShellProperties):
         </aside>
         <main className={contentClasses}>{children}</main>
       </div>
+      {announcements.length === 0 ? null : <AnnouncementPopup announcements={announcements} />}
     </div>
   );
 }

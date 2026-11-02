@@ -7,6 +7,7 @@ import { OfficeAccessPanel } from "@/components/office/office-access-panel";
 import { decideOfficeAccess, officeAccessRedirect } from "@/components/office/navigation";
 import { getMessage } from "@/lib/i18n/messages";
 import { readOfficeActor } from "./office-actor";
+import { readOfficeAnnouncements } from "./office-announcements";
 
 /**
  * The office shell, and the one permission check every office screen inherits.
@@ -27,6 +28,13 @@ import { readOfficeActor } from "./office-actor";
  * `officeAccessRedirect` names the two places it can send the browser. The gate exercises all five
  * outcomes of the pair without a request, and the layout stays the thin adapter it should be: read
  * the account, ask the function, render or redirect.
+ *
+ * ## The banner the shell carries
+ *
+ * Section 24's announcements are shown by the shell rather than by a screen, so the layout reads the
+ * ones this person has not dismissed and passes them down. An announcement table that cannot be read
+ * answers an empty list rather than an outage - see `./office-announcements.ts` - because a courtesy
+ * laid over the office must never be able to close it.
  *
  * ## Why `force-dynamic`
  *
@@ -54,8 +62,13 @@ export default async function AdminLayout({
   }
 
   if (access.kind === "allowed") {
+    // The account is read again from the cache rather than from the decision, because the popup needs
+    // the company and the person it is for, not only the roles. `readOfficeActor` is memoised per
+    // request, so the second call costs nothing.
+    const announcements = await readOfficeAnnouncements();
+
     return (
-      <AdminShell roles={access.roles} sections={access.sections}>
+      <AdminShell announcements={announcements} roles={access.roles} sections={access.sections}>
         {children}
       </AdminShell>
     );

@@ -138,6 +138,11 @@ export const SENSITIVE_ENDPOINTS: readonly SensitiveEndpoint[] = [
   },
   {
     method: "POST",
+    path: "/api/office/announcements",
+    note: "Section 24's announcements (STEP 075): a published banner is the platform's own voice to every signed in person, so the browser that writes or dismisses one is the one that signs.",
+  },
+  {
+    method: "POST",
     path: "/api/office/compliance-calendar",
     note: "Section 3's compliance calendar (STEP 074): filing, renewing or archiving a certificate moves what the platform's own compliance rests on, so the browser that files it is the one that signs.",
   },
