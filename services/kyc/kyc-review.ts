@@ -38,11 +38,11 @@ import type { KycDocumentType } from "./kyc-document-types.ts";
  *
  * ## The two writes
  *
- * `openKycReview` moves a `submitted` row to `in_review` with the first reviewer named, and
+ * `openKycReview` moves a `submitted` row to `in_review` with the first reviewer named,
  * `reviewKycDocument` accepts or rejects one document with the reason `0049` demands on a
- * rejection. Both are conditional updates (by id, company and current status) with the version
- * bumped, re-read to detect a lost race, and both append one audit entry. Approval and rejection of
- * the whole submission belong to STEP 093; this file never writes `approved` or `rejected`.
+ * rejection, and STEP 093's `decideKycSubmission` approves or rejects the whole submission. All
+ * three are conditional updates (by id, company, current status and version) with the version
+ * bumped, re-read to detect a lost race, and each appends one audit entry.
  *
  * ## Audit
  *
@@ -744,6 +744,153 @@ export async function markKycSubmissionRisk(
         submission_id: submission.id,
         high_risk: parsed.data.high_risk,
         four_eye_required: fourEyeRequired,
+      },
+    });
+  } catch {
+    // Same rule as the other writes.
+  }
+
+  return readKycReviewDetail({ actor: input.actor, submissionId }, dependencies);
+}
+
+/* -------------------------------------------------------------------------------------------------
+ * STEP 093: the decision flow. Approve or reject the whole submission, with the reason a rejection
+ * carries because the merchant reads it (0048's reason check), audited on every decision (section 5:
+ * every KYC decision is audit logged).
+ * ---------------------------------------------------------------------------------------------- */
+
+/** The audit action of a final decision on a submission. */
+export const KYC_DECISION_AUDIT_ACTION = "kyc_review.decided";
+
+/**
+ * The roles that may give the final approval: ceo and super_admin. Section 2 gives the ceo "KYC
+ * final approval" and section 5 says final approval by CEO or super_admin is what triggers
+ * sub-merchant provisioning; compliance_kyc does the review and may reject, support has no KYC
+ * approval at all.
+ */
+export const KYC_FINAL_APPROVAL_ROLES: readonly PlatformRole[] = Object.freeze([
+  "ceo",
+  "super_admin",
+] as const satisfies readonly PlatformRole[]);
+
+/** The body of a submission decision: which submission, approve or reject, and the reason. */
+export const decideKycSubmissionBodySchema = z.object({
+  submission_id: z.string().uuid(),
+  decision: z.enum(["approve", "reject"]),
+  reason: z.string().trim().min(1).max(280).nullish(),
+});
+
+/**
+ * Approve or reject one in-review submission - the decision flow of section 5.
+ *
+ * Approval is the final approval of ceo and super_admin (`KYC_FINAL_APPROVAL_ROLES`); rejection is
+ * the review work of the office roles, so compliance_kyc may reject but not approve. A rejection
+ * must carry the trimmed 1..280 reason `0048` demands on a rejected row, because the merchant reads
+ * it on their status screen; an approval may carry one as a note.
+ *
+ * The submission must be `in_review` - opened first, so `first_reviewer_id` is set, which `0048`'s
+ * reviewer check requires of a decided row - and a decided row conflicts with `already_decided`,
+ * because `0048`'s guard locks it as history. When the submission is four-eye, the decider is the
+ * second reviewer: the guard `fourEyeProblems` refuses the first reviewer deciding alone, and
+ * `0048`'s two-people check refuses the same person twice at the database.
+ *
+ * The write is one conditional update (id + company + `status=eq.in_review` + current version, over
+ * live rows) with the status, the reason, both instants, the second reviewer and the bumped version,
+ * then a re-read race check (`stale`), one `kyc_review.decided` audit entry, and the full detail as
+ * the answer.
+ */
+export async function decideKycSubmission(
+  input: { readonly actor: RequestActor; readonly body: unknown },
+  dependencies: KycReviewDependencies,
+): Promise<KycReviewDetail> {
+  const parsed = decideKycSubmissionBodySchema.safeParse(input.body);
+
+  if (!parsed.success) {
+    const details: ErrorDetail[] = parsed.error.issues.map((issue) => ({
+      field: issue.path.join("."),
+      rule: "invalid_format",
+    }));
+
+    throw new AppError("VALIDATION_FAILED", { details });
+  }
+
+  const { submission_id: submissionId, decision, reason } = parsed.data;
+
+  if (decision === "reject" && (reason === undefined || reason === null)) {
+    throw new AppError("VALIDATION_FAILED", { details: [{ field: "reason", rule: "required" }] });
+  }
+
+  // Approval is the ceo's and super_admin's final approval; rejection is review work.
+  if (decision === "approve") {
+    requireAnyRole(input.actor, KYC_FINAL_APPROVAL_ROLES);
+  } else {
+    requireOfficeActor(input.actor);
+  }
+
+  const rest = dependencies.rest;
+  const now = nowOf(dependencies);
+  const submission = await readSubmissionById(submissionId, rest);
+
+  if (submission === null) {
+    throw new AppError("RESOURCE_NOT_FOUND");
+  }
+
+  if (submission.status === "approved" || submission.status === "rejected") {
+    throw new AppError("CONFLICT", { details: [{ field: "status", rule: "already_decided" }] });
+  }
+
+  if (submission.status !== "in_review") {
+    throw new AppError("CONFLICT", { details: [{ field: "status", rule: "not_in_review" }] });
+  }
+
+  // Four eyes: the decider is the second reviewer, and never the first.
+  const secondReviewerId = submission.four_eye_required ? input.actor.userId : null;
+  const problems = fourEyeProblems(
+    { fourEyeRequired: submission.four_eye_required, firstReviewerId: submission.first_reviewer_id },
+    secondReviewerId,
+  );
+
+  if (problems.length > 0) {
+    throw new AppError("VALIDATION_FAILED", { details: [...problems] });
+  }
+
+  const nextStatus = decision === "approve" ? "approved" : "rejected";
+
+  await rest.update(
+    KYC_SUBMISSIONS_TABLE,
+    `id=eq.${encodeURIComponent(submission.id)}&company_id=eq.${encodeURIComponent(submission.company_id)}&status=eq.in_review&version=eq.${submission.version}&deleted_at=is.null`,
+    {
+      status: nextStatus,
+      decision_reason: reason ?? null,
+      reviewed_at: isoOf(now),
+      decided_at: isoOf(now),
+      second_reviewer_id: secondReviewerId,
+      updated_at: isoOf(now),
+      version: submission.version + 1,
+    },
+  );
+
+  const after = await readSubmissionById(submissionId, rest);
+
+  if (after === null || after.version !== submission.version + 1 || after.status !== nextStatus) {
+    throw new AppError("CONFLICT", { details: [{ field: "version", rule: "stale" }] });
+  }
+
+  try {
+    await dependencies.audit.append({
+      action: KYC_DECISION_AUDIT_ACTION,
+      actorUserId: input.actor.userId,
+      entityType: KYC_REVIEW_ENTITY,
+      entityId: submission.id,
+      companyId: submission.company_id,
+      sessionId: input.actor.sessionId,
+      payload: {
+        submission_id: submission.id,
+        decision: nextStatus,
+        reason: reason ?? null,
+        first_reviewer_id: submission.first_reviewer_id,
+        second_reviewer_id: secondReviewerId,
+        four_eye_required: submission.four_eye_required,
       },
     });
   } catch {

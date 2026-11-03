@@ -95,6 +95,16 @@ Every read is scoped to the caller company and every write is audit logged.
   `GET /api/onboarding/payment-holds` serves the queue screen (`/onboarding/payment-holds`),
   `POST /api/onboarding/payment-hold-decide` decides one hold, `GET /api/onboarding/merchant-holds`
   serves the merchant their own holds.
+- STEP 093 decides the KYC submission itself: `services/kyc/kyc-review.ts` gains `decideKycSubmission`
+  (no new migration - `0048` already carries the decision shape: the status vocabulary, the two
+  reviewer columns, the reason checks and the lock guard): approval is the final approval of ceo and
+  super_admin (`KYC_FINAL_APPROVAL_ROLES`), rejection is the review office's work and needs the
+  trimmed 1..280 reason the merchant reads; the submission must be `in_review` (`not_in_review`
+  otherwise), a decided row conflicts `already_decided`, a four-eye row needs a second reviewer who
+  is not the first (`fourEyeProblems`, `same_reviewer`); one conditional update by id + company +
+  `status=eq.in_review` + version with a re-read race check (`stale`), audited `kyc_review.decided` -
+  every KYC decision is audit logged; `POST /api/onboarding/kyc-decide` serves it and the review
+  queue's panel (`/onboarding/kyc-review`) offers approve/reject on an open submission.
 
 ## The reader
 

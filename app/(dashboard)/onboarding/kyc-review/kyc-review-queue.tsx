@@ -26,6 +26,7 @@ const DETAIL_PATH = "/api/onboarding/kyc-review-submission";
 const OPEN_PATH = "/api/onboarding/kyc-review-open";
 const DECIDE_PATH = "/api/onboarding/kyc-document-review";
 const RISK_PATH = "/api/onboarding/kyc-risk-mark";
+const SUBMISSION_DECIDE_PATH = "/api/onboarding/kyc-decide";
 
 /** The catalog label of one document type, reused from the documents step's own block. */
 const DOC_TYPE_LABELS: Readonly<Record<string, MessagePath>> = Object.freeze({
@@ -41,6 +42,7 @@ type RuleKey =
   | "required"
   | "invalid_format"
   | "not_submitted"
+  | "not_in_review"
   | "already_reviewed"
   | "stale"
   | "already_decided"
@@ -50,6 +52,7 @@ const RULE_MESSAGES: Readonly<Record<RuleKey, MessagePath>> = Object.freeze({
   required: "onboardingKycReview.ruleRequired",
   invalid_format: "onboardingKycReview.ruleInvalidFormat",
   not_submitted: "onboardingKycReview.ruleNotSubmitted",
+  not_in_review: "onboardingKycReview.ruleNotInReview",
   already_reviewed: "onboardingKycReview.ruleAlreadyReviewed",
   stale: "onboardingKycReview.ruleStale",
   already_decided: "onboardingKycReview.ruleAlreadyDecided",
@@ -73,6 +76,19 @@ function refusalDetails(payload: unknown): readonly RefusalDetail[] {
   const details = (payload as { readonly error?: { readonly details?: unknown } }).error?.details;
 
   return Array.isArray(details) ? (details as RefusalDetail[]) : [];
+}
+
+/** The catalog label of one submission status. */
+function submissionStatusLabel(status: string): MessagePath {
+  if (status === "approved") {
+    return "onboardingKycReview.statusApproved";
+  }
+
+  if (status === "rejected") {
+    return "onboardingKycReview.statusRejected";
+  }
+
+  return status === "in_review" ? "onboardingKycReview.statusInReview" : "onboardingKycReview.statusSubmitted";
 }
 
 /** The catalog label of one review status of a document or submission. */
@@ -250,6 +266,50 @@ export function KycReviewQueuePanel({ initial }: { readonly initial: KycReviewQu
     }
   }
 
+  async function decideSubmission(decision: "approve" | "reject"): Promise<void> {
+    if (selectedId === null) {
+      return;
+    }
+
+    if (decision === "reject" && reason.trim() === "") {
+      setMessage({ text: getMessage("onboardingKycReview.ruleRequired"), failed: true });
+
+      return;
+    }
+
+    setBusy(true);
+    setMessage(null);
+
+    try {
+      const response = await postJson(SUBMISSION_DECIDE_PATH, {
+        submission_id: selectedId,
+        decision,
+        reason: reason.trim() === "" ? undefined : reason.trim(),
+      });
+
+      if (!response.ok) {
+        setMessage({ text: await readRefusal(response), failed: true });
+
+        return;
+      }
+
+      const decided = (await response.json()) as KycReviewDetail;
+
+      setDetail(decided);
+      setMessage({
+        text: formatMessage("onboardingKycReview.decidedDone", {
+          status: getMessage(submissionStatusLabel(decided.status)),
+        }),
+        failed: false,
+      });
+      router.refresh();
+    } catch {
+      setMessage({ text: getMessage("onboardingKycReview.failed"), failed: true });
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <div className="flex flex-col gap-4">
       <div className="flex flex-col gap-2">
@@ -284,6 +344,9 @@ export function KycReviewQueuePanel({ initial }: { readonly initial: KycReviewQu
             <h3 className="text-sm font-semibold">{getMessage("onboardingKycReview.documentsHeading")}</h3>
             <p className="text-xs text-muted-foreground">
               {formatMessage("onboardingKycReview.companyLine", { company: detail.companyId })}
+            </p>
+            <p className="text-xs font-semibold">
+              {getMessage(submissionStatusLabel(detail.status))}
             </p>
             <p className="text-xs text-muted-foreground">
               {formatMessage("onboardingKycReview.methodLine", { method: detail.method })}
@@ -343,6 +406,32 @@ export function KycReviewQueuePanel({ initial }: { readonly initial: KycReviewQu
             <button type="button" className={buttonClasses} onClick={() => void openReview()} disabled={busy}>
               {busy ? getMessage("onboardingKycReview.openBusy") : getMessage("onboardingKycReview.openButton")}
             </button>
+          ) : null}
+
+          {detail.status === "in_review" ? (
+            <div className="flex flex-col gap-1">
+              <h3 className="text-sm font-semibold">{getMessage("onboardingKycReview.decisionHeading")}</h3>
+              <div className="flex flex-row gap-2">
+                <button
+                  type="button"
+                  className={buttonClasses}
+                  onClick={() => void decideSubmission("approve")}
+                  disabled={busy}
+                >
+                  {busy
+                    ? getMessage("onboardingKycReview.decideBusy")
+                    : getMessage("onboardingKycReview.approveButton")}
+                </button>
+                <button
+                  type="button"
+                  className={buttonClasses}
+                  onClick={() => void decideSubmission("reject")}
+                  disabled={busy}
+                >
+                  {getMessage("onboardingKycReview.rejectSubmissionButton")}
+                </button>
+              </div>
+            </div>
           ) : null}
 
           <ul className="flex flex-col gap-2">

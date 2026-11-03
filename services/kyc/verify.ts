@@ -94,8 +94,11 @@ import {
   UBO_RECORDS_TABLE,
 } from "./kyc-capture.ts";
 import {
+  decideKycSubmission,
   fourEyeProblems,
+  KYC_DECISION_AUDIT_ACTION,
   KYC_DOCUMENT_REVIEW_AUDIT_ACTION,
+  KYC_FINAL_APPROVAL_ROLES,
   KYC_RISK_MARK_AUDIT_ACTION,
   KYC_REVIEW_AUDIT_ACTION,
   KYC_REVIEW_OFFICE_ROLES,
@@ -1082,6 +1085,8 @@ interface SubmissionRowShape {
   submitted_at?: string | null;
   submitted_by?: string | null;
   first_reviewer_id?: string | null;
+  second_reviewer_id?: string | null;
+  reviewed_at?: string | null;
   decided_at?: string | null;
   decision_reason?: string | null;
   provider_reference?: string | null;
@@ -1174,6 +1179,8 @@ interface BusinessDatabase {
   limitRace: boolean;
   /** When true, the hold update branch simulates a lost race the same way. */
   holdRace: boolean;
+  /** When true, the submission update branch simulates a lost race the same way. */
+  submissionRace: boolean;
 }
 
 function businessRow(overrides: Partial<BusinessRowShape> = {}): BusinessRowShape {
@@ -1237,6 +1244,7 @@ function createBusinessDatabase(
     criteriaRace: false,
     limitRace: false,
     holdRace: false,
+    submissionRace: false,
   };
 }
 
@@ -1882,15 +1890,28 @@ function createBusinessStore(database: BusinessDatabase): RestClient {
         const parts = query.split("&");
         const idPart = parts.find((part) => part.startsWith("id=eq."));
         const statusPart = parts.find((part) => part.startsWith("status=eq."));
+        const versionPart = parts.find((part) => part.startsWith("version=eq."));
         const wantedId = idPart === undefined ? null : decodeURIComponent(idPart.slice("id=eq.".length));
         const wantedStatus = statusPart === undefined ? null : decodeURIComponent(statusPart.slice("status=eq.".length));
+        const wantedVersion =
+          versionPart === undefined ? null : Number(versionPart.slice("version=eq.".length));
 
         for (const row of database.submissionRows) {
+          // Rows seeded before a column existed still answer with the migration's default.
+          const currentVersion = row.version ?? 1;
+
           if (
             row.company_id === wanted &&
             (wantedId === null || row.id === wantedId) &&
-            (wantedStatus === null || row.status === wantedStatus)
+            (wantedStatus === null || row.status === wantedStatus) &&
+            (wantedVersion === null || currentVersion === wantedVersion)
           ) {
+            if (database.submissionRace && wantedVersion !== null) {
+              row.version = currentVersion + 5;
+
+              continue;
+            }
+
             for (const [key, value] of Object.entries(values)) {
               (row as unknown as Record<string, unknown>)[key] = value;
             }
@@ -5591,7 +5612,13 @@ async function checkKycSources(): Promise<void> {
   expect(review.includes("read_by_office"), "and audits each office read of one submission");
   expect(review.includes("status=eq.submitted"), "the open is conditional on the row still being submitted");
   expect(review.includes("status=eq.uploaded"), "the document decision is conditional on the row still being uploaded");
-  expectEqual(review.includes('"approved"'), false, "and never writes approved: the decision flow is STEP 093");
+  expect(review.includes('"approved"'), "and now writes approved: the decision flow is STEP 093");
+  expect(review.includes("decideKycSubmission"), "the service owns the submission decision");
+  expect(review.includes("KYC_DECISION_AUDIT_ACTION"), "audited under kyc_review.decided");
+  expect(review.includes("KYC_FINAL_APPROVAL_ROLES"), "with the final-approval roles of section 2");
+  expect(review.includes("fourEyeProblems("), "calling the four-eye guard before the decision write");
+  expect(review.includes("status=eq.in_review"), "the decision is conditional on the row being in review");
+  expect(review.includes("version=eq."), "and on its current version");
   expect(reviewPage.includes("readKycReviewQueue("), "the queue page reads the queue through the service");
   expect(reviewPage.includes("<SessionKeeper"), "and keeps the session rotating");
   expect(reviewPage.includes("KycReviewQueuePanel"), "and hands the rows to the panel");
@@ -5830,7 +5857,7 @@ async function checkReviewCatalog(): Promise<void> {
     expect(path !== undefined && flat.includes(path), `the screen names no missing key (${String(path)})`);
   }
 
-  for (const templated of ["submittedAtLine", "countsLine", "companyLine", "methodLine", "providerLine", "decidedAtLine", "docMetaLine", "docKeyLine", "docHashLine", "docIssuedLine", "docPeriodLine", "docRejectedLine", "reviewDone", "uboLine", "uboScreenedLine", "screeningLine", "screeningNoteLine"]) {
+  for (const templated of ["submittedAtLine", "countsLine", "companyLine", "methodLine", "providerLine", "decidedAtLine", "decidedDone", "docMetaLine", "docKeyLine", "docHashLine", "docIssuedLine", "docPeriodLine", "docRejectedLine", "reviewDone", "uboLine", "uboScreenedLine", "screeningLine", "screeningNoteLine"]) {
     expectEqual(
       sources.includes(`getMessage("onboardingKycReview.${templated}")`),
       false,
@@ -7357,6 +7384,309 @@ async function checkPaymentHoldCatalog(): Promise<void> {
   }
 }
 
+/** ---- STEP 093: the KYC decision flow - approve or reject the whole submission, with reasons. */
+async function checkKycDecision(): Promise<void> {
+  const secondDesk = actorOf(["ceo"], null, { userId: "018f2b8a-1111-4c2d-9c3e-000000000009" });
+  const superDesk2 = actorOf(["super_admin"], null, { userId: "018f2b8a-1111-4c2d-9c3e-00000000000a" });
+  const IN_REVIEW_ID = "018f2b8a-0000-4c2d-9c3e-0000000000c3";
+  const SUBMITTED_ID = "018f2b8a-0000-4c2d-9c3e-0000000000b2";
+  const DECIDED_ID = "018f2b8a-0000-4c2d-9c3e-0000000000a7";
+
+  expectDeepEqual(
+    [...KYC_FINAL_APPROVAL_ROLES],
+    ["ceo", "super_admin"],
+    "the final approval belongs to ceo and super_admin, per section 2 and section 5",
+  );
+
+  // Approval refuses every role that is not ceo/super_admin; rejection refuses every non-office
+  // role. Both refuse before a single query.
+  for (const [description, actor] of [
+    ["compliance_kyc", desk],
+    ["finance_ops", actorOf(["finance_ops"], null, { userId: OFFICE_ID })],
+    ["support", actorOf(["support"], null, { userId: OFFICE_ID })],
+    ["blogger", actorOf(["blogger"], null, { userId: OFFICE_ID })],
+    ["an owner", owner],
+    ["nobody", actorOf([], null)],
+  ] as const) {
+    const database = createBusinessDatabase();
+    const refusal = await rejectionOf(() =>
+      decideKycSubmission(
+        { actor, body: { submission_id: IN_REVIEW_ID, decision: "approve" } },
+        dependenciesOf(database, createInMemoryAuditTrail()),
+      ),
+    );
+
+    expectEqual(refusal?.code, "PERMISSION_DENIED", `approval refuses ${description}`);
+    expectEqual(database.queries.length, 0, `and queries nothing for ${description}`);
+  }
+
+  for (const [description, actor] of [
+    ["finance_ops", actorOf(["finance_ops"], null, { userId: OFFICE_ID })],
+    ["support", actorOf(["support"], null, { userId: OFFICE_ID })],
+    ["an owner", owner],
+    ["nobody", actorOf([], null)],
+  ] as const) {
+    const database = createBusinessDatabase();
+    const refusal = await rejectionOf(() =>
+      decideKycSubmission(
+        { actor, body: { submission_id: IN_REVIEW_ID, decision: "reject", reason: "no" } },
+        dependenciesOf(database, createInMemoryAuditTrail()),
+      ),
+    );
+
+    expectEqual(refusal?.code, "PERMISSION_DENIED", `rejection refuses ${description}`);
+    expectEqual(database.queries.length, 0, `and queries nothing for ${description}`);
+  }
+
+  // Bad bodies are refused before any query: the id, the decision, the reason rules.
+  for (const [description, body, field, rule] of [
+    ["a non-uuid submission id", { submission_id: "nope", decision: "approve" }, "submission_id", "invalid_format"],
+    ["a missing submission id", { decision: "approve" }, "submission_id", "invalid_format"],
+    ["an unknown decision", { submission_id: IN_REVIEW_ID, decision: "hold" }, "decision", "invalid_format"],
+    ["a rejection without a reason", { submission_id: IN_REVIEW_ID, decision: "reject" }, "reason", "required"],
+    ["a blank rejection reason", { submission_id: IN_REVIEW_ID, decision: "reject", reason: "   " }, "reason", "invalid_format"],
+    ["a reason over 280", { submission_id: IN_REVIEW_ID, decision: "reject", reason: "x".repeat(281) }, "reason", "invalid_format"],
+  ] as const) {
+    const database = createBusinessDatabase();
+    const refusal = await rejectionOf(() =>
+      decideKycSubmission({ actor: ceoDesk, body }, dependenciesOf(database, createInMemoryAuditTrail())),
+    );
+
+    expectEqual(refusal?.code, "VALIDATION_FAILED", `the decision refuses ${description}`);
+    expect(
+      refusal?.details?.some((detail) => detail.field === field && detail.rule === rule) === true,
+      `naming ${field} ${rule} for ${description}`,
+    );
+    expectEqual(database.queries.length, 0, `and queries nothing for ${description}`);
+  }
+
+  const unknown = await rejectionOf(() =>
+    decideKycSubmission(
+      { actor: ceoDesk, body: { submission_id: "018f2b8a-9999-4c2d-9c3e-999999999999", decision: "approve" } },
+      dependenciesOf(reviewSeededDatabase(), createInMemoryAuditTrail()),
+    ),
+  );
+
+  expectEqual(unknown?.code, "RESOURCE_NOT_FOUND", "an unknown submission is not found");
+
+  // A decided row is locked by 0048's guard: the service conflicts before writing.
+  const decidedDb = reviewSeededDatabase();
+  const decided = await rejectionOf(() =>
+    decideKycSubmission(
+      { actor: ceoDesk, body: { submission_id: DECIDED_ID, decision: "approve" } },
+      dependenciesOf(decidedDb, createInMemoryAuditTrail()),
+    ),
+  );
+
+  expectEqual(decided?.code, "CONFLICT", "a decided submission conflicts");
+  expectDeepEqual(decided?.details, [{ field: "status", rule: "already_decided" }], "named already_decided");
+  expectEqual(decidedDb.updates.length, 0, "and writes nothing");
+
+  // A submission that was not opened for review conflicts as not_in_review.
+  const submittedDb = reviewSeededDatabase();
+  const notOpen = await rejectionOf(() =>
+    decideKycSubmission(
+      { actor: ceoDesk, body: { submission_id: SUBMITTED_ID, decision: "approve" } },
+      dependenciesOf(submittedDb, createInMemoryAuditTrail()),
+    ),
+  );
+
+  expectEqual(notOpen?.code, "CONFLICT", "a submitted-but-not-open row conflicts");
+  expectDeepEqual(notOpen?.details, [{ field: "status", rule: "not_in_review" }], "named not_in_review");
+  expectEqual(submittedDb.updates.length, 0, "and writes nothing");
+
+  // Four eyes: the first reviewer cannot decide alone.
+  const firstReviewerDb = reviewSeededDatabase();
+  const selfSecond = await rejectionOf(() =>
+    decideKycSubmission(
+      { actor: desk, body: { submission_id: IN_REVIEW_ID, decision: "approve" } },
+      dependenciesOf(firstReviewerDb, createInMemoryAuditTrail()),
+    ),
+  );
+
+  // desk is compliance_kyc, which may not approve at all - so use the ceo who IS the first reviewer.
+  expectEqual(selfSecond?.code, "PERMISSION_DENIED", "compliance_kyc cannot give the final approval");
+
+  const samePersonDb = reviewSeededDatabase();
+  const samePerson = await rejectionOf(() =>
+    decideKycSubmission(
+      { actor: ceoDesk, body: { submission_id: IN_REVIEW_ID, decision: "approve" } },
+      dependenciesOf(samePersonDb, createInMemoryAuditTrail()),
+    ),
+  );
+
+  expectEqual(samePerson?.code, "VALIDATION_FAILED", "the first reviewer deciding a four-eye row is refused");
+  expectDeepEqual(samePerson?.details, [{ field: "second_reviewer_id", rule: "same_reviewer" }], "named same_reviewer");
+  expectEqual(samePersonDb.updates.length, 0, "and writes nothing");
+
+  // The second reviewer approves a four-eye submission: conditional update, second reviewer named,
+  // one kyc_review.decided audit, the detail as the answer.
+  const approveDb = reviewSeededDatabase();
+  const approveAudit = createInMemoryAuditTrail();
+  const approved = await decideKycSubmission(
+    { actor: secondDesk, body: { submission_id: IN_REVIEW_ID, decision: "approve" } },
+    dependenciesOf(approveDb, approveAudit),
+  );
+  const approvedRow = approveDb.submissionRows.find((entry) => entry.id === IN_REVIEW_ID);
+
+  expectEqual(approved.status, "approved", "the returned detail says approved");
+  expectEqual(approvedRow?.status, "approved", "the row is approved");
+  expectEqual(approvedRow?.version, 2, "version bumped");
+  expectEqual(approvedRow?.["second_reviewer_id"], "018f2b8a-1111-4c2d-9c3e-000000000009", "the decider is the second reviewer");
+  expectEqual(approvedRow?.["decided_at"], new Date(NOW).toISOString(), "decided at the request's instant");
+  expectEqual(approvedRow?.["decision_reason"], null, "an approval carries no reason unless given");
+
+  const approveUpdate = approveDb.updates.find((entry) => entry.table === KYC_SUBMISSIONS_TABLE);
+
+  expect(
+    approveUpdate !== undefined &&
+      approveUpdate.query.includes(`id=eq.${IN_REVIEW_ID}`) &&
+      approveUpdate.query.includes("status=eq.in_review") &&
+      approveUpdate.query.includes("version=eq.1") &&
+      approveUpdate.query.includes("deleted_at=is.null"),
+    "the decision update is conditional on id, status in_review, version and live rows",
+  );
+  expectEqual(approveUpdate?.values["version"], 2, "the write bumps the version");
+  expectEqual(
+    approveAudit.entries.filter((entry) => entry.action === KYC_DECISION_AUDIT_ACTION).length,
+    1,
+    "every KYC decision is audited under kyc_review.decided",
+  );
+  expectEqual(
+    approveAudit.entries.find((entry) => entry.action === KYC_DECISION_AUDIT_ACTION)?.payload?.["decision"],
+    "approved",
+    "with the decision in the payload",
+  );
+  expectEqual(
+    approveAudit.entries.find((entry) => entry.action === KYC_DECISION_AUDIT_ACTION)?.payload?.["second_reviewer_id"],
+    "018f2b8a-1111-4c2d-9c3e-000000000009",
+    "recording the second reviewer",
+  );
+
+  // Rejection by the review office: open first, then reject with the trimmed reason.
+  const rejectDb = reviewSeededDatabase();
+  const rejectAudit = createInMemoryAuditTrail();
+  await openKycReview({ actor: desk, submissionId: SUBMITTED_ID }, dependenciesOf(rejectDb, rejectAudit));
+  const rejected = await decideKycSubmission(
+    {
+      actor: desk,
+      body: { submission_id: SUBMITTED_ID, decision: "reject", reason: "  documents did not match  " },
+    },
+    dependenciesOf(rejectDb, rejectAudit),
+  );
+  const rejectedRow = rejectDb.submissionRows.find((entry) => entry.id === SUBMITTED_ID);
+
+  expectEqual(rejected.status, "rejected", "the submission is rejected");
+  expectEqual(rejected.decisionReason, "documents did not match", "the reason is stored trimmed, the merchant reads it");
+  expectEqual(rejectedRow?.["second_reviewer_id"], null, "no second reviewer when four eyes are not required");
+  expectEqual(rejectedRow?.version, 3, "open then decide bumped the version twice");
+
+  const rejectUpdate = rejectDb.updates.filter((entry) => entry.table === KYC_SUBMISSIONS_TABLE)[1];
+
+  expect(
+    rejectUpdate !== undefined && rejectUpdate.query.includes("status=eq.in_review") && rejectUpdate.query.includes("version=eq.2"),
+    "the rejection is conditional on the opened row's status and version",
+  );
+  expectEqual(
+    rejectAudit.entries.filter((entry) => entry.action === KYC_DECISION_AUDIT_ACTION).length,
+    1,
+    "the rejection is audited too",
+  );
+  expectEqual(
+    rejectAudit.entries.find((entry) => entry.action === KYC_DECISION_AUDIT_ACTION)?.payload?.["reason"],
+    "documents did not match",
+    "with the trimmed reason in the payload",
+  );
+
+  // super_admin may approve as well.
+  const superDb = reviewSeededDatabase();
+  const superApproved = await decideKycSubmission(
+    { actor: superDesk2, body: { submission_id: IN_REVIEW_ID, decision: "approve", reason: "all clear" } },
+    dependenciesOf(superDb, createInMemoryAuditTrail()),
+  );
+
+  expectEqual(superApproved.status, "approved", "super_admin approves too");
+  expectEqual(superDb.submissionRows.find((entry) => entry.id === IN_REVIEW_ID)?.["decision_reason"], "all clear", "an approval may carry a note");
+
+  // A lost race on the decision write conflicts as stale, without an audit entry.
+  const raceDb = reviewSeededDatabase();
+  raceDb.submissionRace = true;
+  const raceAudit = createInMemoryAuditTrail();
+  const stale = await rejectionOf(() =>
+    decideKycSubmission(
+      { actor: secondDesk, body: { submission_id: IN_REVIEW_ID, decision: "approve" } },
+      dependenciesOf(raceDb, raceAudit),
+    ),
+  );
+
+  expectEqual(stale?.code, "CONFLICT", "a lost decision race conflicts");
+  expectDeepEqual(stale?.details, [{ field: "version", rule: "stale" }], "named stale");
+  expectEqual(
+    raceAudit.entries.filter((entry) => entry.action === KYC_DECISION_AUDIT_ACTION).length,
+    0,
+    "and a lost race is not audited as decided",
+  );
+
+  // A down audit sink never fails the decision it records.
+  const throwingAudit = {
+    append(): Promise<void> {
+      return Promise.reject(new Error("the audit sink is down"));
+    },
+  };
+  const deafDb = reviewSeededDatabase();
+  const deafApproved = await decideKycSubmission(
+    { actor: secondDesk, body: { submission_id: IN_REVIEW_ID, decision: "approve" } },
+    { rest: createBusinessStore(deafDb), audit: throwingAudit, now: () => NOW },
+  );
+
+  expectEqual(deafApproved.status, "approved", "a decision whose audit sink fails is still recorded");
+}
+
+/** ---- STEP 093 sources: the decide route, the CSRF list, the panel's new action. */
+async function checkKycDecisionSources(): Promise<void> {
+  const decideRoute = await readRepositoryFile("app/api/onboarding/kyc-decide/route.ts");
+  const review = await readRepositoryFile("services/kyc/kyc-review.ts");
+  const csrf = await readRepositoryFile("lib/security/csrf.ts");
+  const reviewPanel = await readRepositoryFile("app/(dashboard)/onboarding/kyc-review/kyc-review-queue.tsx");
+
+  expectEqual(decideRoute.split("\n")[0], "// path: app/api/onboarding/kyc-decide/route.ts", "the decide route states its own path on its first line");
+  expectEqual(/[^\t\n\r\x20-\x7E]/u.test(decideRoute), false, "the decide route is ASCII only");
+  expect(decideRoute.includes("export const POST"), "the decide route answers POST");
+  expectEqual(decideRoute.includes("export const GET"), false, "and answers no GET");
+  expect(decideRoute.includes("requireCsrfToken("), "the token is checked first");
+  expect(decideRoute.indexOf("requireCsrfToken(") < decideRoute.indexOf("readRequestActor("), "before the session is read");
+  expect(decideRoute.indexOf("requireCsrfToken(") < decideRoute.indexOf("request.text()"), "and before the body is read");
+  expect(decideRoute.includes("maximumBodyBytes"), "the body is bounded");
+  expect(decideRoute.includes('"cache-control": "no-store"'), "the answer is not cached");
+  expect(decideRoute.includes("decideKycSubmission("), "the decision goes through the service");
+  expect(decideRoute.includes("logger.info("), "and is logged");
+  expect(csrf.includes('"/api/onboarding/kyc-decide",'), "and the path is on the CSRF-protected list");
+
+  expect(review.includes("KYC_DECISION_AUDIT_ACTION = \"kyc_review.decided\""), "the service names the decision audit action");
+  expect(review.includes("already_decided"), "a decided submission conflicts with a named rule");
+  expect(review.includes("not_in_review"), "an unopened one conflicts as not_in_review");
+  expect(review.includes("same_reviewer"), "and a one-eyed four-eye decision as same_reviewer");
+  expect(review.includes("decideKycSubmissionBodySchema"), "the body schema is exported");
+  expect(review.includes("second_reviewer_id"), "the four-eye decision names its second reviewer");
+
+  expect(
+    (await readdir(new URL("app/api/onboarding/kyc-decide/", repositoryRoot))).includes("route.ts"),
+    "kyc-decide is a route handler of its own",
+  );
+  expectEqual(
+    reviewPanel.split('"/api/onboarding/kyc-decide"').length - 1,
+    1,
+    "the panel posts the decision to exactly one decide literal",
+  );
+  expect(reviewPanel.includes("decideSubmission("), "the panel owns the approve/reject action");
+  expectEqual((reviewPanel.match(/method: "POST"/gu) ?? []).length, 1, "still sharing one POST site");
+  expectEqual((reviewPanel.match(/\.\.\.\(await csrfHeaders\(\)\)/gu) ?? []).length, 1, "with one awaited CSRF spread");
+  for (const key of ["decisionHeading", "approveButton", "rejectSubmissionButton", "decideBusy", "decidedDone", "ruleNotInReview", "statusApproved", "statusRejected"]) {
+    expect(reviewPanel.includes(`onboardingKycReview.${key}`), `the panel uses the copy key ${key}`);
+  }
+  expectEqual(reviewPanel.includes("company_id"), false, "and no company field is ever sent in a body");
+}
+
 async function main(): Promise<void> {
   checkVocabulary();
   await checkRefusals();
@@ -7410,6 +7740,8 @@ async function main(): Promise<void> {
   await checkKycReviewDocument();
   await checkKycReviewRisk();
   await checkKycSources();
+  await checkKycDecision();
+  await checkKycDecisionSources();
   await checkKycCatalog();
   await checkStatusCatalog();
   await checkReviewCatalog();

@@ -99,6 +99,7 @@ export const CSRF_PROTECTED_PATHS: readonly string[] = Object.freeze([
   "/api/onboarding/kyc-review-open",
   "/api/onboarding/kyc-document-review",
   "/api/onboarding/kyc-risk-mark",
+  "/api/onboarding/kyc-decide",
   "/api/onboarding/underwriting-criteria",
   "/api/onboarding/underwriting-risk-tier",
   "/api/onboarding/underwriting-mcc-tier",
