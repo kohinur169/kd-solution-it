@@ -346,6 +346,16 @@ export async function readUnderwritingSettings(
 }
 
 /**
+ * The starting monthly limit of the `0106` criteria row, as a money string - what a new merchant's
+ * limit row is created with (STEP 091). Null when the deployment never ran `0106`.
+ */
+export async function readStartingMonthlyLimit(rest: RestClient): Promise<string | null> {
+  const row = await readCriteriaRow(rest);
+
+  return row === null ? null : row.starting_monthly_limit;
+}
+
+/**
  * The merchant-safe summary: the required bank statement period, and nothing else. The owner of a
  * company may read it - their upload has to satisfy it - while the starting limit, the hold
  * threshold and the tier costs stay with the office.

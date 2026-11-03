@@ -125,6 +125,18 @@ import {
   updateUnderwritingRiskTier,
 } from "./underwriting.ts";
 import {
+  checkTransactionAgainstLimit,
+  MERCHANT_LIMITS_TABLE,
+  MERCHANT_LIMIT_ASSIGNED_AUDIT_ACTION,
+  MERCHANT_LIMIT_ENTITY,
+  MERCHANT_LIMIT_UPDATED_AUDIT_ACTION,
+  MERCHANT_LIMIT_USAGE_AUDIT_ACTION,
+  monthKeyOf,
+  readMerchantLimit,
+  recordTransactionUsage,
+  updateMerchantLimit,
+} from "./merchant-limit.ts";
+import {
   assertProvisionable,
   PROCESSOR_PROFILE_AUDIT_ACTION,
   PROCESSOR_PROFILE_AUDIT_ENTITY,
@@ -915,8 +927,9 @@ async function checkMigrationSet(): Promise<void> {
   expectEqual(numbers.includes("0104"), true, "STEP 081's is too");
   expectEqual(numbers.includes("0105"), true, "STEP 082's is too");
   expectEqual(numbers.includes("0106"), true, "STEP 090's is too");
-  expectEqual(numbers.includes("0107"), false, "and nothing beyond them");
-  expectEqual(Math.max(...numbers.map((number) => Number.parseInt(number, 10))), 106, "the set ends at 0106");
+  expectEqual(numbers.includes("0107"), true, "STEP 091's is too");
+  expectEqual(numbers.includes("0108"), false, "and nothing beyond them");
+  expectEqual(Math.max(...numbers.map((number) => Number.parseInt(number, 10))), 107, "the set ends at 0107");
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -1019,6 +1032,19 @@ function defaultTierRows(): TierRowShape[] {
   }));
 }
 
+/** One `0107` merchant limit row, as the fake store holds it. */
+interface LimitRowShape {
+  id: string;
+  company_id: string;
+  month_key: string;
+  monthly_limit: string;
+  used_amount: string;
+  updated_by: string | null;
+  version: number;
+  updated_at: string;
+  created_at: string;
+}
+
 /** One row of `0048`, as the fake store holds it. */
 interface SubmissionRowShape {
   id: string;
@@ -1104,6 +1130,7 @@ interface BusinessDatabase {
   readonly countryRows: CountryRowShape[];
   readonly criteriaRow: CriteriaRowShape | null;
   readonly tierRows: TierRowShape[];
+  readonly limitRows: LimitRowShape[];
   readonly queries: string[];
   readonly inserts: { readonly table: string; readonly row: Readonly<Record<string, unknown>> }[];
   readonly updates: {
@@ -1114,6 +1141,8 @@ interface BusinessDatabase {
   conflictOnInsert: boolean;
   /** When true, the criteria update branch simulates a lost race: the row moves on, the write does not land. */
   criteriaRace: boolean;
+  /** When true, the limit update branch simulates a lost race the same way. */
+  limitRace: boolean;
 }
 
 function businessRow(overrides: Partial<BusinessRowShape> = {}): BusinessRowShape {
@@ -1154,6 +1183,7 @@ function createBusinessDatabase(
   screeningRows: readonly ScreeningRowShape[] = [],
   criteriaRow: CriteriaRowShape | null = defaultCriteriaRow(),
   tierRows: readonly TierRowShape[] = defaultTierRows(),
+  limitRows: readonly LimitRowShape[] = [],
 ): BusinessDatabase {
   return {
     profileRows: [...profileRows],
@@ -1166,11 +1196,13 @@ function createBusinessDatabase(
     countryRows: [...countryRows],
     criteriaRow: criteriaRow === null ? null : { ...criteriaRow },
     tierRows: [...tierRows].map((row) => ({ ...row })),
+    limitRows: [...limitRows].map((row) => ({ ...row })),
     queries: [],
     inserts: [],
     updates: [],
     conflictOnInsert: false,
     criteriaRace: false,
+    limitRace: false,
   };
 }
 
@@ -1375,7 +1407,8 @@ function createBusinessStore(database: BusinessDatabase): RestClient {
         table === KYC_SUBMISSIONS_TABLE ||
         table === KYC_DOCUMENTS_TABLE ||
         table === UBO_RECORDS_TABLE ||
-        table === SANCTIONS_SCREENINGS_TABLE
+        table === SANCTIONS_SCREENINGS_TABLE ||
+        table === MERCHANT_LIMITS_TABLE
       ) {
         const parts = query.split("&");
         const allRows = (
@@ -1385,7 +1418,9 @@ function createBusinessStore(database: BusinessDatabase): RestClient {
               ? database.documentRows
               : table === UBO_RECORDS_TABLE
                 ? database.uboRows
-                : database.screeningRows
+                : table === SANCTIONS_SCREENINGS_TABLE
+                  ? database.screeningRows
+                  : database.limitRows
         ) as unknown as readonly Record<string, unknown>[];
 
         let matched = wanted === null ? [...allRows] : allRows.filter((row) => row["company_id"] === wanted);
@@ -1600,6 +1635,35 @@ function createBusinessStore(database: BusinessDatabase): RestClient {
               created_at: created,
             });
           }
+        }
+
+        return Promise.resolve();
+      }
+
+      if (table === MERCHANT_LIMITS_TABLE) {
+        if (database.conflictOnInsert) {
+          database.conflictOnInsert = false;
+
+          return Promise.reject(new AppError("CONFLICT", { cause: { code: UNIQUE_VIOLATION } }));
+        }
+
+        for (const row of rows) {
+          database.inserts.push({ table, row: { ...row } });
+
+          const id = `018f2b8a-0000-4c2d-9c3e-${String(database.inserts.length).padStart(12, "0")}`;
+          const created = new Date(NOW).toISOString();
+
+          database.limitRows.push({
+            id,
+            company_id: String(row["company_id"] ?? ""),
+            month_key: String(row["month_key"] ?? ""),
+            monthly_limit: String(row["monthly_limit"] ?? "0.0000"),
+            used_amount: String(row["used_amount"] ?? "0.0000"),
+            updated_by: typeof row["updated_by"] === "string" ? row["updated_by"] : null,
+            version: Number(row["version"] ?? 1),
+            updated_at: created,
+            created_at: created,
+          });
         }
 
         return Promise.resolve();
@@ -1827,6 +1891,48 @@ function createBusinessStore(database: BusinessDatabase): RestClient {
             for (const [key, value] of Object.entries(values)) {
               (row as unknown as Record<string, unknown>)[key] = value;
             }
+          }
+        }
+
+        return Promise.resolve();
+      }
+
+      if (table === MERCHANT_LIMITS_TABLE) {
+        const parts = query.split("&");
+        const idPart = parts.find((part) => part.startsWith("id=eq."));
+        const versionPart = parts.find((part) => part.startsWith("version=eq."));
+        const monthPart = parts.find((part) => part.startsWith("month_key=eq."));
+        const wantedId = idPart === undefined ? null : decodeURIComponent(idPart.slice("id=eq.".length));
+        const wantedVersion =
+          versionPart === undefined ? null : Number(versionPart.slice("version=eq.".length));
+        const wantedMonth =
+          monthPart === undefined ? null : decodeURIComponent(monthPart.slice("month_key=eq.".length));
+
+        for (const row of database.limitRows) {
+          if (row.company_id !== wanted) {
+            continue;
+          }
+
+          if (wantedId !== null && row.id !== wantedId) {
+            continue;
+          }
+
+          if (wantedVersion !== null && row.version !== wantedVersion) {
+            continue;
+          }
+
+          if (wantedMonth !== null && row.month_key !== wantedMonth) {
+            continue;
+          }
+
+          if (database.limitRace) {
+            row.version += 5;
+
+            continue;
+          }
+
+          for (const [key, value] of Object.entries(values)) {
+            (row as unknown as Record<string, unknown>)[key] = value;
           }
         }
 
@@ -6136,6 +6242,409 @@ async function checkUnderwritingCatalog(): Promise<void> {
   }
 }
 
+/** ---- STEP 091: the starting transaction limit enforcement for new merchants. */
+const limitOwnerRefused: readonly (readonly [string, RequestActor])[] = [
+  ["super_admin", actorOf(["super_admin"], null, { userId: OFFICE_ID })],
+  ["ceo", ceoDesk],
+  ["compliance_kyc", desk],
+  ["finance_ops", actorOf(["finance_ops"], null, { userId: OFFICE_ID })],
+  ["support", actorOf(["support"], null, { userId: OFFICE_ID })],
+  ["blogger", actorOf(["blogger"], null, { userId: OFFICE_ID })],
+  ["nobody", actorOf([], null)],
+];
+
+/** A database with the given limit rows and everything else at its default. */
+function limitDatabaseOf(limitRows: readonly LimitRowShape[]): BusinessDatabase {
+  return createBusinessDatabase(
+    [],
+    [],
+    defaultMccRows(),
+    defaultCountryRows(),
+    [],
+    [],
+    [],
+    [],
+    defaultCriteriaRow(),
+    defaultTierRows(),
+    limitRows,
+  );
+}
+
+function limitRow(overrides: Partial<LimitRowShape> = {}): LimitRowShape {
+  return {
+    id: "018f2b8a-0000-4c2d-9c3e-0000000000f1",
+    company_id: COMPANY_A,
+    month_key: "2026-11",
+    monthly_limit: "1000.0000",
+    used_amount: "0.0000",
+    updated_by: null,
+    version: 1,
+    updated_at: "2026-11-01T10:00:00.000Z",
+    created_at: "2026-11-01T10:00:00.000Z",
+    ...overrides,
+  };
+}
+
+async function checkMerchantLimit(): Promise<void> {
+  expectEqual(monthKeyOf(NOW), "2026-11", "the gate's clock sits in November 2026 UTC");
+
+  // Owner-only functions refuse every non-owner before a query.
+  for (const [description, actor] of limitOwnerRefused) {
+    for (const [label, call] of [
+      ["the limit read", () => readMerchantLimit({ actor }, dependenciesOf(createBusinessDatabase(), createInMemoryAuditTrail()))],
+      ["the limit check", () => checkTransactionAgainstLimit({ actor, amount: "10" }, dependenciesOf(createBusinessDatabase(), createInMemoryAuditTrail()))],
+      ["the usage record", () => recordTransactionUsage({ actor, amount: "10" }, dependenciesOf(createBusinessDatabase(), createInMemoryAuditTrail()))],
+    ] as const) {
+      const database = createBusinessDatabase();
+      const deps = dependenciesOf(database, createInMemoryAuditTrail());
+      const refusal = await rejectionOf(() =>
+        label === "the limit read"
+          ? readMerchantLimit({ actor }, deps)
+          : label === "the limit check"
+            ? checkTransactionAgainstLimit({ actor, amount: "10" }, deps)
+            : recordTransactionUsage({ actor, amount: "10" }, deps),
+      );
+
+      expectEqual(refusal?.code, "PERMISSION_DENIED", `${label} refuses ${description}`);
+      expectEqual(database.queries.length, 0, `and queries nothing for ${description}`);
+      void call;
+    }
+  }
+
+  // An owner without a company is refused too.
+  const companyless = await rejectionOf(() =>
+    readMerchantLimit({ actor: actorOf(["owner"], null) }, dependenciesOf(createBusinessDatabase(), createInMemoryAuditTrail())),
+  );
+
+  expectEqual(companyless?.code, "PERMISSION_DENIED", "an owner without a company gets no limit");
+
+  // The first read creates the row from the 0106 criteria, audited as assigned.
+  const database = createBusinessDatabase();
+  const audit = createInMemoryAuditTrail();
+  const first = await readMerchantLimit({ actor: owner }, dependenciesOf(database, audit));
+
+  expectEqual(first.monthlyLimit, "1000.0000", "the new merchant starts at the criteria's starting limit");
+  expectEqual(first.monthKey, "2026-11", "in the current UTC month");
+  expectEqual(first.usedAmount, "0.0000", "with nothing used");
+  expectEqual(first.remainingAmount, "1000.0000", "so the whole limit is left");
+  expectEqual(first.companyId, COMPANY_A, "scoped to the session's company");
+
+  const assigned = database.inserts.filter((entry) => entry.table === MERCHANT_LIMITS_TABLE);
+
+  expectEqual(assigned.length, 1, "exactly one limit row is inserted");
+  expectEqual(
+    audit.entries.filter((entry) => entry.action === MERCHANT_LIMIT_ASSIGNED_AUDIT_ACTION).length,
+    1,
+    "the assignment is audited under merchant_limit.assigned",
+  );
+  expectEqual(
+    audit.entries.find((entry) => entry.action === MERCHANT_LIMIT_ASSIGNED_AUDIT_ACTION)?.payload?.["source"],
+    "underwriting_criteria",
+    "recording where the limit came from",
+  );
+
+  // The second read is idempotent: no second insert.
+  const again = await readMerchantLimit({ actor: owner }, dependenciesOf(database, audit));
+
+  expectEqual(again.monthlyLimit, "1000.0000", "the same limit");
+  expectEqual(
+    database.inserts.filter((entry) => entry.table === MERCHANT_LIMITS_TABLE).length,
+    1,
+    "no second row is created",
+  );
+  expectEqual(
+    audit.entries.filter((entry) => entry.action === MERCHANT_LIMIT_ASSIGNED_AUDIT_ACTION).length,
+    1,
+    "and no second assignment is audited",
+  );
+
+  // A lost insert race converges on the winner's row instead of failing.
+  const raceDatabase = limitDatabaseOf([limitRow()]);
+  raceDatabase.conflictOnInsert = true;
+  const raced = await readMerchantLimit({ actor: owner }, dependenciesOf(raceDatabase, createInMemoryAuditTrail()));
+
+  expectEqual(raced.monthlyLimit, "1000.0000", "a lost insert race re-reads the existing row");
+
+  // The check: inside the limit passes, over the limit conflicts before any write.
+  const checkDatabase = limitDatabaseOf([limitRow({ used_amount: "400.5000" })]);
+  const allowed = await checkTransactionAgainstLimit({ actor: owner, amount: "500.25" }, dependenciesOf(checkDatabase, createInMemoryAuditTrail()));
+
+  expectEqual(allowed.remainingAmount, "599.5000", "400.50 used of 1000 leaves 599.50, and 500.25 fits");
+  expectEqual(checkDatabase.updates.length, 0, "the check writes nothing");
+
+  const overDatabase = limitDatabaseOf([limitRow({ used_amount: "400.5000" })]);
+  const over = await rejectionOf(() =>
+    checkTransactionAgainstLimit({ actor: owner, amount: "600" }, dependenciesOf(overDatabase, createInMemoryAuditTrail())),
+  );
+
+  expectEqual(over?.code, "CONFLICT", "an amount past what is left conflicts");
+  expectDeepEqual(over?.details, [{ field: "amount", rule: "monthly_limit_exceeded" }], "named monthly_limit_exceeded");
+  expectEqual(overDatabase.updates.length, 0, "and writes nothing");
+
+  for (const [description, amount] of [
+    ["a non-numeric amount", "abc"],
+    ["a zero amount", "0"],
+    ["a negative amount", "-5"],
+    ["five decimals", "1.00001"],
+  ] as const) {
+    const badDatabase = limitDatabaseOf([limitRow()]);
+    const refusal = await rejectionOf(() =>
+      checkTransactionAgainstLimit({ actor: owner, amount }, dependenciesOf(badDatabase, createInMemoryAuditTrail())),
+    );
+
+    expectEqual(refusal?.code, "VALIDATION_FAILED", `the check refuses ${description}`);
+    expectEqual(badDatabase.updates.length, 0, `and writes nothing for ${description}`);
+  }
+
+  // Recording usage: conditional update, version bump, audit; over the limit refused before the write.
+  const recordDatabase = limitDatabaseOf([limitRow()]);
+  const recordAudit = createInMemoryAuditTrail();
+  const recorded = await recordTransactionUsage({ actor: owner, amount: "400.50" }, dependenciesOf(recordDatabase, recordAudit));
+
+  expectEqual(recorded.usedAmount, "400.5000", "the usage is recorded to four decimals");
+  expectEqual(recorded.remainingAmount, "599.5000", "and the remainder is exact");
+  expectEqual(recorded.version, 2, "version bumped");
+
+  const usageUpdate = recordDatabase.updates.find((entry) => entry.table === MERCHANT_LIMITS_TABLE);
+
+  expect(
+    usageUpdate !== undefined &&
+      usageUpdate.query.includes("id=eq.") &&
+      usageUpdate.query.includes("company_id=eq.") &&
+      usageUpdate.query.includes("version=eq.1") &&
+      usageUpdate.query.includes("month_key=eq.2026-11"),
+    "the usage update is conditional on id, company, version and month",
+  );
+  expectEqual(
+    recordAudit.entries.filter((entry) => entry.action === MERCHANT_LIMIT_USAGE_AUDIT_ACTION).length,
+    1,
+    "one usage_recorded audit entry",
+  );
+  expectEqual(
+    recordAudit.entries.find((entry) => entry.action === MERCHANT_LIMIT_USAGE_AUDIT_ACTION)?.payload?.["amount"],
+    "400.5000",
+    "with the amount in the payload",
+  );
+
+  const overRecord = await rejectionOf(() =>
+    recordTransactionUsage({ actor: owner, amount: "600.0001" }, dependenciesOf(recordDatabase, createInMemoryAuditTrail())),
+  );
+
+  expectEqual(overRecord?.code, "CONFLICT", "recording past the limit conflicts");
+  expectDeepEqual(overRecord?.details, [{ field: "amount", rule: "monthly_limit_exceeded" }], "named monthly_limit_exceeded");
+  expectEqual(
+    recordDatabase.updates.filter((entry) => entry.table === MERCHANT_LIMITS_TABLE).length,
+    1,
+    "and the refused record writes nothing",
+  );
+
+  // Exactly at the limit is allowed; one cent more is not.
+  const exact = await recordTransactionUsage({ actor: owner, amount: "599.50" }, dependenciesOf(recordDatabase, createInMemoryAuditTrail()));
+
+  expectEqual(exact.usedAmount, "1000.0000", "the limit can be used up exactly");
+  expectEqual(exact.remainingAmount, "0.0000", "with nothing left");
+
+  const centOver = await rejectionOf(() =>
+    recordTransactionUsage({ actor: owner, amount: "0.01" }, dependenciesOf(recordDatabase, createInMemoryAuditTrail())),
+  );
+
+  expectEqual(centOver?.code, "CONFLICT", "one cent over a used-up limit conflicts");
+
+  // A month rollover resets the usage in the same conditional write.
+  const staleMonth = limitDatabaseOf([limitRow({ month_key: "2026-10", used_amount: "900.0000", version: 3 })]);
+  const rollAudit = createInMemoryAuditTrail();
+  const rolled = await checkTransactionAgainstLimit({ actor: owner, amount: "999" }, dependenciesOf(staleMonth, rollAudit));
+
+  expectEqual(rolled.monthKey, "2026-11", "the row rolled into the current month");
+  expectEqual(rolled.usedAmount, "0.0000", "usage reset to zero");
+  expectEqual(rolled.version, 4, "version bumped by the rollover");
+  expectEqual(rolled.remainingAmount, "1000.0000", "the full limit is available again in the new month");
+
+  const rollUpdate = staleMonth.updates.find((entry) => entry.table === MERCHANT_LIMITS_TABLE);
+
+  expect(
+    rollUpdate !== undefined && rollUpdate.query.includes("month_key=eq.2026-10") && rollUpdate.query.includes("version=eq.3"),
+    "the rollover is conditional on the old month key and version",
+  );
+  expectEqual(
+    rollAudit.entries.filter((entry) => entry.action === MERCHANT_LIMIT_USAGE_AUDIT_ACTION).length,
+    1,
+    "the rollover is audited as usage",
+  );
+  expectEqual(
+    rollAudit.entries.find((entry) => entry.action === MERCHANT_LIMIT_USAGE_AUDIT_ACTION)?.payload?.["month_rollover"],
+    true,
+    "flagged as a rollover",
+  );
+
+  // A lost race on the usage write conflicts as stale.
+  const raceDb = limitDatabaseOf([limitRow()]);
+  raceDb.limitRace = true;
+  const stale = await rejectionOf(() =>
+    recordTransactionUsage({ actor: owner, amount: "10" }, dependenciesOf(raceDb, createInMemoryAuditTrail())),
+  );
+
+  expectEqual(stale?.code, "CONFLICT", "a lost usage race conflicts");
+  expectDeepEqual(stale?.details, [{ field: "version", rule: "stale" }], "named stale");
+
+  // The office write: manage roles only, conditional update, audit.
+  for (const [description, actor] of [["an owner", owner], ["ceo", ceoDesk], ["finance_ops", actorOf(["finance_ops"], null, { userId: OFFICE_ID })], ["nobody", actorOf([], null)]] as const) {
+    const db = limitDatabaseOf([limitRow()]);
+    const refusal = await rejectionOf(() =>
+      updateMerchantLimit({ actor, body: { company_id: COMPANY_A, monthly_limit: "5000" } }, dependenciesOf(db, createInMemoryAuditTrail())),
+    );
+
+    expectEqual(refusal?.code, "PERMISSION_DENIED", `the limit change refuses ${description}`);
+    expectEqual(db.updates.length, 0, `and writes nothing for ${description}`);
+  }
+
+  const setDatabase = limitDatabaseOf([limitRow()]);
+  const setAudit = createInMemoryAuditTrail();
+  const set = await updateMerchantLimit(
+    { actor: desk, body: { company_id: COMPANY_A, monthly_limit: "5000.00" } },
+    dependenciesOf(setDatabase, setAudit),
+  );
+
+  expectEqual(set.monthlyLimit, "5000.0000", "the office-set limit is stored to four decimals");
+  expectEqual(set.version, 2, "version bumped");
+
+  const setUpdate = setDatabase.updates.find((entry) => entry.table === MERCHANT_LIMITS_TABLE);
+
+  expect(
+    setUpdate !== undefined && setUpdate.query.includes("version=eq.1") && setUpdate.query.includes("company_id=eq."),
+    "the office update is conditional on company and version",
+  );
+  expectEqual(setUpdate?.values["updated_by"], OFFICE_ID, "the updater is recorded");
+  expectEqual(
+    setAudit.entries.filter((entry) => entry.action === MERCHANT_LIMIT_UPDATED_AUDIT_ACTION).length,
+    1,
+    "audited under merchant_limit.updated",
+  );
+  expectEqual(
+    setAudit.entries.find((entry) => entry.action === MERCHANT_LIMIT_UPDATED_AUDIT_ACTION)?.entityType,
+    MERCHANT_LIMIT_ENTITY,
+    "on the limit entity",
+  );
+
+  for (const [description, body] of [
+    ["a non-uuid company", { company_id: "nope", monthly_limit: "5000" }],
+    ["a non-numeric limit", { company_id: COMPANY_A, monthly_limit: "abc" }],
+    ["a zero limit", { company_id: COMPANY_A, monthly_limit: "0" }],
+    ["a limit over the ceiling", { company_id: COMPANY_A, monthly_limit: "100000001" }],
+    ["a missing field", { company_id: COMPANY_A }],
+  ] as const) {
+    const badDb = limitDatabaseOf([limitRow()]);
+    const refusal = await rejectionOf(() =>
+      updateMerchantLimit({ actor: desk, body }, dependenciesOf(badDb, createInMemoryAuditTrail())),
+    );
+
+    expectEqual(refusal?.code, "VALIDATION_FAILED", `the limit change refuses ${description}`);
+    expectEqual(badDb.updates.length, 0, `and writes nothing for ${description}`);
+  }
+
+  const unknownCompany = await rejectionOf(() =>
+    updateMerchantLimit(
+      { actor: desk, body: { company_id: COMPANY_B, monthly_limit: "5000" } },
+      dependenciesOf(limitDatabaseOf([limitRow()]), createInMemoryAuditTrail()),
+    ),
+  );
+
+  expectEqual(unknownCompany?.code, "RESOURCE_NOT_FOUND", "a merchant with no limit row is not found");
+
+  const staleSetDb = limitDatabaseOf([limitRow()]);
+  staleSetDb.limitRace = true;
+  const staleSet = await rejectionOf(() =>
+    updateMerchantLimit(
+      { actor: desk, body: { company_id: COMPANY_A, monthly_limit: "5000" } },
+      dependenciesOf(staleSetDb, createInMemoryAuditTrail()),
+    ),
+  );
+
+  expectEqual(staleSet?.code, "CONFLICT", "a lost race on the office write conflicts");
+  expectDeepEqual(staleSet?.details, [{ field: "version", rule: "stale" }], "named stale");
+
+  // The office read of another merchant's row is allowed by company, the owner's is not cross-company:
+  // readMerchantLimit is owner-only, and the limit row read is company-scoped by the session.
+  const crossDb = limitDatabaseOf([limitRow({ company_id: COMPANY_B, id: "018f2b8a-0000-4c2d-9c3e-0000000000f2" })]);
+  const ownRead = await readMerchantLimit({ actor: otherOwner }, dependenciesOf(crossDb, createInMemoryAuditTrail()));
+
+  expectEqual(ownRead.companyId, COMPANY_B, "the other owner reads their own company's row");
+  expect(
+    crossDb.queries.every((query) => query.includes("company_id=eq.") || query.startsWith(`${UNDERWRITING_CRITERIA_TABLE}?`)),
+    "every limit query is company-scoped except the criteria read that seeds the row",
+  );
+}
+
+/** ---- STEP 091 sources: the routes, the service, the migration, the merchant wiring. */
+async function checkMerchantLimitSources(): Promise<void> {
+  const limitRoute = await readRepositoryFile("app/api/onboarding/merchant-limit/route.ts");
+  const setRoute = await readRepositoryFile("app/api/onboarding/merchant-limit-set/route.ts");
+  const service = await readRepositoryFile("services/kyc/merchant-limit.ts");
+  const csrf = await readRepositoryFile("lib/security/csrf.ts");
+  const migration = await readRepositoryFile("migrations/0107_merchant_transaction_limits.sql");
+  const rollback = await readRepositoryFile("migrations/0107_merchant_transaction_limits.down.sql");
+  const statusPage = await readRepositoryFile("app/(dashboard)/onboarding/status/page.tsx");
+  const underwriting = await readRepositoryFile("services/kyc/underwriting.ts");
+
+  for (const [path, source] of [
+    ["app/api/onboarding/merchant-limit/route.ts", limitRoute],
+    ["app/api/onboarding/merchant-limit-set/route.ts", setRoute],
+    ["services/kyc/merchant-limit.ts", service],
+  ] as const) {
+    expectEqual(source.split("\n")[0], `// path: ${path}`, `${path} states its own path on its first line`);
+    expectEqual(/[^\t\n\r\x20-\x7E]/u.test(source), false, `${path} is ASCII only`);
+  }
+
+  expect(limitRoute.includes("export const GET"), "the limit route answers GET");
+  expectEqual(limitRoute.includes("export const POST"), false, "and answers no POST");
+  expect(limitRoute.includes("readMerchantLimit("), "reading through the service");
+  expectEqual(limitRoute.includes("searchParams"), false, "and no company comes from the query string");
+
+  expect(setRoute.includes("export const POST"), "the limit-set route answers POST");
+  expectEqual(setRoute.includes("export const GET"), false, "and answers no GET");
+  expect(setRoute.includes("requireCsrfToken("), "the token is checked first");
+  expect(setRoute.indexOf("requireCsrfToken(") < setRoute.indexOf("readRequestActor("), "before the session is read");
+  expect(setRoute.indexOf("requireCsrfToken(") < setRoute.indexOf("request.text()"), "and before the body is read");
+  expect(setRoute.includes("maximumBodyBytes"), "the body is bounded");
+  expect(setRoute.includes('"cache-control": "no-store"'), "the answer is not cached");
+  expect(setRoute.includes("updateMerchantLimit("), "the save goes through the service");
+  expect(csrf.includes('"/api/onboarding/merchant-limit-set",'), "and the path is on the CSRF-protected list");
+
+  expect(service.includes('MERCHANT_LIMITS_TABLE = "merchant_transaction_limits"'), "the service names the 0107 table");
+  expect(service.includes("monthly_limit_exceeded"), "over-limit amounts conflict with a named rule");
+  expect(service.includes("version=eq."), "every write is conditional on the current version");
+  expect(service.includes("month_key=eq."), "the rollover and the usage write pin the month key");
+  expect(service.includes("BigInt"), "money math is integer minor units, no float");
+  expectEqual(service.includes("Math."), false, "no float math anywhere in the service");
+  expect(service.includes(MERCHANT_LIMIT_ASSIGNED_AUDIT_ACTION), "the assignment is audited");
+  expect(service.includes(MERCHANT_LIMIT_UPDATED_AUDIT_ACTION), "the office change is audited");
+  expect(service.includes(MERCHANT_LIMIT_USAGE_AUDIT_ACTION), "the usage is audited");
+  expect(service.includes("readStartingMonthlyLimit"), "the row is born from the 0106 criteria");
+  expect(underwriting.includes("export async function readStartingMonthlyLimit"), "the criteria export exists");
+
+  expect(migration.includes("create table public.merchant_transaction_limits"), "the migration creates the table");
+  expect(migration.includes("used_amount >= 0 and used_amount <= monthly_limit"), "the database enforces the ceiling itself");
+  expect(migration.includes("merchant_transaction_limits_company_key"), "one live row per merchant");
+  expect(migration.includes("merchant_transaction_limits_owner_read"), "the owner reads their own row");
+  expect(migration.includes("merchant_transaction_limits_manage_all"), "only compliance and super_admin write");
+  expect(rollback.includes("drop table if exists public.merchant_transaction_limits;"), "the rollback drops the table");
+
+  expect(statusPage.includes("readMerchantLimit("), "the status screen reads the merchant's limit");
+  expect(statusPage.includes('"onboardingStatus.limitHeading"'), "and shows its heading");
+  expect(statusPage.includes('formatMessage("onboardingStatus.limitLine"'), "and the templated line with its values");
+
+  for (const folder of ["merchant-limit", "merchant-limit-set"]) {
+    expect(
+      (await readdir(new URL(`app/api/onboarding/${folder}/`, repositoryRoot))).includes("route.ts"),
+      `${folder} is a route handler of its own`,
+    );
+  }
+  expect(
+    (await readdir(new URL("services/kyc/", repositoryRoot))).includes("merchant-limit.ts"),
+    "the limit service lives in services/kyc",
+  );
+}
+
 async function main(): Promise<void> {
   checkVocabulary();
   await checkRefusals();
@@ -6195,6 +6704,8 @@ async function main(): Promise<void> {
   await checkUnderwriting();
   await checkUnderwritingSources();
   await checkUnderwritingCatalog();
+  await checkMerchantLimit();
+  await checkMerchantLimitSources();
 
   if (failures.length > 0) {
     process.stderr.write(`onboarding gate failed with ${failures.length} problem(s):\n`);
@@ -6212,7 +6723,7 @@ async function main(): Promise<void> {
     `onboarding gate passed: ${checks} checks, ${ONBOARDING_STEPS.length} steps, ` +
       `${ONBOARDING_OWNER_ROLES.length} role, ${BUSINESS_PROFILE_FIELDS.length} business fields, ` +
       `${PROCESSOR_REQUIREMENT_LIST.length} processors, ${BUSINESS_PROFILE_TABLE} table, ` +
-      `${MCC_CODES_TABLE} vocabulary, ${COUNTRIES_TABLE} list, submerchant profile, kyc pack, underwriting criteria\n`,
+      `${MCC_CODES_TABLE} vocabulary, ${COUNTRIES_TABLE} list, submerchant profile, kyc pack, underwriting criteria, merchant limits\n`,
   );
 }
 

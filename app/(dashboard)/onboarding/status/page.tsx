@@ -7,6 +7,7 @@ import { getAuthRuntime } from "@/lib/auth/runtime";
 import { AppError } from "@/lib/errors/app-error";
 import { formatMessage, getMessage, type MessagePath } from "@/lib/i18n/messages";
 import { readKycSummary, type KycSummarySnapshot } from "@/services/kyc/kyc-capture";
+import { readMerchantLimit, type MerchantLimitSnapshot } from "@/services/kyc/merchant-limit";
 import { StatusForm } from "./status-form";
 import { readOwnerActor } from "../owner-actor";
 
@@ -39,7 +40,7 @@ type StatusPageState =
   | { readonly kind: "signed-out" }
   | { readonly kind: "forbidden" }
   | { readonly kind: "unavailable" }
-  | { readonly kind: "ready"; readonly snapshot: KycSummarySnapshot };
+  | { readonly kind: "ready"; readonly snapshot: KycSummarySnapshot; readonly limit: MerchantLimitSnapshot };
 
 async function readStatusState(): Promise<StatusPageState> {
   const actorState = await readOwnerActor();
@@ -60,7 +61,14 @@ async function readStatusState(): Promise<StatusPageState> {
       { rest: runtime.rest, audit: runtime.audit },
     );
 
-    return { kind: "ready", snapshot };
+    // STEP 091: the merchant's own starting monthly limit, created from the underwriting criteria
+    // on first read, shown here so they know what they can transact before review raises it.
+    const limit = await readMerchantLimit(
+      { actor: actorState.actor },
+      { rest: runtime.rest, audit: runtime.audit },
+    );
+
+    return { kind: "ready", snapshot, limit };
   } catch (error) {
     if (error instanceof AppError && error.code === "AUTHENTICATION_REQUIRED") {
       return { kind: "signed-out" };
@@ -156,6 +164,18 @@ export default async function OnboardingStatusPage(): Promise<ReactNode> {
                 </li>
                 <li>{formatMessage("onboardingStatus.screenedLine", { count: String(state.snapshot.screenedCount) })}</li>
               </ul>
+            </section>
+
+            <section className={sectionClasses}>
+              <h2 className={sectionHeadingClasses}>{getMessage("onboardingStatus.limitHeading")}</h2>
+              <p className={noteClasses}>
+                {formatMessage("onboardingStatus.limitLine", {
+                  limit: state.limit.monthlyLimit,
+                  used: state.limit.usedAmount,
+                  month: state.limit.monthKey,
+                  remaining: state.limit.remainingAmount,
+                })}
+              </p>
             </section>
 
             <section className={sectionClasses}>

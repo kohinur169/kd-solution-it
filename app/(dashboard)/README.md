@@ -71,6 +71,15 @@ Every read is scoped to the caller company and every write is audit logged.
   one criterion that governs their upload - the required bank statement period, which the documents
   route now enforces server side. `POST /api/onboarding/underwriting-criteria`,
   `/underwriting-risk-tier`, `/underwriting-mcc-tier`, `GET /api/onboarding/underwriting-mcc`).
+- STEP 091 enforces the criteria's starting limit per merchant: `0107_merchant_transaction_limits.sql`
+  holds one row per company (assigned `monthly_limit`, UTC `month_key`, `used_amount`, with the
+  `used_amount <= monthly_limit` check as the database backstop); `services/kyc/merchant-limit.ts`
+  creates the row lazily from `underwriting_criteria` on first read (audited `merchant_limit.assigned`),
+  and `checkTransactionAgainstLimit` / `recordTransactionUsage` are the per-transaction enforcement the
+  payment core will call (CONFLICT `monthly_limit_exceeded`, month rollover, conditional version-bumped
+  updates, `merchant_limit.usage_recorded` audit; money as BigInt minor units, no float);
+  `updateMerchantLimit` is the office's raise/lower (`POST /api/onboarding/merchant-limit-set`);
+  `GET /api/onboarding/merchant-limit` serves the merchant's own limit, shown on the status screen.
 
 ## The reader
 

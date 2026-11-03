@@ -1610,6 +1610,8 @@ const catalog = {
     missingNone: "Nothing is missing - you can submit now.",
     missingDocuments: "at least one uploaded document",
     missingScreening: "the sanctions and PEP screening run",
+    limitHeading: "Your monthly transaction limit",
+    limitLine: "Starting limit {limit} USD per month; {used} USD used in {month}, so {remaining} USD is left.",
     submitButton: "Submit for review",
     submitBusy: "Submitting",
     submitDone: "Submitted. The office reviews it now, and the decision appears here.",
