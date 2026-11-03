@@ -127,6 +127,15 @@ Every read is scoped to the caller company and every write is audit logged.
   with one conditional version-guarded update naming the document (`fulfilled_by`), audited
   `kyc_document_request.created` / `.fulfilled`. The webhook pipeline of the payment block enqueues
   the job; no new route was added.
+- STEP 098 runs section 4's duplicate identity check at the KYC submission and before sub-merchant
+  creation: `services/kyc/duplicate-check.ts` collects the applicant's six signals (email, phone,
+  identity document hash, tax id, bank account fingerprint, legal name with date of birth), matches
+  each against live rows of other companies, and records one open `0110` `duplicate_cases` row per
+  matched signal (audited `duplicate_case.opened`, idempotent per tenant + stage + signal). A match
+  blocks: the KYC submit conflicts with the generic `duplicate_identity` rule (the applicant is told
+  an account already exists, never which signal matched) and the provisioning run returns
+  `blocked: true` without writing a row. `checkSignupIdentity` is the signup-stage entry point for
+  the auth-owned signup flow. No new route, no new page.
 
 ## The reader
 

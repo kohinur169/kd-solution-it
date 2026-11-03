@@ -19,12 +19,13 @@ import { csrfHeaders } from "@/lib/security/csrf-client";
 
 const SUBMIT_PATH = "/api/onboarding/kyc-submit";
 
-type RuleKey = "required" | "already_submitted" | "stale" | "invalid_format";
+type RuleKey = "required" | "already_submitted" | "stale" | "invalid_format" | "duplicate_identity";
 
 const RULE_MESSAGES: Readonly<Record<RuleKey, MessagePath>> = Object.freeze({
   required: "onboardingStatus.ruleRequired",
   already_submitted: "onboardingStatus.ruleAlreadySubmitted",
   stale: "onboardingStatus.ruleStale",
+  duplicate_identity: "onboardingStatus.ruleDuplicateIdentity",
   invalid_format: "onboardingStatus.ruleRequired",
 });
 

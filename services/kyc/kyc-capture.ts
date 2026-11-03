@@ -30,6 +30,7 @@ import {
 import { getAuthRuntime } from "../../lib/auth/runtime.ts";
 import { PROVIDER_KEYS } from "../../lib/gateways/registry.ts";
 import { enqueueJob, type JobRegistry } from "../../lib/jobs/registry.ts";
+import { checkDuplicateIdentity, DUPLICATE_IDENTITY_RULE } from "./duplicate-check.ts";
 import type { JobQueue } from "../../lib/jobs/queue.ts";
 import type { EnqueueResult, JobDefinition } from "../../lib/jobs/types.ts";
 
@@ -1594,6 +1595,17 @@ export async function submitKyc(
 
   if (missing.length > 0) {
     throw new AppError("VALIDATION_FAILED", { details: missing });
+  }
+
+  // STEP 098: section 4's duplicate check runs at the KYC submission. A match blocks the submit and
+  // opens a case for compliance_kyc; the answer is generic and never names the signal that matched.
+  const duplicate = await checkDuplicateIdentity(
+    { companyId, stage: "kyc_submission", actor: input.actor },
+    dependencies,
+  );
+
+  if (duplicate.blocked) {
+    throw new AppError("CONFLICT", { details: [{ field: "identity", rule: DUPLICATE_IDENTITY_RULE }] });
   }
 
   // Conditional on the row still being the draft, so a second tab's submit loses the race.

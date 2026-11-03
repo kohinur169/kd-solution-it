@@ -1630,6 +1630,8 @@ const catalog = {
     ruleRequired: "This is still missing before the submission can be sent.",
     ruleAlreadySubmitted: "This submission was already sent for review.",
     ruleStale: "The submission changed in another tab; reload the page.",
+    ruleDuplicateIdentity:
+      "An account with these details already exists on the platform, so this submission was not sent. The compliance office reviews the match.",
     signedOut: "Sign in with a merchant account to see your KYC status.",
     forbidden:
       "This screen belongs to a merchant owner account. An office account reviews submissions from the office screens.",

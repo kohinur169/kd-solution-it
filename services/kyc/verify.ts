@@ -105,6 +105,17 @@ import {
   registerKycDocumentRequestJob,
 } from "./kyc-capture.ts";
 import {
+  checkDuplicateIdentity,
+  checkSignupIdentity,
+  collectIdentitySignals,
+  DUPLICATE_CASES_TABLE,
+  DUPLICATE_CASE_ENTITY,
+  DUPLICATE_CASE_OPENED_AUDIT_ACTION,
+  DUPLICATE_IDENTITY_RULE,
+  DUPLICATE_STAGES,
+  IDENTITY_SIGNALS,
+} from "./duplicate-check.ts";
+import {
   decideKycSubmission,
   fourEyeProblems,
   KYC_DECISION_AUDIT_ACTION,
@@ -981,7 +992,8 @@ async function checkMigrationSet(): Promise<void> {
   expectEqual(numbers.includes("0107"), true, "STEP 091's is too");
   expectEqual(numbers.includes("0108"), true, "STEP 092's is too");
   expectEqual(numbers.includes("0109"), true, "STEP 097's is too");
-  expectEqual(Math.max(...numbers.map((number) => Number.parseInt(number, 10))), 109, "the set ends at 0109");
+  expectEqual(numbers.includes("0110"), true, "STEP 098's is too");
+  expectEqual(Math.max(...numbers.map((number) => Number.parseInt(number, 10))), 110, "the set ends at 0110");
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -989,6 +1001,7 @@ async function checkMigrationSet(): Promise<void> {
  * ---------------------------------------------------------------------------------------------- */
 
 interface BusinessRowShape {
+  id?: string;
   company_id: string;
   legal_name: string | null;
   trading_name: string | null;
@@ -1268,6 +1281,41 @@ interface DocumentRequestRowShape {
   created_at: string;
 }
 
+/** One row of `0003`. */
+interface UserRowShape {
+  id: string;
+  company_id: string | null;
+  email: string;
+  phone: string | null;
+  full_name: string;
+  created_at: string;
+}
+
+/** One row of `0046`. */
+interface BankAccountRowShape {
+  id: string;
+  company_id: string;
+  account_fingerprint: string;
+  created_at: string;
+}
+
+/** One row of `0110`. */
+interface DuplicateCaseRowShape {
+  id: string;
+  company_id: string;
+  stage: string;
+  signal: string;
+  matched_company_id?: string | null;
+  matched_user_id?: string | null;
+  status: string;
+  reviewed_by?: string | null;
+  reviewed_at?: string | null;
+  resolution?: string | null;
+  version?: number;
+  updated_at?: string;
+  created_at: string;
+}
+
 /** One row of `0050`. */
 interface UboRowShape {
   id: string;
@@ -1321,6 +1369,9 @@ interface BusinessDatabase {
   readonly webhookRows: WebhookEventRowShape[];
   readonly companyRows: CompanyRowShape[];
   readonly requestRows: DocumentRequestRowShape[];
+  readonly userRows: UserRowShape[];
+  readonly bankRows: BankAccountRowShape[];
+  readonly caseRows: DuplicateCaseRowShape[];
   readonly queries: string[];
   readonly inserts: { readonly table: string; readonly row: Readonly<Record<string, unknown>> }[];
   readonly updates: {
@@ -1391,6 +1442,9 @@ function createBusinessDatabase(
   webhookRows: readonly WebhookEventRowShape[] = [],
   companyRows: readonly CompanyRowShape[] = defaultCompanyRows(),
   requestRows: readonly DocumentRequestRowShape[] = [],
+  userRows: readonly UserRowShape[] = defaultUserRows(),
+  bankRows: readonly BankAccountRowShape[] = [],
+  caseRows: readonly DuplicateCaseRowShape[] = [],
 ): BusinessDatabase {
   return {
     profileRows: [...profileRows],
@@ -1411,6 +1465,9 @@ function createBusinessDatabase(
     webhookRows: [...webhookRows].map((row) => ({ ...row })),
     companyRows: [...companyRows].map((row) => ({ ...row })),
     requestRows: [...requestRows].map((row) => ({ ...row })),
+    userRows: [...userRows].map((row) => ({ ...row })),
+    bankRows: [...bankRows].map((row) => ({ ...row })),
+    caseRows: [...caseRows].map((row) => ({ ...row })),
     queries: [],
     inserts: [],
     updates: [],
@@ -1430,6 +1487,20 @@ function defaultCompanyRows(): CompanyRowShape[] {
   return [
     { id: COMPANY_A, company_id: COMPANY_A },
     { id: COMPANY_B, company_id: COMPANY_B },
+  ];
+}
+
+/** The `0003` users the gate works against: the owner account of the first company. */
+function defaultUserRows(): UserRowShape[] {
+  return [
+    {
+      id: OWNER_ID,
+      company_id: COMPANY_A,
+      email: "owner@example.test",
+      phone: "+8801000000001",
+      full_name: "Owner One",
+      created_at: "2026-11-01T08:00:00.000Z",
+    },
   ];
 }
 
@@ -1517,6 +1588,32 @@ function createBusinessStore(database: BusinessDatabase): RestClient {
     }
 
     return company === undefined ? null : decodeURIComponent(company.slice("company_id=eq.".length));
+  };
+
+  // STEP 098: the duplicate check matches signal columns across companies with plain eq filters.
+  const eqFilter = (
+    rows: readonly Record<string, unknown>[],
+    parts: readonly string[],
+  ): Record<string, unknown>[] => {
+    let matched = [...rows];
+
+    for (const part of parts) {
+      const eq = /^([a-z_]+)=eq\.(.+)$/u.exec(part);
+
+      if (eq !== null) {
+        const column = eq[1] ?? "";
+        const value = decodeURIComponent(eq[2] ?? "");
+        matched = matched.filter((row) => String(row[column]) === value);
+      }
+    }
+
+    return matched;
+  };
+
+  const limitOf = (parts: readonly string[]): number | null => {
+    const limit = parts.find((part) => part.startsWith("limit="));
+
+    return limit === undefined ? null : Number.parseInt(limit.slice("limit=".length), 10);
   };
 
   return {
@@ -1852,6 +1949,45 @@ function createBusinessStore(database: BusinessDatabase): RestClient {
         return Promise.resolve(withDefaults.map((row) => schema.parse(row)));
       }
 
+      // The `0003` users, the `0046` payout bank accounts and the `0110` duplicate cases: the
+      // duplicate check reads them with plain eq filters, across companies where it matches.
+      if (table === "users" || table === "payout_bank_accounts" || table === DUPLICATE_CASES_TABLE) {
+        const parts = query.split("&");
+
+        if (!parts.includes("deleted_at=is.null")) {
+          return Promise.reject(new Error(`the ${table} read is not over live rows: ${query}`));
+        }
+
+        const allRows = (
+          table === "users"
+            ? database.userRows
+            : table === "payout_bank_accounts"
+              ? database.bankRows
+              : database.caseRows
+        ) as unknown as readonly Record<string, unknown>[];
+        const matched = eqFilter(allRows, parts);
+        const limit = limitOf(parts);
+        const capped = limit === null ? matched : matched.slice(0, limit);
+        const withDefaults = capped.map((row) => ({
+          ...(table === "users" ? { phone: null } : {}),
+          ...(table === DUPLICATE_CASES_TABLE
+            ? {
+                matched_company_id: null,
+                matched_user_id: null,
+                status: "open",
+                reviewed_by: null,
+                reviewed_at: null,
+                resolution: null,
+                version: 1,
+                updated_at: row["created_at"],
+              }
+            : {}),
+          ...row,
+        }));
+
+        return Promise.resolve(withDefaults.map((row) => schema.parse(row)));
+      }
+
       const wanted = scopedCompany(query);
 
       // The KYC tables of 0048-0051: company-scoped like the profile, with their own eq filters.
@@ -1878,11 +2014,12 @@ function createBusinessStore(database: BusinessDatabase): RestClient {
         let matched = wanted === null ? [...allRows] : allRows.filter((row) => row["company_id"] === wanted);
 
         for (const part of parts) {
-          for (const column of ["status", "submission_id", "id", "subject_id", "storage_key"] as const) {
-            if (part.startsWith(`${column}=eq.`)) {
-              const value = decodeURIComponent(part.slice(column.length + 4));
-              matched = matched.filter((row) => row[column] === value);
-            }
+          const eq = /^([a-z_]+)=eq\.(.+)$/u.exec(part);
+
+          if (eq !== null) {
+            const column = eq[1] ?? "";
+            const value = decodeURIComponent(eq[2] ?? "");
+            matched = matched.filter((row) => String(row[column]) === value);
           }
 
           if (part.startsWith("status=in.(")) {
@@ -1944,6 +2081,21 @@ function createBusinessStore(database: BusinessDatabase): RestClient {
 
       if (table === BUSINESS_PROFILE_TABLE) {
         if (wanted === null) {
+          // STEP 098: the duplicate check matches contact_phone and tax_id across companies.
+          const signalEq = /^select=id,company_id&(contact_phone|tax_id)=eq\./u.exec(query);
+
+          if (signalEq !== null) {
+            const column = signalEq[1] ?? "";
+            const value = decodeURIComponent(query.split(`${column}=eq.`)[1]?.split("&")[0] ?? "");
+            const matched = database.profileRows.filter((row) => String((row as unknown as Record<string, unknown>)[column]) === value);
+            const limit = limitOf(query.split("&"));
+            const capped = limit === null ? matched : matched.slice(0, limit);
+
+            return Promise.resolve(
+              capped.map((row) => schema.parse({ id: row.id ?? row.company_id, company_id: row.company_id })),
+            );
+          }
+
           // The one deliberate cross-company profile read: the underwriting MCC overview of
           // STEP 090, which counts profiles by the code they carry and selects nothing else.
           if (query.includes("mcc_code=not.is.null")) {
@@ -2152,6 +2304,33 @@ function createBusinessStore(database: BusinessDatabase): RestClient {
           }
 
           database.requestRows.push(materialised);
+        }
+
+        return Promise.resolve();
+      }
+
+      if (table === DUPLICATE_CASES_TABLE) {
+        for (const row of rows) {
+          database.inserts.push({ table, row: { ...row } });
+
+          const id = `018f2b8a-0000-4c2d-9c3e-${String(database.caseRows.length + 1).padStart(12, "0")}`;
+          const created = new Date(NOW).toISOString();
+
+          database.caseRows.push({
+            id,
+            company_id: String(row["company_id"] ?? ""),
+            stage: String(row["stage"] ?? ""),
+            signal: String(row["signal"] ?? ""),
+            matched_company_id: typeof row["matched_company_id"] === "string" ? row["matched_company_id"] : null,
+            matched_user_id: typeof row["matched_user_id"] === "string" ? row["matched_user_id"] : null,
+            status: String(row["status"] ?? "open"),
+            reviewed_by: null,
+            reviewed_at: null,
+            resolution: null,
+            version: 1,
+            updated_at: created,
+            created_at: created,
+          });
         }
 
         return Promise.resolve();
@@ -9233,6 +9412,326 @@ async function checkDocumentRequestsSources(): Promise<void> {
   expect(forward.includes("kyc_document_requests_default_deny"), "and carries the default-deny policy");
 }
 
+/** ---- STEP 098: the duplicate identity check of section 4. */
+const OTHER_USER_ID = "018f2b8a-1111-4c2d-9c3e-000000000002";
+const DUPLICATE_TAX_ID = "TAX-998877";
+const DUPLICATE_PHONE = "+8801000000002";
+const DUPLICATE_HASH = "a".repeat(64);
+const DUPLICATE_FINGERPRINT = "b".repeat(64);
+
+/** A database whose COMPANY_A applicant carries every signal, matched by COMPANY_B rows. */
+function duplicateSeededDatabase(): BusinessDatabase {
+  const database = createBusinessDatabase();
+
+  database.profileRows.push(
+    businessRow({
+      id: "018f2b8a-0000-4c2d-9c3e-0000000000a1",
+      company_id: COMPANY_A,
+      legal_name: "Acme One Ltd",
+      tax_id: DUPLICATE_TAX_ID,
+      contact_phone: DUPLICATE_PHONE,
+    }),
+    businessRow({
+      id: "018f2b8a-0000-4c2d-9c3e-0000000000a2",
+      company_id: COMPANY_B,
+      legal_name: "Acme Two Ltd",
+      tax_id: DUPLICATE_TAX_ID,
+      contact_phone: DUPLICATE_PHONE,
+    }),
+  );
+
+  database.userRows.push({
+    id: OTHER_USER_ID,
+    company_id: COMPANY_B,
+    email: "other@example.test",
+    phone: DUPLICATE_PHONE,
+    full_name: "Owner Two",
+    created_at: "2026-11-01T08:05:00.000Z",
+  });
+
+  // The applicant's own phone matches COMPANY_B's user phone; its email is its own.
+  database.userRows[0] = {
+    ...database.userRows[0] as UserRowShape,
+    phone: DUPLICATE_PHONE,
+  };
+
+  database.uboRows.push(
+    {
+      id: "018f2b8a-0000-4c2d-9c3e-0000000000b1",
+      company_id: COMPANY_A,
+      submission_id: DRAFT_SUBMISSION_ID,
+      full_name: "Owner One",
+      date_of_birth: "1990-01-01",
+      country: "BD",
+      ownership_bps: 10_000,
+      is_significant: true,
+      id_document_sha256: DUPLICATE_HASH,
+      is_pep: false,
+      screened_at: null,
+      created_at: "2026-11-02T09:20:00.000Z",
+    },
+    {
+      id: "018f2b8a-0000-4c2d-9c3e-0000000000b2",
+      company_id: COMPANY_B,
+      submission_id: OTHER_SUBMISSION_ID,
+      full_name: "Owner One",
+      date_of_birth: "1990-01-01",
+      country: "BD",
+      ownership_bps: 10_000,
+      is_significant: true,
+      id_document_sha256: DUPLICATE_HASH,
+      is_pep: false,
+      screened_at: null,
+      created_at: "2026-11-02T09:25:00.000Z",
+    },
+  );
+
+  database.bankRows.push(
+    {
+      id: "018f2b8a-0000-4c2d-9c3e-0000000000c1",
+      company_id: COMPANY_A,
+      account_fingerprint: DUPLICATE_FINGERPRINT,
+      created_at: "2026-11-02T09:30:00.000Z",
+    },
+    {
+      id: "018f2b8a-0000-4c2d-9c3e-0000000000c2",
+      company_id: COMPANY_B,
+      account_fingerprint: DUPLICATE_FINGERPRINT,
+      created_at: "2026-11-02T09:31:00.000Z",
+    },
+  );
+
+  return database;
+}
+
+async function checkDuplicateIdentityGate(): Promise<void> {
+  expectEqual(DUPLICATE_CASES_TABLE, "duplicate_cases", "the case table of 0110");
+  expectEqual(DUPLICATE_IDENTITY_RULE, "duplicate_identity", "the applicant-facing rule of a block");
+  expectEqual(DUPLICATE_CASE_ENTITY, "duplicate_case", "the case audit entity");
+  expectDeepEqual(
+    [...IDENTITY_SIGNALS],
+    ["email", "phone", "identity_document_hash", "tax_id", "bank_account_fingerprint", "legal_name_with_dob"],
+    "the six signals of section 4, in its order",
+  );
+  expectDeepEqual([...DUPLICATE_STAGES], ["signup", "kyc_submission", "provisioning"], "the three stages of the title");
+
+  // Signal collection: one bounded read per source table, every signal of the applicant.
+  const collectDatabase = duplicateSeededDatabase();
+  const signals = await collectIdentitySignals(COMPANY_A, createBusinessStore(collectDatabase));
+  const bySignal = new Map<string, number>();
+
+  for (const entry of signals) {
+    bySignal.set(entry.signal, (bySignal.get(entry.signal) ?? 0) + 1);
+  }
+
+  expectEqual(bySignal.get("email"), 1, "the account email is a signal");
+  expectEqual(bySignal.get("phone"), 2, "the account phone and the contact phone are phone signals");
+  expectEqual(bySignal.get("tax_id"), 1, "the profile tax id is a signal");
+  expectEqual(bySignal.get("identity_document_hash"), 1, "the owner document hash is a signal");
+  expectEqual(bySignal.get("legal_name_with_dob"), 1, "the owner name with date of birth is a signal");
+  expectEqual(bySignal.get("bank_account_fingerprint"), 1, "the bank account fingerprint is a signal");
+
+  // No match anywhere: not blocked, nothing recorded.
+  const cleanDatabase = createBusinessDatabase();
+  const cleanAudit = createInMemoryAuditTrail();
+  const clean = await checkDuplicateIdentity(
+    { companyId: COMPANY_A, stage: "kyc_submission" },
+    dependenciesOf(cleanDatabase, cleanAudit),
+  );
+
+  expectEqual(clean.blocked, false, "an applicant with no foreign match is not blocked");
+  expectEqual(clean.matches.length, 0, "with no matches");
+  expectEqual(cleanDatabase.caseRows.length, 0, "and no case is recorded");
+  expectEqual(cleanAudit.entries.length, 0, "and nothing is audited");
+
+  // Every signal matched by COMPANY_B: blocked, one open case per signal, one audit each.
+  const database = duplicateSeededDatabase();
+  const audit = createInMemoryAuditTrail();
+  const result = await checkDuplicateIdentity(
+    { companyId: COMPANY_A, stage: "kyc_submission", actor: owner },
+    dependenciesOf(database, audit),
+  );
+
+  expectEqual(result.blocked, true, "a foreign match on any signal blocks");
+  expect(
+    result.matches.every((match) => match.matchedCompanyId === COMPANY_B),
+    "every match names the other company",
+  );
+  expectEqual(database.caseRows.length, 5, "one open case per matched signal (the email is unique, so it cannot match)");
+  expect(
+    database.caseRows.every((row) => row.status === "open" && row.stage === "kyc_submission" && row.company_id === COMPANY_A),
+    "each case is open, at the kyc stage, filed under the applicant",
+  );
+  expectDeepEqual(
+    [...database.caseRows.map((row) => row.signal)].sort(),
+    ["bank_account_fingerprint", "identity_document_hash", "legal_name_with_dob", "phone", "tax_id"],
+    "covering every signal that can match across accounts",
+  );
+  expect(
+    database.caseRows.every((row) => row.matched_company_id === COMPANY_B),
+    "each case names the matched company",
+  );
+  expectEqual(
+    database.caseRows.find((row) => row.signal === "phone")?.matched_user_id,
+    OTHER_USER_ID,
+    "a match on the account phone names the matched user",
+  );
+  expectEqual(audit.entries.length, 5, "one audit per case");
+  expect(
+    audit.entries.every((entry) => entry.action === DUPLICATE_CASE_OPENED_AUDIT_ACTION && entry.entityType === DUPLICATE_CASE_ENTITY),
+    "each under duplicate_case.opened on the case entity",
+  );
+  expectEqual(audit.entries[0]?.actorUserId, OWNER_ID, "with the applicant as the actor");
+
+  // A repeated check at the same stage converges on the open cases instead of piling up.
+  const again = await checkDuplicateIdentity(
+    { companyId: COMPANY_A, stage: "kyc_submission", actor: owner },
+    dependenciesOf(database, audit),
+  );
+
+  expectEqual(again.blocked, true, "still blocked");
+  expectEqual(database.caseRows.length, 5, "but no second case per signal");
+  expectEqual(audit.entries.length, 5, "and no second audit");
+
+  // The signup stage: the email is the only signal present, and the case is filed under the matched
+  // tenant because a blocked applicant has no company of its own yet.
+  const signupAudit = createInMemoryAuditTrail();
+  const signupDatabase = duplicateSeededDatabase();
+  const signup = await checkSignupIdentity(
+    { email: "other@example.test" },
+    dependenciesOf(signupDatabase, signupAudit),
+  );
+
+  expectEqual(signup.blocked, true, "a registered email blocks the signup");
+  expectEqual(signup.matches[0]?.matchedUserId, OTHER_USER_ID, "naming the matched account");
+  expectEqual(signupDatabase.caseRows.length, 1, "one case recorded");
+  expectEqual(signupDatabase.caseRows[0]?.stage, "signup", "at the signup stage");
+  expectEqual(signupDatabase.caseRows[0]?.signal, "email", "on the email signal");
+  expectEqual(signupDatabase.caseRows[0]?.company_id, COMPANY_B, "filed under the matched tenant");
+  expectEqual(signupDatabase.caseRows[0]?.matched_user_id, OTHER_USER_ID, "naming the matched user");
+  expectEqual(signupAudit.entries[0]?.actorUserId, null, "a signup case has no session actor");
+
+  const freshAudit = createInMemoryAuditTrail();
+  const fresh = await checkSignupIdentity({ email: "fresh@example.test" }, dependenciesOf(duplicateSeededDatabase(), freshAudit));
+
+  expectEqual(fresh.blocked, false, "an unregistered email is not blocked");
+  expectEqual(freshAudit.entries.length, 0, "and records nothing");
+
+  const badSignup = await rejectionOf(() =>
+    checkSignupIdentity({ email: "not-an-email" }, dependenciesOf(createBusinessDatabase(), createInMemoryAuditTrail())),
+  );
+
+  expectEqual(badSignup?.code, "VALIDATION_FAILED", "a malformed email is refused at the call site");
+
+  // The KYC submission refuses a blocked applicant before the status moves, and the case is there.
+  const kycDatabase = duplicateSeededDatabase();
+  const kycAudit = createInMemoryAuditTrail();
+  const kycDeps = dependenciesOf(kycDatabase, kycAudit);
+
+  kycDatabase.submissionRows.push({
+    id: DRAFT_SUBMISSION_ID,
+    company_id: COMPANY_A,
+    status: "draft",
+    verification_method: "manual",
+    created_at: "2026-11-02T09:00:00.000Z",
+  });
+  await saveKycDocument({ actor: owner, input: pngDocumentInput() }, kycDeps);
+  await runKycScreening({ actor: owner }, kycDeps);
+
+  const blockedSubmit = await rejectionOf(() => submitKyc({ actor: owner }, kycDeps));
+
+  expectEqual(blockedSubmit?.code, "CONFLICT", "a duplicate at the KYC submission conflicts");
+  expectDeepEqual(
+    blockedSubmit?.details,
+    [{ field: "identity", rule: "duplicate_identity" }],
+    "with the generic rule - never the signal that matched",
+  );
+  expectEqual(
+    kycDatabase.submissionRows[0]?.status,
+    "draft",
+    "the submission stays a draft, nothing moved",
+  );
+  expectEqual(
+    kycDatabase.caseRows.filter((row) => row.stage === "kyc_submission").length,
+    5,
+    "and the cases are in the compliance queue",
+  );
+
+  // Provisioning refuses a blocked merchant before any provision row exists.
+  const provisionDatabase = provisionSeededDatabase();
+  const provisionAudit = createInMemoryAuditTrail();
+
+  // The seeded FULL_PROFILE is the applicant's own profile (read with limit=1), so the shared tax id
+  // goes on it; the other company carries the same tax id in its own profile row.
+  provisionDatabase.profileRows[0] = {
+    ...(provisionDatabase.profileRows[0] as BusinessRowShape),
+    tax_id: DUPLICATE_TAX_ID,
+  };
+  provisionDatabase.profileRows.push(
+    businessRow({ id: "018f2b8a-0000-4c2d-9c3e-0000000000a2", company_id: COMPANY_B, tax_id: DUPLICATE_TAX_ID }),
+  );
+
+  const blockedRun = await runSubmerchantProvisioning(
+    { company_id: COMPANY_A, kyc_submission_id: APPROVED_SUBMISSION_ID },
+    dependenciesOf(provisionDatabase, provisionAudit),
+  );
+
+  expectEqual(blockedRun.blocked, true, "the duplicate blocks the provisioning run");
+  expectEqual(blockedRun.created, 0, "and no provision row is created");
+  expectEqual(
+    provisionDatabase.inserts.filter((insert) => insert.table === SUBMERCHANT_PROVISIONS_TABLE).length,
+    0,
+    "nothing is inserted",
+  );
+  expectEqual(
+    provisionDatabase.caseRows.filter((row) => row.stage === "provisioning" && row.signal === "tax_id").length,
+    1,
+    "the match is a provisioning-stage case",
+  );
+
+  // The unblocked run still provisions and answers blocked: false.
+  const freeDatabase = provisionSeededDatabase();
+  const freeRun = await runSubmerchantProvisioning(
+    { company_id: COMPANY_A, kyc_submission_id: APPROVED_SUBMISSION_ID },
+    dependenciesOf(freeDatabase, createInMemoryAuditTrail()),
+  );
+
+  expectEqual(freeRun.blocked, false, "no foreign match, not blocked");
+  expectEqual(freeRun.created, 2, "and the rows are created as before");
+}
+
+/** ---- STEP 098 sources: the checker service, both wirings and the migration. */
+async function checkDuplicateIdentitySources(): Promise<void> {
+  const checker = await readRepositoryFile("services/kyc/duplicate-check.ts");
+  const capture = await readRepositoryFile("services/kyc/kyc-capture.ts");
+  const provision = await readRepositoryFile("services/submerchant/provision.ts");
+
+  expectEqual(checker.split("\n")[0], "// path: services/kyc/duplicate-check.ts", "the checker states its own path on its first line");
+  expect(/[^\t\n\r\x20-\x7E]/u.test(checker) === false, "the checker is ASCII only");
+  expect(checker.includes('DUPLICATE_CASES_TABLE = "duplicate_cases"'), "the checker names the 0110 table");
+  expect(checker.includes('DUPLICATE_CASE_OPENED_AUDIT_ACTION = "duplicate_case.opened"'), "and the opened audit action");
+  expect(checker.includes('"signup"') && checker.includes('"kyc_submission"') && checker.includes('"provisioning"'), "the three stages");
+  expect(checker.includes('"legal_name_with_dob"'), "the composite name-with-dob signal");
+  expect(checker.includes("status=eq.open"), "a repeated check converges on the open case");
+  expect(checker.includes("matched_company_id"), "the case names the matched account");
+  expect(capture.includes('stage: "kyc_submission"'), "the KYC submission runs the check");
+  expect(capture.includes("DUPLICATE_IDENTITY_RULE"), "and answers with the generic rule");
+  expect(provision.includes('stage: "provisioning"'), "the provisioning job runs the check before any row");
+  expect(provision.includes("blocked: true"), "and a match blocks the run");
+
+  const migrationFiles = await readdir(new URL("migrations/", repositoryRoot));
+
+  expect(migrationFiles.includes("0110_duplicate_cases.sql"), "the 0110 forward file exists");
+  expect(migrationFiles.includes("0110_duplicate_cases.down.sql"), "and its rollback");
+
+  const forward = await readRepositoryFile("migrations/0110_duplicate_cases.sql");
+
+  expect(forward.includes("duplicate_cases_open_unique"), "one open case per tenant, stage and signal");
+  expect(forward.includes("duplicate_cases_signal_check"), "the signal vocabulary is closed");
+  expect(forward.includes("enable row level security"), "the table enables RLS");
+  expect(forward.includes("duplicate_cases_default_deny"), "and carries the default-deny policy");
+}
+
 async function main(): Promise<void> {
   checkVocabulary();
   await checkRefusals();
@@ -9294,6 +9793,8 @@ async function main(): Promise<void> {
   await checkSubmerchantSyncSources();
   await checkDocumentRequests();
   await checkDocumentRequestsSources();
+  await checkDuplicateIdentityGate();
+  await checkDuplicateIdentitySources();
   await checkKycCatalog();
   await checkStatusCatalog();
   await checkReviewCatalog();
@@ -9322,7 +9823,7 @@ async function main(): Promise<void> {
     `onboarding gate passed: ${checks} checks, ${ONBOARDING_STEPS.length} steps, ` +
       `${ONBOARDING_OWNER_ROLES.length} role, ${BUSINESS_PROFILE_FIELDS.length} business fields, ` +
       `${PROCESSOR_REQUIREMENT_LIST.length} processors, ${BUSINESS_PROFILE_TABLE} table, ` +
-      `${MCC_CODES_TABLE} vocabulary, ${COUNTRIES_TABLE} list, submerchant profile, kyc pack, underwriting criteria, merchant limits, payment holds, submerchant provisioning, webhook sync, document requests\n`,
+      `${MCC_CODES_TABLE} vocabulary, ${COUNTRIES_TABLE} list, submerchant profile, kyc pack, underwriting criteria, merchant limits, payment holds, submerchant provisioning, webhook sync, document requests, duplicate checks\n`,
   );
 }
 

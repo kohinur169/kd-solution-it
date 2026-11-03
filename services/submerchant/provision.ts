@@ -9,6 +9,7 @@ import { enqueueJob, type JobRegistry } from "../../lib/jobs/registry.ts";
 import type { JobQueue } from "../../lib/jobs/queue.ts";
 import type { EnqueueResult, JobDefinition } from "../../lib/jobs/types.ts";
 import { KYC_SUBMISSIONS_TABLE } from "../kyc/kyc-capture.ts";
+import { checkDuplicateIdentity } from "../kyc/duplicate-check.ts";
 
 /**
  * The automatic sub-merchant provisioning of FEATURE_LIST section 5 and section 27: final approval
@@ -87,6 +88,8 @@ export interface ProvisionRunSummary {
   readonly created: number;
   readonly skipped: number;
   readonly queuedWithoutMasterAccount: number;
+  /** STEP 098: true when the duplicate identity check blocked the run and no row was written. */
+  readonly blocked: boolean;
 }
 
 function nowOf(dependencies: ProvisionDependencies): number {
@@ -166,6 +169,21 @@ export async function runSubmerchantProvisioning(
   if (submission.status !== "approved") {
     // `0054`'s source guard refuses the insert for any other status; the job refuses earlier.
     throw new AppError("CONFLICT", { details: [{ field: "status", rule: "not_approved" }] });
+  }
+
+  // STEP 098: section 4's duplicate check runs before sub-merchant creation. A match blocks the run:
+  // no provision row is written, and the case for compliance_kyc was opened by the check itself.
+  const duplicate = await checkDuplicateIdentity({ companyId, stage: "provisioning" }, dependencies);
+
+  if (duplicate.blocked) {
+    return {
+      companyId,
+      kycSubmissionId: kycSubmissionId,
+      created: 0,
+      skipped: 0,
+      queuedWithoutMasterAccount: 0,
+      blocked: true,
+    };
   }
 
   // The connected master platform accounts: platform level providers that create sub-merchants
@@ -295,6 +313,7 @@ export async function runSubmerchantProvisioning(
     created,
     skipped,
     queuedWithoutMasterAccount,
+    blocked: false,
   };
 }
 
