@@ -18,6 +18,7 @@ configuration, downloads use short-lived signed URLs, and every file access is a
 | `s3-adapter.ts` | The Amazon S3 adapter (`STORAGE_PROVIDER=s3`). No SDK: it signs requests itself with AWS Signature Version 4 over `node:crypto`, pins the configured `S3_BUCKET` (any other bucket is refused before a request exists), and presigns downloads with `X-Amz-*` query parameters and `UNSIGNED-PAYLOAD`. |
 | `adapters.ts` | The env wiring: `registerConfiguredAdapters(registry, env)` builds and registers both adapters; `registerDefaultStorageAdapters(registry)` does it from the validated `serverEnv()`. Asking for `s3` without the `S3_*` fields fails at wiring, not at the first upload. |
 | `encryption.ts` | The section 21 encryption: `sealFile` turns plaintext into the `KDF1` envelope (AES-256-GCM, one 64 KiB AEAD record per chunk, AAD scope `file:<companyId>:<purpose>`) plus the quartet for the `0057` record (`aes-256-gcm`, key version, base64 IV, base64 first-chunk tag) and the plaintext SHA-256; `openSealedFile` refuses non-envelopes and returns plaintext only after every chunk authenticates. Keyring from `ENCRYPTION_MASTER_KEY` (`master-v1`, version 1). |
+| `records.ts` | The file record service: `newStorageKey` (tenant prefix + purpose + UUID), `recordUploadedFile` (writes the `0057` row from `stored` + `sealed`: provider, bucket, key, type, plaintext size, plaintext hash, quartet), `getFileRecord`/`listFileRecords` (always `company_id` scoped), and the forward status walk `markFileVerified` / `quarantineFile` / `archiveFile` / `softDeleteFile`, each audited (`file.recorded`, `file.verified`, ...). |
 | `verify.ts` | The gate. Run it with `node lib/storage/verify.ts`. |
 
 ## Adapter selection by environment
@@ -30,8 +31,8 @@ Netlify, Vercel or Amazon with only the environment changed. `S3_BUCKET`, `S3_RE
 ## How the later steps build on it
 
 - `service.ts` also exposes the encrypted operations: `uploadEncryptedObject` seals the bytes before the adapter sees them (uploaded as `application/octet-stream`, audited with the quartet and plaintext hash) and `downloadEncryptedObject` opens the envelope under the same tenant and purpose after the adapter answers.
-- STEP 103 writes the `0057` file record (provider, hash, size, type, company, tenant-scoped key)
-  around these operations.
+- `records.ts` writes the `0057` file record (provider, bucket, key, hash, size, type, company,
+  quartet) around `uploadEncryptedObject` and walks its status forward.
 - STEP 104 mints signed URLs for the office screens; STEP 105 exposes upload and download.
 
 ## The rules
@@ -46,3 +47,4 @@ Netlify, Vercel or Amazon with only the environment changed. `S3_BUCKET`, `S3_RE
 5. Stored files never touch server-local disk: no filesystem import in any runtime file, and the gate scans for it.
 6. Credentials and signatures never leave the headers of a signed request, never enter a URL beyond the presigned `X-Amz-*` parameters, and never appear in a log line or an error message.
 7. Only the envelope reaches a provider; the master key lives only in the environment, and the database holds the quartet and the hash, never the ciphertext.
+8. One object is one row: the storage key is unique forever (soft delete included), always under the merchant's own prefix, checked in code and by the `0057` constraint alike.

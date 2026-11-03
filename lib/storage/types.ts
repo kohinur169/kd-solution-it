@@ -129,3 +129,26 @@ export const OBJECT_KEY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/u;
 
 /** The shape of a content type, the same rule `0057` sets on the record. */
 export const CONTENT_TYPE_PATTERN = /^[a-z]+\/[A-Za-z0-9.+-]+$/u;
+
+/**
+ * The purpose vocabulary of the `files` record: the five upload kinds of section 21 (`0057`) plus
+ * the `cms_image` and `compliance_document` that `0058` added. The database check is the authority;
+ * this list is its code mirror, and the record service and the encryption scope both validate
+ * against it.
+ */
+export const FILE_PURPOSES = [
+  "kyc_document",
+  "company_logo",
+  "invoice_pdf",
+  "dispute_document",
+  "support_attachment",
+  "cms_image",
+  "compliance_document",
+] as const;
+
+export type FilePurpose = (typeof FILE_PURPOSES)[number];
+
+/** The status vocabulary of the `files` record, walked forward only by the `0057` guard. */
+export const FILE_STATUSES = ["pending", "ready", "quarantined", "archived"] as const;
+
+export type FileStatus = (typeof FILE_STATUSES)[number];

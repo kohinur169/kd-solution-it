@@ -4,10 +4,26 @@ import { readFile } from "node:fs/promises";
 import { createInMemoryAuditTrail, type AuditTrail } from "../auth/audit.ts";
 import { registerConfiguredAdapters } from "./adapters.ts";
 import { storageErrorForStatus, type StorageFetch } from "./http.ts";
-import { isAppError } from "../errors/app-error.ts";
+import { AppError, isAppError } from "../errors/app-error.ts";
 import { ENCRYPTION_CHUNK_BYTES, isFileEnvelope, readFileEnvelopeInfo } from "../security/encryption.ts";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import type { z } from "zod";
+import type { RestClient } from "../auth/rest.ts";
 import { adapterFor, StorageAdapterAlreadyRegisteredError, StorageAdapterRegistry } from "./registry.ts";
+import {
+  archiveFile,
+  FILE_RECORDED_AUDIT_ACTION,
+  FILE_SOFT_DELETED_AUDIT_ACTION,
+  FILE_VERIFIED_AUDIT_ACTION,
+  fileRowSchema,
+  getFileRecord,
+  listFileRecords,
+  markFileVerified,
+  newStorageKey,
+  quarantineFile,
+  recordUploadedFile,
+  softDeleteFile,
+} from "./records.ts";
 import {
   createFileEncryption,
   fileEncryptionKeyring,
@@ -35,6 +51,7 @@ import {
   validateObjectKey,
 } from "./service.ts";
 import {
+  FILE_PURPOSES,
   MAX_OBJECT_BYTES,
   SIGNED_URL_DEFAULT_TTL_SECONDS,
   SIGNED_URL_MAX_TTL_SECONDS,
@@ -47,6 +64,7 @@ import {
   type StorageAdapterName,
   type StorageObjectRef,
   type StorageUploadInput,
+  type StoredObject,
 } from "./types.ts";
 
 /**
@@ -749,6 +767,274 @@ async function checkEncryptedOperations(): Promise<void> {
   expect(isStorageError(noTenant) && (noTenant as StorageError).code === "invalid_input", "an encrypted upload without a tenant is refused");
 }
 
+/* ---- The file record service over an in-memory PostgREST ---- */
+
+interface FilesDb {
+  rows: Array<Record<string, unknown>>;
+  inserts: Array<Record<string, unknown>>;
+  updates: Array<{ query: string; values: Record<string, unknown> }>;
+  queries: string[];
+}
+
+function queryParts(query: string): Map<string, string> {
+  const parts = new Map<string, string>();
+
+  for (const piece of query.split("&")) {
+    const index = piece.indexOf("=");
+
+    if (index > 0) {
+      parts.set(piece.slice(0, index), piece.slice(index + 1));
+    } else {
+      parts.set(piece, "");
+    }
+  }
+
+  return parts;
+}
+
+/** An in-memory `files` table: every read and update must be scoped to one company, like the RLS policy. */
+function createFilesRest(db: FilesDb): RestClient {
+  return {
+    select<TRow>(table: string, query: string, schema: z.ZodType<TRow>): Promise<readonly TRow[]> {
+      db.queries.push(`${table}?${query}`);
+
+      if (table !== "files") {
+        return Promise.reject(new Error(`the record service reads no table but files: ${table}`));
+      }
+
+      const parts = queryParts(query);
+      const company = parts.get("company_id");
+
+      if (company === undefined || !company.startsWith("eq.")) {
+        return Promise.reject(new Error(`a files read is not scoped to one company: ${query}`));
+      }
+
+      const companyId = company.slice(3);
+      const id = parts.get("id");
+      const purpose = parts.get("purpose");
+      const liveOnly = parts.get("deleted_at") === "is.null";
+
+      let matched = db.rows.filter((row) => row["company_id"] === companyId);
+
+      if (id !== undefined && id.startsWith("eq.")) {
+        matched = matched.filter((row) => row["id"] === id.slice(3));
+      }
+
+      if (purpose !== undefined && purpose.startsWith("eq.")) {
+        matched = matched.filter((row) => row["purpose"] === purpose.slice(3));
+      }
+
+      if (liveOnly) {
+        matched = matched.filter((row) => row["deleted_at"] === null);
+      }
+
+      matched = [...matched].sort((a, b) => String(b["created_at"]).localeCompare(String(a["created_at"])));
+
+      return Promise.resolve(matched.map((row) => schema.parse(row)));
+    },
+    insert(): Promise<never> {
+      return Promise.reject(new Error("the record service inserts with return=representation only"));
+    },
+    insertReturning<TRow>(table: string, rows: readonly Readonly<Record<string, unknown>>[], schema: z.ZodType<TRow>): Promise<readonly TRow[]> {
+      if (table !== "files") {
+        return Promise.reject(new Error(`the record service inserts into no table but files: ${table}`));
+      }
+
+      for (const row of rows) {
+        db.inserts.push({ ...row });
+
+        if (db.rows.some((existing) => existing["storage_key"] === row["storage_key"])) {
+          return Promise.reject(new AppError("CONFLICT", { cause: { code: "23505" } }));
+        }
+
+        const createdAt = new Date(NOW + db.rows.length).toISOString();
+        const stored = {
+          id: randomUUID(),
+          magic_byte_verified: false,
+          verified_at: null,
+          quarantined_reason: null,
+          deleted_at: null,
+          version: 1,
+          created_at: createdAt,
+          updated_at: createdAt,
+          ...row,
+        };
+
+        db.rows.push(stored);
+
+        return Promise.resolve([schema.parse(stored)]);
+      }
+
+      return Promise.reject(new Error("insertReturning needs one row"));
+    },
+    update(table: string, query: string, values: Readonly<Record<string, unknown>>): Promise<void> {
+      db.updates.push({ query, values: { ...values } });
+
+      if (table !== "files") {
+        return Promise.reject(new Error(`the record service updates no table but files: ${table}`));
+      }
+
+      const parts = queryParts(query);
+      const company = parts.get("company_id");
+
+      if (company === undefined || !company.startsWith("eq.")) {
+        return Promise.reject(new Error(`a files update is not scoped to one company: ${query}`));
+      }
+
+      const id = parts.get("id");
+
+      if (id === undefined || !id.startsWith("eq.")) {
+        return Promise.reject(new Error(`a files update is not scoped to one row: ${query}`));
+      }
+
+      const row = db.rows.find(
+        (candidate) =>
+          candidate["id"] === id.slice(3) &&
+          candidate["company_id"] === company.slice(3) &&
+          (parts.get("deleted_at") !== "is.null" || candidate["deleted_at"] === null),
+      );
+
+      // PostgREST reports success when nothing matched; the service re-reads for that reason.
+      if (row !== undefined) {
+        Object.assign(row, values, { updated_at: new Date(NOW + db.rows.length + 1000).toISOString(), version: Number(row["version"]) + 1 });
+      }
+
+      return Promise.resolve();
+    },
+    rpc(): Promise<never> {
+      return Promise.reject(new Error("the record service calls no rpc"));
+    },
+  };
+}
+
+function fileRecordDeps(db: FilesDb): { rest: RestClient; audit: ReturnType<typeof createInMemoryAuditTrail>; now: () => number } {
+  return { rest: createFilesRest(db), audit: createInMemoryAuditTrail(), now: () => NOW };
+}
+
+async function checkRecords(): Promise<void> {
+  expectEqual(FILE_PURPOSES.join(","), "kyc_document,company_logo,invoice_pdf,dispute_document,support_attachment,cms_image,compliance_document", "the purpose vocabulary mirrors 0057+0058");
+
+  // newStorageKey builds a tenant-scoped, unique, valid key
+  const key1 = newStorageKey(COMPANY_ID, "kyc_document");
+  const key2 = newStorageKey(COMPANY_ID, "kyc_document");
+  expect(key1.startsWith(`${COMPANY_ID}/kyc_document/`), "the key starts with the tenant prefix");
+  expectEqual(validateObjectKey(key1), key1, "the generated key passes the key validation");
+  expect(key1 !== key2, "two keys differ");
+  expect(isAppError(rejectionOfSync(() => newStorageKey("nope", "kyc_document"))), "a bad company id is refused");
+  expect(isAppError(rejectionOfSync(() => newStorageKey(COMPANY_ID, "evil" as never))), "an unknown purpose is refused");
+
+  // recordUploadedFile writes the row from stored + sealed
+  const db: FilesDb = { rows: [], inserts: [], updates: [], queries: [] };
+  const dependencies = fileRecordDeps(db);
+  const encryption = createFileEncryption(ENCRYPTION_ENV);
+  const plaintext = new TextEncoder().encode("%PDF-1.4 fake kyc document");
+  const sealed = encryption.seal(plaintext, { companyId: COMPANY_ID, purpose: "kyc_document" });
+  const stored: StoredObject = { provider: "supabase", bucket: BUCKET, key: key1, byteSize: sealed.ciphertextBytes };
+
+  const record = await recordUploadedFile(dependencies, {
+    companyId: COMPANY_ID,
+    uploadedBy: ACTOR_ID,
+    purpose: "kyc_document",
+    contentType: "application/pdf",
+    stored,
+    sealed,
+  });
+
+  expectEqual(record.company_id, COMPANY_ID, "the row names the company");
+  expectEqual(record.storage_provider, "supabase", "the provider of section 21");
+  expectEqual(record.storage_bucket, BUCKET, "the bucket");
+  expectEqual(record.storage_key, key1, "the key");
+  expectEqual(record.content_type, "application/pdf", "the type");
+  expectEqual(record.byte_size, plaintext.length, "the plaintext size");
+  expectEqual(record.content_sha256, sealed.plaintextSha256, "the plaintext hash");
+  expectEqual(record.encryption_algorithm, "aes-256-gcm", "the algorithm");
+  expectEqual(record.encryption_key_version, 1, "the key version");
+  expectEqual(record.ciphertext_iv, sealed.iv, "the iv");
+  expectEqual(record.ciphertext_tag, sealed.tag, "the tag");
+  expectEqual(record.status, "pending", "a fresh row is pending");
+  expectEqual(record.magic_byte_verified, false, "unverified");
+  expectEqual(db.inserts.length, 1, "one insert");
+  expectEqual(dependencies.audit.entries[0]?.action, FILE_RECORDED_AUDIT_ACTION, "audited as file.recorded");
+  expectEqual(dependencies.audit.entries[0]?.entityId, record.id, "naming the new row");
+  expectEqual((dependencies.audit.entries[0]?.payload ?? {})["content_sha256"], sealed.plaintextSha256, "the audit carries the hash");
+
+  // a key outside the tenant prefix is refused before the insert
+  const foreign = await rejectionOf(() =>
+    recordUploadedFile(dependencies, {
+      companyId: COMPANY_ID,
+      uploadedBy: ACTOR_ID,
+      purpose: "kyc_document",
+      contentType: "application/pdf",
+      stored: { provider: "supabase", bucket: BUCKET, key: "018f2b8a-4444-4c2d-9c3e-000000000002/kyc/x.pdf", byteSize: 1 },
+      sealed,
+    }),
+  );
+  expect(isAppError(foreign) && (foreign as AppError).code === "VALIDATION_FAILED", "a foreign-prefix key is refused");
+  expectEqual(db.inserts.length, 1, "and nothing was inserted");
+
+  // a duplicate key answers CONFLICT
+  const duplicate = await rejectionOf(() =>
+    recordUploadedFile(dependencies, {
+      companyId: COMPANY_ID, uploadedBy: ACTOR_ID, purpose: "kyc_document", contentType: "application/pdf", stored, sealed,
+    }),
+  );
+  expect(isAppError(duplicate) && (duplicate as AppError).code === "CONFLICT", "a re-upload of the same key answers CONFLICT");
+
+  // reads are company scoped
+  const read = await getFileRecord(dependencies, { companyId: COMPANY_ID, fileId: record.id });
+  expectEqual(read.id, record.id, "getFileRecord returns the row");
+  const missing = await rejectionOf(() => getFileRecord(dependencies, { companyId: COMPANY_ID, fileId: randomUUID() }));
+  expect(isAppError(missing) && (missing as AppError).code === "RESOURCE_NOT_FOUND", "an unknown id answers 404");
+  const foreignRead = await rejectionOf(() => getFileRecord(dependencies, { companyId: "018f2b8a-4444-4c2d-9c3e-000000000002", fileId: record.id }));
+  expect(isAppError(foreignRead) && (foreignRead as AppError).code === "RESOURCE_NOT_FOUND", "another tenant cannot read the row");
+
+  const listed = await listFileRecords(dependencies, { companyId: COMPANY_ID });
+  expectEqual(listed.length, 1, "list returns the live rows");
+  const byPurpose = await listFileRecords(dependencies, { companyId: COMPANY_ID, purpose: "company_logo" });
+  expectEqual(byPurpose.length, 0, "list filters by purpose");
+
+  // markFileVerified: pending -> ready, audited, re-read
+  const verified = await markFileVerified(dependencies, { companyId: COMPANY_ID, fileId: record.id });
+  expectEqual(verified.status, "ready", "the walk pending -> ready");
+  expectEqual(verified.magic_byte_verified, true, "verified");
+  expectEqual(verified.verified_at, new Date(NOW).toISOString(), "at the injected instant");
+  expectEqual(dependencies.audit.entries[dependencies.audit.entries.length - 1]?.action, FILE_VERIFIED_AUDIT_ACTION, "audited as file.verified");
+
+  // a second verification is not a forward walk
+  const again = await rejectionOf(() => markFileVerified(dependencies, { companyId: COMPANY_ID, fileId: record.id }));
+  expect(isAppError(again) && (again as AppError).code === "VALIDATION_FAILED", "ready -> ready is refused");
+
+  // quarantine needs a reason; pending -> quarantined works, ready -> quarantined works
+  const emptyReason = await rejectionOf(() => quarantineFile(dependencies, { companyId: COMPANY_ID, fileId: record.id, reason: "   " }));
+  expect(isAppError(emptyReason) && (emptyReason as AppError).code === "VALIDATION_FAILED", "an empty quarantine reason is refused");
+
+  const db2: FilesDb = { rows: [], inserts: [], updates: [], queries: [] };
+  const dependencies2 = fileRecordDeps(db2);
+  const record2 = await recordUploadedFile(dependencies2, {
+    companyId: COMPANY_ID, uploadedBy: ACTOR_ID, purpose: "kyc_document", contentType: "application/pdf",
+    stored: { provider: "s3", bucket: "kd-files", key: newStorageKey(COMPANY_ID, "kyc_document"), byteSize: sealed.ciphertextBytes },
+    sealed,
+  });
+  const quarantined = await quarantineFile(dependencies2, { companyId: COMPANY_ID, fileId: record2.id, reason: "the bytes do not match the declared type" });
+  expectEqual(quarantined.status, "quarantined", "pending -> quarantined");
+  expectEqual(quarantined.quarantined_reason, "the bytes do not match the declared type", "the reason is kept");
+
+  // archive: ready -> archived works; quarantined-unverified -> archived is refused
+  const archived = await archiveFile(dependencies, { companyId: COMPANY_ID, fileId: record.id });
+  expectEqual(archived.status, "archived", "ready -> archived");
+  const badArchive = await rejectionOf(() => archiveFile(dependencies2, { companyId: COMPANY_ID, fileId: record2.id }));
+  expect(isAppError(badArchive) && (badArchive as AppError).code === "VALIDATION_FAILED", "quarantined-unverified -> archived is refused");
+
+  // soft delete: deleted_at set once, then the live read 404s
+  const deleted = await softDeleteFile(dependencies, { companyId: COMPANY_ID, fileId: record.id });
+  expectEqual(deleted.deleted_at, new Date(NOW).toISOString(), "deleted_at is set");
+  expectEqual(dependencies.audit.entries[dependencies.audit.entries.length - 1]?.action, FILE_SOFT_DELETED_AUDIT_ACTION, "audited as file.soft_deleted");
+  const afterDelete = await rejectionOf(() => getFileRecord(dependencies, { companyId: COMPANY_ID, fileId: record.id }));
+  expect(isAppError(afterDelete) && (afterDelete as AppError).code === "RESOURCE_NOT_FOUND", "a soft deleted row is not live");
+  const includingDeleted = await dependencies.rest.select("files", `id=eq.${record.id}&company_id=eq.${COMPANY_ID}`, fileRowSchema);
+  expectEqual(includingDeleted.length, 1, "the row is still history");
+}
+
 async function checkSources(): Promise<void> {
   const paths = [
     "lib/storage/types.ts",
@@ -759,6 +1045,7 @@ async function checkSources(): Promise<void> {
     "lib/storage/s3-adapter.ts",
     "lib/storage/adapters.ts",
     "lib/storage/encryption.ts",
+    "lib/storage/records.ts",
     "lib/storage/verify.ts",
     "lib/storage/README.md",
   ];
@@ -822,6 +1109,15 @@ async function checkSources(): Promise<void> {
   expect(encryption.includes("encryptFile"), "sealing delegates to the KDF1 envelope writer");
   expect(encryption.includes("decryptFile"), "opening delegates to the envelope reader");
 
+  const records = await readRepositoryFile("lib/storage/records.ts");
+  expect(records.includes('FILES_TABLE = "files"'), "the record service writes the 0057 table");
+  expect(records.includes("storage_provider"), "it stores the provider");
+  expect(records.includes("content_sha256"), "the hash");
+  expect(records.includes("byte_size"), "the size");
+  expect(records.includes("content_type"), "the type");
+  expect(records.includes("company_id=eq."), "every query is company scoped");
+  expect(records.includes("startsWith(`${companyId}/`)"), "the tenant prefix is checked in code too");
+
   const http = await readRepositoryFile("lib/storage/http.ts");
   expect(http.includes('redirect: "error"'), "redirects are errors");
   expect(http.includes("checkOutboundUrl"), "every url is checked against the outbound policy");
@@ -837,6 +1133,7 @@ async function main(): Promise<void> {
   checkConfiguredRegistration();
   checkEncryption();
   await checkEncryptedOperations();
+  await checkRecords();
   await checkSources();
 
   if (failures.length > 0) {
@@ -854,7 +1151,7 @@ async function main(): Promise<void> {
   process.stdout.write(
     `storage gate passed: ${checks} checks, ${STORAGE_ADAPTER_NAMES.length} adapter names (supabase + s3 wired), ` +
       `${STORAGE_ERROR_CODES.length} error codes, files sealed aes-256-gcm (${FILE_ENCRYPTION_KEY_ID}), ` +
-      `signed urls ${SIGNED_URL_DEFAULT_TTL_SECONDS}s default / ${SIGNED_URL_MAX_TTL_SECONDS}s max\n`,
+      `${FILE_PURPOSES.length} purposes, signed urls ${SIGNED_URL_DEFAULT_TTL_SECONDS}s default / ${SIGNED_URL_MAX_TTL_SECONDS}s max\n`,
   );
 }
 

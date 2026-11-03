@@ -3,7 +3,6 @@ import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import { serverEnv } from "../env/server.ts";
 import { AppError } from "../errors/app-error.ts";
-import { UPLOAD_PURPOSES, type UploadPurpose } from "../security/upload.ts";
 import {
   decryptFile,
   encryptFile,
@@ -14,7 +13,13 @@ import {
   ENCRYPTION_TAG_BYTES,
   type EncryptionKeyring,
 } from "../security/encryption.ts";
-import { MAX_OBJECT_BYTES, MIN_OBJECT_BYTES, StorageError } from "./types.ts";
+import {
+  FILE_PURPOSES,
+  MAX_OBJECT_BYTES,
+  MIN_OBJECT_BYTES,
+  StorageError,
+  type FilePurpose,
+} from "./types.ts";
 
 /**
  * The encryption half of FEATURE_LIST section 21: "Every file is AES-256-GCM encrypted before
@@ -59,7 +64,7 @@ export interface FileEncryptionEnvironment {
 /** The tenant and purpose a file is sealed for; both end up in the authenticated data. */
 export interface FileEncryptionScope {
   readonly companyId: string;
-  readonly purpose: UploadPurpose;
+  readonly purpose: FilePurpose;
 }
 
 /** The environment-scoped keyring: the master key as the primary, no previous keys yet. */
@@ -89,7 +94,7 @@ export function fileEncryptionScope(scope: FileEncryptionScope): string {
     throw new StorageError("invalid_input", "the encryption scope needs a company id");
   }
 
-  if (!UPLOAD_PURPOSES.includes(scope.purpose)) {
+  if (!FILE_PURPOSES.includes(scope.purpose)) {
     throw new StorageError("invalid_input", "the encryption scope needs a known upload purpose");
   }
 

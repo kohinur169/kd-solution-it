@@ -1,8 +1,6 @@
 // path: lib/storage/service.ts
 import type { AuditTrail } from "../auth/audit.ts";
 import { readFileEnvelopeInfo } from "../security/encryption.ts";
-import { UPLOAD_PURPOSES } from "../security/upload.ts";
-import type { UploadPurpose } from "../security/upload.ts";
 import type {
   FileEncryptionScope,
   SealedFile,
@@ -17,7 +15,9 @@ import {
   SIGNED_URL_DEFAULT_TTL_SECONDS,
   SIGNED_URL_MAX_TTL_SECONDS,
   SIGNED_URL_MIN_TTL_SECONDS,
+  FILE_PURPOSES,
   StorageError,
+  type FilePurpose,
   type SignedUrl,
   type SignedUrlInput,
   type StorageAdapter,
@@ -239,11 +239,11 @@ export async function createFileSignedUrl(
 export const ENCRYPTED_ENVELOPE_CONTENT_TYPE = "application/octet-stream";
 
 function encryptionScopeOf(access: FileAccessContext): FileEncryptionScope {
-  if (access.companyId === null || access.purpose === null || !UPLOAD_PURPOSES.includes(access.purpose as UploadPurpose)) {
+  if (access.companyId === null || access.purpose === null || !FILE_PURPOSES.includes(access.purpose as FilePurpose)) {
     throw invalidInput("the encrypted operation needs the tenant id and a known upload purpose");
   }
 
-  return { companyId: access.companyId, purpose: access.purpose as UploadPurpose };
+  return { companyId: access.companyId, purpose: access.purpose as FilePurpose };
 }
 
 export interface EncryptedUploadResult {
