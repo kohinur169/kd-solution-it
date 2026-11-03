@@ -150,6 +150,21 @@ import {
   readMerchantPaymentHolds,
   readPaymentHoldQueue,
 } from "./payment-hold.ts";
+import { createInMemoryJobQueue } from "../../lib/jobs/queue.ts";
+import { JobRegistry } from "../../lib/jobs/registry.ts";
+import {
+  createProvisionJobHandler,
+  enqueueProvisioningAfterApproval,
+  PAYMENT_PROVIDERS_TABLE,
+  PROVIDER_KEYS_TABLE,
+  provisionJobIdempotencyKey,
+  registerSubmerchantProvisionJob,
+  runSubmerchantProvisioning,
+  SUBMERCHANT_PROVISION_JOB,
+  SUBMERCHANT_PROVISION_QUEUED_AUDIT_ACTION,
+  SUBMERCHANT_PROVISION_ENTITY,
+  SUBMERCHANT_PROVISIONS_TABLE,
+} from "../submerchant/provision.ts";
 import {
   assertProvisionable,
   PROCESSOR_PROFILE_AUDIT_ACTION,
@@ -1076,6 +1091,70 @@ interface PaymentHoldRowShape {
   created_at: string;
 }
 
+/** One `0029` platform provider row, as the fake store holds it. Platform level: company_id null. */
+interface ProviderRowShape {
+  id: string;
+  company_id: string | null;
+  provider_key: string;
+  status: string;
+  supports_submerchant: boolean;
+  display_order: number;
+}
+
+/** One `0030` provider key row. Platform level: company_id null. */
+interface ProviderKeyRowShape {
+  id: string;
+  company_id: string | null;
+  provider_id: string;
+  label: string;
+  mode: string;
+  status: string;
+}
+
+/** One `0054` sub-merchant provision row, as the fake store holds it. */
+interface ProvisionRowShape {
+  id: string;
+  company_id: string;
+  kyc_submission_id: string;
+  provider_id: string;
+  provider_key: string;
+  mode: string;
+  master_account_ref: string | null;
+  provider_submerchant_id: string | null;
+  status: string;
+  charges_enabled: boolean;
+  payouts_enabled: boolean;
+  requested_at: string;
+  next_attempt_at: string | null;
+  version: number;
+  updated_at: string;
+  created_at: string;
+}
+
+/** The platform catalogue of the gate: two enabled sub-merchant providers, one without the capability, one disabled. */
+function defaultProviderRows(): ProviderRowShape[] {
+  return [
+    { id: "018f2b8a-0000-4c2d-9c3e-000000000011", company_id: null, provider_key: "nmi", status: "enabled", supports_submerchant: true, display_order: 1 },
+    { id: "018f2b8a-0000-4c2d-9c3e-000000000012", company_id: null, provider_key: "stripe_connect", status: "enabled", supports_submerchant: true, display_order: 2 },
+    { id: "018f2b8a-0000-4c2d-9c3e-000000000013", company_id: null, provider_key: "payoneer", status: "enabled", supports_submerchant: false, display_order: 3 },
+    { id: "018f2b8a-0000-4c2d-9c3e-000000000014", company_id: null, provider_key: "airwallex", status: "disabled", supports_submerchant: true, display_order: 4 },
+  ];
+}
+
+/** One connected master account: an active platform key for nmi in test mode. stripe_connect has none. */
+function defaultProviderKeyRows(): ProviderKeyRowShape[] {
+  return [
+    {
+      id: "018f2b8a-0000-4c2d-9c3e-000000000021",
+      company_id: null,
+      provider_id: "018f2b8a-0000-4c2d-9c3e-000000000011",
+      label: "NMI master",
+      mode: "test",
+      status: "active",
+    },
+  ];
+}
+
 /** One row of `0048`, as the fake store holds it. */
 interface SubmissionRowShape {
   id: string;
@@ -1165,6 +1244,9 @@ interface BusinessDatabase {
   readonly tierRows: TierRowShape[];
   readonly limitRows: LimitRowShape[];
   readonly holdRows: PaymentHoldRowShape[];
+  readonly providerRows: ProviderRowShape[];
+  readonly providerKeyRows: ProviderKeyRowShape[];
+  readonly provisionRows: ProvisionRowShape[];
   readonly queries: string[];
   readonly inserts: { readonly table: string; readonly row: Readonly<Record<string, unknown>> }[];
   readonly updates: {
@@ -1223,6 +1305,9 @@ function createBusinessDatabase(
   tierRows: readonly TierRowShape[] = defaultTierRows(),
   limitRows: readonly LimitRowShape[] = [],
   holdRows: readonly PaymentHoldRowShape[] = [],
+  providerRows: readonly ProviderRowShape[] = defaultProviderRows(),
+  providerKeyRows: readonly ProviderKeyRowShape[] = defaultProviderKeyRows(),
+  provisionRows: readonly ProvisionRowShape[] = [],
 ): BusinessDatabase {
   return {
     profileRows: [...profileRows],
@@ -1237,6 +1322,9 @@ function createBusinessDatabase(
     tierRows: [...tierRows].map((row) => ({ ...row })),
     limitRows: [...limitRows].map((row) => ({ ...row })),
     holdRows: [...holdRows].map((row) => ({ ...row })),
+    providerRows: [...providerRows].map((row) => ({ ...row })),
+    providerKeyRows: [...providerKeyRows].map((row) => ({ ...row })),
+    provisionRows: [...provisionRows].map((row) => ({ ...row })),
     queries: [],
     inserts: [],
     updates: [],
@@ -1481,6 +1569,84 @@ function createBusinessStore(database: BusinessDatabase): RestClient {
 
         if (ordered === "order=held_at.desc") {
           matched = [...matched].sort((left, right) => right.held_at.localeCompare(left.held_at));
+        }
+
+        const limit = parts.find((part) => part.startsWith("limit="));
+        const capped =
+          limit === undefined
+            ? matched
+            : matched.slice(0, Number.parseInt(limit.slice("limit=".length), 10));
+
+        return Promise.resolve(capped.map((row) => schema.parse(row)));
+      }
+
+      // The `0029` platform providers and the `0030` platform keys: platform tables, never
+      // company-scoped, filtered by their own flags like the vocabulary.
+      if (table === PAYMENT_PROVIDERS_TABLE || table === PROVIDER_KEYS_TABLE) {
+        const parts = query.split("&");
+
+        if (!parts.includes("deleted_at=is.null")) {
+          return Promise.reject(new Error(`the platform read is not over live rows: ${query}`));
+        }
+
+        const allRows = (
+          table === PAYMENT_PROVIDERS_TABLE ? database.providerRows : database.providerKeyRows
+        ) as unknown as readonly Record<string, unknown>[];
+
+        let matched = [...allRows];
+
+        if (parts.includes("company_id=is.null")) {
+          matched = matched.filter((row) => row["company_id"] === null);
+        }
+
+        const statusPart = parts.find((part) => part.startsWith("status=eq."));
+
+        if (statusPart !== undefined) {
+          const wantedStatus = decodeURIComponent(statusPart.slice("status=eq.".length));
+          matched = matched.filter((row) => row["status"] === wantedStatus);
+        }
+
+        if (parts.includes("supports_submerchant=is.true")) {
+          matched = matched.filter((row) => row["supports_submerchant"] === true);
+        }
+
+        const ordered = parts.find((part) => part.startsWith("order="));
+
+        if (ordered === "order=display_order.asc") {
+          matched = [...matched].sort((left, right) => Number(left["display_order"]) - Number(right["display_order"]));
+        }
+
+        const limit = parts.find((part) => part.startsWith("limit="));
+        const capped =
+          limit === undefined
+            ? matched
+            : matched.slice(0, Number.parseInt(limit.slice("limit=".length), 10));
+
+        return Promise.resolve(capped.map((row) => schema.parse(row)));
+      }
+
+      // The `0054` provision rows: company-scoped like the KYC tables, with their own eq filters.
+      if (table === SUBMERCHANT_PROVISIONS_TABLE) {
+        const parts = query.split("&");
+
+        if (!parts.includes("deleted_at=is.null")) {
+          return Promise.reject(new Error(`the provision read is not over live rows: ${query}`));
+        }
+
+        const wantedCompany = scopedCompany(query);
+        let matched = [...database.provisionRows];
+
+        if (wantedCompany !== null) {
+          matched = matched.filter((row) => row.company_id === wantedCompany);
+        }
+
+        for (const column of ["id", "provider_id"] as const) {
+          const eqPart = parts.find((part) => part.startsWith(`${column}=eq.`));
+
+          if (eqPart !== undefined) {
+            const value = decodeURIComponent(eqPart.slice(column.length + 4));
+            matched = matched.filter((row) => row[column] === value);
+          }
         }
 
         const limit = parts.find((part) => part.startsWith("limit="));
@@ -1778,6 +1944,42 @@ function createBusinessStore(database: BusinessDatabase): RestClient {
             reviewed_by: null,
             reviewed_at: null,
             decision_reason: null,
+            version: Number(row["version"] ?? 1),
+            updated_at: created,
+            created_at: created,
+          });
+        }
+
+        return Promise.resolve();
+      }
+
+      if (table === SUBMERCHANT_PROVISIONS_TABLE) {
+        if (database.conflictOnInsert) {
+          database.conflictOnInsert = false;
+
+          return Promise.reject(new AppError("CONFLICT", { cause: { code: UNIQUE_VIOLATION } }));
+        }
+
+        for (const row of rows) {
+          database.inserts.push({ table, row: { ...row } });
+
+          const id = `018f2b8a-0000-4c2d-9c3e-${String(database.provisionRows.length + 1).padStart(12, "0")}`;
+          const created = new Date(NOW).toISOString();
+
+          database.provisionRows.push({
+            id,
+            company_id: String(row["company_id"] ?? ""),
+            kyc_submission_id: String(row["kyc_submission_id"] ?? ""),
+            provider_id: String(row["provider_id"] ?? ""),
+            provider_key: String(row["provider_key"] ?? ""),
+            mode: String(row["mode"] ?? "test"),
+            master_account_ref: typeof row["master_account_ref"] === "string" ? row["master_account_ref"] : null,
+            provider_submerchant_id: null,
+            status: String(row["status"] ?? "pending"),
+            charges_enabled: Boolean(row["charges_enabled"] ?? false),
+            payouts_enabled: Boolean(row["payouts_enabled"] ?? false),
+            requested_at: String(row["requested_at"] ?? created),
+            next_attempt_at: typeof row["next_attempt_at"] === "string" ? row["next_attempt_at"] : null,
             version: Number(row["version"] ?? 1),
             updated_at: created,
             created_at: created,
@@ -7687,6 +7889,300 @@ async function checkKycDecisionSources(): Promise<void> {
   expectEqual(reviewPanel.includes("company_id"), false, "and no company field is ever sent in a body");
 }
 
+/** ---- STEP 094: the automatic sub-merchant provisioning job after a KYC approval. */
+const APPROVED_SUBMISSION_ID = "018f2b8a-0000-4c2d-9c3e-0000000000e5";
+const NMI_PROVIDER_ID = "018f2b8a-0000-4c2d-9c3e-000000000011";
+const STRIPE_PROVIDER_ID = "018f2b8a-0000-4c2d-9c3e-000000000012";
+const NMI_MASTER_KEY_ID = "018f2b8a-0000-4c2d-9c3e-000000000021";
+
+/** A review-seeded database with one approved submission on top. */
+function provisionSeededDatabase(): BusinessDatabase {
+  const database = reviewSeededDatabase();
+
+  database.submissionRows.push({
+    id: APPROVED_SUBMISSION_ID,
+    company_id: COMPANY_A,
+    status: "approved",
+    verification_method: "manual",
+    submitted_at: "2026-11-01T10:00:00.000Z",
+    submitted_by: OWNER_ID,
+    first_reviewer_id: OFFICE_ID,
+    decided_at: "2026-11-02T09:00:00.000Z",
+    decision_reason: null,
+    created_at: "2026-11-01T08:45:00.000Z",
+  });
+
+  return database;
+}
+
+async function checkSubmerchantProvision(): Promise<void> {
+  // A malformed payload is refused before any query.
+  const badPayload = provisionSeededDatabase();
+  const badRefusal = await rejectionOf(() =>
+    runSubmerchantProvisioning(
+      { company_id: "nope", kyc_submission_id: APPROVED_SUBMISSION_ID },
+      dependenciesOf(badPayload, createInMemoryAuditTrail()),
+    ),
+  );
+
+  expectEqual(badRefusal?.code, "VALIDATION_FAILED", "a non-uuid company is refused");
+  expectEqual(badPayload.queries.length, 0, "with zero queries");
+
+  const unknown = await rejectionOf(() =>
+    runSubmerchantProvisioning(
+      { company_id: COMPANY_A, kyc_submission_id: "018f2b8a-9999-4c2d-9c3e-999999999999" },
+      dependenciesOf(provisionSeededDatabase(), createInMemoryAuditTrail()),
+    ),
+  );
+
+  expectEqual(unknown?.code, "RESOURCE_NOT_FOUND", "an unknown submission is not found");
+
+  // Only an approved submission provisions - 0054's source guard enforces the same at the DB.
+  const notApproved = provisionSeededDatabase();
+  const refused = await rejectionOf(() =>
+    runSubmerchantProvisioning(
+      { company_id: COMPANY_B, kyc_submission_id: "018f2b8a-0000-4c2d-9c3e-0000000000b2" },
+      dependenciesOf(notApproved, createInMemoryAuditTrail()),
+    ),
+  );
+
+  expectEqual(refused?.code, "CONFLICT", "a submitted-but-not-approved submission conflicts");
+  expectDeepEqual(refused?.details, [{ field: "status", rule: "not_approved" }], "named not_approved");
+  expectEqual(
+    notApproved.inserts.filter((entry) => entry.table === SUBMERCHANT_PROVISIONS_TABLE).length,
+    0,
+    "and nothing is provisioned",
+  );
+
+  // The run: one pending row per connected sub-merchant provider - nmi with its master account,
+  // stripe_connect queued without one. payoneer lacks the capability, airwallex is disabled.
+  const database = provisionSeededDatabase();
+  const audit = createInMemoryAuditTrail();
+  const summary = await runSubmerchantProvisioning(
+    { company_id: COMPANY_A, kyc_submission_id: APPROVED_SUBMISSION_ID },
+    dependenciesOf(database, audit),
+  );
+
+  expectEqual(summary.created, 2, "two providers provision: nmi and stripe_connect");
+  expectEqual(summary.skipped, 0, "nothing existed yet");
+  expectEqual(summary.queuedWithoutMasterAccount, 1, "stripe_connect has no master account connected, so it stays queued");
+
+  const inserts = database.inserts.filter((entry) => entry.table === SUBMERCHANT_PROVISIONS_TABLE);
+
+  expectEqual(inserts.length, 2, "two provision rows are inserted");
+  expect(inserts.every((entry) => entry.row["status"] === "pending"), "both start pending");
+  expect(inserts.every((entry) => entry.row["charges_enabled"] === false && entry.row["payouts_enabled"] === false), "charges and payouts stay disabled until verification completes");
+  expect(inserts.every((entry) => entry.row["kyc_submission_id"] === APPROVED_SUBMISSION_ID), "each row names the approval");
+
+  const nmiInsert = inserts.find((entry) => entry.row["provider_id"] === NMI_PROVIDER_ID);
+  const stripeInsert = inserts.find((entry) => entry.row["provider_id"] === STRIPE_PROVIDER_ID);
+
+  expectEqual(nmiInsert?.row["master_account_ref"], `nmi:${NMI_MASTER_KEY_ID}`, "nmi records the connected master account");
+  expectEqual(nmiInsert?.row["next_attempt_at"], new Date(NOW).toISOString(), "and schedules its first attempt");
+  expectEqual(nmiInsert?.row["mode"], "test", "in the master key's mode");
+  expectEqual(stripeInsert?.row["master_account_ref"], null, "stripe_connect stays queued without a master account");
+  expectEqual(stripeInsert?.row["next_attempt_at"], null, "with no attempt scheduled");
+
+  expect(
+    database.queries.some((query) => query.startsWith(`${PAYMENT_PROVIDERS_TABLE}?`) && query.includes("company_id=is.null") && query.includes("supports_submerchant=is.true") && query.includes("status=eq.enabled")),
+    "the provider read is platform level, sub-merchant capable and enabled",
+  );
+  expect(
+    database.queries.some((query) => query.startsWith(`${PROVIDER_KEYS_TABLE}?`) && query.includes("company_id=is.null") && query.includes("status=eq.active")),
+    "the master account read is platform level and active",
+  );
+  expect(
+    database.queries
+      .filter((query) => query.startsWith(`${SUBMERCHANT_PROVISIONS_TABLE}?`))
+      .every((query) => query.includes(`company_id=eq.${encodeURIComponent(COMPANY_A)}`)),
+    "every provision query is scoped to the merchant",
+  );
+
+  const queuedAudits = audit.entries.filter((entry) => entry.action === SUBMERCHANT_PROVISION_QUEUED_AUDIT_ACTION);
+
+  expectEqual(queuedAudits.length, 2, "every created row is audited under submerchant_provision.queued");
+  expect(queuedAudits.every((entry) => entry.entityType === SUBMERCHANT_PROVISION_ENTITY), "on the provision entity");
+  expect(queuedAudits.every((entry) => entry.entityId !== null), "naming the row");
+  expectEqual(
+    queuedAudits.find((entry) => entry.payload?.["provider_id"] === STRIPE_PROVIDER_ID)?.payload?.["queued_without_master_account"],
+    true,
+    "the queued-without-master case is recorded for the office alert",
+  );
+
+  // A second run is idempotent: everything exists, nothing new is written or audited.
+  const again = await runSubmerchantProvisioning(
+    { company_id: COMPANY_A, kyc_submission_id: APPROVED_SUBMISSION_ID },
+    dependenciesOf(database, audit),
+  );
+
+  expectEqual(again.created, 0, "the second run creates nothing");
+  expectEqual(again.skipped, 2, "both rows already exist");
+  expectEqual(
+    database.inserts.filter((entry) => entry.table === SUBMERCHANT_PROVISIONS_TABLE).length,
+    2,
+    "no third row is inserted",
+  );
+  expectEqual(
+    audit.entries.filter((entry) => entry.action === SUBMERCHANT_PROVISION_QUEUED_AUDIT_ACTION).length,
+    2,
+    "and no second queue audit is appended",
+  );
+
+  // A lost insert race with a winner converges on the winner instead of failing.
+  const raced = provisionSeededDatabase();
+  raced.provisionRows.push({
+    id: "018f2b8a-0000-4c2d-9c3e-0000000000f1",
+    company_id: COMPANY_A,
+    kyc_submission_id: APPROVED_SUBMISSION_ID,
+    provider_id: NMI_PROVIDER_ID,
+    provider_key: "nmi",
+    mode: "test",
+    master_account_ref: `nmi:${NMI_MASTER_KEY_ID}`,
+    provider_submerchant_id: null,
+    status: "pending",
+    charges_enabled: false,
+    payouts_enabled: false,
+    requested_at: "2026-11-02T09:05:00.000Z",
+    next_attempt_at: "2026-11-02T09:05:00.000Z",
+    version: 1,
+    updated_at: "2026-11-02T09:05:00.000Z",
+    created_at: "2026-11-02T09:05:00.000Z",
+  });
+  raced.provisionRows.push({
+    id: "018f2b8a-0000-4c2d-9c3e-0000000000f2",
+    company_id: COMPANY_A,
+    kyc_submission_id: APPROVED_SUBMISSION_ID,
+    provider_id: STRIPE_PROVIDER_ID,
+    provider_key: "stripe_connect",
+    mode: "test",
+    master_account_ref: null,
+    provider_submerchant_id: null,
+    status: "pending",
+    charges_enabled: false,
+    payouts_enabled: false,
+    requested_at: "2026-11-02T09:05:00.000Z",
+    next_attempt_at: null,
+    version: 1,
+    updated_at: "2026-11-02T09:05:00.000Z",
+    created_at: "2026-11-02T09:05:00.000Z",
+  });
+  const racedSummary = await runSubmerchantProvisioning(
+    { company_id: COMPANY_A, kyc_submission_id: APPROVED_SUBMISSION_ID },
+    dependenciesOf(raced, createInMemoryAuditTrail()),
+  );
+
+  expectEqual(racedSummary.created, 0, "a run over existing rows creates nothing");
+  expectEqual(racedSummary.skipped, 2, "both rows are the winners");
+
+  // The job machinery: registration once, idempotent enqueue, and the handler creates the rows.
+  const registry = new JobRegistry();
+  const queue = createInMemoryJobQueue();
+
+  registerSubmerchantProvisionJob(registry);
+
+  expectEqual(registry.has(SUBMERCHANT_PROVISION_JOB), true, "the provision job is registered");
+  expectEqual(registry.size, 1, "one job");
+  registerSubmerchantProvisionJob(registry);
+  expectEqual(registry.size, 1, "registering twice is a no-op");
+
+  const first = await enqueueProvisioningAfterApproval(
+    { registry, queue },
+    { companyId: COMPANY_A, kycSubmissionId: APPROVED_SUBMISSION_ID },
+  );
+
+  expectEqual(first.job.name, SUBMERCHANT_PROVISION_JOB, "the enqueued job is the provision job");
+  expectEqual(first.job.status, "pending", "it waits in the queue");
+  expectEqual(first.deduplicated, false, "the first enqueue is not a duplicate");
+  expectEqual(
+    first.job.idempotencyKey,
+    provisionJobIdempotencyKey(COMPANY_A, APPROVED_SUBMISSION_ID),
+    "keyed by merchant and submission",
+  );
+
+  const second = await enqueueProvisioningAfterApproval(
+    { registry, queue },
+    { companyId: COMPANY_A, kycSubmissionId: APPROVED_SUBMISSION_ID },
+  );
+
+  expectEqual(second.deduplicated, true, "a retried enqueue returns the first job");
+  expectEqual(second.job.id, first.job.id, "the same job");
+
+  const badEnqueue = await rejectionOf(() =>
+    enqueueProvisioningAfterApproval({ registry, queue }, { companyId: "nope", kycSubmissionId: APPROVED_SUBMISSION_ID }),
+  );
+
+  expectEqual(badEnqueue?.code, "VALIDATION_FAILED", "a malformed enqueue payload is refused at the call site");
+
+  let boundaryThrew = false;
+
+  try {
+    registry.get(SUBMERCHANT_PROVISION_JOB).parsePayload({ company_id: "nope" });
+  } catch {
+    boundaryThrew = true;
+  }
+
+  expectEqual(boundaryThrew, true, "the registry validates the payload again before the handler runs");
+
+  // The handler itself, driven against the fake store through the injectable definition.
+  const jobDatabase = provisionSeededDatabase();
+  const jobAudit = createInMemoryAuditTrail();
+  const definition = createProvisionJobHandler(() => ({
+    rest: createBusinessStore(jobDatabase),
+    audit: jobAudit,
+    now: () => NOW,
+  }));
+
+  await definition.handler({
+    jobId: "018f2b8a-0000-4c2d-9c3e-00000000job1",
+    name: SUBMERCHANT_PROVISION_JOB,
+    attempt: 1,
+    maxAttempts: 5,
+    traceId: "trace-1",
+    payload: { company_id: COMPANY_A, kyc_submission_id: APPROVED_SUBMISSION_ID },
+    signal: new AbortController().signal,
+  });
+
+  expectEqual(jobDatabase.provisionRows.length, 2, "the job handler created the two provision rows");
+  expectEqual(
+    jobAudit.entries.filter((entry) => entry.action === SUBMERCHANT_PROVISION_QUEUED_AUDIT_ACTION).length,
+    2,
+    "and audited both",
+  );
+}
+
+/** ---- STEP 094 sources: the provision service, the enqueue hook in the decide route. */
+async function checkSubmerchantProvisionSources(): Promise<void> {
+  const provision = await readRepositoryFile("services/submerchant/provision.ts");
+  const decideRoute = await readRepositoryFile("app/api/onboarding/kyc-decide/route.ts");
+
+  expectEqual(provision.split("\n")[0], "// path: services/submerchant/provision.ts", "the provision service states its own path on its first line");
+  expectEqual(/[^\t\n\r\x20-\x7E]/u.test(provision), false, "the provision service is ASCII only");
+
+  expect(provision.includes('SUBMERCHANT_PROVISIONS_TABLE = "submerchant_provisions"'), "the service names the 0054 table");
+  expect(provision.includes('PAYMENT_PROVIDERS_TABLE = "payment_providers"'), "and the 0029 catalogue");
+  expect(provision.includes('PROVIDER_KEYS_TABLE = "provider_keys"'), "and the 0030 keys");
+  expect(provision.includes('SUBMERCHANT_PROVISION_JOB = "submerchant.provision"'), "and the job name");
+  expect(provision.includes('SUBMERCHANT_PROVISION_QUEUED_AUDIT_ACTION = "submerchant_provision.queued"'), "and the queue audit action");
+  expect(provision.includes("company_id=is.null"), "the master accounts are the platform level rows");
+  expect(provision.includes("supports_submerchant=is.true"), "only sub-merchant capable providers provision");
+  expect(provision.includes("status=eq.active"), "an active key means a connected master account");
+  expect(provision.includes("not_approved"), "only an approved submission provisions");
+  expect(provision.includes("charges_enabled: false"), "charges stay disabled");
+  expect(provision.includes("payouts_enabled: false"), "and payouts too, until verification completes");
+  expect(provision.includes("idempotencyKey"), "the enqueue is idempotent per merchant and submission");
+  expect(provision.includes('error.code === "CONFLICT"'), "a lost insert race converges on the winner's row");
+
+  expect(decideRoute.includes("enqueueProvisioningAfterApproval("), "the decide route enqueues provisioning");
+  expect(decideRoute.includes("getJobRuntime("), "through the process-wide job runtime");
+  expect(decideRoute.includes('detail.status === "approved"'), "only an approval triggers it");
+  expect(decideRoute.includes("logger.error("), "and an enqueue failure is logged, never fatal to the decision");
+
+  expect(
+    (await readdir(new URL("services/submerchant/", repositoryRoot))).includes("provision.ts"),
+    "the provision service lives in services/submerchant",
+  );
+}
+
 async function main(): Promise<void> {
   checkVocabulary();
   await checkRefusals();
@@ -7742,6 +8238,8 @@ async function main(): Promise<void> {
   await checkKycSources();
   await checkKycDecision();
   await checkKycDecisionSources();
+  await checkSubmerchantProvision();
+  await checkSubmerchantProvisionSources();
   await checkKycCatalog();
   await checkStatusCatalog();
   await checkReviewCatalog();
@@ -7770,7 +8268,7 @@ async function main(): Promise<void> {
     `onboarding gate passed: ${checks} checks, ${ONBOARDING_STEPS.length} steps, ` +
       `${ONBOARDING_OWNER_ROLES.length} role, ${BUSINESS_PROFILE_FIELDS.length} business fields, ` +
       `${PROCESSOR_REQUIREMENT_LIST.length} processors, ${BUSINESS_PROFILE_TABLE} table, ` +
-      `${MCC_CODES_TABLE} vocabulary, ${COUNTRIES_TABLE} list, submerchant profile, kyc pack, underwriting criteria, merchant limits, payment holds\n`,
+      `${MCC_CODES_TABLE} vocabulary, ${COUNTRIES_TABLE} list, submerchant profile, kyc pack, underwriting criteria, merchant limits, payment holds, submerchant provisioning\n`,
   );
 }
 

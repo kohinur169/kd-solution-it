@@ -105,6 +105,14 @@ Every read is scoped to the caller company and every write is audit logged.
   `status=eq.in_review` + version with a re-read race check (`stale`), audited `kyc_review.decided` -
   every KYC decision is audit logged; `POST /api/onboarding/kyc-decide` serves it and the review
   queue's panel (`/onboarding/kyc-review`) offers approve/reject on an open submission.
+- STEP 094 provisions the sub-merchant automatically after that approval: `POST /api/onboarding/kyc-decide`
+  enqueues the `submerchant.provision` job (idempotent per merchant + submission) when a decision lands
+  `approved`; `services/submerchant/provision.ts` runs it against `0054_submerchant_provisions` - one
+  `pending` row per platform-level enabled sub-merchant-capable `payment_providers` entry, carrying
+  `master_account_ref` from the active platform `provider_keys` row when a master account is connected
+  (else queued without one, which is the office alert STEP 096 reads), charges/payouts written
+  `false` until verification, audited `submerchant_provision.queued`, lost insert races converging on
+  the winner's row. No new migration: `0054` already holds the provision rows.
 
 ## The reader
 

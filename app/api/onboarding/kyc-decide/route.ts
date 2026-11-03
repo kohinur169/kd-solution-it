@@ -4,9 +4,11 @@ import { AppError } from "@/lib/errors/app-error";
 import { withErrorResponse } from "@/lib/errors/respond";
 import { readRequestActor } from "@/lib/auth/request-actor";
 import { getAuthRuntime } from "@/lib/auth/runtime";
+import { getJobRuntime } from "@/lib/jobs/runtime";
 import { logger } from "@/lib/logger/logger";
 import { requireCsrfToken } from "@/lib/security/csrf";
 import { decideKycSubmission, type KycReviewDetail } from "@/services/kyc/kyc-review";
+import { enqueueProvisioningAfterApproval } from "@/services/submerchant/provision";
 
 export const dynamic = "force-dynamic";
 
@@ -27,7 +29,10 @@ const maximumBodyBytes = 8_192;
  * `already_decided`, because `0048` locks it. A four-eye submission is decided by a second reviewer
  * who is not the first (`same_reviewer` otherwise). The write is one conditional update by id +
  * company + `status=eq.in_review` + current version with a re-read race check, audited
- * `kyc_review.decided` - every KYC decision is audit logged.
+ * `kyc_review.decided` - every KYC decision is audit logged. An approval additionally enqueues
+ * the `submerchant.provision` job of STEP 094, so the sub-merchant accounts are created under the
+ * connected master platform accounts; the enqueue is idempotent per merchant and submission and
+ * never fails the decision it follows.
  *
  * ## The order of the checks
  *
@@ -78,6 +83,25 @@ export const POST = withErrorResponse(
       submissionId: detail.submissionId,
       status: detail.status,
     });
+
+    // Section 5: final approval triggers automatic sub-merchant account creation. The job is
+    // idempotent per merchant and submission, and a queue that is down must not undo the decision.
+    if (detail.status === "approved") {
+      try {
+        const jobs = getJobRuntime();
+
+        await enqueueProvisioningAfterApproval(jobs, {
+          companyId: detail.companyId,
+          kycSubmissionId: detail.submissionId,
+        });
+      } catch (error) {
+        logger.error("submerchant provisioning enqueue failed", {
+          submissionId: detail.submissionId,
+          companyId: detail.companyId,
+          code: error instanceof AppError ? error.code : "INTERNAL_ERROR",
+        });
+      }
+    }
 
     return NextResponse.json(detail, {
       status: 200,
