@@ -1,5 +1,13 @@
 // path: lib/storage/service.ts
 import type { AuditTrail } from "../auth/audit.ts";
+import { readFileEnvelopeInfo } from "../security/encryption.ts";
+import { UPLOAD_PURPOSES } from "../security/upload.ts";
+import type { UploadPurpose } from "../security/upload.ts";
+import type {
+  FileEncryptionScope,
+  SealedFile,
+  StorageFileEncryption,
+} from "./encryption.ts";
 import {
   BUCKET_NAME_PATTERN,
   CONTENT_TYPE_PATTERN,
@@ -225,6 +233,119 @@ export async function createFileSignedUrl(
   });
 
   return signed;
+}
+
+/** The content type the encrypted envelope is uploaded as: the bytes are an envelope, not a document. */
+export const ENCRYPTED_ENVELOPE_CONTENT_TYPE = "application/octet-stream";
+
+function encryptionScopeOf(access: FileAccessContext): FileEncryptionScope {
+  if (access.companyId === null || access.purpose === null || !UPLOAD_PURPOSES.includes(access.purpose as UploadPurpose)) {
+    throw invalidInput("the encrypted operation needs the tenant id and a known upload purpose");
+  }
+
+  return { companyId: access.companyId, purpose: access.purpose as UploadPurpose };
+}
+
+export interface EncryptedUploadResult {
+  /** What the adapter stored: provider, bucket, key, ciphertext size. */
+  readonly stored: StoredObject;
+  /** The quartet and hash STEP 103 writes into the `0057` record. */
+  readonly sealed: SealedFile;
+}
+
+export interface EncryptedOperationDependencies extends StorageOperationDependencies {
+  readonly encryption: StorageFileEncryption;
+}
+
+/**
+ * Store the encrypted form of a file: the bytes are sealed with AES-256-GCM for the tenant and
+ * purpose (section 21: "Every file is AES-256-GCM encrypted before upload") and only the envelope
+ * reaches the adapter, uploaded as `application/octet-stream`. The audit entry carries the quartet
+ * and the plaintext hash, so the access log says what was stored without ever holding the bytes.
+ */
+export async function uploadEncryptedObject(
+  adapter: StorageAdapter,
+  input: StorageUploadInput,
+  access: FileAccessContext,
+  dependencies: EncryptedOperationDependencies,
+): Promise<EncryptedUploadResult> {
+  const ref = validateObjectRef(input);
+
+  if (typeof input.contentType !== "string" || !CONTENT_TYPE_PATTERN.test(input.contentType)) {
+    throw invalidInput("the content type is not a valid mime type");
+  }
+
+  const scope = encryptionScopeOf(access);
+  const sealed = dependencies.encryption.seal(input.bytes, scope);
+  const stored = await adapter.upload({
+    ...ref,
+    bytes: sealed.envelope,
+    contentType: ENCRYPTED_ENVELOPE_CONTENT_TYPE,
+  });
+
+  await appendAccessTolerated(dependencies.audit, {
+    action: FILE_UPLOADED_AUDIT_ACTION,
+    actorUserId: access.actorUserId,
+    entityType: FILE_AUDIT_ENTITY,
+    entityId: access.fileId ?? null,
+    companyId: access.companyId,
+    sessionId: null,
+    payload: accessPayload(ref, access, {
+      provider: stored.provider,
+      byte_size: sealed.ciphertextBytes,
+      content_type: input.contentType,
+      encrypted: true,
+      encryption_algorithm: sealed.algorithm,
+      encryption_key_version: sealed.keyVersion,
+      ciphertext_iv: sealed.iv,
+      ciphertext_tag: sealed.tag,
+      plaintext_sha256: sealed.plaintextSha256,
+      plaintext_bytes: sealed.plaintextBytes,
+    }),
+  });
+
+  return { stored, sealed };
+}
+
+/**
+ * Read a stored file back and decrypt it. The object must be a well formed envelope whose plaintext
+ * size is within the ceiling, and it is opened under the same tenant and purpose it was sealed for -
+ * a ciphertext moved to another row fails the tag here, before any byte is returned. The access is
+ * audited with the plaintext size, never the bytes.
+ */
+export async function downloadEncryptedObject(
+  adapter: StorageAdapter,
+  ref: StorageObjectRef,
+  access: FileAccessContext,
+  dependencies: EncryptedOperationDependencies,
+): Promise<Uint8Array> {
+  const valid = validateObjectRef(ref);
+  const scope = encryptionScopeOf(access);
+  const envelope = await adapter.download(valid);
+  const info = readFileEnvelopeInfo(envelope);
+
+  if (info === null || info.plaintextBytes > MAX_OBJECT_BYTES) {
+    throw new StorageError("provider_error", "the stored object is not a readable encrypted envelope");
+  }
+
+  const plaintext = dependencies.encryption.open(envelope, scope);
+
+  await appendAccessTolerated(dependencies.audit, {
+    action: FILE_ACCESSED_AUDIT_ACTION,
+    actorUserId: access.actorUserId,
+    entityType: FILE_AUDIT_ENTITY,
+    entityId: access.fileId ?? null,
+    companyId: access.companyId,
+    sessionId: null,
+    payload: accessPayload(valid, access, {
+      operation: "download",
+      byte_size: plaintext.length,
+      encrypted: true,
+      encryption_key_version: info.keyId,
+    }),
+  });
+
+  return plaintext;
 }
 
 /** Delete the object through the adapter, audited `file.deleted`. */

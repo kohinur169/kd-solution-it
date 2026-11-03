@@ -4,13 +4,27 @@ import { readFile } from "node:fs/promises";
 import { createInMemoryAuditTrail, type AuditTrail } from "../auth/audit.ts";
 import { registerConfiguredAdapters } from "./adapters.ts";
 import { storageErrorForStatus, type StorageFetch } from "./http.ts";
+import { isAppError } from "../errors/app-error.ts";
+import { ENCRYPTION_CHUNK_BYTES, isFileEnvelope, readFileEnvelopeInfo } from "../security/encryption.ts";
+import { createHash } from "node:crypto";
 import { adapterFor, StorageAdapterAlreadyRegisteredError, StorageAdapterRegistry } from "./registry.ts";
+import {
+  createFileEncryption,
+  fileEncryptionKeyring,
+  fileEncryptionScope,
+  keyVersionOfKeyId,
+  FILE_ENCRYPTION_ALGORITHM,
+  FILE_ENCRYPTION_KEY_ID,
+  FILE_ENCRYPTION_KEY_VERSION,
+} from "./encryption.ts";
 import { amzDates, awsUriEncode, createS3StorageAdapter, S3_ALGORITHM } from "./s3-adapter.ts";
 import { createSupabaseStorageAdapter, SUPABASE_SIGNED_PATH_PREFIX } from "./supabase-adapter.ts";
 import {
   createFileSignedUrl,
   deleteObject,
+  downloadEncryptedObject,
   downloadObject,
+  uploadEncryptedObject,
   FILE_ACCESSED_AUDIT_ACTION,
   FILE_AUDIT_ENTITY,
   FILE_DELETED_AUDIT_ACTION,
@@ -97,6 +111,11 @@ class FakeAdapter implements StorageAdapter {
   readonly calls: RecordedCall[] = [];
   private readonly objects = new Map<string, Uint8Array>();
   failWith: StorageError | null = null;
+
+  /** Plant an object directly, for downloads the upload path did not write. */
+  plant(bucket: string, key: string, bytes: Uint8Array): void {
+    this.objects.set(`${bucket}/${key}`, bytes);
+  }
 
   constructor(name: StorageAdapterName) {
     this.name = name;
@@ -597,6 +616,139 @@ function checkConfiguredRegistration(): void {
   expect(partial instanceof Error && /set together/u.test((partial as Error).message), "partial S3 fields fail at wiring");
 }
 
+const MASTER_KEY = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=";
+const ENCRYPTION_ENV = { ENCRYPTION_MASTER_KEY: MASTER_KEY };
+
+function encryptionReason(error: unknown): string | null {
+  if (isAppError(error) && error.cause !== null && typeof error.cause === "object" && "reason" in error.cause) {
+    return String((error.cause as { readonly reason: unknown }).reason);
+  }
+
+  return null;
+}
+
+function checkEncryption(): void {
+  const encryption = createFileEncryption(ENCRYPTION_ENV);
+  const scope = { companyId: COMPANY_ID, purpose: "kyc_document" as const };
+  const plaintext = new TextEncoder().encode("%PDF-1.4 fake kyc document");
+
+  expectEqual(FILE_ENCRYPTION_ALGORITHM, "aes-256-gcm", "the only allowed cipher");
+  expectEqual(FILE_ENCRYPTION_KEY_ID, "master-v1", "the master key id");
+  expectEqual(FILE_ENCRYPTION_KEY_VERSION, 1, "and its version");
+  expectEqual(keyVersionOfKeyId("master-v1"), 1, "the version of a key id");
+  expectEqual(keyVersionOfKeyId("master-v999"), 999, "the ceiling version parses");
+  expect(rejectionOfSync(() => keyVersionOfKeyId("master-v1000")) instanceof Error, "version 1000 is refused");
+  expect(rejectionOfSync(() => keyVersionOfKeyId("master-x")) instanceof Error, "a key id without a version is refused");
+  expect(rejectionOfSync(() => fileEncryptionKeyring({ ENCRYPTION_MASTER_KEY: "not-base64!!" })) instanceof Error, "a malformed master key is refused at the keyring");
+
+  // scope
+  expectEqual(fileEncryptionScope(scope), `file:${COMPANY_ID}:kyc_document`, "the scope binds tenant and purpose");
+  expect(isStorageError(rejectionOfSync(() => fileEncryptionScope({ companyId: "not-a-uuid", purpose: "kyc_document" }))), "a malformed company id is refused");
+  expect(isStorageError(rejectionOfSync(() => fileEncryptionScope({ companyId: COMPANY_ID, purpose: "evil" as never }))), "an unknown purpose is refused");
+
+  // seal: envelope + quartet + hash
+  const sealed = encryption.seal(plaintext, scope);
+  expectEqual(new TextDecoder().decode(sealed.envelope.subarray(0, 4)), "KDF1", "the envelope carries the file magic");
+  expect(isFileEnvelope(sealed.envelope), "the envelope is recognised without a key");
+  expectEqual(sealed.algorithm, "aes-256-gcm", "the quartet algorithm");
+  expectEqual(sealed.keyVersion, 1, "the quartet key version");
+  expectEqual(Buffer.from(sealed.iv, "base64").length, 12, "the iv is the 12-byte base vector in base64");
+  expectEqual(Buffer.from(sealed.tag, "base64").length, 16, "the tag is the 16-byte first-chunk tag in base64");
+  expectEqual(sealed.plaintextSha256, createHashForTest(plaintext), "the hash is the sha256 of the plaintext");
+  expectEqual(sealed.plaintextBytes, plaintext.length, "the plaintext size");
+  expectEqual(sealed.ciphertextBytes, sealed.envelope.length, "the ciphertext size is the envelope");
+  expect(sealed.envelope.length > plaintext.length, "the envelope is larger than the plaintext (header + tags)");
+
+  // round trip
+  const opened = encryption.open(sealed.envelope, scope);
+  expectEqual(opened.length, plaintext.length, "the round trip returns the plaintext length");
+  expectEqual(Buffer.from(opened).toString("utf8"), Buffer.from(plaintext).toString("utf8"), "the round trip returns the plaintext");
+
+  // a second seal of the same plaintext differs (random base iv)
+  expect(Buffer.from(encryption.seal(plaintext, scope).envelope).equals(Buffer.from(sealed.envelope)) === false, "two seals differ in the iv");
+
+  // multi-chunk round trip
+  const big = new Uint8Array(ENCRYPTION_CHUNK_BYTES + 100);
+  for (let i = 0; i < big.length; i += 1) big[i] = i % 251;
+  const bigSealed = encryption.seal(big, scope);
+  const bigInfo = readFileEnvelopeInfo(bigSealed.envelope);
+  expectEqual(bigInfo?.chunkCount, 2, "a file over one chunk seals two records");
+  expectEqual(Buffer.from(encryption.open(bigSealed.envelope, scope)).equals(Buffer.from(big)), true, "the multi-chunk round trip returns the plaintext");
+
+  // wrong tenant fails the tag
+  const wrongTenant = encryption.seal(plaintext, { companyId: "018f2b8a-4444-4c2d-9c3e-000000000002", purpose: "kyc_document" });
+  const crossTenant = rejectionOfSync(() => encryption.open(wrongTenant.envelope, scope));
+  expect(encryptionReason(crossTenant) === "authentication_failed", "a ciphertext opened under another tenant fails the tag");
+  const wrongPurpose = rejectionOfSync(() => encryption.open(sealed.envelope, { companyId: COMPANY_ID, purpose: "company_logo" }));
+  expect(encryptionReason(wrongPurpose) === "authentication_failed", "a ciphertext opened under another purpose fails the tag");
+
+  // tampering and truncation
+  const tampered = Uint8Array.from(sealed.envelope);
+  tampered[tampered.length - 1] = (tampered[tampered.length - 1] ?? 0) ^ 0xff;
+  expect(encryptionReason(rejectionOfSync(() => encryption.open(tampered, scope))) === "authentication_failed", "an edited byte fails the tag");
+  const truncated = sealed.envelope.subarray(0, sealed.envelope.length - 5);
+  expect(!isFileEnvelope(truncated), "a truncated envelope is not an envelope");
+  expect(encryptionReason(rejectionOfSync(() => encryption.open(truncated, scope))) === "envelope_invalid", "a truncated envelope is refused");
+  expect(encryptionReason(rejectionOfSync(() => encryption.open(plaintext, scope))) === "envelope_invalid", "plaintext that is not an envelope is refused");
+
+  // size bounds
+  expect(isStorageError(rejectionOfSync(() => encryption.seal(new Uint8Array(0), scope))), "an empty file is refused");
+  expect(isStorageError(rejectionOfSync(() => encryption.seal(new Uint8Array(MAX_OBJECT_BYTES + 1), scope))), "an over-ceiling file is refused");
+}
+
+function createHashForTest(data: Uint8Array): string {
+  return createHash("sha256").update(data).digest("hex");
+}
+
+async function checkEncryptedOperations(): Promise<void> {
+  const encryption = createFileEncryption(ENCRYPTION_ENV);
+  const adapter = new FakeAdapter("supabase");
+  const audit = createInMemoryAuditTrail();
+  const dependencies = { audit, now: () => NOW, encryption };
+  const plaintext = new TextEncoder().encode("%PDF-1.4 fake kyc document");
+
+  // encrypted upload: the adapter never sees the plaintext
+  const result = await uploadEncryptedObject(
+    adapter,
+    { bucket: BUCKET, key: KEY, bytes: plaintext, contentType: "application/pdf" },
+    access,
+    dependencies,
+  );
+  expectEqual(result.stored.provider, "supabase", "the encrypted upload answers the provider");
+  expectEqual(result.sealed.algorithm, "aes-256-gcm", "and the quartet");
+  expectEqual((adapter.calls[0]?.input as { contentType?: string }).contentType, "application/octet-stream", "the envelope is uploaded as octet-stream");
+  const uploadedBytes = (adapter.calls[0]?.input as { bytes?: string }).bytes;
+  expectEqual(uploadedBytes, `<${result.sealed.ciphertextBytes} bytes>`, "the adapter received the envelope, not the plaintext");
+  expect(result.sealed.ciphertextBytes > plaintext.length, "the envelope is bigger than the plaintext");
+  expectEqual(audit.entries[0]?.action, FILE_UPLOADED_AUDIT_ACTION, "the encrypted upload is audited");
+  const payload = audit.entries[0]?.payload ?? {};
+  expectEqual(payload["encrypted"], true, "the audit says the object is encrypted");
+  expectEqual(payload["encryption_algorithm"], "aes-256-gcm", "with the algorithm");
+  expectEqual(payload["encryption_key_version"], 1, "the key version");
+  expectEqual(payload["plaintext_sha256"], result.sealed.plaintextSha256, "and the plaintext hash");
+  expectEqual(payload["byte_size"], result.sealed.ciphertextBytes, "the stored size is the ciphertext size");
+  expectEqual(payload["content_type"], "application/pdf", "the real type stays in the record fields");
+
+  // encrypted download: the adapter answers the envelope, the caller gets the plaintext
+  const { stored } = result;
+  void stored;
+  const read = await downloadEncryptedObject(adapter, { bucket: BUCKET, key: KEY }, access, dependencies);
+  expectEqual(Buffer.from(read).toString("utf8"), Buffer.from(plaintext).toString("utf8"), "the encrypted download decrypts to the plaintext");
+  expectEqual((audit.entries[1]?.payload ?? {})["operation"], "download", "audited as a download");
+  expectEqual((audit.entries[1]?.payload ?? {})["encrypted"], true, "audited as encrypted");
+
+  // a stored object that is not an envelope is refused before decryption
+  adapter.plant(BUCKET, KEY, plaintext);
+  const notEnvelope = await rejectionOf(() => downloadEncryptedObject(adapter, { bucket: BUCKET, key: KEY }, access, dependencies));
+  expect(isStorageError(notEnvelope) && (notEnvelope as StorageError).code === "provider_error", "a non-envelope object answers provider_error");
+
+  // the tenant is required for the scope
+  const noTenant = await rejectionOf(() =>
+    uploadEncryptedObject(adapter, { bucket: BUCKET, key: KEY, bytes: plaintext, contentType: "application/pdf" }, { ...access, companyId: null }, dependencies),
+  );
+  expect(isStorageError(noTenant) && (noTenant as StorageError).code === "invalid_input", "an encrypted upload without a tenant is refused");
+}
+
 async function checkSources(): Promise<void> {
   const paths = [
     "lib/storage/types.ts",
@@ -606,6 +758,7 @@ async function checkSources(): Promise<void> {
     "lib/storage/supabase-adapter.ts",
     "lib/storage/s3-adapter.ts",
     "lib/storage/adapters.ts",
+    "lib/storage/encryption.ts",
     "lib/storage/verify.ts",
     "lib/storage/README.md",
   ];
@@ -638,6 +791,9 @@ async function checkSources(): Promise<void> {
   expect(service.includes('FILE_ACCESSED_AUDIT_ACTION = "file.accessed"'), "the access audit action is declared");
   expect(service.includes('FILE_DELETED_AUDIT_ACTION = "file.deleted"'), "the delete audit action is declared");
   expect(service.includes("includes(\"..\")"), "the key validation refuses traversal segments");
+  expect(service.includes("uploadEncryptedObject"), "the service seals before upload");
+  expect(service.includes("downloadEncryptedObject"), "and opens after download");
+  expect(service.includes("application/octet-stream"), "the envelope is uploaded as octet-stream");
 
   const registry = await readRepositoryFile("lib/storage/registry.ts");
   expect(registry.includes("getServerConfig().storageProvider"), "the active adapter comes from the environment configuration");
@@ -659,6 +815,13 @@ async function checkSources(): Promise<void> {
   expect(wiring.includes("registerConfiguredAdapters"), "the wiring registers the configured adapters");
   expect(wiring.includes("serverEnv()"), "the default wiring reads the validated environment");
 
+  const encryption = await readRepositoryFile("lib/storage/encryption.ts");
+  expect(encryption.includes('"aes-256-gcm"'), "the cipher is fixed to aes-256-gcm");
+  expect(encryption.includes("file:"), "the aad scope binds the file to tenant and purpose");
+  expect(encryption.includes("ENCRYPTION_MASTER_KEY"), "the key comes from the environment");
+  expect(encryption.includes("encryptFile"), "sealing delegates to the KDF1 envelope writer");
+  expect(encryption.includes("decryptFile"), "opening delegates to the envelope reader");
+
   const http = await readRepositoryFile("lib/storage/http.ts");
   expect(http.includes('redirect: "error"'), "redirects are errors");
   expect(http.includes("checkOutboundUrl"), "every url is checked against the outbound policy");
@@ -672,6 +835,8 @@ async function main(): Promise<void> {
   await checkSupabaseAdapter();
   await checkS3Adapter();
   checkConfiguredRegistration();
+  checkEncryption();
+  await checkEncryptedOperations();
   await checkSources();
 
   if (failures.length > 0) {
@@ -688,7 +853,8 @@ async function main(): Promise<void> {
 
   process.stdout.write(
     `storage gate passed: ${checks} checks, ${STORAGE_ADAPTER_NAMES.length} adapter names (supabase + s3 wired), ` +
-      `${STORAGE_ERROR_CODES.length} error codes, signed urls ${SIGNED_URL_DEFAULT_TTL_SECONDS}s default / ${SIGNED_URL_MAX_TTL_SECONDS}s max\n`,
+      `${STORAGE_ERROR_CODES.length} error codes, files sealed aes-256-gcm (${FILE_ENCRYPTION_KEY_ID}), ` +
+      `signed urls ${SIGNED_URL_DEFAULT_TTL_SECONDS}s default / ${SIGNED_URL_MAX_TTL_SECONDS}s max\n`,
   );
 }
 
