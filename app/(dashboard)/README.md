@@ -113,6 +113,13 @@ Every read is scoped to the caller company and every write is audit logged.
   (else queued without one, which is the office alert STEP 096 reads), charges/payouts written
   `false` until verification, audited `submerchant_provision.queued`, lost insert races converging on
   the winner's row. No new migration: `0054` already holds the provision rows.
+- STEP 095 syncs the provision row from verified provider webhooks: `services/submerchant/provision-sync.ts`
+  reads a `processed`, signature-verified `0032_webhook_events` row, maps `submerchant.verified` /
+  `action_required` / `rejected` / `restricted` onto the `0054` state walk (locked end states conflict),
+  applies a company-scoped conditional update by id + version (re-read race check `stale`), enables
+  charges/payouts only on `verified`, records `last_webhook_event_id` + `last_synced_at` (re-deliveries
+  are no-ops), audits `submerchant_provision.synced`, and runs as the idempotent `submerchant.sync`
+  background job keyed per webhook event (`registerSubmerchantJobs` registers provision + sync).
 
 ## The reader
 

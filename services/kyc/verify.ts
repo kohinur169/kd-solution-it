@@ -166,6 +166,17 @@ import {
   SUBMERCHANT_PROVISIONS_TABLE,
 } from "../submerchant/provision.ts";
 import {
+  createSyncJobHandler,
+  enqueueProvisionSync,
+  PROVISION_SYNC_EVENT_TYPES,
+  registerSubmerchantJobs,
+  SUBMERCHANT_SYNC_JOB,
+  SUBMERCHANT_PROVISION_SYNCED_AUDIT_ACTION,
+  syncJobIdempotencyKey,
+  syncProvisionFromWebhook,
+  WEBHOOK_EVENTS_TABLE,
+} from "../submerchant/provision-sync.ts";
+import {
   assertProvisionable,
   PROCESSOR_PROFILE_AUDIT_ACTION,
   PROCESSOR_PROFILE_AUDIT_ENTITY,
@@ -1126,6 +1137,32 @@ interface ProvisionRowShape {
   payouts_enabled: boolean;
   requested_at: string;
   next_attempt_at: string | null;
+  last_webhook_event_id?: string | null;
+  last_synced_at?: string | null;
+  verified_at?: string | null;
+  restricted_at?: string | null;
+  rejected_at?: string | null;
+  action_required_detail?: string | null;
+  rejection_reason?: string | null;
+  version: number;
+  updated_at: string;
+  created_at: string;
+}
+
+/** One `0032` webhook event row, as the fake store holds it. */
+interface WebhookEventRowShape {
+  id: string;
+  company_id: string | null;
+  provider_id: string;
+  mode: string;
+  external_event_id: string;
+  event_type: string;
+  payload_hash: string;
+  signature_ok: boolean;
+  received_at: string;
+  status: string;
+  processed_at: string | null;
+  failure_detail: string | null;
   version: number;
   updated_at: string;
   created_at: string;
@@ -1247,6 +1284,7 @@ interface BusinessDatabase {
   readonly providerRows: ProviderRowShape[];
   readonly providerKeyRows: ProviderKeyRowShape[];
   readonly provisionRows: ProvisionRowShape[];
+  readonly webhookRows: WebhookEventRowShape[];
   readonly queries: string[];
   readonly inserts: { readonly table: string; readonly row: Readonly<Record<string, unknown>> }[];
   readonly updates: {
@@ -1263,6 +1301,8 @@ interface BusinessDatabase {
   holdRace: boolean;
   /** When true, the submission update branch simulates a lost race the same way. */
   submissionRace: boolean;
+  /** When true, the provision update branch simulates a lost race the same way. */
+  provisionRace: boolean;
 }
 
 function businessRow(overrides: Partial<BusinessRowShape> = {}): BusinessRowShape {
@@ -1308,6 +1348,7 @@ function createBusinessDatabase(
   providerRows: readonly ProviderRowShape[] = defaultProviderRows(),
   providerKeyRows: readonly ProviderKeyRowShape[] = defaultProviderKeyRows(),
   provisionRows: readonly ProvisionRowShape[] = [],
+  webhookRows: readonly WebhookEventRowShape[] = [],
 ): BusinessDatabase {
   return {
     profileRows: [...profileRows],
@@ -1325,6 +1366,7 @@ function createBusinessDatabase(
     providerRows: [...providerRows].map((row) => ({ ...row })),
     providerKeyRows: [...providerKeyRows].map((row) => ({ ...row })),
     provisionRows: [...provisionRows].map((row) => ({ ...row })),
+    webhookRows: [...webhookRows].map((row) => ({ ...row })),
     queries: [],
     inserts: [],
     updates: [],
@@ -1333,6 +1375,7 @@ function createBusinessDatabase(
     limitRace: false,
     holdRace: false,
     submissionRace: false,
+    provisionRace: false,
   };
 }
 
@@ -1647,6 +1690,39 @@ function createBusinessStore(database: BusinessDatabase): RestClient {
             const value = decodeURIComponent(eqPart.slice(column.length + 4));
             matched = matched.filter((row) => row[column] === value);
           }
+        }
+
+        const limit = parts.find((part) => part.startsWith("limit="));
+        const capped =
+          limit === undefined
+            ? matched
+            : matched.slice(0, Number.parseInt(limit.slice("limit=".length), 10));
+
+        // Rows seeded before the sync columns existed still answer with the migration's defaults.
+        const withDefaults = capped.map((row) => ({
+          last_webhook_event_id: null,
+          last_synced_at: null,
+          ...row,
+        }));
+
+        return Promise.resolve(withDefaults.map((row) => schema.parse(row)));
+      }
+
+      // The `0032` webhook events: read by id, never company-scoped - the event names its own
+      // merchant once it has resolved it.
+      if (table === WEBHOOK_EVENTS_TABLE) {
+        const parts = query.split("&");
+
+        if (!parts.includes("deleted_at=is.null")) {
+          return Promise.reject(new Error(`the webhook read is not over live rows: ${query}`));
+        }
+
+        let matched = [...database.webhookRows];
+        const idPart = parts.find((part) => part.startsWith("id=eq."));
+
+        if (idPart !== undefined) {
+          const wantedId = decodeURIComponent(idPart.slice("id=eq.".length));
+          matched = matched.filter((row) => row.id === wantedId);
         }
 
         const limit = parts.find((part) => part.startsWith("limit="));
@@ -1980,6 +2056,8 @@ function createBusinessStore(database: BusinessDatabase): RestClient {
             payouts_enabled: Boolean(row["payouts_enabled"] ?? false),
             requested_at: String(row["requested_at"] ?? created),
             next_attempt_at: typeof row["next_attempt_at"] === "string" ? row["next_attempt_at"] : null,
+            last_webhook_event_id: null,
+            last_synced_at: null,
             version: Number(row["version"] ?? 1),
             updated_at: created,
             created_at: created,
@@ -2110,6 +2188,40 @@ function createBusinessStore(database: BusinessDatabase): RestClient {
           ) {
             if (database.submissionRace && wantedVersion !== null) {
               row.version = currentVersion + 5;
+
+              continue;
+            }
+
+            for (const [key, value] of Object.entries(values)) {
+              (row as unknown as Record<string, unknown>)[key] = value;
+            }
+          }
+        }
+
+        return Promise.resolve();
+      }
+
+      if (table === SUBMERCHANT_PROVISIONS_TABLE) {
+        const parts = query.split("&");
+
+        if (!parts.includes("deleted_at=is.null")) {
+          return Promise.reject(new Error(`the provision update is not over live rows: ${query}`));
+        }
+
+        const idPart = parts.find((part) => part.startsWith("id=eq."));
+        const versionPart = parts.find((part) => part.startsWith("version=eq."));
+        const wantedId = idPart === undefined ? null : decodeURIComponent(idPart.slice("id=eq.".length));
+        const wantedVersion =
+          versionPart === undefined ? null : Number(versionPart.slice("version=eq.".length));
+
+        for (const row of database.provisionRows) {
+          if (
+            row.company_id === wanted &&
+            (wantedId === null || row.id === wantedId) &&
+            (wantedVersion === null || (row.version ?? 1) === wantedVersion)
+          ) {
+            if (database.provisionRace && wantedVersion !== null) {
+              row.version = (row.version ?? 1) + 5;
 
               continue;
             }
@@ -8183,6 +8295,383 @@ async function checkSubmerchantProvisionSources(): Promise<void> {
   );
 }
 
+/** ---- STEP 095: the verified-webhook sync of the provision rows. */
+const PROV_ID = "018f2b8a-0000-4c2d-9c3e-000000000031";
+const EVENT_VERIFIED = "018f2b8a-0000-4c2d-9c3e-000000000041";
+const EVENT_PENDING = "018f2b8a-0000-4c2d-9c3e-000000000042";
+const EVENT_UNSIGNED = "018f2b8a-0000-4c2d-9c3e-000000000043";
+const EVENT_UNRESOLVED = "018f2b8a-0000-4c2d-9c3e-000000000044";
+const EVENT_OTHER_TYPE = "018f2b8a-0000-4c2d-9c3e-000000000045";
+const EVENT_ACTION = "018f2b8a-0000-4c2d-9c3e-000000000046";
+const EVENT_REJECTED = "018f2b8a-0000-4c2d-9c3e-000000000047";
+const EVENT_RESTRICTED = "018f2b8a-0000-4c2d-9c3e-000000000048";
+
+/** A provision-seeded database with one pending nmi provision row on top. */
+function syncSeededDatabase(provisionStatus = "pending"): BusinessDatabase {
+  const database = provisionSeededDatabase();
+
+  database.provisionRows.push({
+    id: PROV_ID,
+    company_id: COMPANY_A,
+    kyc_submission_id: APPROVED_SUBMISSION_ID,
+    provider_id: NMI_PROVIDER_ID,
+    provider_key: "nmi",
+    mode: "test",
+    master_account_ref: `nmi:${NMI_MASTER_KEY_ID}`,
+    provider_submerchant_id: null,
+    status: provisionStatus,
+    charges_enabled: provisionStatus === "verified",
+    payouts_enabled: provisionStatus === "verified",
+    requested_at: "2026-11-02T09:05:00.000Z",
+    next_attempt_at: "2026-11-02T09:05:00.000Z",
+    verified_at: provisionStatus === "verified" || provisionStatus === "restricted" ? "2026-11-02T10:00:00.000Z" : null,
+    version: 1,
+    updated_at: "2026-11-02T09:05:00.000Z",
+    created_at: "2026-11-02T09:05:00.000Z",
+  });
+
+  return database;
+}
+
+function webhookEventOf(
+  database: BusinessDatabase,
+  overrides: Partial<WebhookEventRowShape>,
+): void {
+  database.webhookRows.push({
+    id: EVENT_VERIFIED,
+    company_id: COMPANY_A,
+    provider_id: NMI_PROVIDER_ID,
+    mode: "test",
+    external_event_id: "evt_1",
+    event_type: "submerchant.verified",
+    payload_hash: "a".repeat(64),
+    signature_ok: true,
+    received_at: "2026-11-02T10:30:00.000Z",
+    status: "processed",
+    processed_at: "2026-11-02T10:30:05.000Z",
+    failure_detail: null,
+    version: 1,
+    updated_at: "2026-11-02T10:30:05.000Z",
+    created_at: "2026-11-02T10:30:00.000Z",
+    ...overrides,
+  });
+}
+
+async function checkSubmerchantSync(): Promise<void> {
+  expectDeepEqual(
+    { ...PROVISION_SYNC_EVENT_TYPES },
+    {
+      "submerchant.verified": "verified",
+      "submerchant.action_required": "action_required",
+      "submerchant.rejected": "rejected",
+      "submerchant.restricted": "restricted",
+    },
+    "the provider event types map to the provision statuses of 0054",
+  );
+
+  // A malformed payload is refused before any query.
+  const badPayload = syncSeededDatabase();
+  const badRefusal = await rejectionOf(() =>
+    syncProvisionFromWebhook({ webhook_event_id: "nope" }, dependenciesOf(badPayload, createInMemoryAuditTrail())),
+  );
+
+  expectEqual(badRefusal?.code, "VALIDATION_FAILED", "a non-uuid event id is refused");
+  expectEqual(badPayload.queries.length, 0, "with zero queries");
+
+  const unknown = await rejectionOf(() =>
+    syncProvisionFromWebhook(
+      { webhook_event_id: "018f2b8a-9999-4c2d-9c3e-999999999999" },
+      dependenciesOf(syncSeededDatabase(), createInMemoryAuditTrail()),
+    ),
+  );
+
+  expectEqual(unknown?.code, "RESOURCE_NOT_FOUND", "an unknown event is not found");
+
+  // Only a processed event syncs; an unverified one never does; an unresolved merchant cannot.
+  for (const [description, eventId, rule] of [
+    ["a pending event", EVENT_PENDING, "not_processed"],
+    ["an unsigned event", EVENT_UNSIGNED, "signature_unverified"],
+    ["an event whose merchant never resolved", EVENT_UNRESOLVED, "merchant_unresolved"],
+  ] as const) {
+    const database = syncSeededDatabase();
+
+    webhookEventOf(database, {
+      id: eventId,
+      status: eventId === EVENT_PENDING ? "pending" : "processed",
+      processed_at: eventId === EVENT_PENDING ? null : "2026-11-02T10:30:05.000Z",
+      signature_ok: eventId !== EVENT_UNSIGNED,
+      company_id: eventId === EVENT_UNRESOLVED ? null : COMPANY_A,
+    });
+
+    const refusal = await rejectionOf(() =>
+      syncProvisionFromWebhook({ webhook_event_id: eventId }, dependenciesOf(database, createInMemoryAuditTrail())),
+    );
+
+    expectEqual(refusal?.code, "CONFLICT", `${description} conflicts`);
+    expectDeepEqual(refusal?.details, [{ field: eventId === EVENT_UNRESOLVED ? "company_id" : eventId === EVENT_UNSIGNED ? "signature" : "status", rule }], `named ${rule}`);
+    expectEqual(database.updates.length, 0, `and writes nothing for ${description}`);
+  }
+
+  // No provision row at the event's provider and merchant.
+  const noRow = syncSeededDatabase();
+  noRow.provisionRows.length = 0;
+  webhookEventOf(noRow, { id: EVENT_VERIFIED });
+  const missing = await rejectionOf(() =>
+    syncProvisionFromWebhook({ webhook_event_id: EVENT_VERIFIED }, dependenciesOf(noRow, createInMemoryAuditTrail())),
+  );
+
+  expectEqual(missing?.code, "RESOURCE_NOT_FOUND", "an event with no provision row is not found");
+
+  // The verified event on a pending row: the walk lands, charges and payouts enable, the sync is
+  // recorded and audited.
+  const database = syncSeededDatabase();
+  const audit = createInMemoryAuditTrail();
+
+  webhookEventOf(database, { id: EVENT_VERIFIED });
+
+  const synced = await syncProvisionFromWebhook(
+    { webhook_event_id: EVENT_VERIFIED },
+    dependenciesOf(database, audit),
+  );
+  const row = database.provisionRows.find((entry) => entry.id === PROV_ID);
+
+  expectEqual(synced.applied, true, "the sync is applied");
+  expectEqual(synced.fromStatus, "pending", "from pending");
+  expectEqual(synced.toStatus, "verified", "to verified");
+  expectEqual(synced.version, 2, "version bumped");
+  expectEqual(row?.status, "verified", "the row is verified");
+  expectEqual(row?.charges_enabled, true, "charges enable once verification completes");
+  expectEqual(row?.payouts_enabled, true, "and payouts too");
+  expectEqual(row?.["verified_at"], new Date(NOW).toISOString(), "verified at the sync instant");
+  expectEqual(row?.["last_webhook_event_id"], EVENT_VERIFIED, "the row names the event that synced it");
+  expectEqual(row?.["last_synced_at"], new Date(NOW).toISOString(), "and when");
+
+  const update = database.updates.find((entry) => entry.table === SUBMERCHANT_PROVISIONS_TABLE);
+
+  expect(
+    update !== undefined &&
+      update.query.includes(`id=eq.${PROV_ID}`) &&
+      update.query.includes(`company_id=eq.${encodeURIComponent(COMPANY_A)}`) &&
+      update.query.includes("version=eq.1") &&
+      update.query.includes("deleted_at=is.null"),
+    "the sync update is conditional on id, company, version and live rows",
+  );
+  expectEqual(update?.values["last_webhook_event_id"], EVENT_VERIFIED, "recording the evidence event");
+  expectEqual(update?.values["version"], 2, "with the version bumped");
+  expectEqual(
+    audit.entries.filter((entry) => entry.action === SUBMERCHANT_PROVISION_SYNCED_AUDIT_ACTION).length,
+    1,
+    "the sync is audited under submerchant_provision.synced",
+  );
+  expectEqual(
+    audit.entries.find((entry) => entry.action === SUBMERCHANT_PROVISION_SYNCED_AUDIT_ACTION)?.payload?.["to_status"],
+    "verified",
+    "with the walked status in the payload",
+  );
+  expectEqual(
+    audit.entries.find((entry) => entry.action === SUBMERCHANT_PROVISION_SYNCED_AUDIT_ACTION)?.entityId,
+    PROV_ID,
+    "against the provision row",
+  );
+
+  // Re-delivery of the same event changes nothing.
+  const again = await syncProvisionFromWebhook(
+    { webhook_event_id: EVENT_VERIFIED },
+    dependenciesOf(database, audit),
+  );
+
+  expectEqual(again.applied, false, "a re-delivered event is answered as already synced");
+  expectEqual(
+    database.updates.filter((entry) => entry.table === SUBMERCHANT_PROVISIONS_TABLE).length,
+    1,
+    "with no second write",
+  );
+
+  // An event type outside the provision vocabulary only records the sync, status unchanged.
+  const otherDb = syncSeededDatabase();
+  webhookEventOf(otherDb, { id: EVENT_OTHER_TYPE, event_type: "payment.succeeded", external_event_id: "evt_9" });
+  const other = await syncProvisionFromWebhook(
+    { webhook_event_id: EVENT_OTHER_TYPE },
+    dependenciesOf(otherDb, createInMemoryAuditTrail()),
+  );
+
+  expectEqual(other.applied, true, "the sync is still recorded");
+  expectEqual(other.toStatus, "pending", "but the status does not move");
+  expectEqual(
+    otherDb.provisionRows.find((entry) => entry.id === PROV_ID)?.["last_webhook_event_id"],
+    EVENT_OTHER_TYPE,
+    "the row names the event",
+  );
+
+  // The rest of the walk: action_required carries its detail, rejected its reason and instant.
+  const actionDb = syncSeededDatabase();
+  webhookEventOf(actionDb, { id: EVENT_ACTION, event_type: "submerchant.action_required", external_event_id: "evt_2" });
+  const action = await syncProvisionFromWebhook(
+    { webhook_event_id: EVENT_ACTION },
+    dependenciesOf(actionDb, createInMemoryAuditTrail()),
+  );
+
+  expectEqual(action.toStatus, "action_required", "pending walks to action_required");
+  expectEqual(
+    actionDb.provisionRows.find((entry) => entry.id === PROV_ID)?.["action_required_detail"],
+    "provider event submerchant.action_required evt_2",
+    "with the provider event as the detail",
+  );
+
+  const rejectDb = syncSeededDatabase("action_required");
+  webhookEventOf(rejectDb, { id: EVENT_REJECTED, event_type: "submerchant.rejected", external_event_id: "evt_3" });
+  const rejected = await syncProvisionFromWebhook(
+    { webhook_event_id: EVENT_REJECTED },
+    dependenciesOf(rejectDb, createInMemoryAuditTrail()),
+  );
+
+  expectEqual(rejected.toStatus, "rejected", "action_required walks to rejected");
+  expectEqual(
+    rejectDb.provisionRows.find((entry) => entry.id === PROV_ID)?.["rejection_reason"],
+    "provider event submerchant.rejected evt_3",
+    "with the reason 0054 demands on a rejection",
+  );
+  expectEqual(
+    rejectDb.provisionRows.find((entry) => entry.id === PROV_ID)?.["rejected_at"],
+    new Date(NOW).toISOString(),
+    "and the rejection instant",
+  );
+
+  // Verified walks to restricted, which takes the money flags back off.
+  const restrictDb = syncSeededDatabase("verified");
+  webhookEventOf(restrictDb, { id: EVENT_RESTRICTED, event_type: "submerchant.restricted", external_event_id: "evt_4" });
+  const restricted = await syncProvisionFromWebhook(
+    { webhook_event_id: EVENT_RESTRICTED },
+    dependenciesOf(restrictDb, createInMemoryAuditTrail()),
+  );
+  const restrictedRow = restrictDb.provisionRows.find((entry) => entry.id === PROV_ID);
+
+  expectEqual(restricted.toStatus, "restricted", "verified walks to restricted");
+  expectEqual(restrictedRow?.charges_enabled, false, "a restricted sub-merchant takes no charges");
+  expectEqual(restrictedRow?.payouts_enabled, false, "and pays out nothing");
+  expectEqual(restrictedRow?.["restricted_at"], new Date(NOW).toISOString(), "with the restriction instant");
+  expectEqual(restrictedRow?.["verified_at"], "2026-11-02T10:00:00.000Z", "keeping its verification instant");
+
+  // The impossible walks conflict before any write, exactly as 0054's state guard demands.
+  for (const [description, fromStatus, eventId, eventType, rule] of [
+    ["restricted from pending", "pending", EVENT_RESTRICTED, "submerchant.restricted", "invalid_transition"],
+    ["verified on a rejected row", "rejected", EVENT_VERIFIED, "submerchant.verified", "locked"],
+  ] as const) {
+    const walkDb = syncSeededDatabase(fromStatus);
+
+    webhookEventOf(walkDb, { id: eventId, event_type: eventType });
+
+    const refusal = await rejectionOf(() =>
+      syncProvisionFromWebhook({ webhook_event_id: eventId }, dependenciesOf(walkDb, createInMemoryAuditTrail())),
+    );
+
+    expectEqual(refusal?.code, "CONFLICT", `${description} conflicts`);
+    expectDeepEqual(refusal?.details, [{ field: "status", rule }], `named ${rule}`);
+    expectEqual(walkDb.updates.length, 0, `and writes nothing for ${description}`);
+  }
+
+  // A lost race on the sync write conflicts as stale, without an audit entry.
+  const raceDb = syncSeededDatabase();
+  raceDb.provisionRace = true;
+  webhookEventOf(raceDb, { id: EVENT_VERIFIED });
+  const raceAudit = createInMemoryAuditTrail();
+  const stale = await rejectionOf(() =>
+    syncProvisionFromWebhook({ webhook_event_id: EVENT_VERIFIED }, dependenciesOf(raceDb, raceAudit)),
+  );
+
+  expectEqual(stale?.code, "CONFLICT", "a lost sync race conflicts");
+  expectDeepEqual(stale?.details, [{ field: "version", rule: "stale" }], "named stale");
+  expectEqual(
+    raceAudit.entries.filter((entry) => entry.action === SUBMERCHANT_PROVISION_SYNCED_AUDIT_ACTION).length,
+    0,
+    "and a lost race is not audited as synced",
+  );
+
+  // The job machinery: both sub-merchant jobs register once, the enqueue is idempotent per event,
+  // and the handler applies the sync against the fake store.
+  const registry = new JobRegistry();
+  const queue = createInMemoryJobQueue();
+
+  registerSubmerchantJobs(registry);
+
+  expectEqual(registry.size, 2, "provision and sync are registered");
+  expectEqual(registry.has(SUBMERCHANT_PROVISION_JOB), true, "the provision job of STEP 094");
+  expectEqual(registry.has(SUBMERCHANT_SYNC_JOB), true, "the sync job of this STEP");
+  registerSubmerchantJobs(registry);
+  expectEqual(registry.size, 2, "registering twice is a no-op");
+
+  const jobDatabase = syncSeededDatabase();
+  webhookEventOf(jobDatabase, { id: EVENT_VERIFIED });
+
+  const first = await enqueueProvisionSync({ registry, queue }, { webhookEventId: EVENT_VERIFIED });
+
+  expectEqual(first.job.name, SUBMERCHANT_SYNC_JOB, "the enqueued job is the sync job");
+  expectEqual(first.deduplicated, false, "the first enqueue is not a duplicate");
+  expectEqual(first.job.idempotencyKey, syncJobIdempotencyKey(EVENT_VERIFIED), "keyed by the event");
+
+  const second = await enqueueProvisionSync({ registry, queue }, { webhookEventId: EVENT_VERIFIED });
+
+  expectEqual(second.deduplicated, true, "a re-delivery returns the first job");
+  expectEqual(second.job.id, first.job.id, "the same job");
+
+  const badEnqueue = await rejectionOf(() =>
+    enqueueProvisionSync({ registry, queue }, { webhookEventId: "nope" }),
+  );
+
+  expectEqual(badEnqueue?.code, "VALIDATION_FAILED", "a malformed event id is refused at the call site");
+
+  const definition = createSyncJobHandler(() => ({
+    rest: createBusinessStore(jobDatabase),
+    audit: createInMemoryAuditTrail(),
+    now: () => NOW,
+  }));
+
+  await definition.handler({
+    jobId: "018f2b8a-0000-4c2d-9c3e-00000000job2",
+    name: SUBMERCHANT_SYNC_JOB,
+    attempt: 1,
+    maxAttempts: 5,
+    traceId: "trace-2",
+    payload: { webhook_event_id: EVENT_VERIFIED },
+    signal: new AbortController().signal,
+  });
+
+  expectEqual(
+    jobDatabase.provisionRows.find((entry) => entry.id === PROV_ID)?.status,
+    "verified",
+    "the job handler applied the verified event",
+  );
+}
+
+/** ---- STEP 095 sources: the sync service and its job. */
+async function checkSubmerchantSyncSources(): Promise<void> {
+  const sync = await readRepositoryFile("services/submerchant/provision-sync.ts");
+
+  expectEqual(sync.split("\n")[0], "// path: services/submerchant/provision-sync.ts", "the sync service states its own path on its first line");
+  expectEqual(/[^\t\n\r\x20-\x7E]/u.test(sync), false, "the sync service is ASCII only");
+
+  expect(sync.includes('WEBHOOK_EVENTS_TABLE = "webhook_events"'), "the service names the 0032 table");
+  expect(sync.includes('SUBMERCHANT_SYNC_JOB = "submerchant.sync"'), "and the sync job name");
+  expect(sync.includes('SUBMERCHANT_PROVISION_SYNCED_AUDIT_ACTION = "submerchant_provision.synced"'), "and the sync audit action");
+  expect(sync.includes("not_processed"), "an unprocessed event never syncs");
+  expect(sync.includes("signature_unverified"), "and an unverified one never does either");
+  expect(sync.includes("merchant_unresolved"), "an event without its merchant conflicts");
+  expect(sync.includes("invalid_transition"), "the status walk is enforced before the write");
+  expect(sync.includes('"locked"'), "a closed row is history");
+  expect(sync.includes("last_webhook_event_id"), "the row records the evidence event");
+  expect(sync.includes('values["charges_enabled"] = true'), "verification enables charges");
+  expect(sync.includes('values["payouts_enabled"] = true'), "and payouts");
+  expect(sync.includes('values["charges_enabled"] = false'), "a restriction disables them again");
+  expect(sync.includes("version=eq."), "the sync write is conditional on the current version");
+  expect(sync.includes("idempotencyKey"), "the enqueue is idempotent per event");
+  expect(sync.includes("registerSubmerchantJobs"), "both sub-merchant jobs register through one call");
+
+  expect(
+    (await readdir(new URL("services/submerchant/", repositoryRoot))).includes("provision-sync.ts"),
+    "the sync service lives in services/submerchant beside the provision service",
+  );
+}
+
 async function main(): Promise<void> {
   checkVocabulary();
   await checkRefusals();
@@ -8240,6 +8729,8 @@ async function main(): Promise<void> {
   await checkKycDecisionSources();
   await checkSubmerchantProvision();
   await checkSubmerchantProvisionSources();
+  await checkSubmerchantSync();
+  await checkSubmerchantSyncSources();
   await checkKycCatalog();
   await checkStatusCatalog();
   await checkReviewCatalog();
@@ -8268,7 +8759,7 @@ async function main(): Promise<void> {
     `onboarding gate passed: ${checks} checks, ${ONBOARDING_STEPS.length} steps, ` +
       `${ONBOARDING_OWNER_ROLES.length} role, ${BUSINESS_PROFILE_FIELDS.length} business fields, ` +
       `${PROCESSOR_REQUIREMENT_LIST.length} processors, ${BUSINESS_PROFILE_TABLE} table, ` +
-      `${MCC_CODES_TABLE} vocabulary, ${COUNTRIES_TABLE} list, submerchant profile, kyc pack, underwriting criteria, merchant limits, payment holds, submerchant provisioning\n`,
+      `${MCC_CODES_TABLE} vocabulary, ${COUNTRIES_TABLE} list, submerchant profile, kyc pack, underwriting criteria, merchant limits, payment holds, submerchant provisioning, webhook sync\n`,
   );
 }
 
