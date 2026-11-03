@@ -48,6 +48,15 @@ Every read is scoped to the caller company and every write is audit logged.
   summary (`readKycSummary`: status, counts, decision reason; never the verification method, a
   provider reference, a screening result or a storage key) and the submit that moves the draft to
   `submitted` (`submitKyc`, conditional update + audit; `POST /api/onboarding/kyc-submit`).
+- `onboarding/kyc-review/` - STEP 088: the compliance KYC review queue with document viewer - the
+  office side of `0048`-`0051` in `services/kyc/kyc-review.ts` (queue of submitted/in_review rows,
+  full detail with storage keys, hashes and screening results, `kyc_review.read_by_office` audit per
+  read; `openKycReview` moves submitted to in_review; `reviewKycDocument` accepts/rejects one
+  document with the reason 0049 demands; `GET /api/onboarding/kyc-review`, `/kyc-review-submission`,
+  `POST /api/onboarding/kyc-review-open`, `/kyc-document-review`). The screen lives under the
+  onboarding block's owned path and gates on the office roles through the service; merchants keep
+  the 087 summary screen, which never carries method, provider reference, screening results or
+  storage keys.
 
 ## The reader
 

@@ -94,6 +94,16 @@ import {
   UBO_RECORDS_TABLE,
 } from "./kyc-capture.ts";
 import {
+  KYC_DOCUMENT_REVIEW_AUDIT_ACTION,
+  KYC_REVIEW_AUDIT_ACTION,
+  KYC_REVIEW_OFFICE_ROLES,
+  KYC_REVIEW_OPEN_AUDIT_ACTION,
+  openKycReview,
+  readKycReviewDetail,
+  readKycReviewQueue,
+  reviewKycDocument,
+} from "./kyc-review.ts";
+import {
   assertProvisionable,
   PROCESSOR_PROFILE_AUDIT_ACTION,
   PROCESSOR_PROFILE_AUDIT_ENTITY,
@@ -217,6 +227,17 @@ function actorOf(
 
 const owner = actorOf(["owner"], COMPANY_A);
 const otherOwner = actorOf(["owner"], COMPANY_B, { userId: OTHER_OWNER_ID });
+const desk = actorOf(["compliance_kyc"], null, { userId: OFFICE_ID });
+const ceoDesk = actorOf(["ceo"], null, { userId: OFFICE_ID });
+
+// Actors the review queue must refuse: every role that is not one of KYC_REVIEW_OFFICE_ROLES.
+const reviewRefused: readonly (readonly [string, RequestActor])[] = [
+  ["an owner", owner],
+  ["finance_ops", actorOf(["finance_ops"], null, { userId: OFFICE_ID })],
+  ["support", actorOf(["support"], null, { userId: OFFICE_ID })],
+  ["blogger", actorOf(["blogger"], null, { userId: OFFICE_ID })],
+  ["nobody", actorOf([], null)],
+];
 
 /** The actors the wizard must refuse before it reads a row. */
 const refusedActors: readonly (readonly [string, RequestActor])[] = [
@@ -929,8 +950,12 @@ interface SubmissionRowShape {
   verification_method: string;
   submitted_at?: string | null;
   submitted_by?: string | null;
+  first_reviewer_id?: string | null;
   decided_at?: string | null;
   decision_reason?: string | null;
+  provider_reference?: string | null;
+  high_risk?: boolean;
+  four_eye_required?: boolean;
   version?: number;
   updated_at?: string;
   created_at: string;
@@ -951,6 +976,10 @@ interface DocumentRowShape {
   status: string;
   created_at: string;
   rejection_reason?: string | null;
+  reviewed_at?: string | null;
+  reviewed_by?: string | null;
+  version?: number;
+  updated_at?: string;
 }
 
 /** One row of `0050`. */
@@ -1132,16 +1161,17 @@ function profileRowFrom(companyId: string, values: Readonly<Record<string, unkno
 
 /** The store the form writes through: two tables, and nothing else answers. */
 function createBusinessStore(database: BusinessDatabase): RestClient {
-  const scopedCompany = (query: string): string => {
-    const company = query
-      .split("&")
-      .find((part) => part.startsWith("company_id=eq."));
+  // Null when the query carries no company: the office review queue of STEP 088 reads across
+  // companies on purpose; every merchant flow still passes a company and the gate asserts it.
+  const scopedCompany = (query: string): string | null => {
+    const parts = query.split("&");
+    const company = parts.find((part) => part.startsWith("company_id=eq."));
 
-    if (company === undefined || !query.split("&").includes("deleted_at=is.null")) {
-      throw new Error(`the form's query is not scoped to one live company: ${query}`);
+    if (!parts.includes("deleted_at=is.null")) {
+      throw new Error(`a read is not over live rows: ${query}`);
     }
 
-    return decodeURIComponent(company.slice("company_id=eq.".length));
+    return company === undefined ? null : decodeURIComponent(company.slice("company_id=eq.".length));
   };
 
   return {
@@ -1233,7 +1263,7 @@ function createBusinessStore(database: BusinessDatabase): RestClient {
                 : database.screeningRows
         ) as unknown as readonly Record<string, unknown>[];
 
-        let matched = allRows.filter((row) => row["company_id"] === wanted);
+        let matched = wanted === null ? [...allRows] : allRows.filter((row) => row["company_id"] === wanted);
 
         for (const part of parts) {
           for (const column of ["status", "submission_id", "id", "subject_id"] as const) {
@@ -1241,6 +1271,11 @@ function createBusinessStore(database: BusinessDatabase): RestClient {
               const value = decodeURIComponent(part.slice(column.length + 4));
               matched = matched.filter((row) => row[column] === value);
             }
+          }
+
+          if (part.startsWith("status=in.(")) {
+            const values = decodeURIComponent(part.slice("status=in.(".length).replace(/\)$/u, "")).split(",");
+            matched = matched.filter((row) => values.includes(String(row["status"])));
           }
         }
 
@@ -1258,6 +1293,12 @@ function createBusinessStore(database: BusinessDatabase): RestClient {
           );
         }
 
+        if (ordered === "order=submitted_at.asc") {
+          matched = [...matched].sort((left, right) =>
+            String(left["submitted_at"] ?? "").localeCompare(String(right["submitted_at"] ?? "")),
+          );
+        }
+
         const limit = parts.find((part) => part.startsWith("limit="));
         const capped =
           limit === undefined
@@ -1270,13 +1311,19 @@ function createBusinessStore(database: BusinessDatabase): RestClient {
             ? {
                 submitted_at: null,
                 submitted_by: null,
+                first_reviewer_id: null,
                 decided_at: null,
                 decision_reason: null,
+                provider_reference: null,
+                high_risk: false,
+                four_eye_required: false,
                 version: 1,
                 updated_at: row["created_at"],
               }
             : {}),
-          ...(table === KYC_DOCUMENTS_TABLE ? { rejection_reason: null } : {}),
+          ...(table === KYC_DOCUMENTS_TABLE
+            ? { rejection_reason: null, reviewed_at: null, reviewed_by: null, version: 1, updated_at: row["created_at"] }
+            : {}),
           ...row,
         }));
 
@@ -1284,6 +1331,10 @@ function createBusinessStore(database: BusinessDatabase): RestClient {
       }
 
       if (table === BUSINESS_PROFILE_TABLE) {
+        if (wanted === null) {
+          throw new Error(`the profile read is not scoped to one live company: ${query}`);
+        }
+
         const limit = query.split("&").find((part) => part.startsWith("limit="));
 
         if (limit === undefined) {
@@ -1296,6 +1347,10 @@ function createBusinessStore(database: BusinessDatabase): RestClient {
       }
 
       if (table === ONBOARDING_PROGRESS_TABLE) {
+        if (wanted === null) {
+          throw new Error(`the progress read is not scoped to one live company: ${query}`);
+        }
+
         const matched = database.onboardingRows.filter((row) => row.company_id === wanted);
 
         return Promise.resolve(matched.slice(0, 1).map((row) => schema.parse(row)));
@@ -1338,8 +1393,12 @@ function createBusinessStore(database: BusinessDatabase): RestClient {
               verification_method: text("verification_method") || "manual",
               submitted_at: nullable("submitted_at"),
               submitted_by: nullable("submitted_by"),
+              first_reviewer_id: nullable("first_reviewer_id"),
               decided_at: nullable("decided_at"),
               decision_reason: nullable("decision_reason"),
+              provider_reference: nullable("provider_reference"),
+              high_risk: Boolean(row["high_risk"]),
+              four_eye_required: Boolean(row["four_eye_required"]),
               version: Number(row["version"] ?? 1),
               updated_at: created,
               created_at: created,
@@ -1360,6 +1419,10 @@ function createBusinessStore(database: BusinessDatabase): RestClient {
               expires_at: nullable("expires_at"),
               status: text("status") || "uploaded",
               rejection_reason: nullable("rejection_reason"),
+              reviewed_at: nullable("reviewed_at"),
+              reviewed_by: nullable("reviewed_by"),
+              version: Number(row["version"] ?? 1),
+              updated_at: created,
               created_at: created,
             });
           }
@@ -1511,6 +1574,28 @@ function createBusinessStore(database: BusinessDatabase): RestClient {
         const wantedStatus = statusPart === undefined ? null : decodeURIComponent(statusPart.slice("status=eq.".length));
 
         for (const row of database.submissionRows) {
+          if (
+            row.company_id === wanted &&
+            (wantedId === null || row.id === wantedId) &&
+            (wantedStatus === null || row.status === wantedStatus)
+          ) {
+            for (const [key, value] of Object.entries(values)) {
+              (row as unknown as Record<string, unknown>)[key] = value;
+            }
+          }
+        }
+
+        return Promise.resolve();
+      }
+
+      if (table === KYC_DOCUMENTS_TABLE) {
+        const parts = query.split("&");
+        const idPart = parts.find((part) => part.startsWith("id=eq."));
+        const statusPart = parts.find((part) => part.startsWith("status=eq."));
+        const wantedId = idPart === undefined ? null : decodeURIComponent(idPart.slice("id=eq.".length));
+        const wantedStatus = statusPart === undefined ? null : decodeURIComponent(statusPart.slice("status=eq.".length));
+
+        for (const row of database.documentRows) {
           if (
             row.company_id === wanted &&
             (wantedId === null || row.id === wantedId) &&
@@ -4477,6 +4562,331 @@ async function checkKycSubmit(): Promise<void> {
   );
 }
 
+/** ---- STEP 088: the compliance review queue, the detail viewer, and the two writes. */
+
+/** A seeded store with one draft, one submitted and one in-review submission across two companies. */
+function reviewSeededDatabase(): BusinessDatabase {
+  return createBusinessDatabase(
+    [FULL_PROFILE],
+    [],
+    defaultMccRows(),
+    defaultCountryRows(),
+    [
+      { id: "018f2b8a-0000-4c2d-9c3e-0000000000a1", company_id: COMPANY_A, status: "draft", verification_method: "manual", created_at: "2026-11-01T08:00:00.000Z" },
+      {
+        id: "018f2b8a-0000-4c2d-9c3e-0000000000b2",
+        company_id: COMPANY_B,
+        status: "submitted",
+        verification_method: "manual",
+        submitted_at: "2026-11-01T09:00:00.000Z",
+        submitted_by: OTHER_OWNER_ID,
+        created_at: "2026-11-01T08:30:00.000Z",
+      },
+      {
+        id: "018f2b8a-0000-4c2d-9c3e-0000000000c3",
+        company_id: COMPANY_A,
+        status: "in_review",
+        verification_method: "manual",
+        submitted_at: "2026-11-01T10:00:00.000Z",
+        submitted_by: OWNER_ID,
+        first_reviewer_id: OFFICE_ID,
+        created_at: "2026-11-01T08:45:00.000Z",
+      },
+    ],
+    [
+      {
+        id: "018f2b8a-0000-4c2d-9c3e-0000000000d4",
+        company_id: COMPANY_B,
+        submission_id: "018f2b8a-0000-4c2d-9c3e-0000000000b2",
+        document_type: "utility_bill",
+        storage_key: `${COMPANY_B}/kyc/doc-open`,
+        content_sha256: "a".repeat(64),
+        content_type: "image/png",
+        byte_size: 128,
+        issued_at: "2026-10-01",
+        expires_at: null,
+        status: "uploaded",
+        created_at: "2026-11-01T09:05:00.000Z",
+      },
+    ],
+    [
+      {
+        id: "018f2b8a-0000-4c2d-9c3e-0000000000e5",
+        company_id: COMPANY_B,
+        submission_id: "018f2b8a-0000-4c2d-9c3e-0000000000b2",
+        full_name: "Other Owner",
+        date_of_birth: "1985-04-04",
+        country: "BD",
+        ownership_bps: 4000,
+        is_significant: true,
+        id_document_sha256: "b".repeat(64),
+        is_pep: false,
+        screened_at: "2026-11-01T09:10:00.000Z",
+        created_at: "2026-11-01T09:04:00.000Z",
+      },
+    ],
+    [
+      {
+        id: "018f2b8a-0000-4c2d-9c3e-0000000000f6",
+        company_id: COMPANY_B,
+        subject_kind: "company",
+        subject_id: COMPANY_B,
+        ofac_checked: true,
+        un_checked: true,
+        eu_checked: true,
+        us_checked: true,
+        result: "clear",
+        provider: "manual",
+        screened_at: "2026-11-01T09:10:00.000Z",
+        note: null,
+        sar_case: false,
+        created_at: "2026-11-01T09:10:00.000Z",
+      },
+    ],
+  );
+}
+
+async function checkKycReviewQueue(): Promise<void> {
+  for (const [description, actor] of reviewRefused) {
+    const database = createBusinessDatabase();
+    const refusal = await rejectionOf(() =>
+      readKycReviewQueue({ actor }, dependenciesOf(database, createInMemoryAuditTrail())),
+    );
+
+    expectEqual(refusal?.code, "PERMISSION_DENIED", `the queue refuses ${description}`);
+    expectEqual(database.queries.length, 0, `and reads nothing for ${description}`);
+  }
+
+  expectDeepEqual([...KYC_REVIEW_OFFICE_ROLES], ["super_admin", "ceo", "compliance_kyc"], "the queue's roles are the three office roles of section 5's review");
+
+  const database = reviewSeededDatabase();
+  const queue = await readKycReviewQueue({ actor: desk }, dependenciesOf(database, createInMemoryAuditTrail()));
+
+  expectEqual(queue.rows.length, 2, "the draft is not queued, the submitted and in-review ones are");
+  expectEqual(queue.rows[0]?.submissionId, "018f2b8a-0000-4c2d-9c3e-0000000000b2", "ordered by submitted_at ascending");
+  expectEqual(queue.rows[1]?.submissionId, "018f2b8a-0000-4c2d-9c3e-0000000000c3", "then the one already in review");
+  expectEqual(queue.rows[0]?.documentCount, 1, "with the document counted against its submission");
+  expectEqual(queue.rows[0]?.ownerCount, 1, "the owner against its submission");
+  expectEqual(queue.rows[0]?.screenedCount, 1, "the screening counted against its company, 0051 having no submission column");
+  expectEqual(queue.rows[1]?.screenedCount, 0, "company A has no screening rows");
+  expect(
+    database.queries.every((query) => !query.includes("company_id=eq.")),
+    "the queue reads across companies on purpose: no company filter on any queue query",
+  );
+  expect(
+    database.queries.every((query) => query.includes("deleted_at=is.null")),
+    "and every queue query is over live rows",
+  );
+
+  const ceoQueue = await readKycReviewQueue({ actor: ceoDesk }, dependenciesOf(reviewSeededDatabase(), createInMemoryAuditTrail()));
+
+  expectEqual(ceoQueue.rows.length, 2, "ceo and super_admin see the same queue as compliance_kyc");
+}
+
+async function checkKycReviewDetail(): Promise<void> {
+  for (const [description, actor] of reviewRefused) {
+    const database = createBusinessDatabase();
+    const refusal = await rejectionOf(() =>
+      readKycReviewDetail({ actor, submissionId: "018f2b8a-0000-4c2d-9c3e-0000000000b2" }, dependenciesOf(database, createInMemoryAuditTrail())),
+    );
+
+    expectEqual(refusal?.code, "PERMISSION_DENIED", `the detail refuses ${description}`);
+    expectEqual(database.queries.length, 0, `and reads nothing for ${description}`);
+  }
+
+  const badId = createBusinessDatabase();
+  const badRefusal = await rejectionOf(() =>
+    readKycReviewDetail({ actor: desk, submissionId: "not-a-uuid" }, dependenciesOf(badId, createInMemoryAuditTrail())),
+  );
+
+  expectEqual(badRefusal?.code, "VALIDATION_FAILED", "a non-uuid id is a validation failure");
+  expectDeepEqual(badRefusal?.details, [{ field: "submission_id", rule: "invalid_format" }], "naming the parameter");
+  expectEqual(badId.queries.length, 0, "before any query runs");
+
+  const missing = createBusinessDatabase();
+  const missingRefusal = await rejectionOf(() =>
+    readKycReviewDetail(
+      { actor: desk, submissionId: "018f2b8a-9999-4c2d-9c3e-999999999999" },
+      dependenciesOf(missing, createInMemoryAuditTrail()),
+    ),
+  );
+
+  expectEqual(missingRefusal?.code, "RESOURCE_NOT_FOUND", "an unknown id is not found");
+
+  const database = reviewSeededDatabase();
+  const audit = createInMemoryAuditTrail();
+  const detail = await readKycReviewDetail({ actor: desk, submissionId: "018f2b8a-0000-4c2d-9c3e-0000000000b2" }, dependenciesOf(database, audit));
+
+  expectEqual(detail.submissionId, "018f2b8a-0000-4c2d-9c3e-0000000000b2", "the submission is found by id");
+  expectEqual(detail.companyId, COMPANY_B, "and the company comes from the row, never from the request");
+  expectEqual(detail.status, "submitted", "its status");
+  expectEqual(detail.method, "manual", "the office sees the verification method, unlike the merchant");
+  expectEqual(detail.providerReference, null, "manual mode carries no provider reference");
+  expectEqual(detail.documents.length, 1, "one document");
+  expectEqual(detail.documents[0]?.storageKey, `${COMPANY_B}/kyc/doc-open`, "the viewer sees the storage key");
+  expectEqual(detail.documents[0]?.contentSha256, "a".repeat(64), "and the hash that binds row to bytes");
+  expectEqual(detail.documents[0]?.status, "uploaded", "waiting for a decision");
+  expectEqual(detail.ubos.length, 1, "one owner");
+  expectEqual(detail.screenings.length, 1, "one screening row");
+  expectEqual(detail.screenings[0]?.result, "clear", "the office sees the result, unlike the merchant");
+  expectDeepEqual(detail.screenings[0]?.listsCovered, ["ofac", "un", "eu", "us"], "and the four lists covered");
+
+  expectEqual(audit.entries.length, 1, "the office read is audited once");
+  expectEqual(audit.entries[0]?.action, KYC_REVIEW_AUDIT_ACTION, "under kyc_review.read_by_office");
+  expectEqual(audit.entries[0]?.entityId, "018f2b8a-0000-4c2d-9c3e-0000000000b2", "against the submission");
+  expectEqual(audit.entries[0]?.companyId, COMPANY_B, "the merchant read, not the office's own company");
+
+  const lookup = database.queries[0] ?? "";
+
+  expect(lookup.includes("id=eq.018f2b8a-0000-4c2d-9c3e-0000000000b2") && lookup.includes("deleted_at=is.null"), "the lookup is by id over live rows");
+  expect(
+    database.queries.slice(1).every((query) => query.includes(`company_id=eq.${encodeURIComponent(COMPANY_B)}`)),
+    "and every query after the lookup is scoped to the submission's own company",
+  );
+
+  const ownDetail = await readKycReviewDetail({ actor: desk, submissionId: "018f2b8a-0000-4c2d-9c3e-0000000000c3" }, dependenciesOf(database, audit));
+
+  expectEqual(ownDetail.legalName, FULL_PROFILE.legal_name, "the merchant's legal name is read beside its submission");
+  expectEqual(ownDetail.firstReviewerId, OFFICE_ID, "the in-review row names its first reviewer");
+}
+
+async function checkKycReviewOpen(): Promise<void> {
+  for (const [description, actor] of reviewRefused) {
+    const database = createBusinessDatabase();
+    const refusal = await rejectionOf(() =>
+      openKycReview({ actor, submissionId: "018f2b8a-0000-4c2d-9c3e-0000000000b2" }, dependenciesOf(database, createInMemoryAuditTrail())),
+    );
+
+    expectEqual(refusal?.code, "PERMISSION_DENIED", `the open refuses ${description}`);
+    expectEqual(database.updates.length, 0, `and writes nothing for ${description}`);
+  }
+
+  const database = reviewSeededDatabase();
+  const audit = createInMemoryAuditTrail();
+  const detail = await openKycReview({ actor: desk, submissionId: "018f2b8a-0000-4c2d-9c3e-0000000000b2" }, dependenciesOf(database, audit));
+  const row = database.submissionRows.find((entry) => entry.id === "018f2b8a-0000-4c2d-9c3e-0000000000b2");
+
+  expectEqual(detail.status, "in_review", "the returned detail says in review");
+  expectEqual(row?.status, "in_review", "the row moved from submitted to in_review");
+  expectEqual(row?.first_reviewer_id, OFFICE_ID, "with the first reviewer named");
+  expectEqual(row?.version, 2, "the version moved");
+
+  const update = database.updates.find((entry) => entry.table === KYC_SUBMISSIONS_TABLE);
+
+  expect(
+    update !== undefined &&
+      update.query.includes("id=eq.018f2b8a-0000-4c2d-9c3e-0000000000b2") &&
+      update.query.includes("status=eq.submitted") &&
+      update.query.includes(`company_id=eq.${encodeURIComponent(COMPANY_B)}`),
+    "the update is conditional on the row still being submitted",
+  );
+  expectEqual(audit.entries.filter((entry) => entry.action === KYC_REVIEW_OPEN_AUDIT_ACTION).length, 1, "the open is audited");
+  expectEqual(
+    audit.entries.filter((entry) => entry.action === KYC_REVIEW_OPEN_AUDIT_ACTION)[0]?.payload?.["first_reviewer_id"],
+    OFFICE_ID,
+    "recording the reviewer",
+  );
+
+  const again = await openKycReview({ actor: desk, submissionId: "018f2b8a-0000-4c2d-9c3e-0000000000b2" }, dependenciesOf(database, audit));
+
+  expectEqual(again.status, "in_review", "opening one's own in-review submission is the same answer");
+  expectEqual(
+    database.updates.filter((entry) => entry.table === KYC_SUBMISSIONS_TABLE).length,
+    1,
+    "and writes nothing the second time",
+  );
+
+  const draftDb = reviewSeededDatabase();
+  const draftRefusal = await rejectionOf(() =>
+    openKycReview({ actor: desk, submissionId: "018f2b8a-0000-4c2d-9c3e-0000000000a1" }, dependenciesOf(draftDb, createInMemoryAuditTrail())),
+  );
+
+  expectEqual(draftRefusal?.code, "CONFLICT", "a draft cannot be opened for review");
+  expectDeepEqual(draftRefusal?.details, [{ field: "status", rule: "not_submitted" }], "named as not submitted");
+  expectEqual(draftDb.updates.length, 0, "and nothing is written");
+}
+
+async function checkKycReviewDocument(): Promise<void> {
+  for (const [description, actor] of reviewRefused) {
+    const database = createBusinessDatabase();
+    const refusal = await rejectionOf(() =>
+      reviewKycDocument({ actor, body: { document_id: "018f2b8a-0000-4c2d-9c3e-0000000000d4", decision: "accept" } }, dependenciesOf(database, createInMemoryAuditTrail())),
+    );
+
+    expectEqual(refusal?.code, "PERMISSION_DENIED", `the document decision refuses ${description}`);
+    expectEqual(database.updates.length, 0, `and writes nothing for ${description}`);
+  }
+
+  const badBody = createBusinessDatabase();
+  const badRefusal = await rejectionOf(() =>
+    reviewKycDocument({ actor: desk, body: { document_id: "nope", decision: "accept" } }, dependenciesOf(badBody, createInMemoryAuditTrail())),
+  );
+
+  expectEqual(badRefusal?.code, "VALIDATION_FAILED", "a malformed body is a validation failure");
+  expectEqual(badBody.queries.length, 0, "before any query runs");
+
+  const rejectNoReason = reviewSeededDatabase();
+  const noReason = await rejectionOf(() =>
+    reviewKycDocument(
+      { actor: desk, body: { document_id: "018f2b8a-0000-4c2d-9c3e-0000000000d4", decision: "reject" } },
+      dependenciesOf(rejectNoReason, createInMemoryAuditTrail()),
+    ),
+  );
+
+  expectEqual(noReason?.code, "VALIDATION_FAILED", "a rejection without a reason is refused, as 0049's check demands");
+  expectDeepEqual(noReason?.details, [{ field: "reason", rule: "required" }], "naming the reason");
+  expectEqual(rejectNoReason.updates.length, 0, "and nothing is written");
+
+  const database = reviewSeededDatabase();
+  const audit = createInMemoryAuditTrail();
+  const accepted = await reviewKycDocument(
+    { actor: desk, body: { document_id: "018f2b8a-0000-4c2d-9c3e-0000000000d4", decision: "accept" } },
+    dependenciesOf(database, audit),
+  );
+  const row = database.documentRows[0];
+
+  expectEqual(accepted.status, "accepted", "the answer is the updated document");
+  expectEqual(row?.status, "accepted", "the row moved from uploaded to accepted");
+  expectEqual(row?.reviewed_at, new Date(NOW).toISOString(), "with the reviewed instant 0049 ties to the decision");
+  expectEqual(row?.reviewed_by, OFFICE_ID, "and the reviewer");
+  expectEqual(row?.rejection_reason, null, "no reason on an acceptance");
+  expectEqual(row?.version, 2, "version moved");
+
+  const update = database.updates.find((entry) => entry.table === KYC_DOCUMENTS_TABLE);
+
+  expect(
+    update !== undefined && update.query.includes("id=eq.018f2b8a-0000-4c2d-9c3e-0000000000d4") && update.query.includes("status=eq.uploaded"),
+    "the update is conditional on the document still being uploaded",
+  );
+  expectEqual(audit.entries.filter((entry) => entry.action === KYC_DOCUMENT_REVIEW_AUDIT_ACTION).length, 1, "the decision is audited");
+  expectEqual(
+    audit.entries.filter((entry) => entry.action === KYC_DOCUMENT_REVIEW_AUDIT_ACTION)[0]?.entityId,
+    "018f2b8a-0000-4c2d-9c3e-0000000000d4",
+    "against the document",
+  );
+
+  const again = await rejectionOf(() =>
+    reviewKycDocument(
+      { actor: desk, body: { document_id: "018f2b8a-0000-4c2d-9c3e-0000000000d4", decision: "reject", reason: "illegible" } },
+      dependenciesOf(database, audit),
+    ),
+  );
+
+  expectEqual(again?.code, "CONFLICT", "an already-decided document conflicts");
+  expectDeepEqual(again?.details, [{ field: "status", rule: "already_reviewed" }], "named as already reviewed");
+  expectEqual(database.updates.filter((entry) => entry.table === KYC_DOCUMENTS_TABLE).length, 1, "and is not written twice");
+
+  const rejectDb = reviewSeededDatabase();
+  const rejected = await reviewKycDocument(
+    { actor: desk, body: { document_id: "018f2b8a-0000-4c2d-9c3e-0000000000d4", decision: "reject", reason: "  illegible scan  " } },
+    dependenciesOf(rejectDb, createInMemoryAuditTrail()),
+  );
+
+  expectEqual(rejected.status, "rejected", "a rejection with a reason lands");
+  expectEqual(rejected.rejectionReason, "illegible scan", "trimmed, as 0049's check requires");
+  expectEqual(rejectDb.documentRows[0]?.rejection_reason, "illegible scan", "recorded on the row");
+}
+
 async function checkKycSources(): Promise<void> {
   const documentRoute = await readRepositoryFile("app/api/onboarding/kyc-document/route.ts");
   const uboRoute = await readRepositoryFile("app/api/onboarding/kyc-ubo/route.ts");
@@ -4484,6 +4894,13 @@ async function checkKycSources(): Promise<void> {
   const submitRoute = await readRepositoryFile("app/api/onboarding/kyc-submit/route.ts");
   const statusPage = await readRepositoryFile("app/(dashboard)/onboarding/status/page.tsx");
   const statusForm = await readRepositoryFile("app/(dashboard)/onboarding/status/status-form.tsx");
+  const queueRoute = await readRepositoryFile("app/api/onboarding/kyc-review/route.ts");
+  const detailRoute = await readRepositoryFile("app/api/onboarding/kyc-review-submission/route.ts");
+  const openRoute = await readRepositoryFile("app/api/onboarding/kyc-review-open/route.ts");
+  const decideRoute = await readRepositoryFile("app/api/onboarding/kyc-document-review/route.ts");
+  const reviewPage = await readRepositoryFile("app/(dashboard)/onboarding/kyc-review/page.tsx");
+  const reviewPanel = await readRepositoryFile("app/(dashboard)/onboarding/kyc-review/kyc-review-queue.tsx");
+  const review = await readRepositoryFile("services/kyc/kyc-review.ts");
   const page = await readRepositoryFile("app/(dashboard)/onboarding/documents/page.tsx");
   const form = await readRepositoryFile("app/(dashboard)/onboarding/documents/documents-form.tsx");
   const copy = await readRepositoryFile("app/(dashboard)/onboarding/step-copy.ts");
@@ -4500,6 +4917,13 @@ async function checkKycSources(): Promise<void> {
     ["app/(dashboard)/onboarding/documents/documents-form.tsx", form],
     ["app/(dashboard)/onboarding/status/page.tsx", statusPage],
     ["app/(dashboard)/onboarding/status/status-form.tsx", statusForm],
+    ["app/api/onboarding/kyc-review/route.ts", queueRoute],
+    ["app/api/onboarding/kyc-review-submission/route.ts", detailRoute],
+    ["app/api/onboarding/kyc-review-open/route.ts", openRoute],
+    ["app/api/onboarding/kyc-document-review/route.ts", decideRoute],
+    ["app/(dashboard)/onboarding/kyc-review/page.tsx", reviewPage],
+    ["app/(dashboard)/onboarding/kyc-review/kyc-review-queue.tsx", reviewPanel],
+    ["services/kyc/kyc-review.ts", review],
   ] as const) {
     expectEqual(source.split("\n")[0], `// path: ${path}`, `${path} states its own path on its first line`);
     expectEqual(/[^\t\n\r\x20-\x7E]/u.test(source), false, `${path} is ASCII only`);
@@ -4510,6 +4934,8 @@ async function checkKycSources(): Promise<void> {
     ["app/api/onboarding/kyc-ubo/route.ts", uboRoute],
     ["app/api/onboarding/kyc-screening/route.ts", screeningRoute],
     ["app/api/onboarding/kyc-submit/route.ts", submitRoute],
+    ["app/api/onboarding/kyc-review-open/route.ts", openRoute],
+    ["app/api/onboarding/kyc-document-review/route.ts", decideRoute],
   ] as const) {
     expect(route.includes("export const POST"), `${path} answers POST`);
     expectEqual(route.includes("export const GET"), false, `${path} answers no GET`);
@@ -4531,6 +4957,34 @@ async function checkKycSources(): Promise<void> {
   expect(uboRoute.includes("saveUbo("), "the UBO route saves through the service");
   expect(screeningRoute.includes("runKycScreening("), "the screening route runs through the service");
   expect(submitRoute.includes("submitKyc("), "the submit route submits through the service");
+  expect(queueRoute.includes("export const GET"), "the queue route is a GET");
+  expectEqual(queueRoute.includes("export const POST"), false, "and answers no POST");
+  expect(queueRoute.includes("readKycReviewQueue("), "reading the queue through the service");
+  expectEqual(queueRoute.includes("searchParams"), false, "the queue takes no parameter at all: it is every open submission");
+  expect(detailRoute.includes("export const GET"), "the detail route is a GET");
+  expect(detailRoute.includes('searchParams.get("id")'), "reading the submission id, never a company, from the query string");
+  expectEqual(detailRoute.includes('"company_id"'), false, "and no company field anywhere");
+  expect(detailRoute.includes("readKycReviewDetail("), "reading the detail through the service");
+  expect(openRoute.includes("openKycReview("), "the open route opens through the service");
+  expect(decideRoute.includes("reviewKycDocument("), "the document decision route decides through the service");
+  expect(review.includes("KYC_REVIEW_OFFICE_ROLES"), "the service owns the office role list");
+  expect(review.includes("read_by_office"), "and audits each office read of one submission");
+  expect(review.includes("status=eq.submitted"), "the open is conditional on the row still being submitted");
+  expect(review.includes("status=eq.uploaded"), "the document decision is conditional on the row still being uploaded");
+  expectEqual(review.includes('"approved"'), false, "and never writes approved: the decision flow is STEP 093");
+  expect(reviewPage.includes("readKycReviewQueue("), "the queue page reads the queue through the service");
+  expect(reviewPage.includes("<SessionKeeper"), "and keeps the session rotating");
+  expect(reviewPage.includes("KycReviewQueuePanel"), "and hands the rows to the panel");
+  for (const state of ["signed-out", "forbidden", "unavailable", "ready"]) {
+    expect(reviewPage.includes(`"${state}"`), `the queue page keeps the ${state} answer apart`);
+  }
+  expectEqual(reviewPanel.includes('"use client"'), true, "the panel is a client component");
+  expectEqual((reviewPanel.match(/method: "POST"/gu) ?? []).length, 1, "its two actions share one POST site");
+  expectEqual((reviewPanel.match(/\.\.\.\(await csrfHeaders\(\)\)/gu) ?? []).length, 1, "with one awaited CSRF spread");
+  expect(reviewPanel.includes("/api/onboarding/kyc-review-open"), "opening posts to the open route");
+  expect(reviewPanel.includes("/api/onboarding/kyc-document-review"), "deciding posts to the document route");
+  expect(reviewPanel.includes("/api/onboarding/kyc-review-submission"), "and the detail is one GET by id");
+  expectEqual(reviewPanel.includes("company_id"), false, "and no company field is ever sent in a body");
   for (const route of [uboRoute, screeningRoute]) {
     expectEqual(route.includes("searchParams"), false, "no route takes a company from the query string");
     expectEqual(route.includes('"company_id"'), false, "and none reads a company field from the body");
@@ -4613,7 +5067,7 @@ async function checkKycSources(): Promise<void> {
     (await readdir(new URL("app/(dashboard)/onboarding/documents/", repositoryRoot))).includes("documents-form.tsx"),
     "with its form beside it",
   );
-  for (const folder of ["kyc-document", "kyc-ubo", "kyc-screening", "kyc-submit"]) {
+  for (const folder of ["kyc-document", "kyc-ubo", "kyc-screening", "kyc-submit", "kyc-review", "kyc-review-submission", "kyc-review-open", "kyc-document-review"]) {
     expect(
       (await readdir(new URL(`app/api/onboarding/${folder}/`, repositoryRoot))).includes("route.ts"),
       `${folder} is a route handler of its own`,
@@ -4721,6 +5175,54 @@ async function checkStatusCatalog(): Promise<void> {
   }
 }
 
+/** ---- STEP 088 catalog: every sentence of the review queue screen is used, and every key it names exists. */
+async function checkReviewCatalog(): Promise<void> {
+  const block = en.onboardingKycReview as unknown as Record<string, unknown>;
+  const page = await readRepositoryFile("app/(dashboard)/onboarding/kyc-review/page.tsx");
+  const panel = await readRepositoryFile("app/(dashboard)/onboarding/kyc-review/kyc-review-queue.tsx");
+  const sources = `${page}\n${panel}`;
+
+  const flat: string[] = [];
+
+  const walk = (node: Record<string, unknown>, prefix: string): void => {
+    for (const [key, value] of Object.entries(node)) {
+      const path = `${prefix}.${key}`;
+
+      if (typeof value === "string") {
+        flat.push(path);
+      } else if (typeof value === "object" && value !== null) {
+        walk(value as Record<string, unknown>, path);
+      }
+    }
+  };
+
+  walk(block, "onboardingKycReview");
+
+  expect(flat.length >= 40, "the review queue has its own block of copy");
+
+  for (const path of flat) {
+    expect(sources.includes(`"${path}"`), `the copy key ${path} is used by the screen`);
+  }
+
+  const referenced = [...sources.matchAll(/"(onboardingKycReview\.[A-Za-z.]+)"/gu)].map((match) => match[1]);
+
+  for (const path of new Set(referenced)) {
+    expect(path !== undefined && flat.includes(path), `the screen names no missing key (${String(path)})`);
+  }
+
+  for (const templated of ["submittedAtLine", "countsLine", "companyLine", "methodLine", "providerLine", "decidedAtLine", "docMetaLine", "docKeyLine", "docHashLine", "docIssuedLine", "docPeriodLine", "docRejectedLine", "reviewDone", "uboLine", "uboScreenedLine", "screeningLine", "screeningNoteLine"]) {
+    expectEqual(
+      sources.includes(`getMessage("onboardingKycReview.${templated}")`),
+      false,
+      `${templated} is never rendered without its values`,
+    );
+    expect(
+      sources.includes(`formatMessage("onboardingKycReview.${templated}"`),
+      `and is rendered through formatMessage`,
+    );
+  }
+}
+
 async function main(): Promise<void> {
   checkVocabulary();
   await checkRefusals();
@@ -4768,9 +5270,14 @@ async function main(): Promise<void> {
   await checkKycScreening();
   await checkKycSummary();
   await checkKycSubmit();
+  await checkKycReviewQueue();
+  await checkKycReviewDetail();
+  await checkKycReviewOpen();
+  await checkKycReviewDocument();
   await checkKycSources();
   await checkKycCatalog();
   await checkStatusCatalog();
+  await checkReviewCatalog();
 
   if (failures.length > 0) {
     process.stderr.write(`onboarding gate failed with ${failures.length} problem(s):\n`);
