@@ -92,6 +92,17 @@ import {
   SANCTIONS_SCREENINGS_TABLE,
   UBO_AUDIT_ACTION,
   UBO_RECORDS_TABLE,
+  COMPANIES_TABLE,
+  createDocumentRequest,
+  createDocumentRequestJobHandler,
+  documentRequestIdempotencyKey,
+  enqueueDocumentRequest,
+  KYC_DOCUMENT_REQUESTS_TABLE,
+  KYC_DOCUMENT_REQUEST_CREATED_AUDIT_ACTION,
+  KYC_DOCUMENT_REQUEST_ENTITY,
+  KYC_DOCUMENT_REQUEST_FULFILLED_AUDIT_ACTION,
+  KYC_DOCUMENT_REQUEST_JOB,
+  registerKycDocumentRequestJob,
 } from "./kyc-capture.ts";
 import {
   decideKycSubmission,
@@ -969,8 +980,8 @@ async function checkMigrationSet(): Promise<void> {
   expectEqual(numbers.includes("0106"), true, "STEP 090's is too");
   expectEqual(numbers.includes("0107"), true, "STEP 091's is too");
   expectEqual(numbers.includes("0108"), true, "STEP 092's is too");
-  expectEqual(numbers.includes("0109"), false, "and nothing beyond them");
-  expectEqual(Math.max(...numbers.map((number) => Number.parseInt(number, 10))), 108, "the set ends at 0108");
+  expectEqual(numbers.includes("0109"), true, "STEP 097's is too");
+  expectEqual(Math.max(...numbers.map((number) => Number.parseInt(number, 10))), 109, "the set ends at 0109");
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -1234,6 +1245,29 @@ interface DocumentRowShape {
   updated_at?: string;
 }
 
+/** One row of the `0001` tenant root. */
+interface CompanyRowShape {
+  id: string;
+  company_id: string;
+}
+
+/** One row of `0109`. */
+interface DocumentRequestRowShape {
+  id: string;
+  company_id: string;
+  submission_id: string;
+  provider_id: string;
+  document_label: string;
+  note: string | null;
+  status: string;
+  fulfilled_by?: string | null;
+  fulfilled_at?: string | null;
+  cancelled_at?: string | null;
+  version?: number;
+  updated_at?: string;
+  created_at: string;
+}
+
 /** One row of `0050`. */
 interface UboRowShape {
   id: string;
@@ -1285,6 +1319,8 @@ interface BusinessDatabase {
   readonly providerKeyRows: ProviderKeyRowShape[];
   readonly provisionRows: ProvisionRowShape[];
   readonly webhookRows: WebhookEventRowShape[];
+  readonly companyRows: CompanyRowShape[];
+  readonly requestRows: DocumentRequestRowShape[];
   readonly queries: string[];
   readonly inserts: { readonly table: string; readonly row: Readonly<Record<string, unknown>> }[];
   readonly updates: {
@@ -1303,6 +1339,10 @@ interface BusinessDatabase {
   submissionRace: boolean;
   /** When true, the provision update branch simulates a lost race the same way. */
   provisionRace: boolean;
+  /** When true, the request update branch simulates a lost race the same way. */
+  requestRace: boolean;
+  /** When true, the request insert branch answers a unique conflict with the winner's row present. */
+  requestInsertConflict: boolean;
 }
 
 function businessRow(overrides: Partial<BusinessRowShape> = {}): BusinessRowShape {
@@ -1349,6 +1389,8 @@ function createBusinessDatabase(
   providerKeyRows: readonly ProviderKeyRowShape[] = defaultProviderKeyRows(),
   provisionRows: readonly ProvisionRowShape[] = [],
   webhookRows: readonly WebhookEventRowShape[] = [],
+  companyRows: readonly CompanyRowShape[] = defaultCompanyRows(),
+  requestRows: readonly DocumentRequestRowShape[] = [],
 ): BusinessDatabase {
   return {
     profileRows: [...profileRows],
@@ -1367,6 +1409,8 @@ function createBusinessDatabase(
     providerKeyRows: [...providerKeyRows].map((row) => ({ ...row })),
     provisionRows: [...provisionRows].map((row) => ({ ...row })),
     webhookRows: [...webhookRows].map((row) => ({ ...row })),
+    companyRows: [...companyRows].map((row) => ({ ...row })),
+    requestRows: [...requestRows].map((row) => ({ ...row })),
     queries: [],
     inserts: [],
     updates: [],
@@ -1376,7 +1420,17 @@ function createBusinessDatabase(
     holdRace: false,
     submissionRace: false,
     provisionRace: false,
+    requestRace: false,
+    requestInsertConflict: false,
   };
+}
+
+/** The tenant root rows the gate works against: the two seeded companies. */
+function defaultCompanyRows(): CompanyRowShape[] {
+  return [
+    { id: COMPANY_A, company_id: COMPANY_A },
+    { id: COMPANY_B, company_id: COMPANY_B },
+  ];
 }
 
 const EMPTY_PROFILE_COLUMNS = [
@@ -1708,6 +1762,14 @@ function createBusinessStore(database: BusinessDatabase): RestClient {
         return Promise.resolve(withDefaults.map((row) => schema.parse(row)));
       }
 
+      // The `0001` tenant root: the request service proves the asked merchant exists.
+      if (table === COMPANIES_TABLE) {
+        const wantedCompany = scopedCompany(query);
+        const matched = database.companyRows.filter((row) => row.company_id === wantedCompany);
+
+        return Promise.resolve(matched.map((row) => schema.parse({ id: row.id })));
+      }
+
       // The `0032` webhook events: read by id, never company-scoped - the event names its own
       // merchant once it has resolved it.
       if (table === WEBHOOK_EVENTS_TABLE) {
@@ -1732,6 +1794,62 @@ function createBusinessStore(database: BusinessDatabase): RestClient {
             : matched.slice(0, Number.parseInt(limit.slice("limit=".length), 10));
 
         return Promise.resolve(capped.map((row) => schema.parse(row)));
+      }
+
+      // The `0109` document requests: company-scoped, any eq filter, ordered and limited.
+      if (table === KYC_DOCUMENT_REQUESTS_TABLE) {
+        const parts = query.split("&");
+
+        if (!parts.includes("deleted_at=is.null")) {
+          return Promise.reject(new Error(`the request read is not over live rows: ${query}`));
+        }
+
+        const wantedRequestCompany = scopedCompany(query);
+        let matched = [...database.requestRows];
+
+        if (wantedRequestCompany !== null) {
+          matched = matched.filter((row) => row.company_id === wantedRequestCompany);
+        }
+
+        for (const part of parts) {
+          const eq = /^([a-z_]+)=eq\.(.+)$/u.exec(part);
+
+          if (eq !== null) {
+            const column = eq[1] ?? "";
+            const value = decodeURIComponent(eq[2] ?? "");
+            matched = matched.filter(
+              (row) => String((row as unknown as Record<string, unknown>)[column]) === value,
+            );
+          }
+        }
+
+        const ordered = parts.find((part) => part.startsWith("order="));
+
+        if (ordered === "order=created_at.asc") {
+          matched = [...matched].sort((left, right) => left.created_at.localeCompare(right.created_at));
+        }
+
+        if (ordered === "order=created_at.desc") {
+          matched = [...matched].sort((left, right) => right.created_at.localeCompare(left.created_at));
+        }
+
+        const limit = parts.find((part) => part.startsWith("limit="));
+        const capped =
+          limit === undefined
+            ? matched
+            : matched.slice(0, Number.parseInt(limit.slice("limit=".length), 10));
+
+        // Rows seeded before a column existed still answer with the migration's default.
+        const withDefaults = capped.map((row) => ({
+          fulfilled_by: null,
+          fulfilled_at: null,
+          cancelled_at: null,
+          version: 1,
+          updated_at: row.created_at,
+          ...row,
+        }));
+
+        return Promise.resolve(withDefaults.map((row) => schema.parse(row)));
       }
 
       const wanted = scopedCompany(query);
@@ -1760,7 +1878,7 @@ function createBusinessStore(database: BusinessDatabase): RestClient {
         let matched = wanted === null ? [...allRows] : allRows.filter((row) => row["company_id"] === wanted);
 
         for (const part of parts) {
-          for (const column of ["status", "submission_id", "id", "subject_id"] as const) {
+          for (const column of ["status", "submission_id", "id", "subject_id", "storage_key"] as const) {
             if (part.startsWith(`${column}=eq.`)) {
               const value = decodeURIComponent(part.slice(column.length + 4));
               matched = matched.filter((row) => row[column] === value);
@@ -1998,6 +2116,42 @@ function createBusinessStore(database: BusinessDatabase): RestClient {
             updated_at: created,
             created_at: created,
           });
+        }
+
+        return Promise.resolve();
+      }
+
+      if (table === KYC_DOCUMENT_REQUESTS_TABLE) {
+        for (const row of rows) {
+          const id = `018f2b8a-0000-4c2d-9c3e-${String(database.requestRows.length + 1).padStart(12, "0")}`;
+          const created = new Date(NOW).toISOString();
+          const materialised: DocumentRequestRowShape = {
+            id,
+            company_id: String(row["company_id"] ?? ""),
+            submission_id: String(row["submission_id"] ?? ""),
+            provider_id: String(row["provider_id"] ?? ""),
+            document_label: String(row["document_label"] ?? ""),
+            note: typeof row["note"] === "string" ? row["note"] : null,
+            status: String(row["status"] ?? "open"),
+            fulfilled_by: null,
+            fulfilled_at: null,
+            cancelled_at: null,
+            version: 1,
+            updated_at: created,
+            created_at: created,
+          };
+
+          database.inserts.push({ table, row: { ...row } });
+
+          if (database.requestInsertConflict) {
+            // The winner's row exists; our insert loses the unique race.
+            database.requestInsertConflict = false;
+            database.requestRows.push(materialised);
+
+            return Promise.reject(new AppError("CONFLICT", { cause: { code: UNIQUE_VIOLATION } }));
+          }
+
+          database.requestRows.push(materialised);
         }
 
         return Promise.resolve();
@@ -2248,6 +2402,46 @@ function createBusinessStore(database: BusinessDatabase): RestClient {
             (wantedId === null || row.id === wantedId) &&
             (wantedStatus === null || row.status === wantedStatus)
           ) {
+            for (const [key, value] of Object.entries(values)) {
+              (row as unknown as Record<string, unknown>)[key] = value;
+            }
+          }
+        }
+
+        return Promise.resolve();
+      }
+
+      if (table === KYC_DOCUMENT_REQUESTS_TABLE) {
+        const parts = query.split("&");
+
+        if (!parts.includes("deleted_at=is.null")) {
+          return Promise.reject(new Error(`the request update is not over live rows: ${query}`));
+        }
+
+        const idPart = parts.find((part) => part.startsWith("id=eq."));
+        const statusPart = parts.find((part) => part.startsWith("status=eq."));
+        const versionPart = parts.find((part) => part.startsWith("version=eq."));
+        const wantedId = idPart === undefined ? null : decodeURIComponent(idPart.slice("id=eq.".length));
+        const wantedStatus = statusPart === undefined ? null : decodeURIComponent(statusPart.slice("status=eq.".length));
+        const wantedVersion =
+          versionPart === undefined ? null : Number(versionPart.slice("version=eq.".length));
+
+        for (const row of database.requestRows) {
+          // Rows seeded before a column existed still answer with the migration's default.
+          const currentVersion = row.version ?? 1;
+
+          if (
+            row.company_id === wanted &&
+            (wantedId === null || row.id === wantedId) &&
+            (wantedStatus === null || row.status === wantedStatus) &&
+            (wantedVersion === null || currentVersion === wantedVersion)
+          ) {
+            if (database.requestRace && wantedVersion !== null) {
+              row.version = currentVersion + 5;
+
+              continue;
+            }
+
             for (const [key, value] of Object.entries(values)) {
               (row as unknown as Record<string, unknown>)[key] = value;
             }
@@ -8672,6 +8866,373 @@ async function checkSubmerchantSyncSources(): Promise<void> {
   );
 }
 
+/** ---- STEP 097: the extra document a processor asks for. */
+const DRAFT_SUBMISSION_ID = "018f2b8a-0000-4c2d-9c3e-0000000000d1";
+const OTHER_SUBMISSION_ID = "018f2b8a-0000-4c2d-9c3e-0000000000d2";
+const REQUEST_ID = "018f2b8a-0000-4c2d-9c3e-000000000051";
+const UNKNOWN_COMPANY_ID = "018f2b8a-4444-4c2d-9c3e-000000000099";
+
+function requestSeededDatabase(overrides: Partial<DocumentRequestRowShape> = {}): BusinessDatabase {
+  const database = createBusinessDatabase();
+
+  database.submissionRows.push({
+    id: DRAFT_SUBMISSION_ID,
+    company_id: COMPANY_A,
+    status: "draft",
+    verification_method: "manual",
+    created_at: "2026-11-02T09:00:00.000Z",
+  });
+
+  database.requestRows.push({
+    id: REQUEST_ID,
+    company_id: COMPANY_A,
+    submission_id: DRAFT_SUBMISSION_ID,
+    provider_id: "nmi",
+    document_label: "Signed merchant agreement",
+    note: "The countersigned copy, please.",
+    status: "open",
+    version: 1,
+    created_at: "2026-11-02T09:10:00.000Z",
+    ...overrides,
+  });
+
+  return database;
+}
+
+async function checkDocumentRequests(): Promise<void> {
+  expectEqual(KYC_DOCUMENT_REQUESTS_TABLE, "kyc_document_requests", "the request table of 0109");
+  expectEqual(KYC_DOCUMENT_REQUEST_JOB, "kyc.document_request", "the request job name");
+  expectEqual(KYC_DOCUMENT_REQUEST_ENTITY, "kyc_document_request", "the request audit entity");
+
+  const database = requestSeededDatabase();
+  const audit = createInMemoryAuditTrail();
+  const dependencies = dependenciesOf(database, audit);
+
+  const queriesBefore = database.queries.length;
+
+  const badCompany = await rejectionOf(() =>
+    createDocumentRequest({ company_id: "not-a-uuid", provider_id: "nmi", document_label: "x" }, dependencies),
+  );
+
+  expectEqual(badCompany?.code, "VALIDATION_FAILED", "a malformed company id is refused at the call site");
+  expectEqual(database.queries.length, queriesBefore, "before any query runs");
+
+  const badProvider = await rejectionOf(() =>
+    createDocumentRequest({ company_id: COMPANY_A, provider_id: "not-a-provider", document_label: "x" }, dependencies),
+  );
+
+  expectEqual(badProvider?.code, "VALIDATION_FAILED", "a provider outside the registry vocabulary is refused");
+
+  const badLabel = await rejectionOf(() =>
+    createDocumentRequest(
+      { company_id: COMPANY_A, provider_id: "nmi", document_label: `${"y".repeat(121)}` },
+      dependencies,
+    ),
+  );
+
+  expectEqual(badLabel?.code, "VALIDATION_FAILED", "a label over 120 characters is refused");
+
+  const unknownCompany = await rejectionOf(() =>
+    createDocumentRequest(
+      { company_id: UNKNOWN_COMPANY_ID, provider_id: "nmi", document_label: "Bank statement addendum" },
+      dependencies,
+    ),
+  );
+
+  expectEqual(unknownCompany?.code, "RESOURCE_NOT_FOUND", "an ask for a company that does not exist is 404");
+  expectEqual(
+    database.inserts.filter((insert) => insert.table === KYC_DOCUMENT_REQUESTS_TABLE).length,
+    0,
+    "and writes nothing",
+  );
+
+  const created = await createDocumentRequest(
+    { company_id: COMPANY_A, provider_id: "nmi", document_label: "Bank statement addendum", note: "Last three months, please." },
+    dependencies,
+  );
+
+  expectEqual(created.created, true, "the first ask for a label creates the row");
+  expectEqual(created.request.status, "open", "the ask starts open");
+  expectEqual(created.request.documentLabel, "Bank statement addendum", "carrying the provider's own words");
+  expectEqual(created.request.note, "Last three months, please.", "and its note");
+  expectEqual(created.request.providerId, "nmi", "and the asking provider");
+  expectEqual(created.request.submissionId, DRAFT_SUBMISSION_ID, "the ask hangs off the draft submission");
+
+  const insert = database.inserts.find((entry) => entry.table === KYC_DOCUMENT_REQUESTS_TABLE);
+
+  expectEqual(insert?.row["status"], "open", "the insert writes it open");
+  expectEqual(insert?.row["submission_id"], DRAFT_SUBMISSION_ID, "on the seeded draft submission");
+  expectEqual(database.submissionRows.length, 1, "the draft is reused, not recreated");
+  expectEqual(audit.entries.length, 1, "one audit entry for the ask");
+  expectEqual(audit.entries[0]?.action, KYC_DOCUMENT_REQUEST_CREATED_AUDIT_ACTION, "under kyc_document_request.created");
+  expectEqual(audit.entries[0]?.actorUserId, null, "a provider ask carries no session actor");
+  expectEqual(audit.entries[0]?.entityType, KYC_DOCUMENT_REQUEST_ENTITY, "on the request entity");
+  expectEqual(audit.entries[0]?.entityId, created.request.id, "naming the row");
+
+  const again = await createDocumentRequest(
+    { company_id: COMPANY_A, provider_id: "nmi", document_label: "Bank statement addendum" },
+    dependencies,
+  );
+
+  expectEqual(again.created, false, "the same ask delivered again answers with the existing row");
+  expectEqual(again.request.id, created.request.id, "the same row");
+  expectEqual(
+    database.inserts.filter((entry) => entry.table === KYC_DOCUMENT_REQUESTS_TABLE).length,
+    1,
+    "no second insert",
+  );
+  expectEqual(audit.entries.length, 1, "and no second audit");
+
+  const raceDatabase = requestSeededDatabase();
+  const raceAudit = createInMemoryAuditTrail();
+
+  raceDatabase.requestInsertConflict = true;
+
+  const raced = await createDocumentRequest(
+    { company_id: COMPANY_A, provider_id: "nmi", document_label: "Bank statement addendum" },
+    dependenciesOf(raceDatabase, raceAudit),
+  );
+
+  expectEqual(raced.created, false, "a lost insert race converges on the winner's row");
+  expectEqual(raced.request.documentLabel, "Bank statement addendum", "the winner's label");
+  expectEqual(raceAudit.entries.length, 0, "and is not audited as a new ask");
+
+  const packDatabase = requestSeededDatabase();
+  const pack = await readKycPack({ actor: owner }, dependenciesOf(packDatabase, createInMemoryAuditTrail()));
+
+  expectEqual(pack.openRequests.length, 1, "the pack lists the open ask");
+  expectEqual(pack.openRequests[0]?.id, REQUEST_ID, "by id");
+  expectEqual(pack.openRequests[0]?.documentLabel, "Signed merchant agreement", "with its label");
+  expectEqual(pack.openRequests[0]?.note, "The countersigned copy, please.", "and its note");
+  expect(
+    packDatabase.queries.some(
+      (query) => query.startsWith(`${KYC_DOCUMENT_REQUESTS_TABLE}?`) && query.includes("status=eq.open"),
+    ),
+    "the pack reads only open requests over live rows",
+  );
+
+  const uploadDatabase = requestSeededDatabase();
+  const uploadAudit = createInMemoryAuditTrail();
+  const saved = await saveKycDocument(
+    {
+      actor: owner,
+      input: pngDocumentInput({
+        document_type: "processor_request",
+        request_id: REQUEST_ID,
+        file_name: "agreement.pdf",
+        declared_content_type: "application/pdf",
+        bytes: PDF_BYTES,
+      }),
+    },
+    dependenciesOf(uploadDatabase, uploadAudit),
+  );
+  const requestRow = uploadDatabase.requestRows.find((row) => row.id === REQUEST_ID);
+
+  expectEqual(uploadDatabase.documentRows[0]?.document_type, "processor_request", "the answer is a processor_request document");
+  expectEqual(requestRow?.status, "fulfilled", "the ask is fulfilled by the upload");
+  expectEqual(requestRow?.fulfilled_by, uploadDatabase.documentRows[0]?.id, "naming the document row");
+  expectEqual(requestRow?.fulfilled_at !== null && requestRow?.fulfilled_at !== undefined, true, "with its instant");
+  expectEqual(requestRow?.version, 2, "and the version bumped");
+
+  const requestUpdate = uploadDatabase.updates.find((entry) => entry.table === KYC_DOCUMENT_REQUESTS_TABLE);
+
+  expect(
+    requestUpdate !== undefined &&
+      requestUpdate.query.includes("status=eq.open") &&
+      requestUpdate.query.includes("version=eq.1") &&
+      requestUpdate.query.includes("deleted_at=is.null"),
+    "the fulfill write is conditional on open, the current version and a live row",
+  );
+  expectEqual(saved.openRequests.length, 0, "and the pack no longer lists the ask");
+  expectEqual(saved.documents.length, 1, "the document itself is listed");
+  expectEqual(uploadAudit.entries.length, 2, "the upload and the fulfill are both audited");
+  expectEqual(uploadAudit.entries[0]?.action, KYC_DOCUMENT_AUDIT_ACTION, "the upload first");
+  expectEqual(uploadAudit.entries[0]?.payload?.["request_id"], REQUEST_ID, "naming the request it answered");
+  expectEqual(uploadAudit.entries[1]?.action, KYC_DOCUMENT_REQUEST_FULFILLED_AUDIT_ACTION, "then the fulfill");
+  expectEqual(uploadAudit.entries[1]?.entityId, REQUEST_ID, "on the request entity");
+  expectEqual(uploadAudit.entries[1]?.payload?.["document_id"], uploadDatabase.documentRows[0]?.id, "naming the document");
+
+  const wrongTypeDatabase = requestSeededDatabase();
+  const wrongType = await rejectionOf(() =>
+    saveKycDocument(
+      { actor: owner, input: pngDocumentInput({ document_type: "identity_document", request_id: REQUEST_ID }) },
+      dependenciesOf(wrongTypeDatabase, createInMemoryAuditTrail()),
+    ),
+  );
+
+  expectEqual(wrongType?.code, "VALIDATION_FAILED", "another document type cannot answer a request");
+  expectDeepEqual(
+    wrongType?.details,
+    [{ field: "document_type", rule: "request_document_type" }],
+    "named request_document_type",
+  );
+  expectEqual(wrongTypeDatabase.documentRows.length, 0, "and no document is written");
+
+  const badIdDatabase = requestSeededDatabase();
+  const badId = await rejectionOf(() =>
+    saveKycDocument(
+      { actor: owner, input: pngDocumentInput({ document_type: "processor_request", request_id: "nope" }) },
+      dependenciesOf(badIdDatabase, createInMemoryAuditTrail()),
+    ),
+  );
+
+  expectEqual(badId?.code, "VALIDATION_FAILED", "a malformed request id is refused");
+  expectDeepEqual(badId?.details, [{ field: "request_id", rule: "invalid_format" }], "named invalid_format");
+
+  const unknownRequestDatabase = requestSeededDatabase();
+  const unknownRequest = await rejectionOf(() =>
+    saveKycDocument(
+      {
+        actor: owner,
+        input: pngDocumentInput({
+          document_type: "processor_request",
+          request_id: "018f2b8a-0000-4c2d-9c3e-000000000099",
+        }),
+      },
+      dependenciesOf(unknownRequestDatabase, createInMemoryAuditTrail()),
+    ),
+  );
+
+  expectEqual(unknownRequest?.code, "RESOURCE_NOT_FOUND", "an unknown request id is 404");
+  expectEqual(unknownRequestDatabase.documentRows.length, 0, "and no document is written");
+
+  const closedDatabase = requestSeededDatabase({
+    status: "fulfilled",
+    fulfilled_by: "018f2b8a-0000-4c2d-9c3e-000000000050",
+    fulfilled_at: "2026-11-02T10:00:00.000Z",
+    version: 2,
+  });
+  const closed = await rejectionOf(() =>
+    saveKycDocument(
+      { actor: owner, input: pngDocumentInput({ document_type: "processor_request", request_id: REQUEST_ID }) },
+      dependenciesOf(closedDatabase, createInMemoryAuditTrail()),
+    ),
+  );
+
+  expectEqual(closed?.code, "CONFLICT", "an already answered ask conflicts");
+  expectDeepEqual(closed?.details, [{ field: "request_id", rule: "not_open" }], "with not_open");
+  expectEqual(closedDatabase.documentRows.length, 0, "and nothing is written");
+
+  const mismatchDatabase = requestSeededDatabase({ submission_id: OTHER_SUBMISSION_ID });
+  const mismatch = await rejectionOf(() =>
+    saveKycDocument(
+      { actor: owner, input: pngDocumentInput({ document_type: "processor_request", request_id: REQUEST_ID }) },
+      dependenciesOf(mismatchDatabase, createInMemoryAuditTrail()),
+    ),
+  );
+
+  expectEqual(mismatch?.code, "CONFLICT", "an ask of another submission conflicts");
+  expectDeepEqual(mismatch?.details, [{ field: "request_id", rule: "submission_mismatch" }], "with submission_mismatch");
+
+  const staleDatabase = requestSeededDatabase();
+  const staleAudit = createInMemoryAuditTrail();
+
+  staleDatabase.requestRace = true;
+
+  const stale = await rejectionOf(() =>
+    saveKycDocument(
+      { actor: owner, input: pngDocumentInput({ document_type: "processor_request", request_id: REQUEST_ID }) },
+      dependenciesOf(staleDatabase, staleAudit),
+    ),
+  );
+
+  expectEqual(stale?.code, "CONFLICT", "a lost race on the fulfill write conflicts");
+  expectDeepEqual(stale?.details, [{ field: "version", rule: "stale" }], "with stale");
+  expectEqual(staleDatabase.requestRows[0]?.status, "open", "the ask stays open");
+  expectEqual(
+    staleAudit.entries.filter((entry) => entry.action === KYC_DOCUMENT_REQUEST_FULFILLED_AUDIT_ACTION).length,
+    0,
+    "and is not audited as fulfilled",
+  );
+
+  const registry = new JobRegistry();
+
+  registerKycDocumentRequestJob(registry);
+  expectEqual(registry.size, 1, "the request job registers once");
+  registerKycDocumentRequestJob(registry);
+  expectEqual(registry.size, 1, "and a second register is a no-op");
+
+  const queue = createInMemoryJobQueue();
+  const first = await enqueueDocumentRequest(
+    { registry, queue },
+    { company_id: COMPANY_A, provider_id: "nmi", document_label: "Bank statement addendum" },
+  );
+
+  expectEqual(first.job.name, KYC_DOCUMENT_REQUEST_JOB, "the enqueued job is the request job");
+  expectEqual(first.deduplicated, false, "the first enqueue is not a duplicate");
+  expectEqual(
+    first.job.idempotencyKey,
+    documentRequestIdempotencyKey(COMPANY_A, "nmi", "Bank statement addendum"),
+    "keyed by merchant, provider and label",
+  );
+
+  const second = await enqueueDocumentRequest(
+    { registry, queue },
+    { company_id: COMPANY_A, provider_id: "nmi", document_label: "Bank statement addendum" },
+  );
+
+  expectEqual(second.deduplicated, true, "a repeated delivery returns the first job");
+  expectEqual(second.job.id, first.job.id, "the same job");
+
+  const badEnqueue = await rejectionOf(() =>
+    enqueueDocumentRequest({ registry, queue }, { company_id: COMPANY_A, provider_id: "nope", document_label: "x" }),
+  );
+
+  expectEqual(badEnqueue?.code, "VALIDATION_FAILED", "a malformed ask is refused at the call site");
+
+  const jobDatabase = requestSeededDatabase();
+  const definition = createDocumentRequestJobHandler(() => dependenciesOf(jobDatabase, createInMemoryAuditTrail()));
+
+  await definition.handler({
+    jobId: "018f2b8a-0000-4c2d-9c3e-00000000job3",
+    name: KYC_DOCUMENT_REQUEST_JOB,
+    attempt: 1,
+    maxAttempts: 5,
+    traceId: "trace-3",
+    payload: { company_id: COMPANY_A, provider_id: "stripe_connect", document_label: "Payout schedule" },
+    signal: new AbortController().signal,
+  });
+
+  expectEqual(jobDatabase.requestRows.length, 2, "the job handler recorded the ask");
+  expectEqual(jobDatabase.requestRows[1]?.status, "open", "as an open row");
+  expectEqual(jobDatabase.requestRows[1]?.provider_id, "stripe_connect", "for the asking provider");
+  expectEqual(jobDatabase.requestRows[1]?.submission_id, DRAFT_SUBMISSION_ID, "on the draft submission");
+}
+
+/** ---- STEP 097 sources: the capture service, the route, the form and the migration. */
+async function checkDocumentRequestsSources(): Promise<void> {
+  const capture = await readRepositoryFile("services/kyc/kyc-capture.ts");
+  const route = await readRepositoryFile("app/api/onboarding/kyc-document/route.ts");
+  const form = await readRepositoryFile("app/(dashboard)/onboarding/documents/documents-form.tsx");
+
+  expect(capture.includes('KYC_DOCUMENT_REQUESTS_TABLE = "kyc_document_requests"'), "the capture service names the 0109 table");
+  expect(capture.includes('KYC_DOCUMENT_REQUEST_JOB = "kyc.document_request"'), "and the request job name");
+  expect(capture.includes('KYC_DOCUMENT_REQUEST_CREATED_AUDIT_ACTION = "kyc_document_request.created"'), "and the created audit action");
+  expect(capture.includes('KYC_DOCUMENT_REQUEST_FULFILLED_AUDIT_ACTION = "kyc_document_request.fulfilled"'), "and the fulfilled audit action");
+  expect(capture.includes("status=eq.open"), "the fulfill write is conditional on the open status");
+  expect(capture.includes("version=eq."), "and on the current version");
+  expect(capture.includes("fulfilled_by"), "the row names the answering document");
+  expect(capture.includes('"not_open"'), "an answered ask conflicts");
+  expect(capture.includes('"submission_mismatch"'), "a foreign submission conflicts");
+  expect(capture.includes('"request_document_type"'), "only a processor_request document answers a request");
+  expect(capture.includes('"stale"'), "a lost race conflicts");
+  expect(capture.includes("idempotencyKey"), "the enqueue is idempotent per ask");
+  expect(route.includes('request_id: formText(form, "request_id")'), "the upload route passes the request id through");
+  expect(form.includes('form.append("request_id", requestId)'), "the form sends it");
+  expect(form.includes("pack.openRequests"), "and renders the open asks");
+
+  const migrationFiles = await readdir(new URL("migrations/", repositoryRoot));
+
+  expect(migrationFiles.includes("0109_kyc_document_requests.sql"), "the 0109 forward file exists");
+  expect(migrationFiles.includes("0109_kyc_document_requests.down.sql"), "and its rollback");
+
+  const forward = await readRepositoryFile("migrations/0109_kyc_document_requests.sql");
+
+  expect(forward.includes("kyc_document_requests_open_unique"), "one open ask per submission, provider and label");
+  expect(forward.includes("enable row level security"), "the table enables RLS");
+  expect(forward.includes("kyc_document_requests_default_deny"), "and carries the default-deny policy");
+}
+
 async function main(): Promise<void> {
   checkVocabulary();
   await checkRefusals();
@@ -8731,6 +9292,8 @@ async function main(): Promise<void> {
   await checkSubmerchantProvisionSources();
   await checkSubmerchantSync();
   await checkSubmerchantSyncSources();
+  await checkDocumentRequests();
+  await checkDocumentRequestsSources();
   await checkKycCatalog();
   await checkStatusCatalog();
   await checkReviewCatalog();
@@ -8759,7 +9322,7 @@ async function main(): Promise<void> {
     `onboarding gate passed: ${checks} checks, ${ONBOARDING_STEPS.length} steps, ` +
       `${ONBOARDING_OWNER_ROLES.length} role, ${BUSINESS_PROFILE_FIELDS.length} business fields, ` +
       `${PROCESSOR_REQUIREMENT_LIST.length} processors, ${BUSINESS_PROFILE_TABLE} table, ` +
-      `${MCC_CODES_TABLE} vocabulary, ${COUNTRIES_TABLE} list, submerchant profile, kyc pack, underwriting criteria, merchant limits, payment holds, submerchant provisioning, webhook sync\n`,
+      `${MCC_CODES_TABLE} vocabulary, ${COUNTRIES_TABLE} list, submerchant profile, kyc pack, underwriting criteria, merchant limits, payment holds, submerchant provisioning, webhook sync, document requests\n`,
   );
 }
 

@@ -1510,6 +1510,17 @@ const catalog = {
     docTypeBankStatement: "Bank statement",
     docTypeSourceOfFunds: "Source of funds document",
     docTypeProcessorRequest: "Document a processor asked for",
+    requestsHeading: "Extra documents a processor asked for",
+    requestsEmpty: "No processor has asked for an extra document right now.",
+    requestAskedByLine: "Asked by {provider}",
+    requestSelectLabel: "Answering a request",
+    requestSelectPlaceholder: "No request - this is a document of your own",
+    requestSelectHint:
+      "Optional. When the upload answers a processor's request, choose it here and the request is marked answered.",
+    ruleRequestNotOpen: "That request is already answered.",
+    ruleSubmissionMismatch: "That request belongs to another submission.",
+    ruleRequestDocumentType: "A request is answered with the document type a processor asked for.",
+    ruleStale: "That request changed just now; try again.",
     issuedAtLabel: "Issued on",
     issuedAtHint: "Optional for other document types, and only when the document itself carries a date.",
     utilityBillRuleLine:

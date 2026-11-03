@@ -27,6 +27,11 @@ import {
   nextOnboardingStep,
   type OnboardingStep,
 } from "./onboarding-steps.ts";
+import { getAuthRuntime } from "../../lib/auth/runtime.ts";
+import { PROVIDER_KEYS } from "../../lib/gateways/registry.ts";
+import { enqueueJob, type JobRegistry } from "../../lib/jobs/registry.ts";
+import type { JobQueue } from "../../lib/jobs/queue.ts";
+import type { EnqueueResult, JobDefinition } from "../../lib/jobs/types.ts";
 
 /**
  * The documents step of section 5: what a merchant uploads, who owns the business, and the
@@ -119,6 +124,24 @@ export const KYC_DOCUMENT_MAXIMUM_BYTES = UPLOAD_DATABASE_MAXIMUM_BYTES;
 /** An owner of 25 percent or more is significant: 2500 basis points, as `0050`'s check ties it. */
 export const SIGNIFICANT_OWNER_BPS = 2_500;
 
+/** The table of `0001`: the tenant root, read to prove a request names a real merchant. */
+export const COMPANIES_TABLE = "companies";
+
+/** The table of `0109`: one extra document a processor asked the merchant for. */
+export const KYC_DOCUMENT_REQUESTS_TABLE = "kyc_document_requests";
+
+/** The audit entity of a document request row. */
+export const KYC_DOCUMENT_REQUEST_ENTITY = "kyc_document_request";
+
+/** The audit action of a provider's extra-document request being recorded. */
+export const KYC_DOCUMENT_REQUEST_CREATED_AUDIT_ACTION = "kyc_document_request.created";
+
+/** The audit action of a merchant's upload answering that request. */
+export const KYC_DOCUMENT_REQUEST_FULFILLED_AUDIT_ACTION = "kyc_document_request.fulfilled";
+
+/** The background job that records a provider's request for an extra document. */
+export const KYC_DOCUMENT_REQUEST_JOB = "kyc.document_request";
+
 const submissionRowSchema = z.object({
   id: z.string(),
   company_id: z.string(),
@@ -193,6 +216,33 @@ const onboardingRowSchema = z.object({
   completed_steps: z.array(z.string()),
 });
 
+/** One row of `0109`, as the request service reads it. */
+const documentRequestRowSchema = z.object({
+  id: z.string(),
+  company_id: z.string(),
+  submission_id: z.string(),
+  provider_id: z.string(),
+  document_label: z.string(),
+  note: z.string().nullable(),
+  status: z.string(),
+  fulfilled_by: z.string().nullable(),
+  fulfilled_at: z.string().nullable(),
+  cancelled_at: z.string().nullable(),
+  version: z.coerce.number(),
+  created_at: z.string(),
+});
+
+/** The columns of one open request the pack lists. */
+const openDocumentRequestRowSchema = z.object({
+  id: z.string(),
+  submission_id: z.string(),
+  provider_id: z.string(),
+  document_label: z.string(),
+  note: z.string().nullable(),
+  status: z.string(),
+  created_at: z.string(),
+});
+
 /** One uploaded document, as the pack lists it. */
 export interface KycDocumentRecord {
   readonly id: string;
@@ -205,6 +255,17 @@ export interface KycDocumentRecord {
   readonly expiresAt: string | null;
   readonly status: string;
   readonly rejectionReason: string | null;
+  readonly createdAt: string;
+}
+
+/** One open extra-document request of `0109`, as the pack lists it. */
+export interface KycDocumentRequestView {
+  readonly id: string;
+  readonly submissionId: string;
+  readonly providerId: string;
+  readonly documentLabel: string;
+  readonly note: string | null;
+  readonly status: string;
   readonly createdAt: string;
 }
 
@@ -229,6 +290,8 @@ export interface KycPackSnapshot {
   readonly countries: readonly { readonly code: string; readonly name: string }[];
   readonly screenedCount: number;
   readonly documentsComplete: boolean;
+  /** The open asks of `0109`: what a processor asked for and is still waiting for. */
+  readonly openRequests: readonly KycDocumentRequestView[];
 }
 
 export interface KycCaptureDependencies {
@@ -374,6 +437,8 @@ export interface KycDocumentInput {
   readonly bytes: Uint8Array;
   readonly issued_at?: unknown;
   readonly expires_at?: unknown;
+  /** STEP 097: when the upload answers a processor's request, the request's id. */
+  readonly request_id?: unknown;
 }
 
 const DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/u;
@@ -396,6 +461,7 @@ export function parseKycDocumentInput(
     readonly byteSize: number;
     readonly issuedAt: string | null;
     readonly expiresAt: string | null;
+    readonly requestId: string | null;
   } | null;
   readonly problems: readonly ErrorDetail[];
 } {
@@ -439,6 +505,17 @@ export function parseKycDocumentInput(
       issuedAt = raw;
     } else {
       expiresAt = raw;
+    }
+  }
+
+  // STEP 097: an upload can answer one open request; the id is a uuid or the field is named.
+  let requestId: string | null = null;
+
+  if (input.request_id !== undefined && input.request_id !== null && input.request_id !== "") {
+    if (typeof input.request_id === "string" && z.string().uuid().safeParse(input.request_id).success) {
+      requestId = input.request_id;
+    } else {
+      problems.push({ field: "request_id", rule: "invalid_format" });
     }
   }
 
@@ -534,6 +611,7 @@ export function parseKycDocumentInput(
       byteSize: verdict.byteSize,
       issuedAt,
       expiresAt,
+      requestId,
     },
     problems,
   };
@@ -560,6 +638,15 @@ export async function saveKycDocument(
 
   const record = parsed.record;
   const submission = await ensureDraftSubmission(companyId, input.actor.userId, rest);
+
+  // STEP 097: when the upload answers a processor's request, the request is resolved before any
+  // write - open, the merchant's own, the same submission, and answered by a processor_request
+  // document, which is the only type `0109` links through fulfilled_by.
+  const request =
+    record.requestId === null
+      ? null
+      : await resolveRequestForUpload(record.requestId, companyId, submission.id, record.documentType, rest);
+
   const storageKey = `${companyId}/kyc/${randomUUID()}`;
 
   await rest.insert(KYC_DOCUMENTS_TABLE, [
@@ -589,15 +676,407 @@ export async function saveKycDocument(
         byte_size: record.byteSize,
         content_sha256: record.contentSha256,
         storage_key: storageKey,
+        ...(record.requestId === null ? {} : { request_id: record.requestId }),
       },
     });
   } catch {
     // The audit sink failing must not fail the record; the save services hold the same rule.
   }
 
+  if (request !== null) {
+    // The document row is found by its own storage key, unique per upload, and the request is
+    // marked fulfilled against it with one conditional update on the request's current version.
+    const documentRows = await rest.select(
+      KYC_DOCUMENTS_TABLE,
+      `select=id&company_id=eq.${encodeURIComponent(companyId)}&submission_id=eq.${encodeURIComponent(submission.id)}&storage_key=eq.${encodeURIComponent(storageKey)}&deleted_at=is.null&limit=1`,
+      z.object({ id: z.string() }),
+    );
+    const documentId = documentRows[0]?.id;
+
+    if (documentId === undefined) {
+      throw new AppError("INTERNAL_ERROR");
+    }
+
+    await markRequestFulfilled(request, documentId, input.actor, dependencies);
+  }
+
   await syncDocumentsStep(companyId, input.actor.userId, true, rest);
 
   return readKycPack({ actor: input.actor }, dependencies);
+}
+
+/* -------------------------------------------------------------------------------------------------
+ * STEP 097: the extra document a processor asks for. `0109` stores the ask as a row against the
+ * merchant's draft submission; the `kyc.document_request` job records it when a provider delivery
+ * lands (the webhook pipeline of the payment block enqueues it, the way STEP 095's sync runs), the
+ * pack lists the open asks so the merchant sees them on the documents step, and an upload that
+ * carries the request's id answers it: the only document type that may fulfill a request is
+ * `processor_request`, and the request row then names the document through fulfilled_by.
+ * ---------------------------------------------------------------------------------------------- */
+
+/** The input of one provider ask, as the job payload and the direct call share it. */
+const documentRequestInputSchema = z.object({
+  company_id: z.string().uuid(),
+  provider_id: z
+    .string()
+    .refine((value) => (PROVIDER_KEYS as readonly string[]).includes(value), "unknown provider"),
+  document_label: z
+    .string()
+    .min(1)
+    .max(120)
+    .refine((value) => value === value.trim(), "trimmed"),
+  note: z
+    .string()
+    .min(1)
+    .max(280)
+    .refine((value) => value === value.trim(), "trimmed")
+    .optional(),
+});
+
+/** The payload of the `kyc.document_request` job: one provider ask for one merchant. */
+export const documentRequestJobPayloadSchema = documentRequestInputSchema;
+
+export type DocumentRequestJobPayload = z.infer<typeof documentRequestJobPayloadSchema>;
+
+/** The idempotency key of one ask: one job per merchant, provider and label. */
+export function documentRequestIdempotencyKey(
+  companyId: string,
+  providerId: string,
+  documentLabel: string,
+): string {
+  return `${KYC_DOCUMENT_REQUEST_JOB}:${companyId}:${providerId}:${documentLabel}`;
+}
+
+export interface DocumentRequestDependencies {
+  readonly rest: RestClient;
+  readonly audit: AuditTrail;
+  readonly now?: () => number;
+}
+
+export interface DocumentRequestResult {
+  readonly request: KycDocumentRequestView;
+  readonly created: boolean;
+}
+
+function viewOfRequest(row: {
+  readonly id: string;
+  readonly submission_id: string;
+  readonly provider_id: string;
+  readonly document_label: string;
+  readonly note: string | null;
+  readonly status: string;
+  readonly created_at: string;
+}): KycDocumentRequestView {
+  return {
+    id: row.id,
+    submissionId: row.submission_id,
+    providerId: row.provider_id,
+    documentLabel: row.document_label,
+    note: row.note,
+    status: row.status,
+    createdAt: row.created_at,
+  };
+}
+
+const requestSelectColumns =
+  "id,submission_id,provider_id,document_label,note,status,fulfilled_by,fulfilled_at,cancelled_at,version,created_at";
+
+/** Find the company's draft submission, creating it as the system when none exists yet. */
+async function ensureDraftSubmissionForRequest(
+  companyId: string,
+  rest: RestClient,
+): Promise<{ id: string; status: string; verification_method: string }> {
+  const existing = await readDraftSubmission(companyId, rest);
+
+  if (existing !== null) {
+    return existing;
+  }
+
+  try {
+    // A draft carries no submitter yet: `0048`'s check ties submitted_by to a non-draft status.
+    await rest.insert(KYC_SUBMISSIONS_TABLE, [
+      { company_id: companyId, verification_method: "manual", status: "draft", submitted_by: null },
+    ]);
+  } catch (error) {
+    if (!isConflictError(error)) {
+      throw error;
+    }
+  }
+
+  const after = await readDraftSubmission(companyId, rest);
+
+  if (after === null) {
+    throw new AppError("INTERNAL_ERROR");
+  }
+
+  return after;
+}
+
+/**
+ * Record one provider ask for one extra document. The merchant must exist (404 otherwise) and the
+ * ask hangs off the company's draft submission. One open ask per submission, provider and label:
+ * a repeated delivery answers with the existing row instead of inserting a second one, and a lost
+ * insert race converges on the winner's row the same way.
+ */
+export async function createDocumentRequest(
+  input: {
+    readonly company_id: unknown;
+    readonly provider_id: unknown;
+    readonly document_label: unknown;
+    readonly note?: unknown;
+  },
+  dependencies: DocumentRequestDependencies,
+): Promise<DocumentRequestResult> {
+  const parsed = documentRequestInputSchema.safeParse(input);
+
+  if (!parsed.success) {
+    const details: readonly ErrorDetail[] = parsed.error.issues.map((issue) => ({
+      field: issue.path.join("."),
+      rule: "invalid_format",
+    }));
+
+    throw new AppError("VALIDATION_FAILED", { details });
+  }
+
+  const companyId = parsed.data.company_id;
+  const providerId = parsed.data.provider_id;
+  const documentLabel = parsed.data.document_label;
+  const note = parsed.data.note ?? null;
+  const rest = dependencies.rest;
+
+  const companies = await rest.select(
+    COMPANIES_TABLE,
+    `select=id&company_id=eq.${encodeURIComponent(companyId)}&deleted_at=is.null&limit=1`,
+    z.object({ id: z.string() }),
+  );
+
+  if (companies.length === 0) {
+    throw new AppError("RESOURCE_NOT_FOUND");
+  }
+
+  const submission = await ensureDraftSubmissionForRequest(companyId, rest);
+  const findQuery = `select=${requestSelectColumns}&company_id=eq.${encodeURIComponent(companyId)}&submission_id=eq.${encodeURIComponent(submission.id)}&provider_id=eq.${encodeURIComponent(providerId)}&document_label=eq.${encodeURIComponent(documentLabel)}&status=eq.open&deleted_at=is.null&limit=1`;
+
+  const existing = await rest.select(KYC_DOCUMENT_REQUESTS_TABLE, findQuery, documentRequestRowSchema);
+  const existingRow = existing[0];
+
+  if (existingRow !== undefined) {
+    return { request: viewOfRequest(existingRow), created: false };
+  }
+
+  let created = true;
+
+  try {
+    await rest.insert(KYC_DOCUMENT_REQUESTS_TABLE, [
+      {
+        company_id: companyId,
+        submission_id: submission.id,
+        provider_id: providerId,
+        document_label: documentLabel,
+        note,
+        status: "open",
+      },
+    ]);
+  } catch (error) {
+    if (!isConflictError(error)) {
+      throw error;
+    }
+
+    // `0109`'s open unique index converged a lost insert race on the winner's row.
+    created = false;
+  }
+
+  const after = await rest.select(KYC_DOCUMENT_REQUESTS_TABLE, findQuery, documentRequestRowSchema);
+  const row = after[0];
+
+  if (row === undefined) {
+    throw new AppError("INTERNAL_ERROR");
+  }
+
+  if (created) {
+    try {
+      await dependencies.audit.append({
+        action: KYC_DOCUMENT_REQUEST_CREATED_AUDIT_ACTION,
+        actorUserId: null,
+        entityType: KYC_DOCUMENT_REQUEST_ENTITY,
+        entityId: row.id,
+        companyId,
+        sessionId: null,
+        payload: {
+          submission_id: submission.id,
+          provider_id: providerId,
+          document_label: documentLabel,
+        },
+      });
+    } catch {
+      // An audit sink that is down never fails the write it records.
+    }
+  }
+
+  return { request: viewOfRequest(row), created };
+}
+
+/**
+ * Resolve the request an upload answers, before anything is written. The request must exist for
+ * this merchant (404), still be open (CONFLICT `not_open`), belong to the same submission
+ * (CONFLICT `submission_mismatch`), and be answered by a `processor_request` document, the only
+ * type `0109` links through fulfilled_by (VALIDATION_FAILED on the type).
+ */
+async function resolveRequestForUpload(
+  requestId: string,
+  companyId: string,
+  submissionId: string,
+  documentType: KycDocumentType,
+  rest: RestClient,
+): Promise<z.infer<typeof documentRequestRowSchema>> {
+  if (documentType !== "processor_request") {
+    throw new AppError("VALIDATION_FAILED", {
+      details: [{ field: "document_type", rule: "request_document_type" }],
+    });
+  }
+
+  const rows = await rest.select(
+    KYC_DOCUMENT_REQUESTS_TABLE,
+    `select=${requestSelectColumns}&id=eq.${encodeURIComponent(requestId)}&company_id=eq.${encodeURIComponent(companyId)}&deleted_at=is.null&limit=1`,
+    documentRequestRowSchema,
+  );
+  const request = rows[0];
+
+  if (request === undefined) {
+    throw new AppError("RESOURCE_NOT_FOUND");
+  }
+
+  if (request.status !== "open") {
+    throw new AppError("CONFLICT", { details: [{ field: "request_id", rule: "not_open" }] });
+  }
+
+  if (request.submission_id !== submissionId) {
+    throw new AppError("CONFLICT", { details: [{ field: "request_id", rule: "submission_mismatch" }] });
+  }
+
+  return request;
+}
+
+/** Mark one request fulfilled by the uploaded document: one conditional update, re-read, audit. */
+async function markRequestFulfilled(
+  request: z.infer<typeof documentRequestRowSchema>,
+  documentId: string,
+  actor: RequestActor,
+  dependencies: KycCaptureDependencies,
+): Promise<void> {
+  const rest = dependencies.rest;
+  const companyId = request.company_id;
+  const now = nowOf(dependencies);
+
+  await rest.update(
+    KYC_DOCUMENT_REQUESTS_TABLE,
+    `id=eq.${encodeURIComponent(request.id)}&company_id=eq.${encodeURIComponent(companyId)}&status=eq.open&version=eq.${request.version}&deleted_at=is.null`,
+    {
+      status: "fulfilled",
+      fulfilled_by: documentId,
+      fulfilled_at: isoOf(now),
+      updated_at: isoOf(now),
+      version: request.version + 1,
+    },
+  );
+
+  const afterRows = await rest.select(
+    KYC_DOCUMENT_REQUESTS_TABLE,
+    `select=id,status,fulfilled_by,version&id=eq.${encodeURIComponent(request.id)}&company_id=eq.${encodeURIComponent(companyId)}&deleted_at=is.null&limit=1`,
+    z.object({
+      id: z.string(),
+      status: z.string(),
+      fulfilled_by: z.string().nullable(),
+      version: z.coerce.number(),
+    }),
+  );
+  const after = afterRows[0];
+
+  if (after === undefined || after.version !== request.version + 1) {
+    throw new AppError("CONFLICT", { details: [{ field: "version", rule: "stale" }] });
+  }
+
+  try {
+    await dependencies.audit.append({
+      action: KYC_DOCUMENT_REQUEST_FULFILLED_AUDIT_ACTION,
+      actorUserId: actor.userId,
+      entityType: KYC_DOCUMENT_REQUEST_ENTITY,
+      entityId: request.id,
+      companyId,
+      sessionId: actor.sessionId,
+      payload: {
+        document_id: documentId,
+        provider_id: request.provider_id,
+        document_label: request.document_label,
+      },
+    });
+  } catch {
+    // An audit sink that is down never fails the write it records.
+  }
+}
+
+/**
+ * The request job definition with injectable dependencies, so the gate can drive the handler
+ * against its fake store. The default wiring closes over the auth runtime, like a route does.
+ */
+export function createDocumentRequestJobHandler(
+  dependenciesOf: () => DocumentRequestDependencies,
+): JobDefinition<DocumentRequestJobPayload> {
+  return {
+    name: KYC_DOCUMENT_REQUEST_JOB,
+    payloadSchema: documentRequestJobPayloadSchema,
+    handler: async (context) => {
+      await createDocumentRequest(context.payload, dependenciesOf());
+    },
+  };
+}
+
+const defaultDocumentRequestJob = createDocumentRequestJobHandler(() => {
+  const runtime = getAuthRuntime();
+
+  return { rest: runtime.rest, audit: runtime.audit };
+});
+
+/** Register the request job once; a second call is a no-op. */
+export function registerKycDocumentRequestJob(registry: JobRegistry): void {
+  if (!registry.has(KYC_DOCUMENT_REQUEST_JOB)) {
+    registry.register(defaultDocumentRequestJob);
+  }
+}
+
+/**
+ * Enqueue the recording of one provider ask. The webhook pipeline calls this when a delivery asks
+ * for an extra document; the idempotency key makes a repeated delivery return the first job.
+ */
+export async function enqueueDocumentRequest(
+  dependencies: { readonly registry: JobRegistry; readonly queue: JobQueue },
+  input: {
+    readonly company_id: unknown;
+    readonly provider_id: unknown;
+    readonly document_label: unknown;
+    readonly note?: unknown;
+  },
+): Promise<EnqueueResult> {
+  const parsed = documentRequestJobPayloadSchema.safeParse(input);
+
+  if (!parsed.success) {
+    const details: readonly ErrorDetail[] = parsed.error.issues.map((issue) => ({
+      field: issue.path.join("."),
+      rule: "invalid_format",
+    }));
+
+    throw new AppError("VALIDATION_FAILED", { details });
+  }
+
+  registerKycDocumentRequestJob(dependencies.registry);
+
+  return enqueueJob(dependencies, KYC_DOCUMENT_REQUEST_JOB, parsed.data, {
+    idempotencyKey: documentRequestIdempotencyKey(
+      parsed.data.company_id,
+      parsed.data.provider_id,
+      parsed.data.document_label,
+    ),
+  });
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -891,7 +1370,7 @@ export async function readKycPack(
   const rest = dependencies.rest;
 
   const submission = await readDraftSubmission(companyId, rest);
-  const [documents, screenings, countries] = await Promise.all([
+  const [documents, screenings, countries, openRequests] = await Promise.all([
     rest.select(
       KYC_DOCUMENTS_TABLE,
       `select=id,document_type,storage_key,content_sha256,content_type,byte_size,issued_at,expires_at,status,rejection_reason,created_at&company_id=eq.${encodeURIComponent(companyId)}&deleted_at=is.null&order=created_at.asc&limit=500`,
@@ -906,6 +1385,11 @@ export async function readKycPack(
       COUNTRIES_TABLE,
       `select=code,name&deleted_at=is.null&order=code.asc&limit=500`,
       z.object({ code: z.string(), name: z.string() }),
+    ),
+    rest.select(
+      KYC_DOCUMENT_REQUESTS_TABLE,
+      `select=id,submission_id,provider_id,document_label,note,status,created_at&company_id=eq.${encodeURIComponent(companyId)}&status=eq.open&deleted_at=is.null&order=created_at.asc&limit=100`,
+      openDocumentRequestRowSchema,
     ),
   ]);
 
@@ -940,6 +1424,7 @@ export async function readKycPack(
     countries,
     screenedCount: screenings.length,
     documentsComplete: documents.length > 0,
+    openRequests: openRequests.map((row) => viewOfRequest(row)),
   };
 }
 

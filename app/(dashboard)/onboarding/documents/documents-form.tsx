@@ -67,7 +67,11 @@ type RuleKey =
   | "too_short"
   | "too_long"
   | "ownership_total_exceeded"
-  | "not_found";
+  | "not_found"
+  | "not_open"
+  | "submission_mismatch"
+  | "request_document_type"
+  | "stale";
 
 const RULE_MESSAGES: Readonly<Record<RuleKey, MessagePath>> = Object.freeze({
   file_not_acceptable: "onboardingDocuments.ruleFileNotAcceptable",
@@ -79,6 +83,10 @@ const RULE_MESSAGES: Readonly<Record<RuleKey, MessagePath>> = Object.freeze({
   too_long: "onboardingDocuments.ruleTooLong",
   ownership_total_exceeded: "onboardingDocuments.ruleOwnershipTotalExceeded",
   not_found: "onboardingDocuments.ruleNotFound",
+  not_open: "onboardingDocuments.ruleRequestNotOpen",
+  submission_mismatch: "onboardingDocuments.ruleSubmissionMismatch",
+  request_document_type: "onboardingDocuments.ruleRequestDocumentType",
+  stale: "onboardingDocuments.ruleStale",
 });
 
 function ruleSentence(rule: string | null): string {
@@ -128,6 +136,7 @@ export function DocumentsForm({
   const [uploadMessage, setUploadMessage] = useState<SectionMessage | null>(null);
   const [uploadBusy, setUploadBusy] = useState(false);
   const [documentType, setDocumentType] = useState<KycDocumentType | "">("");
+  const [requestId, setRequestId] = useState("");
   const [issuedAt, setIssuedAt] = useState("");
   const [expiresAt, setExpiresAt] = useState("");
   const [uploadFieldErrors, setUploadFieldErrors] = useState<Readonly<Record<string, string>>>({});
@@ -259,6 +268,11 @@ export function DocumentsForm({
       form.append("issued_at", issuedAt);
       form.append("expires_at", expiresAt);
 
+      // STEP 097: the upload can answer one of the processor's open asks.
+      if (requestId !== "") {
+        form.append("request_id", requestId);
+      }
+
       const response = await fetch(UPLOAD_PATH, {
         method: "POST",
         // No content-type here: the browser sets the multipart boundary itself.
@@ -286,6 +300,7 @@ export function DocumentsForm({
 
       setPack(await readPack(response));
       setDocumentType("");
+      setRequestId("");
       setIssuedAt("");
       setExpiresAt("");
 
@@ -416,6 +431,26 @@ export function DocumentsForm({
               {uploadFieldErrors["document_type"] ?? getMessage("onboardingDocuments.docTypeHint")}
             </span>
           </label>
+          {documentType === "processor_request" && pack.openRequests.length > 0 ? (
+            <label className={labelClasses}>
+              <span>{getMessage("onboardingDocuments.requestSelectLabel")}</span>
+              <select
+                className={inputClasses}
+                value={requestId}
+                onChange={(event) => setRequestId(event.target.value)}
+              >
+                <option value="">{getMessage("onboardingDocuments.requestSelectPlaceholder")}</option>
+                {pack.openRequests.map((request) => (
+                  <option key={request.id} value={request.id}>
+                    {request.documentLabel}
+                  </option>
+                ))}
+              </select>
+              <span className={hintClasses}>
+                {uploadFieldErrors["request_id"] ?? getMessage("onboardingDocuments.requestSelectHint")}
+              </span>
+            </label>
+          ) : null}
           <label className={labelClasses}>
             <span>{getMessage("onboardingDocuments.fileLabel")}</span>
             <input
@@ -484,6 +519,29 @@ export function DocumentsForm({
               : getMessage("onboardingDocuments.uploadSubmit")}
           </button>
         </form>
+      </section>
+
+      <section className={sectionClasses}>
+        <h2 className={sectionHeadingClasses}>{getMessage("onboardingDocuments.requestsHeading")}</h2>
+        {pack.openRequests.length === 0 ? (
+          <p className={descriptionClasses}>{getMessage("onboardingDocuments.requestsEmpty")}</p>
+        ) : (
+          <ul className="flex flex-col gap-2">
+            {pack.openRequests.map((request) => (
+              <li key={request.id} className={rowClasses}>
+                <span className="font-semibold">{request.documentLabel}</span>
+                <span className={noteClasses}>
+                  {formatMessage("onboardingDocuments.requestAskedByLine", {
+                    provider: request.providerId,
+                  })}
+                </span>
+                {request.note === null ? null : (
+                  <span className={noteClasses}>{request.note}</span>
+                )}
+              </li>
+            ))}
+          </ul>
+        )}
       </section>
 
       <section className={sectionClasses}>

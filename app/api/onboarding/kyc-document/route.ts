@@ -107,6 +107,8 @@ export const POST = withErrorResponse(
           bytes,
           issued_at: formText(form, "issued_at"),
           expires_at: formText(form, "expires_at"),
+          // STEP 097: when the upload answers a processor's request, the form carries its id.
+          request_id: formText(form, "request_id"),
         },
       },
       { rest: runtime.rest, audit: runtime.audit, bankStatementPeriodMonths: summary.bankStatementPeriodMonths },

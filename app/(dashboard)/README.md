@@ -120,6 +120,13 @@ Every read is scoped to the caller company and every write is audit logged.
   charges/payouts only on `verified`, records `last_webhook_event_id` + `last_synced_at` (re-deliveries
   are no-ops), audits `submerchant_provision.synced`, and runs as the idempotent `submerchant.sync`
   background job keyed per webhook event (`registerSubmerchantJobs` registers provision + sync).
+- STEP 097 records the extra document a processor asks for as a `0109` request row against the
+  merchant's draft submission and answers it on upload: the `kyc.document_request` job (idempotent
+  per merchant + provider + label) records the ask, the documents step lists the open asks, and an
+  upload carrying the request's id must be a `processor_request` document - it fulfills the request
+  with one conditional version-guarded update naming the document (`fulfilled_by`), audited
+  `kyc_document_request.created` / `.fulfilled`. The webhook pipeline of the payment block enqueues
+  the job; no new route was added.
 
 ## The reader
 
