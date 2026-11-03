@@ -25,6 +25,7 @@ import type { KycReviewDetail, KycReviewQueue } from "@/services/kyc/kyc-review"
 const DETAIL_PATH = "/api/onboarding/kyc-review-submission";
 const OPEN_PATH = "/api/onboarding/kyc-review-open";
 const DECIDE_PATH = "/api/onboarding/kyc-document-review";
+const RISK_PATH = "/api/onboarding/kyc-risk-mark";
 
 /** The catalog label of one document type, reused from the documents step's own block. */
 const DOC_TYPE_LABELS: Readonly<Record<string, MessagePath>> = Object.freeze({
@@ -36,7 +37,14 @@ const DOC_TYPE_LABELS: Readonly<Record<string, MessagePath>> = Object.freeze({
   processor_request: "onboardingDocuments.docTypeProcessorRequest",
 });
 
-type RuleKey = "required" | "invalid_format" | "not_submitted" | "already_reviewed" | "stale";
+type RuleKey =
+  | "required"
+  | "invalid_format"
+  | "not_submitted"
+  | "already_reviewed"
+  | "stale"
+  | "already_decided"
+  | "same_reviewer";
 
 const RULE_MESSAGES: Readonly<Record<RuleKey, MessagePath>> = Object.freeze({
   required: "onboardingKycReview.ruleRequired",
@@ -44,6 +52,8 @@ const RULE_MESSAGES: Readonly<Record<RuleKey, MessagePath>> = Object.freeze({
   not_submitted: "onboardingKycReview.ruleNotSubmitted",
   already_reviewed: "onboardingKycReview.ruleAlreadyReviewed",
   stale: "onboardingKycReview.ruleStale",
+  already_decided: "onboardingKycReview.ruleAlreadyDecided",
+  same_reviewer: "onboardingKycReview.ruleSameReviewer",
 });
 
 function ruleSentence(rule: string | null): string {
@@ -209,6 +219,37 @@ export function KycReviewQueuePanel({ initial }: { readonly initial: KycReviewQu
     }
   }
 
+  async function markRisk(highRisk: boolean): Promise<void> {
+    if (selectedId === null) {
+      return;
+    }
+
+    setBusy(true);
+    setMessage(null);
+
+    try {
+      const response = await postJson(RISK_PATH, {
+        submission_id: selectedId,
+        high_risk: highRisk,
+        four_eye_required: highRisk,
+      });
+
+      if (!response.ok) {
+        setMessage({ text: await readRefusal(response), failed: true });
+
+        return;
+      }
+
+      setDetail((await response.json()) as KycReviewDetail);
+      setMessage({ text: getMessage("onboardingKycReview.riskDone"), failed: false });
+      router.refresh();
+    } catch {
+      setMessage({ text: getMessage("onboardingKycReview.failed"), failed: true });
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <div className="flex flex-col gap-4">
       <div className="flex flex-col gap-2">
@@ -256,8 +297,36 @@ export function KycReviewQueuePanel({ initial }: { readonly initial: KycReviewQu
               <p className="text-xs font-semibold text-destructive">{getMessage("onboardingKycReview.highRiskLine")}</p>
             ) : null}
             {detail.fourEyeRequired ? (
-              <p className="text-xs font-semibold text-destructive">{getMessage("onboardingKycReview.fourEyeLine")}</p>
+              <>
+                <p className="text-xs font-semibold text-destructive">{getMessage("onboardingKycReview.fourEyeLine")}</p>
+                <p className="text-xs text-muted-foreground">{getMessage("onboardingKycReview.secondReviewerHint")}</p>
+              </>
             ) : null}
+            {detail.status === "approved" || detail.status === "rejected" ? null : (
+              <div className="flex flex-col gap-1">
+                <h3 className="text-sm font-semibold">{getMessage("onboardingKycReview.riskHeading")}</h3>
+                <div className="flex flex-row gap-2">
+                  <button
+                    type="button"
+                    className={buttonClasses}
+                    onClick={() => void markRisk(true)}
+                    disabled={busy}
+                  >
+                    {busy
+                      ? getMessage("onboardingKycReview.riskBusy")
+                      : getMessage("onboardingKycReview.riskMarkButton")}
+                  </button>
+                  <button
+                    type="button"
+                    className={buttonClasses}
+                    onClick={() => void markRisk(false)}
+                    disabled={busy}
+                  >
+                    {getMessage("onboardingKycReview.riskClearButton")}
+                  </button>
+                </div>
+              </div>
+            )}
             {detail.decidedAt === null ? null : (
               <p className="text-xs text-muted-foreground">
                 {formatMessage("onboardingKycReview.decidedAtLine", { at: detail.decidedAt })}

@@ -56,7 +56,10 @@ Every read is scoped to the caller company and every write is audit logged.
   `POST /api/onboarding/kyc-review-open`, `/kyc-document-review`). The screen lives under the
   onboarding block's owned path and gates on the office roles through the service; merchants keep
   the 087 summary screen, which never carries method, provider reference, screening results or
-  storage keys.
+  storage keys. STEP 089 adds the four-eye flow on the same service:
+  `markKycSubmissionRisk` (high risk forces `four_eye_required`; decided rows are locked and
+  conflict; `POST /api/onboarding/kyc-risk-mark`), the queue badges four-eye rows, and
+  `fourEyeProblems` is the guard STEP 093's decision flow calls before writing a decision.
 
 ## The reader
 

@@ -105,6 +105,11 @@ export default async function OnboardingKycReviewPage(): Promise<ReactNode> {
                   <li key={row.submissionId} className={rowClasses}>
                     <span className="font-mono text-xs">{row.submissionId}</span>
                     <span className="font-semibold">{getMessage(queueStatusKey(row.status))}</span>
+                    {row.fourEyeRequired ? (
+                      <span className="text-xs font-semibold text-destructive">
+                        {getMessage("onboardingKycReview.queueFourEye")}
+                      </span>
+                    ) : null}
                     <span className={noteClasses}>
                       {row.submittedAt === null
                         ? getMessage("onboardingKycReview.statusSubmitted")

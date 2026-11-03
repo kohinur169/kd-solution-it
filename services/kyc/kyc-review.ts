@@ -66,6 +66,9 @@ export const KYC_REVIEW_OPEN_AUDIT_ACTION = "kyc_review.opened";
 /** The audit action deciding one document. */
 export const KYC_DOCUMENT_REVIEW_AUDIT_ACTION = "kyc_document.reviewed";
 
+/** The audit action marking a submission high risk or four-eye. */
+export const KYC_RISK_MARK_AUDIT_ACTION = "kyc_review.risk_marked";
+
 /** The audit entity of the queue: the submission. */
 export const KYC_REVIEW_ENTITY = "kyc_submission";
 
@@ -109,6 +112,8 @@ const queueRowSchema = z.object({
   company_id: z.string(),
   status: z.string(),
   submitted_at: z.string().nullable(),
+  high_risk: z.boolean(),
+  four_eye_required: z.boolean(),
   created_at: z.string(),
 });
 
@@ -189,6 +194,8 @@ export interface KycReviewQueueRow {
   readonly companyId: string;
   readonly status: string;
   readonly submittedAt: string | null;
+  readonly highRisk: boolean;
+  readonly fourEyeRequired: boolean;
   readonly createdAt: string;
   readonly documentCount: number;
   readonly ownerCount: number;
@@ -277,7 +284,7 @@ export async function readKycReviewQueue(
   const [submissionRows, documentRows, uboRows, screeningRows] = await Promise.all([
     rest.select(
       KYC_SUBMISSIONS_TABLE,
-      `select=id,company_id,status,submitted_at,created_at&status=in.(${statuses})&deleted_at=is.null&order=submitted_at.asc&limit=200`,
+      `select=id,company_id,status,submitted_at,high_risk,four_eye_required,created_at&status=in.(${statuses})&deleted_at=is.null&order=submitted_at.asc&limit=200`,
       queueRowSchema,
     ),
     rest.select(
@@ -303,6 +310,8 @@ export async function readKycReviewQueue(
       companyId: row.company_id,
       status: row.status,
       submittedAt: row.submitted_at,
+      highRisk: row.high_risk,
+      fourEyeRequired: row.four_eye_required,
       createdAt: row.created_at,
       documentCount: documentRows.filter((document) => document.submission_id === row.id).length,
       ownerCount: uboRows.filter((ubo) => ubo.submission_id === row.id).length,
@@ -629,4 +638,117 @@ export async function reviewKycDocument(
     version: updated.version,
     createdAt: updated.created_at,
   };
+}
+
+/* -------------------------------------------------------------------------------------------------
+ * STEP 089: the four-eye flow. The compliance team marks a merchant high risk - or large - and
+ * 0048 then requires a decided row to name a second reviewer who is not the first.
+ * ---------------------------------------------------------------------------------------------- */
+
+/** The statuses a submission can be risk-marked in: never a decided one, which 0048 locks. */
+const MARKABLE_STATUSES = ["draft", "submitted", "in_review"] as const;
+
+const riskMarkSchema = z.object({
+  high_risk: z.boolean(),
+  four_eye_required: z.boolean().optional(),
+});
+
+/**
+ * The four-eye guard STEP 093's decision flow calls before it writes `approved` or `rejected`:
+ * when the submission requires four eyes, the decision must name a second reviewer, and
+ * `0048`'s `kyc_submissions_two_people_check` refuses the same person twice, so the guard refuses
+ * the first reviewer as the second here, before any write.
+ */
+export function fourEyeProblems(
+  submission: { readonly fourEyeRequired: boolean; readonly firstReviewerId: string | null },
+  secondReviewerId: string | null,
+): readonly ErrorDetail[] {
+  if (!submission.fourEyeRequired) {
+    return [];
+  }
+
+  if (secondReviewerId === null) {
+    return [{ field: "second_reviewer_id", rule: "required" }];
+  }
+
+  if (secondReviewerId === submission.firstReviewerId) {
+    return [{ field: "second_reviewer_id", rule: "same_reviewer" }];
+  }
+
+  return [];
+}
+
+/**
+ * Mark one submission high risk and/or four-eye required. Section 5: large or high-risk merchants
+ * need two reviewers. Until a volume-based "large" signal exists, the team sets the flags
+ * directly; `high_risk` always forces `four_eye_required`, because a high-risk merchant is never
+ * one-eyed. A decided submission is locked by `0048`'s guard, so marking it conflicts instead of
+ * writing. One conditional update, one audit entry, the full detail as the answer.
+ */
+export async function markKycSubmissionRisk(
+  input: { readonly actor: RequestActor; readonly submissionId: unknown; readonly body: unknown },
+  dependencies: KycReviewDependencies,
+): Promise<KycReviewDetail> {
+  requireOfficeActor(input.actor);
+
+  const submissionId = requireUuid(input.submissionId, "submission_id");
+  const parsed = riskMarkSchema.safeParse(input.body);
+
+  if (!parsed.success) {
+    throw new AppError("VALIDATION_FAILED", {
+      details: parsed.error.issues.map((issue) => ({ field: issue.path.join("."), rule: "invalid_format" })),
+    });
+  }
+
+  const rest = dependencies.rest;
+  const now = nowOf(dependencies);
+  const submission = await readSubmissionById(submissionId, rest);
+
+  if (submission === null) {
+    throw new AppError("RESOURCE_NOT_FOUND");
+  }
+
+  if (!MARKABLE_STATUSES.includes(submission.status as (typeof MARKABLE_STATUSES)[number])) {
+    throw new AppError("CONFLICT", { details: [{ field: "status", rule: "already_decided" }] });
+  }
+
+  // A high-risk merchant always needs four eyes, whatever the request says.
+  const fourEyeRequired = parsed.data.high_risk || (parsed.data.four_eye_required ?? false);
+
+  await rest.update(
+    KYC_SUBMISSIONS_TABLE,
+    `id=eq.${encodeURIComponent(submission.id)}&company_id=eq.${encodeURIComponent(submission.company_id)}&status=eq.${encodeURIComponent(submission.status)}&deleted_at=is.null`,
+    {
+      high_risk: parsed.data.high_risk,
+      four_eye_required: fourEyeRequired,
+      updated_at: isoOf(now),
+      version: submission.version + 1,
+    },
+  );
+
+  const after = await readSubmissionById(submissionId, rest);
+
+  if (after === null || after.version !== submission.version + 1) {
+    throw new AppError("CONFLICT", { details: [{ field: "status", rule: "stale" }] });
+  }
+
+  try {
+    await dependencies.audit.append({
+      action: KYC_RISK_MARK_AUDIT_ACTION,
+      actorUserId: input.actor.userId,
+      entityType: KYC_REVIEW_ENTITY,
+      entityId: submission.id,
+      companyId: submission.company_id,
+      sessionId: input.actor.sessionId,
+      payload: {
+        submission_id: submission.id,
+        high_risk: parsed.data.high_risk,
+        four_eye_required: fourEyeRequired,
+      },
+    });
+  } catch {
+    // Same rule as the other writes.
+  }
+
+  return readKycReviewDetail({ actor: input.actor, submissionId }, dependencies);
 }

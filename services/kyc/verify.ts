@@ -94,10 +94,13 @@ import {
   UBO_RECORDS_TABLE,
 } from "./kyc-capture.ts";
 import {
+  fourEyeProblems,
   KYC_DOCUMENT_REVIEW_AUDIT_ACTION,
+  KYC_RISK_MARK_AUDIT_ACTION,
   KYC_REVIEW_AUDIT_ACTION,
   KYC_REVIEW_OFFICE_ROLES,
   KYC_REVIEW_OPEN_AUDIT_ACTION,
+  markKycSubmissionRisk,
   openKycReview,
   readKycReviewDetail,
   readKycReviewQueue,
@@ -4590,7 +4593,21 @@ function reviewSeededDatabase(): BusinessDatabase {
         submitted_at: "2026-11-01T10:00:00.000Z",
         submitted_by: OWNER_ID,
         first_reviewer_id: OFFICE_ID,
+        high_risk: true,
+        four_eye_required: true,
         created_at: "2026-11-01T08:45:00.000Z",
+      },
+      {
+        id: "018f2b8a-0000-4c2d-9c3e-0000000000a7",
+        company_id: COMPANY_A,
+        status: "rejected",
+        verification_method: "manual",
+        submitted_at: "2026-11-01T07:00:00.000Z",
+        submitted_by: OWNER_ID,
+        first_reviewer_id: OFFICE_ID,
+        decided_at: "2026-11-01T07:30:00.000Z",
+        decision_reason: "documents did not match",
+        created_at: "2026-11-01T06:30:00.000Z",
       },
     ],
     [
@@ -4665,6 +4682,9 @@ async function checkKycReviewQueue(): Promise<void> {
   expectEqual(queue.rows.length, 2, "the draft is not queued, the submitted and in-review ones are");
   expectEqual(queue.rows[0]?.submissionId, "018f2b8a-0000-4c2d-9c3e-0000000000b2", "ordered by submitted_at ascending");
   expectEqual(queue.rows[1]?.submissionId, "018f2b8a-0000-4c2d-9c3e-0000000000c3", "then the one already in review");
+  expectEqual(queue.rows[1]?.fourEyeRequired, true, "the four-eye flag is queued beside the row");
+  expectEqual(queue.rows[1]?.highRisk, true, "and the high-risk flag with it");
+  expectEqual(queue.rows[0]?.fourEyeRequired, false, "the other row needs no second reviewer");
   expectEqual(queue.rows[0]?.documentCount, 1, "with the document counted against its submission");
   expectEqual(queue.rows[0]?.ownerCount, 1, "the owner against its submission");
   expectEqual(queue.rows[0]?.screenedCount, 1, "the screening counted against its company, 0051 having no submission column");
@@ -4887,6 +4907,131 @@ async function checkKycReviewDocument(): Promise<void> {
   expectEqual(rejectDb.documentRows[0]?.rejection_reason, "illegible scan", "recorded on the row");
 }
 
+/** ---- STEP 089: the four-eye flow - the risk mark and the guard the decision flow will call. */
+async function checkKycReviewRisk(): Promise<void> {
+  // The guard STEP 093 will call before writing approved/rejected.
+  expectDeepEqual(
+    fourEyeProblems({ fourEyeRequired: true, firstReviewerId: OFFICE_ID }, null),
+    [{ field: "second_reviewer_id", rule: "required" }],
+    "a four-eye decision without a second reviewer is refused as required",
+  );
+  expectDeepEqual(
+    fourEyeProblems({ fourEyeRequired: true, firstReviewerId: OFFICE_ID }, OFFICE_ID),
+    [{ field: "second_reviewer_id", rule: "same_reviewer" }],
+    "and the first reviewer cannot be the second, as 0048's two-people check demands",
+  );
+  expectDeepEqual(
+    fourEyeProblems({ fourEyeRequired: true, firstReviewerId: OFFICE_ID }, OTHER_OWNER_ID),
+    [],
+    "a distinct second reviewer satisfies the guard",
+  );
+  expectDeepEqual(
+    fourEyeProblems({ fourEyeRequired: false, firstReviewerId: OFFICE_ID }, null),
+    [],
+    "and a submission that needs no four eyes passes with no second reviewer",
+  );
+
+  for (const [description, actor] of reviewRefused) {
+    const database = createBusinessDatabase();
+    const refusal = await rejectionOf(() =>
+      markKycSubmissionRisk(
+        { actor, submissionId: "018f2b8a-0000-4c2d-9c3e-0000000000b2", body: { high_risk: true } },
+        dependenciesOf(database, createInMemoryAuditTrail()),
+      ),
+    );
+
+    expectEqual(refusal?.code, "PERMISSION_DENIED", `the risk mark refuses ${description}`);
+    expectEqual(database.updates.length, 0, `and writes nothing for ${description}`);
+  }
+
+  const badId = createBusinessDatabase();
+  const badRefusal = await rejectionOf(() =>
+    markKycSubmissionRisk(
+      { actor: desk, submissionId: "nope", body: { high_risk: true } },
+      dependenciesOf(badId, createInMemoryAuditTrail()),
+    ),
+  );
+
+  expectEqual(badRefusal?.code, "VALIDATION_FAILED", "a non-uuid id is refused before any query");
+  expectEqual(badId.queries.length, 0, "with zero queries");
+
+  const decided = reviewSeededDatabase();
+  const decidedRefusal = await rejectionOf(() =>
+    markKycSubmissionRisk(
+      { actor: desk, submissionId: "018f2b8a-0000-4c2d-9c3e-0000000000a7", body: { high_risk: true } },
+      dependenciesOf(decided, createInMemoryAuditTrail()),
+    ),
+  );
+
+  expectEqual(decidedRefusal?.code, "CONFLICT", "a decided submission is locked, as 0048's guard says");
+  expectDeepEqual(decidedRefusal?.details, [{ field: "status", rule: "already_decided" }], "named as already decided");
+  expectEqual(decided.updates.length, 0, "and nothing is written");
+
+  // Mark high risk: four-eye follows automatically, even if the request said false.
+  const database = reviewSeededDatabase();
+  const audit = createInMemoryAuditTrail();
+  const detail = await markKycSubmissionRisk(
+    {
+      actor: desk,
+      submissionId: "018f2b8a-0000-4c2d-9c3e-0000000000b2",
+      body: { high_risk: true, four_eye_required: false },
+    },
+    dependenciesOf(database, audit),
+  );
+  const row = database.submissionRows.find((entry) => entry.id === "018f2b8a-0000-4c2d-9c3e-0000000000b2");
+
+  expectEqual(detail.highRisk, true, "the answer says high risk");
+  expectEqual(detail.fourEyeRequired, true, "and four-eye, forced by the high-risk flag");
+  expectEqual(row?.high_risk, true, "the row carries high_risk");
+  expectEqual(row?.four_eye_required, true, "and four_eye_required");
+  expectEqual(row?.version, 2, "version moved");
+
+  const update = database.updates.find((entry) => entry.table === KYC_SUBMISSIONS_TABLE);
+
+  expect(
+    update !== undefined &&
+      update.query.includes("status=eq.submitted") &&
+      update.query.includes("id=eq.018f2b8a-0000-4c2d-9c3e-0000000000b2"),
+    "the update is conditional on the row's current status",
+  );
+  expectEqual(
+    audit.entries.filter((entry) => entry.action === KYC_RISK_MARK_AUDIT_ACTION).length,
+    1,
+    "the mark is audited under kyc_review.risk_marked",
+  );
+  expectEqual(
+    audit.entries.filter((entry) => entry.action === KYC_RISK_MARK_AUDIT_ACTION)[0]?.payload?.["four_eye_required"],
+    true,
+    "recording the derived four-eye flag",
+  );
+
+  // A large merchant can be four-eye without being high risk.
+  const large = await markKycSubmissionRisk(
+    {
+      actor: desk,
+      submissionId: "018f2b8a-0000-4c2d-9c3e-0000000000b2",
+      body: { high_risk: false, four_eye_required: true },
+    },
+    dependenciesOf(database, audit),
+  );
+
+  expectEqual(large.highRisk, false, "cleared");
+  expectEqual(large.fourEyeRequired, true, "but still four-eye, as a large merchant is");
+
+  // Clearing both.
+  const cleared = await markKycSubmissionRisk(
+    {
+      actor: desk,
+      submissionId: "018f2b8a-0000-4c2d-9c3e-0000000000b2",
+      body: { high_risk: false },
+    },
+    dependenciesOf(database, audit),
+  );
+
+  expectEqual(cleared.highRisk, false, "and the flags are cleared");
+  expectEqual(cleared.fourEyeRequired, false, "with no four-eye left");
+}
+
 async function checkKycSources(): Promise<void> {
   const documentRoute = await readRepositoryFile("app/api/onboarding/kyc-document/route.ts");
   const uboRoute = await readRepositoryFile("app/api/onboarding/kyc-ubo/route.ts");
@@ -4898,6 +5043,7 @@ async function checkKycSources(): Promise<void> {
   const detailRoute = await readRepositoryFile("app/api/onboarding/kyc-review-submission/route.ts");
   const openRoute = await readRepositoryFile("app/api/onboarding/kyc-review-open/route.ts");
   const decideRoute = await readRepositoryFile("app/api/onboarding/kyc-document-review/route.ts");
+  const riskRoute = await readRepositoryFile("app/api/onboarding/kyc-risk-mark/route.ts");
   const reviewPage = await readRepositoryFile("app/(dashboard)/onboarding/kyc-review/page.tsx");
   const reviewPanel = await readRepositoryFile("app/(dashboard)/onboarding/kyc-review/kyc-review-queue.tsx");
   const review = await readRepositoryFile("services/kyc/kyc-review.ts");
@@ -4917,6 +5063,7 @@ async function checkKycSources(): Promise<void> {
     ["app/(dashboard)/onboarding/documents/documents-form.tsx", form],
     ["app/(dashboard)/onboarding/status/page.tsx", statusPage],
     ["app/(dashboard)/onboarding/status/status-form.tsx", statusForm],
+    ["app/api/onboarding/kyc-risk-mark/route.ts", riskRoute],
     ["app/api/onboarding/kyc-review/route.ts", queueRoute],
     ["app/api/onboarding/kyc-review-submission/route.ts", detailRoute],
     ["app/api/onboarding/kyc-review-open/route.ts", openRoute],
@@ -4936,6 +5083,7 @@ async function checkKycSources(): Promise<void> {
     ["app/api/onboarding/kyc-submit/route.ts", submitRoute],
     ["app/api/onboarding/kyc-review-open/route.ts", openRoute],
     ["app/api/onboarding/kyc-document-review/route.ts", decideRoute],
+    ["app/api/onboarding/kyc-risk-mark/route.ts", riskRoute],
   ] as const) {
     expect(route.includes("export const POST"), `${path} answers POST`);
     expectEqual(route.includes("export const GET"), false, `${path} answers no GET`);
@@ -4967,6 +5115,14 @@ async function checkKycSources(): Promise<void> {
   expect(detailRoute.includes("readKycReviewDetail("), "reading the detail through the service");
   expect(openRoute.includes("openKycReview("), "the open route opens through the service");
   expect(decideRoute.includes("reviewKycDocument("), "the document decision route decides through the service");
+  expect(riskRoute.includes("markKycSubmissionRisk("), "the risk mark route goes through the service");
+  expect(csrf.includes('"/api/onboarding/kyc-risk-mark",'), "and the path is on the CSRF-protected list");
+  expect(review.includes("markKycSubmissionRisk"), "the service owns the risk mark");
+  expect(review.includes("fourEyeProblems"), "and exports the four-eye guard the decision flow of STEP 093 will call");
+  expect(review.includes("already_decided"), "refusing to mark a decided row, which 0048 locks");
+  expect(reviewPanel.includes("/api/onboarding/kyc-risk-mark"), "the panel posts the mark to its route");
+  expect(reviewPanel.includes("riskMarkButton"), "and offers the mark and the clear");
+  expect(reviewPage.includes("queueFourEye"), "the queue badges a four-eye row");
   expect(review.includes("KYC_REVIEW_OFFICE_ROLES"), "the service owns the office role list");
   expect(review.includes("read_by_office"), "and audits each office read of one submission");
   expect(review.includes("status=eq.submitted"), "the open is conditional on the row still being submitted");
@@ -5067,7 +5223,7 @@ async function checkKycSources(): Promise<void> {
     (await readdir(new URL("app/(dashboard)/onboarding/documents/", repositoryRoot))).includes("documents-form.tsx"),
     "with its form beside it",
   );
-  for (const folder of ["kyc-document", "kyc-ubo", "kyc-screening", "kyc-submit", "kyc-review", "kyc-review-submission", "kyc-review-open", "kyc-document-review"]) {
+  for (const folder of ["kyc-document", "kyc-ubo", "kyc-screening", "kyc-submit", "kyc-review", "kyc-review-submission", "kyc-review-open", "kyc-document-review", "kyc-risk-mark"]) {
     expect(
       (await readdir(new URL(`app/api/onboarding/${folder}/`, repositoryRoot))).includes("route.ts"),
       `${folder} is a route handler of its own`,
@@ -5274,6 +5430,7 @@ async function main(): Promise<void> {
   await checkKycReviewDetail();
   await checkKycReviewOpen();
   await checkKycReviewDocument();
+  await checkKycReviewRisk();
   await checkKycSources();
   await checkKycCatalog();
   await checkStatusCatalog();
