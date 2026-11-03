@@ -148,6 +148,13 @@ export const FILE_PURPOSES = [
 
 export type FilePurpose = (typeof FILE_PURPOSES)[number];
 
+/**
+ * The bucket the category flows store in when the provider is Supabase: the same name
+ * `.env.example` sets `S3_BUCKET` to, so the S3 adapter's configured-bucket pin and the default
+ * agree and one deployment stores in exactly one bucket per environment.
+ */
+export const DEFAULT_STORAGE_BUCKET = "kd-solution-it-files";
+
 /** The status vocabulary of the `files` record, walked forward only by the `0057` guard. */
 export const FILE_STATUSES = ["pending", "ready", "quarantined", "archived"] as const;
 

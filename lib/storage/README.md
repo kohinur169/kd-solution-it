@@ -19,6 +19,7 @@ configuration, downloads use short-lived signed URLs, and every file access is a
 | `adapters.ts` | The env wiring: `registerConfiguredAdapters(registry, env)` builds and registers both adapters; `registerDefaultStorageAdapters(registry)` does it from the validated `serverEnv()`. Asking for `s3` without the `S3_*` fields fails at wiring, not at the first upload. |
 | `encryption.ts` | The section 21 encryption: `sealFile` turns plaintext into the `KDF1` envelope (AES-256-GCM, one 64 KiB AEAD record per chunk, AAD scope `file:<companyId>:<purpose>`) plus the quartet for the `0057` record (`aes-256-gcm`, key version, base64 IV, base64 first-chunk tag) and the plaintext SHA-256; `openSealedFile` refuses non-envelopes and returns plaintext only after every chunk authenticates. Keyring from `ENCRYPTION_MASTER_KEY` (`master-v1`, version 1). |
 | `records.ts` | The file record service: `newStorageKey` (tenant prefix + purpose + UUID), `recordUploadedFile` (writes the `0057` row from `stored` + `sealed`: provider, bucket, key, type, plaintext size, plaintext hash, quartet), `getFileRecord`/`listFileRecords` (always `company_id` scoped), and the forward status walk `markFileVerified` / `quarantineFile` / `archiveFile` / `softDeleteFile`, each audited (`file.recorded`, `file.verified`, ...). |
+| `kyc.ts` | The KYC document category: key layout `<companyId>/kyc/<documentType>/<uuid><ext>` with `parseKycStorageKey` / `assertKycKeyForCompany` enforcing tenant isolation on the read path, and the category flows `uploadKycDocument` (magic-byte verdict -> encrypted upload -> `0057` row -> `ready`/`quarantined`), `createKycDownloadUrl` (short-lived signed URL for a verified row of this merchant only), `readKycDocument` (server-side download + decrypt), `archiveKycDocument`. |
 | `verify.ts` | The gate. Run it with `node lib/storage/verify.ts`. |
 
 ## Adapter selection by environment
@@ -33,7 +34,8 @@ Netlify, Vercel or Amazon with only the environment changed. `S3_BUCKET`, `S3_RE
 - `service.ts` also exposes the encrypted operations: `uploadEncryptedObject` seals the bytes before the adapter sees them (uploaded as `application/octet-stream`, audited with the quartet and plaintext hash) and `downloadEncryptedObject` opens the envelope under the same tenant and purpose after the adapter answers.
 - `records.ts` writes the `0057` file record (provider, bucket, key, hash, size, type, company,
   quartet) around `uploadEncryptedObject` and walks its status forward.
-- STEP 104 mints signed URLs for the office screens; STEP 105 exposes upload and download.
+- `kyc.ts` is the KYC document category with tenant isolation paths; STEP 105 is the logo and
+  branding asset category on the same pattern.
 
 ## The rules
 
@@ -48,3 +50,4 @@ Netlify, Vercel or Amazon with only the environment changed. `S3_BUCKET`, `S3_RE
 6. Credentials and signatures never leave the headers of a signed request, never enter a URL beyond the presigned `X-Amz-*` parameters, and never appear in a log line or an error message.
 7. Only the envelope reaches a provider; the master key lives only in the environment, and the database holds the quartet and the hash, never the ciphertext.
 8. One object is one row: the storage key is unique forever (soft delete included), always under the merchant's own prefix, checked in code and by the `0057` constraint alike.
+9. A pending or quarantined file is never served: signed URLs and server-side reads require a verified (or archived) row whose key belongs to the asking merchant.

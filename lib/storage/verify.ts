@@ -9,6 +9,17 @@ import { ENCRYPTION_CHUNK_BYTES, isFileEnvelope, readFileEnvelopeInfo } from "..
 import { createHash, randomUUID } from "node:crypto";
 import type { z } from "zod";
 import type { RestClient } from "../auth/rest.ts";
+import {
+  archiveKycDocument,
+  assertKycKeyForCompany,
+  createKycDownloadUrl,
+  isKycDocumentType,
+  KYC_DOCUMENT_TYPES,
+  kycStorageKey,
+  parseKycStorageKey,
+  readKycDocument,
+  uploadKycDocument,
+} from "./kyc.ts";
 import { adapterFor, StorageAdapterAlreadyRegisteredError, StorageAdapterRegistry } from "./registry.ts";
 import {
   archiveFile,
@@ -1035,6 +1046,137 @@ async function checkRecords(): Promise<void> {
   expectEqual(includingDeleted.length, 1, "the row is still history");
 }
 
+const PDF_BYTES = new TextEncoder().encode("%PDF-1.4 " + "x".repeat(64));
+const PNG_BYTES = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, ...new Array(48).fill(0x00)]);
+
+async function checkKycCategory(): Promise<void> {
+  // the mirrored document types match the 0049 vocabulary of the kyc service
+  const kycTypesSource = await readRepositoryFile("services/kyc/kyc-document-types.ts");
+  for (const type of KYC_DOCUMENT_TYPES) {
+    expect(kycTypesSource.includes(`"${type}"`), `the mirrored document type ${type} matches 0049's list`);
+  }
+  expect(isKycDocumentType("utility_bill"), "a known type parses");
+  expect(!isKycDocumentType("evil"), "an unknown type does not");
+
+  // the key layout and its parser
+  const key = kycStorageKey(COMPANY_ID, "identity_document", "application/pdf");
+  expect(key.startsWith(`${COMPANY_ID}/kyc/identity_document/`), "the key carries the tenant prefix and the kyc segment");
+  expect(key.endsWith(".pdf"), "and the extension of the verified type");
+  expectEqual(validateObjectKey(key), key, "the kyc key passes the port validation");
+  const parsed = parseKycStorageKey(key);
+  expectEqual(parsed?.companyId, COMPANY_ID, "the parser reads the tenant back");
+  expectEqual(parsed?.documentType, "identity_document", "and the document type");
+  expectEqual(parseKycStorageKey(`${COMPANY_ID}/logo/x.png`), null, "a non-kyc key does not parse");
+  expectEqual(parseKycStorageKey(`${COMPANY_ID}/kyc/utility_bill/notauuid.pdf`), null, "a non-uuid file does not parse");
+  expect(isStorageError(rejectionOfSync(() => assertKycKeyForCompany(key, "018f2b8a-4444-4c2d-9c3e-000000000002"))), "a key of another tenant is refused");
+  expect(isStorageError(rejectionOfSync(() => kycStorageKey(COMPANY_ID, "utility_bill", "image/svg+xml"))), "an unverified type has no extension and is refused");
+
+  // the end-to-end upload of a verified document
+  const db: FilesDb = { rows: [], inserts: [], updates: [], queries: [] };
+  const audit = createInMemoryAuditTrail();
+  const adapter = new FakeAdapter("supabase");
+  const dependencies = {
+    rest: createFilesRest(db),
+    audit,
+    adapter,
+    encryption: createFileEncryption(ENCRYPTION_ENV),
+    now: () => NOW,
+  };
+
+  const uploaded = await uploadKycDocument(dependencies, {
+    companyId: COMPANY_ID,
+    uploadedBy: ACTOR_ID,
+    documentType: "identity_document",
+    fileName: "passport scan.pdf",
+    declaredType: "application/pdf",
+    bytes: PDF_BYTES,
+  });
+
+  expectEqual(uploaded.verdict.decision, "verified", "a pdf declared as pdf verifies");
+  expectEqual(uploaded.verdict.contentType, "application/pdf", "with the detected type");
+  expectEqual(uploaded.record.status, "ready", "and the row lands ready");
+  expectEqual(uploaded.record.magic_byte_verified, true, "verified");
+  expectEqual(uploaded.record.purpose, "kyc_document", "as a kyc document");
+  expect(uploaded.record.storage_key.startsWith(`${COMPANY_ID}/kyc/identity_document/`), "under the tenant kyc path");
+  expectEqual(adapter.calls[0]?.op, "upload", "the adapter stored the envelope");
+  expectEqual(uploaded.stored.bucket, "kd-solution-it-files", "in the default bucket");
+  const actions = audit.entries.map((entry) => entry.action);
+  expect(actions.includes(FILE_UPLOADED_AUDIT_ACTION), "the upload is audited");
+  expect(actions.includes(FILE_RECORDED_AUDIT_ACTION), "the record is audited");
+  expect(actions.includes(FILE_VERIFIED_AUDIT_ACTION), "the verification is audited");
+
+  // a lying type is quarantined, not refused
+  const lied = await uploadKycDocument(dependencies, {
+    companyId: COMPANY_ID,
+    uploadedBy: ACTOR_ID,
+    documentType: "utility_bill",
+    fileName: "bill.pdf",
+    declaredType: "application/pdf",
+    bytes: PNG_BYTES,
+  });
+  expectEqual(lied.verdict.decision, "quarantined", "a png declared as pdf is quarantined");
+  expectEqual(lied.record.status, "quarantined", "and the row says so");
+  expectEqual(typeof lied.record.quarantined_reason, "string", "with the reason");
+  expect(lied.record.storage_key.endsWith(".png"), "keyed by the detected type");
+
+  // a refused upload stores nothing
+  const before = db.inserts.length;
+  const callsBefore = adapter.calls.length;
+  const refused = await rejectionOf(() =>
+    uploadKycDocument(dependencies, {
+      companyId: COMPANY_ID,
+      uploadedBy: ACTOR_ID,
+      documentType: "identity_document",
+      fileName: "vector.svg",
+      declaredType: "image/svg+xml",
+      bytes: new TextEncoder().encode("<svg></svg>"),
+    }),
+  );
+  expect(isAppError(refused) && (refused as AppError).code === "VALIDATION_FAILED", "an svg upload is a 422");
+  expectEqual(db.inserts.length, before, "no row");
+  expectEqual(adapter.calls.length, callsBefore, "no object");
+
+  // the signed download url: verified row of this merchant only
+  const url = await createKycDownloadUrl(dependencies, { companyId: COMPANY_ID, fileId: uploaded.record.id });
+  expect(url.url.includes(`ttl=${SIGNED_URL_DEFAULT_TTL_SECONDS}`), "the signed url uses the default ttl");
+  expectEqual(url.expiresAt, new Date(NOW + SIGNED_URL_DEFAULT_TTL_SECONDS * 1000).toISOString(), "and expires then");
+  expect((audit.entries[audit.entries.length - 1]?.payload ?? {})["operation"] === "signed_url", "the signed url access is audited");
+
+  const customTtl = await createKycDownloadUrl(dependencies, { companyId: COMPANY_ID, fileId: uploaded.record.id, expiresInSeconds: 120 });
+  expect(customTtl.url.includes("ttl=120"), "a custom ttl is honoured");
+
+  const denied = await rejectionOf(() => createKycDownloadUrl(dependencies, { companyId: COMPANY_ID, fileId: lied.record.id }));
+  expect(isAppError(denied) && (denied as AppError).code === "PERMISSION_DENIED", "a quarantined file is never served");
+
+  const foreign = await rejectionOf(() => createKycDownloadUrl(dependencies, { companyId: "018f2b8a-4444-4c2d-9c3e-000000000002", fileId: uploaded.record.id }));
+  expect(isAppError(foreign) && (foreign as AppError).code === "RESOURCE_NOT_FOUND", "another tenant gets a 404, not a key");
+
+  // a non-kyc row is not a kyc download
+  const encryption2 = createFileEncryption(ENCRYPTION_ENV);
+  const logoSealed = encryption2.seal(new TextEncoder().encode("png bytes"), { companyId: COMPANY_ID, purpose: "company_logo" });
+  const logoRecord = await recordUploadedFile(
+    { rest: dependencies.rest, audit, now: () => NOW },
+    {
+      companyId: COMPANY_ID,
+      uploadedBy: ACTOR_ID,
+      purpose: "company_logo",
+      contentType: "image/png",
+      stored: { provider: "supabase", bucket: "kd-solution-it-files", key: `${COMPANY_ID}/company_logo/${randomUUID()}.png`, byteSize: logoSealed.ciphertextBytes },
+      sealed: logoSealed,
+    },
+  );
+  const notKyc = await rejectionOf(() => createKycDownloadUrl(dependencies, { companyId: COMPANY_ID, fileId: logoRecord.id }));
+  expect(isAppError(notKyc) && (notKyc as AppError).code === "VALIDATION_FAILED", "a logo is not a kyc download");
+
+  // the server side read decrypts under the tenant scope
+  const read = await readKycDocument(dependencies, { companyId: COMPANY_ID, fileId: uploaded.record.id });
+  expectEqual(Buffer.from(read.bytes).toString("utf8"), Buffer.from(PDF_BYTES).toString("utf8"), "the read returns the plaintext");
+
+  // archive walks the row forward
+  const archived = await archiveKycDocument(dependencies, { companyId: COMPANY_ID, fileId: uploaded.record.id });
+  expectEqual(archived.status, "archived", "a verified kyc document archives");
+}
+
 async function checkSources(): Promise<void> {
   const paths = [
     "lib/storage/types.ts",
@@ -1046,6 +1188,7 @@ async function checkSources(): Promise<void> {
     "lib/storage/adapters.ts",
     "lib/storage/encryption.ts",
     "lib/storage/records.ts",
+    "lib/storage/kyc.ts",
     "lib/storage/verify.ts",
     "lib/storage/README.md",
   ];
@@ -1118,6 +1261,14 @@ async function checkSources(): Promise<void> {
   expect(records.includes("company_id=eq."), "every query is company scoped");
   expect(records.includes("startsWith(`${companyId}/`)"), "the tenant prefix is checked in code too");
 
+  const kyc = await readRepositoryFile("lib/storage/kyc.ts");
+  expect(kyc.includes("/kyc/"), "the kyc key layout carries the tenant prefix and the kyc segment");
+  expect(kyc.includes("assertKycKeyForCompany"), "the tenant check runs on the read path too");
+  expect(kyc.includes("validateUpload"), "the magic byte verdict comes from the upload validator");
+  expect(kyc.includes("uploadKycDocument"), "the category upload flow is one call");
+  expect(kyc.includes("createKycDownloadUrl"), "and the signed url flow is one call");
+  expect(kyc.includes("PERMISSION_DENIED"), "a pending or quarantined file is never served");
+
   const http = await readRepositoryFile("lib/storage/http.ts");
   expect(http.includes('redirect: "error"'), "redirects are errors");
   expect(http.includes("checkOutboundUrl"), "every url is checked against the outbound policy");
@@ -1134,6 +1285,7 @@ async function main(): Promise<void> {
   checkEncryption();
   await checkEncryptedOperations();
   await checkRecords();
+  await checkKycCategory();
   await checkSources();
 
   if (failures.length > 0) {
@@ -1151,7 +1303,7 @@ async function main(): Promise<void> {
   process.stdout.write(
     `storage gate passed: ${checks} checks, ${STORAGE_ADAPTER_NAMES.length} adapter names (supabase + s3 wired), ` +
       `${STORAGE_ERROR_CODES.length} error codes, files sealed aes-256-gcm (${FILE_ENCRYPTION_KEY_ID}), ` +
-      `${FILE_PURPOSES.length} purposes, signed urls ${SIGNED_URL_DEFAULT_TTL_SECONDS}s default / ${SIGNED_URL_MAX_TTL_SECONDS}s max\n`,
+      `${FILE_PURPOSES.length} purposes, kyc category with tenant paths, signed urls ${SIGNED_URL_DEFAULT_TTL_SECONDS}s default / ${SIGNED_URL_MAX_TTL_SECONDS}s max\n`,
   );
 }
 
