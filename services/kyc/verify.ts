@@ -137,6 +137,17 @@ import {
   updateMerchantLimit,
 } from "./merchant-limit.ts";
 import {
+  decidePaymentHold,
+  holdLargeTransaction,
+  PAYMENT_HOLDS_TABLE,
+  PAYMENT_HOLD_CREATED_AUDIT_ACTION,
+  PAYMENT_HOLD_DECIDED_AUDIT_ACTION,
+  PAYMENT_HOLD_ENTITY,
+  PAYMENT_HOLD_READ_AUDIT_ACTION,
+  readMerchantPaymentHolds,
+  readPaymentHoldQueue,
+} from "./payment-hold.ts";
+import {
   assertProvisionable,
   PROCESSOR_PROFILE_AUDIT_ACTION,
   PROCESSOR_PROFILE_AUDIT_ENTITY,
@@ -928,8 +939,9 @@ async function checkMigrationSet(): Promise<void> {
   expectEqual(numbers.includes("0105"), true, "STEP 082's is too");
   expectEqual(numbers.includes("0106"), true, "STEP 090's is too");
   expectEqual(numbers.includes("0107"), true, "STEP 091's is too");
-  expectEqual(numbers.includes("0108"), false, "and nothing beyond them");
-  expectEqual(Math.max(...numbers.map((number) => Number.parseInt(number, 10))), 107, "the set ends at 0107");
+  expectEqual(numbers.includes("0108"), true, "STEP 092's is too");
+  expectEqual(numbers.includes("0109"), false, "and nothing beyond them");
+  expectEqual(Math.max(...numbers.map((number) => Number.parseInt(number, 10))), 108, "the set ends at 0108");
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -1045,6 +1057,22 @@ interface LimitRowShape {
   created_at: string;
 }
 
+/** One `0108` payment hold row, as the fake store holds it. */
+interface PaymentHoldRowShape {
+  id: string;
+  company_id: string;
+  reference: string | null;
+  amount: string;
+  status: string;
+  held_at: string;
+  reviewed_by: string | null;
+  reviewed_at: string | null;
+  decision_reason: string | null;
+  version: number;
+  updated_at: string;
+  created_at: string;
+}
+
 /** One row of `0048`, as the fake store holds it. */
 interface SubmissionRowShape {
   id: string;
@@ -1131,6 +1159,7 @@ interface BusinessDatabase {
   readonly criteriaRow: CriteriaRowShape | null;
   readonly tierRows: TierRowShape[];
   readonly limitRows: LimitRowShape[];
+  readonly holdRows: PaymentHoldRowShape[];
   readonly queries: string[];
   readonly inserts: { readonly table: string; readonly row: Readonly<Record<string, unknown>> }[];
   readonly updates: {
@@ -1143,6 +1172,8 @@ interface BusinessDatabase {
   criteriaRace: boolean;
   /** When true, the limit update branch simulates a lost race the same way. */
   limitRace: boolean;
+  /** When true, the hold update branch simulates a lost race the same way. */
+  holdRace: boolean;
 }
 
 function businessRow(overrides: Partial<BusinessRowShape> = {}): BusinessRowShape {
@@ -1184,6 +1215,7 @@ function createBusinessDatabase(
   criteriaRow: CriteriaRowShape | null = defaultCriteriaRow(),
   tierRows: readonly TierRowShape[] = defaultTierRows(),
   limitRows: readonly LimitRowShape[] = [],
+  holdRows: readonly PaymentHoldRowShape[] = [],
 ): BusinessDatabase {
   return {
     profileRows: [...profileRows],
@@ -1197,12 +1229,14 @@ function createBusinessDatabase(
     criteriaRow: criteriaRow === null ? null : { ...criteriaRow },
     tierRows: [...tierRows].map((row) => ({ ...row })),
     limitRows: [...limitRows].map((row) => ({ ...row })),
+    holdRows: [...holdRows].map((row) => ({ ...row })),
     queries: [],
     inserts: [],
     updates: [],
     conflictOnInsert: false,
     criteriaRace: false,
     limitRace: false,
+    holdRace: false,
   };
 }
 
@@ -1389,6 +1423,56 @@ function createBusinessStore(database: BusinessDatabase): RestClient {
 
         if (parts.includes("order=tier.asc")) {
           matched = [...matched].sort((left, right) => left.tier.localeCompare(right.tier));
+        }
+
+        const limit = parts.find((part) => part.startsWith("limit="));
+        const capped =
+          limit === undefined
+            ? matched
+            : matched.slice(0, Number.parseInt(limit.slice("limit=".length), 10));
+
+        return Promise.resolve(capped.map((row) => schema.parse(row)));
+      }
+
+      // The `0108` hold table: the office queue read is deliberately unscoped (cross-company), so
+      // this branch applies the company filter only when the query itself carries one.
+      if (table === PAYMENT_HOLDS_TABLE) {
+        const parts = query.split("&");
+
+        if (!parts.includes("deleted_at=is.null")) {
+          return Promise.reject(new Error(`the hold read is not over live rows: ${query}`));
+        }
+
+        let matched = [...database.holdRows];
+
+        const companyPart = parts.find((part) => part.startsWith("company_id=eq."));
+
+        if (companyPart !== undefined) {
+          const wantedCompany = decodeURIComponent(companyPart.slice("company_id=eq.".length));
+          matched = matched.filter((row) => row.company_id === wantedCompany);
+        }
+
+        for (const column of ["id", "status", "reference"] as const) {
+          const eqPart = parts.find((part) => part.startsWith(`${column}=eq.`));
+
+          if (eqPart !== undefined) {
+            const value = decodeURIComponent(eqPart.slice(column.length + 4));
+            matched = matched.filter((row) => row[column] === value);
+          }
+
+          if (parts.includes(`${column}=is.null`)) {
+            matched = matched.filter((row) => row[column] === null);
+          }
+        }
+
+        const ordered = parts.find((part) => part.startsWith("order="));
+
+        if (ordered === "order=held_at.asc") {
+          matched = [...matched].sort((left, right) => left.held_at.localeCompare(right.held_at));
+        }
+
+        if (ordered === "order=held_at.desc") {
+          matched = [...matched].sort((left, right) => right.held_at.localeCompare(left.held_at));
         }
 
         const limit = parts.find((part) => part.startsWith("limit="));
@@ -1669,6 +1753,32 @@ function createBusinessStore(database: BusinessDatabase): RestClient {
         return Promise.resolve();
       }
 
+      if (table === PAYMENT_HOLDS_TABLE) {
+        for (const row of rows) {
+          database.inserts.push({ table, row: { ...row } });
+
+          const id = `018f2b8a-0000-4c2d-9c3e-${String(database.holdRows.length + 1).padStart(12, "0")}`;
+          const created = new Date(NOW).toISOString();
+
+          database.holdRows.push({
+            id,
+            company_id: String(row["company_id"] ?? ""),
+            reference: typeof row["reference"] === "string" ? row["reference"] : null,
+            amount: String(row["amount"] ?? "0.0000"),
+            status: String(row["status"] ?? "held"),
+            held_at: String(row["held_at"] ?? created),
+            reviewed_by: null,
+            reviewed_at: null,
+            decision_reason: null,
+            version: Number(row["version"] ?? 1),
+            updated_at: created,
+            created_at: created,
+          });
+        }
+
+        return Promise.resolve();
+      }
+
       for (const row of rows) {
         if (table === BUSINESS_PROFILE_TABLE) {
           if (database.conflictOnInsert) {
@@ -1926,6 +2036,49 @@ function createBusinessStore(database: BusinessDatabase): RestClient {
           }
 
           if (database.limitRace) {
+            row.version += 5;
+
+            continue;
+          }
+
+          for (const [key, value] of Object.entries(values)) {
+            (row as unknown as Record<string, unknown>)[key] = value;
+          }
+        }
+
+        return Promise.resolve();
+      }
+
+      if (table === PAYMENT_HOLDS_TABLE) {
+        const parts = query.split("&");
+
+        if (!parts.includes("deleted_at=is.null")) {
+          return Promise.reject(new Error(`the hold update is not over live rows: ${query}`));
+        }
+
+        const idPart = parts.find((part) => part.startsWith("id=eq."));
+        const statusPart = parts.find((part) => part.startsWith("status=eq."));
+        const versionPart = parts.find((part) => part.startsWith("version=eq."));
+        const wantedId = idPart === undefined ? null : decodeURIComponent(idPart.slice("id=eq.".length));
+        const wantedStatus =
+          statusPart === undefined ? null : decodeURIComponent(statusPart.slice("status=eq.".length));
+        const wantedVersion =
+          versionPart === undefined ? null : Number(versionPart.slice("version=eq.".length));
+
+        for (const row of database.holdRows) {
+          if (wantedId !== null && row.id !== wantedId) {
+            continue;
+          }
+
+          if (wantedStatus !== null && row.status !== wantedStatus) {
+            continue;
+          }
+
+          if (wantedVersion !== null && row.version !== wantedVersion) {
+            continue;
+          }
+
+          if (database.holdRace) {
             row.version += 5;
 
             continue;
@@ -6645,6 +6798,565 @@ async function checkMerchantLimitSources(): Promise<void> {
   );
 }
 
+/** ---- STEP 092: the unusual large transaction hold and its review. */
+
+/** A database with the given hold rows and everything else at its default. */
+function holdDatabaseOf(
+  holdRows: readonly PaymentHoldRowShape[],
+  criteriaRow: CriteriaRowShape | null = defaultCriteriaRow(),
+): BusinessDatabase {
+  return createBusinessDatabase(
+    [],
+    [],
+    defaultMccRows(),
+    defaultCountryRows(),
+    [],
+    [],
+    [],
+    [],
+    criteriaRow,
+    defaultTierRows(),
+    [],
+    holdRows,
+  );
+}
+
+function holdRow(overrides: Partial<PaymentHoldRowShape> = {}): PaymentHoldRowShape {
+  return {
+    id: "018f2b8a-0000-4c2d-9c3e-0000000000a1",
+    company_id: COMPANY_A,
+    reference: "pay_001",
+    amount: "10000.0000",
+    status: "held",
+    held_at: "2026-11-01T09:00:00.000Z",
+    reviewed_by: null,
+    reviewed_at: null,
+    decision_reason: null,
+    version: 1,
+    updated_at: "2026-11-01T09:00:00.000Z",
+    created_at: "2026-11-01T09:00:00.000Z",
+    ...overrides,
+  };
+}
+
+async function checkPaymentHolds(): Promise<void> {
+  const financeDesk = actorOf(["finance_ops"], null, { userId: OFFICE_ID });
+  const superDesk = actorOf(["super_admin"], null, { userId: OFFICE_ID });
+
+  // The trigger and the merchant list are owner-only; the queue is the office read roles; the
+  // decision is the manage roles. Every refusal happens before a single query.
+  for (const [description, actor] of [
+    ["super_admin", superDesk],
+    ["ceo", ceoDesk],
+    ["compliance_kyc", desk],
+    ["finance_ops", financeDesk],
+    ["support", actorOf(["support"], null, { userId: OFFICE_ID })],
+    ["blogger", actorOf(["blogger"], null, { userId: OFFICE_ID })],
+    ["nobody", actorOf([], null)],
+  ] as const) {
+    for (const [label, call] of [
+      ["the trigger", () => holdLargeTransaction({ actor, amount: "20000" }, dependenciesOf(createBusinessDatabase(), createInMemoryAuditTrail()))],
+      ["the merchant list", () => readMerchantPaymentHolds({ actor }, dependenciesOf(createBusinessDatabase(), createInMemoryAuditTrail()))],
+    ] as const) {
+      const database = createBusinessDatabase();
+      const refusal = await rejectionOf(() =>
+        label === "the trigger"
+          ? holdLargeTransaction({ actor, amount: "20000" }, dependenciesOf(database, createInMemoryAuditTrail()))
+          : readMerchantPaymentHolds({ actor }, dependenciesOf(database, createInMemoryAuditTrail())),
+      );
+
+      expectEqual(refusal?.code, "PERMISSION_DENIED", `${label} refuses ${description}`);
+      expectEqual(database.queries.length, 0, `and queries nothing for ${description}`);
+      void call;
+    }
+  }
+
+  for (const [description, actor] of [
+    ["an owner", owner],
+    ["support", actorOf(["support"], null, { userId: OFFICE_ID })],
+    ["blogger", actorOf(["blogger"], null, { userId: OFFICE_ID })],
+    ["nobody", actorOf([], null)],
+  ] as const) {
+    const queueDatabase = createBusinessDatabase();
+    const queueRefusal = await rejectionOf(() =>
+      readPaymentHoldQueue({ actor }, dependenciesOf(queueDatabase, createInMemoryAuditTrail())),
+    );
+
+    expectEqual(queueRefusal?.code, "PERMISSION_DENIED", `the queue refuses ${description}`);
+    expectEqual(queueDatabase.queries.length, 0, `and queries nothing for the queue read by ${description}`);
+
+    const decideDatabase = createBusinessDatabase();
+    const decideRefusal = await rejectionOf(() =>
+      decidePaymentHold(
+        { actor, holdId: "018f2b8a-0000-4c2d-9c3e-0000000000a1", body: { decision: "release" } },
+        dependenciesOf(decideDatabase, createInMemoryAuditTrail()),
+      ),
+    );
+
+    expectEqual(decideRefusal?.code, "PERMISSION_DENIED", `the decision refuses ${description}`);
+    expectEqual(decideDatabase.queries.length, 0, `and queries nothing for the decision by ${description}`);
+  }
+
+  // finance_ops and ceo may read the queue; only the manage roles may decide.
+  for (const [description, actor] of [
+    ["compliance_kyc", desk],
+    ["super_admin", superDesk],
+    ["ceo", ceoDesk],
+    ["finance_ops", financeDesk],
+  ] as const) {
+    const queue = await readPaymentHoldQueue({ actor }, dependenciesOf(holdDatabaseOf([holdRow()]), createInMemoryAuditTrail()));
+
+    expectEqual(queue.rows.length, 1, `the queue answers ${description}`);
+  }
+
+  // An owner without a company is refused too.
+  const companyless = await rejectionOf(() =>
+    holdLargeTransaction(
+      { actor: actorOf(["owner"], null), amount: "20000" },
+      dependenciesOf(createBusinessDatabase(), createInMemoryAuditTrail()),
+    ),
+  );
+
+  expectEqual(companyless?.code, "PERMISSION_DENIED", "an owner without a company triggers no hold");
+
+  // Bad amounts are refused before the criteria read: no query, no write.
+  for (const [description, amount, rule] of [
+    ["a non-numeric amount", "abc", "invalid_format"],
+    ["a negative amount", "-5", "invalid_format"],
+    ["fifteen digits", "100000000000001", "invalid_format"],
+    ["five decimals", "1.00001", "invalid_format"],
+    ["a zero amount", "0", "out_of_range"],
+    ["a zero fraction", "0.0000", "out_of_range"],
+  ] as const) {
+    const database = createBusinessDatabase();
+    const refusal = await rejectionOf(() =>
+      holdLargeTransaction({ actor: owner, amount }, dependenciesOf(database, createInMemoryAuditTrail())),
+    );
+
+    expectEqual(refusal?.code, "VALIDATION_FAILED", `the trigger refuses ${description}`);
+    expectDeepEqual(refusal?.details, [{ field: "amount", rule }], `naming ${rule}`);
+    expectEqual(database.queries.length, 0, `and queries nothing for ${description}`);
+    expectEqual(database.inserts.length, 0, `and writes nothing for ${description}`);
+  }
+
+  // Below the threshold, and with the switch off: answered { held: false }, nothing written.
+  const belowDatabase = createBusinessDatabase();
+  const below = await holdLargeTransaction(
+    { actor: owner, amount: "9999.9999", reference: "pay_small" },
+    dependenciesOf(belowDatabase, createInMemoryAuditTrail()),
+  );
+
+  expectEqual(below.held, false, "an amount below the 10000 threshold is not held");
+  expectEqual(below.threshold, "10000.0000", "the criteria threshold is reported");
+  expectEqual(below.hold, null, "with no hold");
+  expectEqual(belowDatabase.inserts.length, 0, "and nothing is written");
+
+  const disabledDatabase = holdDatabaseOf([], { ...defaultCriteriaRow(), large_transaction_hold_enabled: false });
+  const disabled = await holdLargeTransaction(
+    { actor: owner, amount: "50000" },
+    dependenciesOf(disabledDatabase, createInMemoryAuditTrail()),
+  );
+
+  expectEqual(disabled.held, false, "a disabled hold criterion holds nothing");
+  expectEqual(disabledDatabase.inserts.length, 0, "and writes nothing");
+
+  const noCriteria = await rejectionOf(() =>
+    holdLargeTransaction({ actor: owner, amount: "20000" }, dependenciesOf(holdDatabaseOf([], null), createInMemoryAuditTrail())),
+  );
+
+  expectEqual(noCriteria?.code, "RESOURCE_NOT_FOUND", "a missing criteria row is not found");
+
+  // At and above the threshold the transaction is held: one insert, one re-read, one audit entry.
+  const heldDatabase = createBusinessDatabase();
+  const heldAudit = createInMemoryAuditTrail();
+  const held = await holdLargeTransaction(
+    { actor: owner, amount: "25000.5", reference: "pay_100" },
+    dependenciesOf(heldDatabase, heldAudit),
+  );
+
+  expectEqual(held.held, true, "an amount at the threshold is held");
+  expectEqual(held.amount, "25000.5000", "normalised to four decimals");
+  expectEqual(held.hold?.status, "held", "the hold is waiting");
+  expectEqual(held.hold?.companyId, COMPANY_A, "scoped to the session's company");
+  expectEqual(held.hold?.reference, "pay_100", "carrying the payment reference");
+  expectEqual(held.hold?.version, 1, "born at version 1");
+
+  const holdInserts = heldDatabase.inserts.filter((entry) => entry.table === PAYMENT_HOLDS_TABLE);
+
+  expectEqual(holdInserts.length, 1, "exactly one hold row is inserted");
+  expectEqual(holdInserts[0]?.row["status"], "held", "inserted in status held");
+  expectEqual(holdInserts[0]?.row["company_id"], COMPANY_A, "for the session's company");
+  expectEqual(
+    heldAudit.entries.filter((entry) => entry.action === PAYMENT_HOLD_CREATED_AUDIT_ACTION).length,
+    1,
+    "the hold is audited under payment_hold.created",
+  );
+  expectEqual(
+    heldAudit.entries.find((entry) => entry.action === PAYMENT_HOLD_CREATED_AUDIT_ACTION)?.entityType,
+    PAYMENT_HOLD_ENTITY,
+    "on the payment_hold entity",
+  );
+  expectEqual(
+    heldAudit.entries.find((entry) => entry.action === PAYMENT_HOLD_CREATED_AUDIT_ACTION)?.payload?.["amount"],
+    "25000.5000",
+    "with the held amount in the payload",
+  );
+
+  const atThreshold = await holdLargeTransaction(
+    { actor: owner, amount: "10000" },
+    dependenciesOf(createBusinessDatabase(), createInMemoryAuditTrail()),
+  );
+
+  expectEqual(atThreshold.held, true, "exactly at the threshold is held too");
+
+  // A down audit sink never fails the write it records.
+  const throwingAudit = {
+    append(): Promise<void> {
+      return Promise.reject(new Error("the audit sink is down"));
+    },
+  };
+  const deafHeld = await holdLargeTransaction(
+    { actor: owner, amount: "20000" },
+    { rest: createBusinessStore(createBusinessDatabase()), audit: throwingAudit, now: () => NOW },
+  );
+
+  expectEqual(deafHeld.held, true, "a hold whose audit sink fails is still held");
+
+  // Idempotent per reference: the repeated trigger answers with the existing hold, no second row.
+  const seeded = holdDatabaseOf([holdRow({ reference: "pay_100" })]);
+  const seededAudit = createInMemoryAuditTrail();
+  const repeated = await holdLargeTransaction(
+    { actor: owner, amount: "20000", reference: "pay_100" },
+    dependenciesOf(seeded, seededAudit),
+  );
+
+  expectEqual(repeated.held, true, "the repeated reference is still held");
+  expectEqual(repeated.hold?.id, "018f2b8a-0000-4c2d-9c3e-0000000000a1", "answering with the existing hold");
+  expectEqual(seeded.inserts.length, 0, "no second row is inserted");
+  expectEqual(
+    seededAudit.entries.filter((entry) => entry.action === PAYMENT_HOLD_CREATED_AUDIT_ACTION).length,
+    0,
+    "and no second creation is audited",
+  );
+  expect(
+    seeded.queries.some((query) => query.startsWith(`${PAYMENT_HOLDS_TABLE}?`) && query.includes("reference=eq.pay_100")),
+    "the idempotency lookup pins the reference",
+  );
+
+  // The office queue: cross-company on purpose, oldest first, one read audit per call.
+  const queueDatabase = holdDatabaseOf([
+    holdRow({ id: "018f2b8a-0000-4c2d-9c3e-0000000000a1", company_id: COMPANY_A, held_at: "2026-11-01T09:00:00.000Z" }),
+    holdRow({ id: "018f2b8a-0000-4c2d-9c3e-0000000000a2", company_id: COMPANY_B, reference: "pay_002", held_at: "2026-11-02T10:00:00.000Z" }),
+  ]);
+  const queueAudit = createInMemoryAuditTrail();
+  const queue = await readPaymentHoldQueue({ actor: desk }, dependenciesOf(queueDatabase, queueAudit));
+
+  expectEqual(queue.rows.length, 2, "the queue sees every merchant's held transactions");
+  expectEqual(queue.rows[0]?.companyId, COMPANY_A, "oldest first");
+  expectEqual(queue.rows[1]?.companyId, COMPANY_B, "across companies on purpose");
+  expect(
+    queueDatabase.queries.every(
+      (query) => !query.startsWith(`${PAYMENT_HOLDS_TABLE}?`) || !query.includes("company_id=eq."),
+    ),
+    "the queue query is never company-scoped",
+  );
+  expect(
+    queueDatabase.queries.some((query) => query.includes("order=held_at.asc") && query.includes("limit=200")),
+    "the queue is ordered oldest first with its cap",
+  );
+  expectEqual(
+    queueAudit.entries.filter((entry) => entry.action === PAYMENT_HOLD_READ_AUDIT_ACTION).length,
+    1,
+    "one office read is audited under payment_hold.read_by_office",
+  );
+  expectEqual(
+    queueAudit.entries.find((entry) => entry.action === PAYMENT_HOLD_READ_AUDIT_ACTION)?.payload?.["waiting"],
+    2,
+    "with the waiting count in the payload",
+  );
+
+  // The merchant list: own company only, newest first.
+  const ownDatabase = holdDatabaseOf([
+    holdRow({ id: "018f2b8a-0000-4c2d-9c3e-0000000000a1", company_id: COMPANY_A, held_at: "2026-11-01T09:00:00.000Z" }),
+    holdRow({ id: "018f2b8a-0000-4c2d-9c3e-0000000000a2", company_id: COMPANY_A, reference: "pay_002", held_at: "2026-11-02T10:00:00.000Z" }),
+    holdRow({ id: "018f2b8a-0000-4c2d-9c3e-0000000000a3", company_id: COMPANY_B, reference: "pay_003", held_at: "2026-11-02T11:00:00.000Z" }),
+  ]);
+  const own = await readMerchantPaymentHolds({ actor: owner }, dependenciesOf(ownDatabase, createInMemoryAuditTrail()));
+
+  expectEqual(own.rows.length, 2, "the merchant sees only their own company's holds");
+  expect(own.rows.every((row) => row.companyId === COMPANY_A), "every row is the session's company");
+  expectEqual(own.rows[0]?.reference, "pay_002", "newest first");
+  expect(
+    ownDatabase.queries.every((query) => query.includes(`company_id=eq.${COMPANY_A}`) && query.includes("order=held_at.desc")),
+    "the merchant list is company-scoped, newest first",
+  );
+
+  // The decision: uuid validated before any query, body next, then the held row.
+  const badIdDatabase = createBusinessDatabase();
+  const badId = await rejectionOf(() =>
+    decidePaymentHold({ actor: desk, holdId: "nope", body: { decision: "release" } }, dependenciesOf(badIdDatabase, createInMemoryAuditTrail())),
+  );
+
+  expectEqual(badId?.code, "VALIDATION_FAILED", "a non-uuid hold id is refused");
+  expectDeepEqual(badId?.details, [{ field: "hold_id", rule: "invalid_format" }], "named hold_id invalid_format");
+  expectEqual(badIdDatabase.queries.length, 0, "before any query");
+
+  for (const [description, body, rule] of [
+    ["an unknown decision", { decision: "hold" }, "invalid_format"],
+    ["a missing decision", {}, "invalid_format"],
+    ["a rejection without a reason", { decision: "reject" }, "out_of_range"],
+    ["a blank rejection reason", { decision: "reject", reason: "   " }, "out_of_range"],
+  ] as const) {
+    const bodyDatabase = createBusinessDatabase();
+    const refusal = await rejectionOf(() =>
+      decidePaymentHold(
+        { actor: desk, holdId: "018f2b8a-0000-4c2d-9c3e-0000000000a1", body },
+        dependenciesOf(bodyDatabase, createInMemoryAuditTrail()),
+      ),
+    );
+
+    expectEqual(refusal?.code, "VALIDATION_FAILED", `the decision refuses ${description}`);
+    expect(refusal?.details?.some((detail) => detail.rule === rule) === true, `naming ${rule}`);
+    expectEqual(bodyDatabase.queries.length, 0, `and queries nothing for ${description}`);
+  }
+
+  const unknown = await rejectionOf(() =>
+    decidePaymentHold(
+      { actor: desk, holdId: "018f2b8a-0000-4c2d-9c3e-00000000ffff", body: { decision: "release" } },
+      dependenciesOf(holdDatabaseOf([]), createInMemoryAuditTrail()),
+    ),
+  );
+
+  expectEqual(unknown?.code, "RESOURCE_NOT_FOUND", "an unknown hold id is not found");
+
+  const decidedDb = holdDatabaseOf([
+    holdRow({ status: "released", version: 2, reviewed_by: OFFICE_ID, reviewed_at: "2026-11-02T10:30:00.000Z" }),
+  ]);
+  const already = await rejectionOf(() =>
+    decidePaymentHold(
+      { actor: desk, holdId: "018f2b8a-0000-4c2d-9c3e-0000000000a1", body: { decision: "reject", reason: "again" } },
+      dependenciesOf(decidedDb, createInMemoryAuditTrail()),
+    ),
+  );
+
+  expectEqual(already?.code, "CONFLICT", "a decided hold conflicts");
+  expectDeepEqual(already?.details, [{ field: "status", rule: "already_decided" }], "named already_decided");
+  expectEqual(decidedDb.updates.length, 0, "and writes nothing");
+
+  // Release: one conditional update, the reviewer named, version bumped, audited, fresh row answered.
+  const releaseDatabase = holdDatabaseOf([holdRow()]);
+  const releaseAudit = createInMemoryAuditTrail();
+  const released = await decidePaymentHold(
+    { actor: desk, holdId: "018f2b8a-0000-4c2d-9c3e-0000000000a1", body: { decision: "release" } },
+    dependenciesOf(releaseDatabase, releaseAudit),
+  );
+
+  expectEqual(released.status, "released", "the hold is released");
+  expectEqual(released.reviewedBy, OFFICE_ID, "the reviewer is recorded");
+  expectEqual(released.reviewedAt, new Date(NOW).toISOString(), "at the decision instant");
+  expectEqual(released.decisionReason, null, "a release carries no reason");
+  expectEqual(released.version, 2, "version bumped");
+
+  const holdUpdate = releaseDatabase.updates.find((entry) => entry.table === PAYMENT_HOLDS_TABLE);
+
+  expect(
+    holdUpdate !== undefined &&
+      holdUpdate.query.includes("id=eq.018f2b8a-0000-4c2d-9c3e-0000000000a1") &&
+      holdUpdate.query.includes("status=eq.held") &&
+      holdUpdate.query.includes("version=eq.1") &&
+      holdUpdate.query.includes("deleted_at=is.null"),
+    "the decision update is conditional on id, status held, version and live rows",
+  );
+  expectEqual(holdUpdate?.values["version"], 2, "the write bumps the version");
+  expectEqual(holdUpdate?.values["reviewed_by"], OFFICE_ID, "and names the reviewer");
+  expectEqual(
+    releaseAudit.entries.filter((entry) => entry.action === PAYMENT_HOLD_DECIDED_AUDIT_ACTION).length,
+    1,
+    "audited under payment_hold.decided",
+  );
+  expectEqual(
+    releaseAudit.entries.find((entry) => entry.action === PAYMENT_HOLD_DECIDED_AUDIT_ACTION)?.entityType,
+    PAYMENT_HOLD_ENTITY,
+    "on the payment_hold entity",
+  );
+  expectEqual(
+    releaseAudit.entries.find((entry) => entry.action === PAYMENT_HOLD_DECIDED_AUDIT_ACTION)?.payload?.["decision"],
+    "release",
+    "with the decision in the payload",
+  );
+
+  // Reject: the reason is required and stored trimmed.
+  const rejectDatabase = holdDatabaseOf([holdRow()]);
+  const rejected = await decidePaymentHold(
+    { actor: desk, holdId: "018f2b8a-0000-4c2d-9c3e-0000000000a1", body: { decision: "reject", reason: "  too big for the profile  " } },
+    dependenciesOf(rejectDatabase, createInMemoryAuditTrail()),
+  );
+
+  expectEqual(rejected.status, "rejected", "the hold is rejected");
+  expectEqual(rejected.decisionReason, "too big for the profile", "the reason is stored trimmed");
+
+  // A lost race on the decision write conflicts as stale.
+  const raceDb = holdDatabaseOf([holdRow()]);
+  raceDb.holdRace = true;
+  const stale = await rejectionOf(() =>
+    decidePaymentHold(
+      { actor: desk, holdId: "018f2b8a-0000-4c2d-9c3e-0000000000a1", body: { decision: "release" } },
+      dependenciesOf(raceDb, createInMemoryAuditTrail()),
+    ),
+  );
+
+  expectEqual(stale?.code, "CONFLICT", "a lost decision race conflicts");
+  expectDeepEqual(stale?.details, [{ field: "version", rule: "stale" }], "named stale");
+}
+
+/** ---- STEP 092 sources: the routes, the service, the migration, the screen wiring. */
+async function checkPaymentHoldSources(): Promise<void> {
+  const queueRoute = await readRepositoryFile("app/api/onboarding/payment-holds/route.ts");
+  const decideRoute = await readRepositoryFile("app/api/onboarding/payment-hold-decide/route.ts");
+  const merchantRoute = await readRepositoryFile("app/api/onboarding/merchant-holds/route.ts");
+  const service = await readRepositoryFile("services/kyc/payment-hold.ts");
+  const csrf = await readRepositoryFile("lib/security/csrf.ts");
+  const migration = await readRepositoryFile("migrations/0108_payment_holds.sql");
+  const rollback = await readRepositoryFile("migrations/0108_payment_holds.down.sql");
+  const page = await readRepositoryFile("app/(dashboard)/onboarding/payment-holds/page.tsx");
+  const panel = await readRepositoryFile("app/(dashboard)/onboarding/payment-holds/payment-holds-panel.tsx");
+
+  for (const [path, source] of [
+    ["app/api/onboarding/payment-holds/route.ts", queueRoute],
+    ["app/api/onboarding/payment-hold-decide/route.ts", decideRoute],
+    ["app/api/onboarding/merchant-holds/route.ts", merchantRoute],
+    ["services/kyc/payment-hold.ts", service],
+    ["app/(dashboard)/onboarding/payment-holds/page.tsx", page],
+    ["app/(dashboard)/onboarding/payment-holds/payment-holds-panel.tsx", panel],
+  ] as const) {
+    expectEqual(source.split("\n")[0], `// path: ${path}`, `${path} states its own path on its first line`);
+    expectEqual(/[^\t\n\r\x20-\x7E]/u.test(source), false, `${path} is ASCII only`);
+  }
+
+  expect(queueRoute.includes("export const GET"), "the queue route answers GET");
+  expectEqual(queueRoute.includes("export const POST"), false, "and answers no POST");
+  expect(queueRoute.includes("readPaymentHoldQueue("), "the queue reads through the service");
+  expectEqual(queueRoute.includes("searchParams"), false, "and no company comes from the query string");
+  expect(queueRoute.includes('"cache-control": "no-store"'), "the queue answer is not cached");
+
+  expect(decideRoute.includes("export const POST"), "the decide route answers POST");
+  expectEqual(decideRoute.includes("export const GET"), false, "and answers no GET");
+  expect(decideRoute.includes("requireCsrfToken("), "the token is checked first");
+  expect(decideRoute.indexOf("requireCsrfToken(") < decideRoute.indexOf("readRequestActor("), "before the session is read");
+  expect(decideRoute.indexOf("requireCsrfToken(") < decideRoute.indexOf("request.text()"), "and before the body is read");
+  expect(decideRoute.includes("maximumBodyBytes"), "the body is bounded");
+  expect(decideRoute.includes('"cache-control": "no-store"'), "the answer is not cached");
+  expect(decideRoute.includes("decidePaymentHold("), "the decision goes through the service");
+  expect(decideRoute.includes("logger.info("), "and is logged");
+  expect(csrf.includes('"/api/onboarding/payment-hold-decide",'), "and the path is on the CSRF-protected list");
+
+  expect(merchantRoute.includes("export const GET"), "the merchant route answers GET");
+  expectEqual(merchantRoute.includes("export const POST"), false, "and answers no POST");
+  expect(merchantRoute.includes("readMerchantPaymentHolds("), "the merchant list reads through the service");
+  expectEqual(merchantRoute.includes("searchParams"), false, "and no company comes from the query string");
+  expect(merchantRoute.includes('"cache-control": "no-store"'), "the list answer is not cached");
+
+  expect(service.includes('PAYMENT_HOLDS_TABLE = "payment_holds"'), "the service names the 0108 table");
+  expect(service.includes("BigInt"), "money math is integer minor units, no float");
+  expectEqual(service.includes("Math."), false, "no float math anywhere in the service");
+  expect(service.includes("already_decided"), "a decided hold conflicts with a named rule");
+  expect(service.includes('"stale"'), "a lost race conflicts as stale");
+  expect(service.includes("version=eq."), "the decision write is conditional on the current version");
+  expect(service.includes("status=eq.held"), "and on the hold still waiting");
+  expect(service.includes("reference=eq."), "the trigger is idempotent per reference");
+  expect(service.includes("order=held_at.asc"), "the queue is oldest first");
+  expect(service.includes("order=held_at.desc"), "the merchant list is newest first");
+  expect(service.includes(PAYMENT_HOLD_CREATED_AUDIT_ACTION), "the creation is audited");
+  expect(service.includes(PAYMENT_HOLD_DECIDED_AUDIT_ACTION), "the decision is audited");
+  expect(service.includes(PAYMENT_HOLD_READ_AUDIT_ACTION), "the office read is audited");
+  expect(service.includes("readLargeTransactionHold"), "the threshold comes from the 0106 criteria");
+
+  expect(migration.includes("create table public.payment_holds"), "the migration creates the table");
+  expect(migration.includes("payment_holds_status_check"), "the status vocabulary is enforced");
+  expect(migration.includes("payment_holds_amount_check"), "the amount ceiling is enforced");
+  expect(migration.includes("payment_holds_reason_check"), "the rejection reason rule is enforced");
+  expect(migration.includes("enable row level security"), "RLS is on");
+  expect(migration.includes("payment_holds_default_deny"), "with a default deny");
+  expect(migration.includes("payment_holds_owner_read"), "the owner reads their own holds");
+  expect(migration.includes("payment_holds_office_read"), "the office roles read the queue");
+  expect(migration.includes("payment_holds_manage_all"), "only compliance and super_admin write");
+  expect(rollback.includes("drop table if exists public.payment_holds;"), "the rollback drops the table");
+
+  expect(page.includes("readOwnerActor("), "the queue screen reads the session actor");
+  expect(page.includes("<SessionKeeper"), "and keeps the session alive");
+  expect(page.includes("readPaymentHoldQueue("), "and reads the queue through the service");
+  expect(page.includes("PaymentHoldsPanel"), "and renders the panel");
+  expectEqual(
+    panel.split('"/api/onboarding/payment-hold-decide"').length - 1,
+    1,
+    "the panel posts to exactly one decide literal",
+  );
+  expect(panel.includes("csrfHeaders"), "with the CSRF headers on the post");
+  expect(panel.includes("postJson("), "through its single post helper");
+
+  for (const folder of ["payment-holds", "payment-hold-decide", "merchant-holds"]) {
+    expect(
+      (await readdir(new URL(`app/api/onboarding/${folder}/`, repositoryRoot))).includes("route.ts"),
+      `${folder} is a route handler of its own`,
+    );
+  }
+  expect(
+    (await readdir(new URL("app/(dashboard)/onboarding/payment-holds/", repositoryRoot))).includes("payment-holds-panel.tsx"),
+    "the queue screen lives under the owned onboarding path",
+  );
+  expect(
+    (await readdir(new URL("services/kyc/", repositoryRoot))).includes("payment-hold.ts"),
+    "the hold service lives in services/kyc",
+  );
+}
+
+async function checkPaymentHoldCatalog(): Promise<void> {
+  const block = en.onboardingPaymentHolds as unknown as Record<string, unknown>;
+  const page = await readRepositoryFile("app/(dashboard)/onboarding/payment-holds/page.tsx");
+  const panel = await readRepositoryFile("app/(dashboard)/onboarding/payment-holds/payment-holds-panel.tsx");
+  const sources = `${page}\n${panel}`;
+
+  const flat: string[] = [];
+
+  const walk = (node: Record<string, unknown>, prefix: string): void => {
+    for (const [key, value] of Object.entries(node)) {
+      const path = `${prefix}.${key}`;
+
+      if (typeof value === "string") {
+        flat.push(path);
+      } else if (typeof value === "object" && value !== null) {
+        walk(value as Record<string, unknown>, path);
+      }
+    }
+  };
+
+  walk(block, "onboardingPaymentHolds");
+
+  expect(flat.length >= 30, "the hold queue screen has its own block of copy");
+
+  for (const path of flat) {
+    expect(sources.includes(`"${path}"`), `the copy key ${path} is used by the screen`);
+  }
+
+  const referenced = [...sources.matchAll(/"(onboardingPaymentHolds\.[A-Za-z.]+)"/gu)].map((match) => match[1]);
+
+  for (const path of new Set(referenced)) {
+    expect(path !== undefined && flat.includes(path), `the screen names no missing key (${String(path)})`);
+  }
+
+  for (const templated of ["companyLine", "amountLine", "referenceLine", "heldAtLine", "decidedLine", "reasonShownLine"]) {
+    expectEqual(
+      sources.includes(`getMessage("onboardingPaymentHolds.${templated}")`),
+      false,
+      `${templated} is never rendered without its values`,
+    );
+    expect(
+      sources.includes(`formatMessage("onboardingPaymentHolds.${templated}"`),
+      `and is rendered through formatMessage`,
+    );
+  }
+}
+
 async function main(): Promise<void> {
   checkVocabulary();
   await checkRefusals();
@@ -6706,6 +7418,9 @@ async function main(): Promise<void> {
   await checkUnderwritingCatalog();
   await checkMerchantLimit();
   await checkMerchantLimitSources();
+  await checkPaymentHolds();
+  await checkPaymentHoldSources();
+  await checkPaymentHoldCatalog();
 
   if (failures.length > 0) {
     process.stderr.write(`onboarding gate failed with ${failures.length} problem(s):\n`);
@@ -6723,7 +7438,7 @@ async function main(): Promise<void> {
     `onboarding gate passed: ${checks} checks, ${ONBOARDING_STEPS.length} steps, ` +
       `${ONBOARDING_OWNER_ROLES.length} role, ${BUSINESS_PROFILE_FIELDS.length} business fields, ` +
       `${PROCESSOR_REQUIREMENT_LIST.length} processors, ${BUSINESS_PROFILE_TABLE} table, ` +
-      `${MCC_CODES_TABLE} vocabulary, ${COUNTRIES_TABLE} list, submerchant profile, kyc pack, underwriting criteria, merchant limits\n`,
+      `${MCC_CODES_TABLE} vocabulary, ${COUNTRIES_TABLE} list, submerchant profile, kyc pack, underwriting criteria, merchant limits, payment holds\n`,
   );
 }
 

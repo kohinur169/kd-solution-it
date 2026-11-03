@@ -80,6 +80,21 @@ Every read is scoped to the caller company and every write is audit logged.
   updates, `merchant_limit.usage_recorded` audit; money as BigInt minor units, no float);
   `updateMerchantLimit` is the office's raise/lower (`POST /api/onboarding/merchant-limit-set`);
   `GET /api/onboarding/merchant-limit` serves the merchant's own limit, shown on the status screen.
+- STEP 092 holds unusually large transactions for review: `0108_payment_holds.sql` holds one row per
+  held transaction (amount numeric(18,4) with the ceiling check, status held/released/rejected with
+  the decision and trimmed-reason checks, `held_at`, reviewer fields, RLS default-deny + owner read +
+  office read + compliance/super_admin write);
+  `services/kyc/payment-hold.ts` is the trigger and the queue: `holdLargeTransaction` (owner-only,
+  idempotent per `reference`, at/above the `0106` `large_transaction_hold_threshold` it inserts one
+  `held` row and audits `payment_hold.created`, below it writes nothing), `readPaymentHoldQueue`
+  (office read roles, cross-company oldest-first, audited `payment_hold.read_by_office`),
+  `readMerchantPaymentHolds` (the merchant's own list, newest first),
+  `decidePaymentHold` (compliance_kyc/super_admin: release or reject, reject needs the trimmed
+  1..280 reason, conditional version-bumped update, `already_decided`/`stale` conflicts, audited
+  `payment_hold.decided`; money as BigInt minor units, no float);
+  `GET /api/onboarding/payment-holds` serves the queue screen (`/onboarding/payment-holds`),
+  `POST /api/onboarding/payment-hold-decide` decides one hold, `GET /api/onboarding/merchant-holds`
+  serves the merchant their own holds.
 
 ## The reader
 

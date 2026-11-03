@@ -356,6 +356,25 @@ export async function readStartingMonthlyLimit(rest: RestClient): Promise<string
 }
 
 /**
+ * The large-transaction hold switch of the `0106` criteria row, as the STEP 092 hold trigger reads
+ * it: whether the hold is on, and the threshold amount. Null when the deployment never ran `0106`.
+ */
+export async function readLargeTransactionHold(
+  rest: RestClient,
+): Promise<{ readonly enabled: boolean; readonly threshold: string } | null> {
+  const row = await readCriteriaRow(rest);
+
+  if (row === null) {
+    return null;
+  }
+
+  return {
+    enabled: row.large_transaction_hold_enabled,
+    threshold: row.large_transaction_hold_threshold,
+  };
+}
+
+/**
  * The merchant-safe summary: the required bank statement period, and nothing else. The owner of a
  * company may read it - their upload has to satisfy it - while the starting limit, the hold
  * threshold and the tier costs stay with the office.
