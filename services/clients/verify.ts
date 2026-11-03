@@ -17,6 +17,17 @@ import {
   type ClientDependencies,
 } from "./clients.ts";
 import { CLIENT_FIELDS, CLIENT_FIELD_LIMITS } from "./client-fields.ts";
+import {
+  CLIENT_LIST_MAXIMUM_OFFSET,
+  CLIENT_LIST_PAGE_SIZE,
+  CLIENT_SEARCH_FIELDS,
+  CLIENT_SEARCH_MAXIMUM_LENGTH,
+  CLIENT_SEARCH_PATTERN,
+  clientListQueryOf,
+  listClients,
+  parseClientListQuery,
+  type ClientListDependencies,
+} from "./client-list.ts";
 
 /**
  * Client service gate. Run with `node services/clients/verify.ts`.
@@ -144,6 +155,49 @@ function queryParts(query: string): Map<string, string> {
   return parts;
 }
 
+/**
+ * The phrase an `or=(...)` search clause asks for, decoded the way PostgREST reads it.
+ *
+ * The fake refuses a clause set that names different phrases on different columns, which is the one
+ * mistake a hand written query makes: a search that matched the name but not the email.
+ */
+function searchTermOf(clause: string): string {
+  const inner = clause.startsWith("(") && clause.endsWith(")") ? clause.slice(1, -1) : clause;
+  const terms = new Set<string>();
+
+  for (const piece of inner.split(",")) {
+    // PostgREST splits a filter at its first two dots and takes the rest as the value, so a term
+    // carrying a dot - an email address, for instance - is one value and not three.
+    const firstDot = piece.indexOf(".");
+    const secondDot = piece.indexOf(".", firstDot + 1);
+    const column = piece.slice(0, firstDot);
+    const operator = piece.slice(firstDot + 1, secondDot);
+    const value = secondDot === -1 ? undefined : piece.slice(secondDot + 1);
+
+    if (operator !== "ilike" || value === undefined) {
+      throw new Error(`the client list search is not a set of ilike clauses: ${piece}`);
+    }
+
+    if (!(CLIENT_SEARCH_FIELDS as readonly string[]).includes(column ?? "")) {
+      throw new Error(`the client list searches a column it does not print: ${piece}`);
+    }
+
+    const decoded = decodeURIComponent(value);
+
+    if (!decoded.startsWith("*") || !decoded.endsWith("*") || decoded.length < 2) {
+      throw new Error(`the client list search is not a substring match: ${piece}`);
+    }
+
+    terms.add(decoded.slice(1, -1).toLowerCase());
+  }
+
+  if (terms.size !== 1) {
+    throw new Error(`the client list searches different phrases per column: ${clause}`);
+  }
+
+  return [...terms][0] ?? "";
+}
+
 function createClientsRest(db: ClientsDb): RestClient {
   return {
     select<TRow>(table: string, query: string, schema: z.ZodType<TRow>): Promise<readonly TRow[]> {
@@ -174,7 +228,50 @@ function createClientsRest(db: ClientsDb): RestClient {
         matched = matched.filter((row) => row["deleted_at"] === null);
       }
 
-      return Promise.resolve(matched.map((row) => schema.parse(row)));
+      // PostgREST answers an `or=(...)` of `ilike` clauses as one case insensitive substring test;
+      // the fake does the same so a search that is not a phrase would show up here.
+      const search = parts.get("or");
+
+      if (search !== undefined) {
+        const term = searchTermOf(search);
+
+        matched = matched.filter((row) =>
+          CLIENT_SEARCH_FIELDS.some(
+            (field) => typeof row[field] === "string" && row[field].toLowerCase().includes(term),
+          ),
+        );
+      }
+
+      // A select names its columns; the fake keeps only those, which is what proves the list reads
+      // the six facts it prints and not the notes and the address lines.
+      const columns = parts.get("select");
+
+      if (columns !== undefined) {
+        const wanted = new Set(columns.split(","));
+        matched = matched.map((row) => {
+          const projected: Record<string, unknown> = {};
+
+          for (const [key, value] of Object.entries(row)) {
+            if (wanted.has(key)) {
+              projected[key] = value;
+            }
+          }
+
+          return projected;
+        });
+      }
+
+      const ordered = [...matched].sort((left, right) => {
+        const difference =
+          Date.parse(String(right["created_at"])) - Date.parse(String(left["created_at"]));
+
+        return difference !== 0 ? difference : String(right["id"]).localeCompare(String(left["id"]));
+      });
+      const offset = Number.parseInt(parts.get("offset") ?? "0", 10);
+      const limit = Number.parseInt(parts.get("limit") ?? String(ordered.length), 10);
+      const page = ordered.slice(offset, Number.isFinite(limit) ? offset + limit : undefined);
+
+      return Promise.resolve(page.map((row) => schema.parse(row)));
     },
     insert(): Promise<never> {
       return Promise.reject(new Error("the client service inserts with return=representation only"));
@@ -260,6 +357,10 @@ function createClientsRest(db: ClientsDb): RestClient {
 
 function depsOf(db: ClientsDb, audit: AuditTrail = createInMemoryAuditTrail()): ClientDependencies & { readonly audit: AuditTrail } {
   return { rest: createClientsRest(db), audit, now: () => NOW };
+}
+
+function listDepsOf(db: ClientsDb): ClientListDependencies {
+  return { rest: createClientsRest(db), now: () => NOW };
 }
 
 async function rejectionOf(action: () => Promise<unknown>): Promise<unknown> {
@@ -442,6 +543,285 @@ async function checkReadAndUpdate(): Promise<void> {
   expect(isAppError(foreignUpdate) && foreignUpdate.code === "RESOURCE_NOT_FOUND", "a foreign edit is a 404");
 }
 
+/* ---- the paginated list with search of STEP 107 ---- */
+
+/** One client body with a distinct name, so a page can be told apart row by row. */
+function clientBody(index: number, overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    name: `Client ${String(index).padStart(2, "0")}`,
+    company_name: index % 2 === 0 ? "Rahman Trading" : "Lake View Studio",
+    email: `client${String(index)}@example.com`,
+    phone: `+880171100${String(1_000 + index).slice(-4)}`,
+    address_line1: `${String(10 + index)} Lake View Road`,
+    city: "Dhaka",
+    country: "BD",
+    ...overrides,
+  };
+}
+
+/** A database holding `count` clients of company A, plus one of company B and one deleted row. */
+async function seededListDb(count: number): Promise<ClientsDb> {
+  const db: ClientsDb = { rows: [], inserts: [], updates: [], queries: [] };
+  const dependencies = depsOf(db);
+
+  for (let index = 1; index <= count; index += 1) {
+    await createClient({ actor: owner, body: clientBody(index) }, dependencies);
+  }
+
+  const live = at(db.rows, 0, "the first seeded row");
+  db.rows.push({ ...live, id: randomUUID(), company_id: COMPANY_B, name: "Another Merchant Client" });
+  db.rows.push({
+    ...live,
+    id: randomUUID(),
+    name: "Deleted Client",
+    email: "deleted@example.com",
+    deleted_at: new Date(NOW).toISOString(),
+  });
+
+  return db;
+}
+
+async function checkListPaging(): Promise<void> {
+  const db = await seededListDb(CLIENT_LIST_PAGE_SIZE * 2 + 5);
+
+  const first = await listClients(
+    { actor: owner, query: parseClientListQuery({}) },
+    listDepsOf(db),
+  );
+
+  expectEqual(first.clients.length, CLIENT_LIST_PAGE_SIZE, "a page holds the page size");
+  expectEqual(first.offset, 0, "an empty query starts at the first row");
+  expectEqual(first.pageNumber, 1, "and is the first page");
+  expectEqual(first.previousOffset, null, "there is nothing newer than the first page");
+  expectEqual(first.nextOffset, CLIENT_LIST_PAGE_SIZE, "and a next page because more rows exist");
+  expectEqual(first.search, null, "no search is applied");
+  expectEqual(first.pageSize, CLIENT_LIST_PAGE_SIZE, "the page names its own size");
+  expectEqual(first.readAtEpochMs, NOW, "the read instant comes from the injected clock");
+  expect(
+    db.queries.every((query) => query.includes(`company_id=eq.${COMPANY_A}`)),
+    "every list query is scoped to the actor's company",
+  );
+  expect(
+    first.clients.every((client) => client.name !== "Another Merchant Client"),
+    "another merchant's client is never on the page",
+  );
+  expect(
+    first.clients.every((client) => client.name !== "Deleted Client"),
+    "a soft deleted client is never on the page",
+  );
+
+  // newest first, and the tie is broken by the id so two pages never overlap
+  const created = first.clients.map((client) => client.createdAtEpochMs);
+  expect(
+    created.every((value, index) => index === 0 || (created[index - 1] ?? 0) >= value),
+    "the page is newest first",
+  );
+
+  const second = await listClients(
+    { actor: owner, query: parseClientListQuery({ offset: String(CLIENT_LIST_PAGE_SIZE) }) },
+    listDepsOf(db),
+  );
+  expectEqual(second.pageNumber, 2, "the second page is page two");
+  expectEqual(second.previousOffset, 0, "with a newer page behind it");
+  expectEqual(second.nextOffset, CLIENT_LIST_PAGE_SIZE * 2, "and a third page ahead");
+  expectEqual(
+    second.clients.filter((client) => first.clients.some((other) => other.id === client.id)).length,
+    0,
+    "no row appears on two pages",
+  );
+
+  const third = await listClients(
+    { actor: owner, query: parseClientListQuery({ offset: String(CLIENT_LIST_PAGE_SIZE * 2) }) },
+    listDepsOf(db),
+  );
+  expectEqual(third.clients.length, 5, "the last page holds the remainder");
+  expectEqual(third.nextOffset, null, "and there is no page after it");
+
+  // the query the page builds names its columns, the tenant, the live rows, the order and the window
+  const query = clientListQueryOf(COMPANY_A, parseClientListQuery({ offset: "50" }), 26);
+  expect(query.includes("select=id,name,company_name,email,phone,city,created_at,updated_at"), "the page selects only the columns it prints");
+  expect(query.includes("order=created_at.desc,id.desc"), "and orders them the way 0019 indexes them");
+  expect(query.includes("limit=26"), "asking for one row more than it shows");
+  expect(query.includes("offset=50"), "at the offset it read");
+  expectEqual(query.includes("notes"), false, "the notes never leave the database for a list");
+  expectEqual(query.includes("tax_id"), false, "and neither does the tax identifier");
+  expectEqual(query.includes("address_line1"), false, "or the street line");
+
+  // the offset is a grid position inside the cap, and a hand-edited one is reported
+  expectEqual(parseClientListQuery({ offset: "30" }).offset, CLIENT_LIST_PAGE_SIZE, "an offset lands on the page that holds it");
+  expectEqual(parseClientListQuery({ offset: "999999999" }).offset, CLIENT_LIST_MAXIMUM_OFFSET, "an offset past the cap is clamped to it");
+  expectDeepEqual(parseClientListQuery({ offset: "-1" }).problems, [{ field: "offset", rule: "invalid_format" }], "a negative offset is refused");
+  expectDeepEqual(parseClientListQuery({ offset: "2;drop" }).problems, [{ field: "offset", rule: "invalid_format" }], "an offset that is not digits is refused");
+}
+
+async function checkListSearch(): Promise<void> {
+  const db = await seededListDb(CLIENT_LIST_PAGE_SIZE + 3);
+
+  const byName = await listClients(
+    { actor: owner, query: parseClientListQuery({ search: "client 05" }) },
+    listDepsOf(db),
+  );
+  expectEqual(byName.search, "client 05", "the search phrase is answered back for the screen");
+  expectEqual(byName.clients.length, 1, "one client matches the phrase");
+  expectEqual(byName.clients[0]?.name, "Client 05", "and it is the one typed");
+
+  // case insensitively, and against the company name rather than the person
+  const byCompany = await listClients(
+    { actor: owner, query: parseClientListQuery({ search: "LAKE VIEW" }) },
+    listDepsOf(db),
+  );
+  expect(byCompany.clients.length > 0, "the company name is searched case insensitively");
+  expect(
+    byCompany.clients.every((client) => client.companyName === "Lake View Studio"),
+    "and every match is the company asked for",
+  );
+
+  // the email and the phone are searched too
+  const byEmail = await listClients(
+    { actor: owner, query: parseClientListQuery({ search: "client7@example.com" }) },
+    listDepsOf(db),
+  );
+  expectEqual(byEmail.clients.length, 1, "the email is searched");
+  const byPhone = await listClients(
+    { actor: owner, query: parseClientListQuery({ search: "1711" }) },
+    listDepsOf(db),
+  );
+  expectEqual(byPhone.clients.length, CLIENT_LIST_PAGE_SIZE, "the phone is searched and the whole book matches");
+  expect(
+    byPhone.clients.every((client) => client.phone !== null && client.phone.includes("1711")),
+    "and every match carries the digits typed",
+  );
+
+  const noMatch = await listClients(
+    { actor: owner, query: parseClientListQuery({ search: "nobody" }) },
+    listDepsOf(db),
+  );
+  expectEqual(noMatch.clients.length, 0, "a phrase nobody matches answers an empty page");
+  expectEqual(noMatch.nextOffset, null, "with no page after it");
+
+  // the term is sanitised before it is measured, and refused rather than rewritten
+  expectEqual(parseClientListQuery({ search: "   " }).filters.search, null, "a blank search is no search");
+  expectEqual(parseClientListQuery({ search: "  Amina  Rahman " }).filters.search, "Amina Rahman", "the term is collapsed to one line");
+  expectDeepEqual(
+    parseClientListQuery({ search: "a,b" }).problems,
+    [{ field: "search", rule: "invalid_format" }],
+    "a comma is refused, because PostgREST reads it as structure",
+  );
+
+  for (const hostile of ["x*", "a)", "(a", 'a"', "a\\", "a:b", "a%", "a(b)"]) {
+    const parsed = parseClientListQuery({ search: hostile });
+    expectEqual(parsed.filters.search, null, `the term ${hostile} never reaches a filter`);
+    expectEqual(parsed.problems.length, 1, `and ${hostile} is reported rather than dropped silently`);
+  }
+
+  expectDeepEqual(
+    parseClientListQuery({ search: "x".repeat(CLIENT_SEARCH_MAXIMUM_LENGTH + 1) }).problems,
+    [{ field: "search", rule: "too_long" }],
+    "an over long search is refused, not truncated",
+  );
+  expectEqual(
+    parseClientListQuery({ search: "x".repeat(CLIENT_SEARCH_MAXIMUM_LENGTH) }).filters.search?.length,
+    CLIENT_SEARCH_MAXIMUM_LENGTH,
+    "a search at the ceiling is accepted",
+  );
+  expect(CLIENT_SEARCH_PATTERN.test("Jose Alvarez-Nunez"), "a hyphenated name is a legal search");
+  expect(CLIENT_SEARCH_PATTERN.test("o'brien"), "and an apostrophe is");
+  expect(CLIENT_SEARCH_PATTERN.test("accounts@example.com"), "and an email address is");
+  expectEqual(CLIENT_SEARCH_PATTERN.test("a,b"), false, "a comma is not a legal search");
+}
+
+async function checkListTenancy(): Promise<void> {
+  const db = await seededListDb(3);
+
+  // another merchant sees their own book, which holds the one row seeded for company B
+  const foreign = await listClients(
+    { actor: otherOwner, query: parseClientListQuery({}) },
+    listDepsOf(db),
+  );
+  expectEqual(foreign.clients.length, 1, "another merchant sees only their own client");
+  expectEqual(foreign.clients[0]?.name, "Another Merchant Client", "which is the row of their company");
+
+  // the same phrase against the other merchant finds nothing of company A
+  const foreignSearch = await listClients(
+    { actor: otherOwner, query: parseClientListQuery({ search: "Client 01" }) },
+    listDepsOf(db),
+  );
+  expectEqual(foreignSearch.clients.length, 0, "and a search cannot reach across the tenant");
+
+  for (const roles of [["compliance_kyc"], ["support"], ["finance_ops"], ["ceo"], ["super_admin"], ["blogger"]] as const) {
+    const refused = await rejectionOf(() =>
+      listClients(
+        { actor: actorOf([...roles], COMPANY_A, { userId: OFFICE_ID }), query: parseClientListQuery({}) },
+        listDepsOf(db),
+      ),
+    );
+    expect(isAppError(refused) && refused.code === "PERMISSION_DENIED", `the role ${roles[0]} may not list clients`);
+  }
+
+  const platformAccount = await rejectionOf(() =>
+    listClients({ actor: desk, query: parseClientListQuery({}) }, listDepsOf(db)),
+  );
+  expect(isAppError(platformAccount) && platformAccount.code === "PERMISSION_DENIED", "a platform account with no company is refused");
+
+  // a deleted row is invisible to a search that names it
+  const deleted = await listClients(
+    { actor: owner, query: parseClientListQuery({ search: "deleted" }) },
+    listDepsOf(db),
+  );
+  expectEqual(deleted.clients.length, 0, "a soft deleted client is not findable");
+}
+
+async function checkListSources(): Promise<void> {
+  const listSource = await readRepositoryFile("services/clients/client-list.ts");
+  const service = await readRepositoryFile("services/clients/clients.ts");
+  const route = await readRepositoryFile("app/api/clients/list/route.ts");
+  const screen = await readRepositoryFile("app/(dashboard)/clients/page.tsx");
+  const form = await readRepositoryFile("app/(dashboard)/clients/client-search-form.tsx");
+
+  expect(listSource.includes('from "zod"'), "the list validates its rows with zod");
+  expect(listSource.includes("company_id=eq."), "and scopes every query to one company");
+  expect(listSource.includes("deleted_at=is.null"), "skipping deleted rows");
+  expect(listSource.includes("sanitizeSingleLineText"), "the search term is sanitised before it is used");
+  expect(listSource.includes("encodeURIComponent(`*${term}*`)"), "the term is escaped into the filter");
+  expect(listSource.includes("CLIENT_MANAGE_ROLES"), "the list uses the owner role list of the service");
+  expect(service.includes("export const CLIENT_MANAGE_ROLES"), "which the service exports");
+
+  expect(route.includes("export const GET"), "the list route answers GET");
+  expect(!/export const (POST|PUT|PATCH|DELETE)/u.test(route), "and no mutation, so it needs no token");
+  expectEqual(route.split("requireCsrfToken(").length - 1, 0, "the read route never asks for a token");
+  expect(route.includes("readRequestActor"), "the account comes from the cookie");
+  expect(route.includes('"cache-control": "no-store"'), "and the answer is never cached");
+  expect(route.includes("parseClientListQuery"), "the route reads the query through the parser");
+
+  // the screen does not restate the rule and the form does not restate the alphabet
+  expect(screen.includes("listClients("), "the screen calls the service");
+  expectEqual(screen.includes("requireAnyRole"), false, "and states no role of its own");
+  expectEqual(screen.includes("CLIENT_MANAGE_ROLES"), false, "restating neither the role list");
+  expect(form.includes("ClientListProblem"), "the form renders the service's problems");
+  expectEqual(/\[a-z0-9\]/u.test(form), false, "the form carries no pattern of its own");
+
+  // the catalog carries every key the two files use
+  const catalog = await readRepositoryFile("lib/i18n/strings/en.ts");
+  const keys = new Set<string>();
+
+  for (const source of [screen, form]) {
+    for (const match of source.matchAll(/"(clients\.[a-zA-Z0-9]+)"/gu)) {
+      const key = match[1];
+
+      if (key !== undefined) {
+        keys.add(key);
+      }
+    }
+  }
+
+  expect(keys.size > 0, "the list screens use catalog keys");
+
+  for (const key of keys) {
+    const leaf = key.slice("clients.".length);
+    expect(catalog.includes(`${leaf}:`), `the catalog carries ${key}`);
+  }
+}
+
 async function checkSources(): Promise<void> {
   const paths = [
     "services/clients/client-fields.ts",
@@ -449,7 +829,10 @@ async function checkSources(): Promise<void> {
     "services/clients/verify.ts",
     "app/api/clients/route.ts",
     "app/api/clients/[id]/route.ts",
+    "services/clients/client-list.ts",
+    "app/api/clients/list/route.ts",
     "app/(dashboard)/clients/page.tsx",
+    "app/(dashboard)/clients/client-search-form.tsx",
     "app/(dashboard)/clients/new/page.tsx",
     "app/(dashboard)/clients/[id]/page.tsx",
     "app/(dashboard)/clients/client-form.tsx",
@@ -522,6 +905,10 @@ async function main(): Promise<void> {
   await checkCreate();
   await checkValidation();
   await checkReadAndUpdate();
+  await checkListPaging();
+  await checkListSearch();
+  await checkListTenancy();
+  await checkListSources();
   await checkSources();
 
   if (failures.length > 0) {
@@ -537,7 +924,8 @@ async function main(): Promise<void> {
   }
 
   process.stdout.write(
-    `clients gate passed: ${checks} checks, ${CLIENT_FIELDS.length} fields, table "${CLIENTS_TABLE}"\n`,
+    `clients gate passed: ${checks} checks, ${CLIENT_FIELDS.length} fields, ` +
+      `${CLIENT_LIST_PAGE_SIZE} per page, table "${CLIENTS_TABLE}"\n`,
   );
 }
 
