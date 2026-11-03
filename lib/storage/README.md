@@ -20,6 +20,7 @@ configuration, downloads use short-lived signed URLs, and every file access is a
 | `encryption.ts` | The section 21 encryption: `sealFile` turns plaintext into the `KDF1` envelope (AES-256-GCM, one 64 KiB AEAD record per chunk, AAD scope `file:<companyId>:<purpose>`) plus the quartet for the `0057` record (`aes-256-gcm`, key version, base64 IV, base64 first-chunk tag) and the plaintext SHA-256; `openSealedFile` refuses non-envelopes and returns plaintext only after every chunk authenticates. Keyring from `ENCRYPTION_MASTER_KEY` (`master-v1`, version 1). |
 | `records.ts` | The file record service: `newStorageKey` (tenant prefix + purpose + UUID), `recordUploadedFile` (writes the `0057` row from `stored` + `sealed`: provider, bucket, key, type, plaintext size, plaintext hash, quartet), `getFileRecord`/`listFileRecords` (always `company_id` scoped), and the forward status walk `markFileVerified` / `quarantineFile` / `archiveFile` / `softDeleteFile`, each audited (`file.recorded`, `file.verified`, ...). |
 | `kyc.ts` | The KYC document category: key layout `<companyId>/kyc/<documentType>/<uuid><ext>` with `parseKycStorageKey` / `assertKycKeyForCompany` enforcing tenant isolation on the read path, and the category flows `uploadKycDocument` (magic-byte verdict -> encrypted upload -> `0057` row -> `ready`/`quarantined`), `createKycDownloadUrl` (short-lived signed URL for a verified row of this merchant only), `readKycDocument` (server-side download + decrypt), `archiveKycDocument`. |
+| `branding.ts` | The logo and branding asset category (`company_logo`): key layout `<companyId>/logo/<uuid><ext>` with the same tenant checks, `uploadBrandingAsset` (image-only 2 MB policy, verdict walk, and a new verified logo archives the previous one so a merchant has one current logo), `createBrandingDownloadUrl` (current logo or a given row, never pending/quarantined), `currentBrandingAsset`. |
 | `verify.ts` | The gate. Run it with `node lib/storage/verify.ts`. |
 
 ## Adapter selection by environment
@@ -34,8 +35,9 @@ Netlify, Vercel or Amazon with only the environment changed. `S3_BUCKET`, `S3_RE
 - `service.ts` also exposes the encrypted operations: `uploadEncryptedObject` seals the bytes before the adapter sees them (uploaded as `application/octet-stream`, audited with the quartet and plaintext hash) and `downloadEncryptedObject` opens the envelope under the same tenant and purpose after the adapter answers.
 - `records.ts` writes the `0057` file record (provider, bucket, key, hash, size, type, company,
   quartet) around `uploadEncryptedObject` and walks its status forward.
-- `kyc.ts` is the KYC document category with tenant isolation paths; STEP 105 is the logo and
-  branding asset category on the same pattern.
+- `kyc.ts` is the KYC document category with tenant isolation paths; `branding.ts` is the logo and
+  branding asset category on the same pattern. The block is complete: port, adapters, encryption,
+  record service and the two categories.
 
 ## The rules
 

@@ -28,6 +28,7 @@ import {
 import {
   DEFAULT_STORAGE_BUCKET,
   StorageError,
+  storageExtensionFor,
   type StorageAdapter,
   type StoredObject,
 } from "./types.ts";
@@ -73,14 +74,6 @@ export type KycDocumentType = (typeof KYC_DOCUMENT_TYPES)[number];
 /** The middle segment of a KYC storage key. */
 export const KYC_KEY_SEGMENT = "kyc";
 
-/** The extension each verified content type gets in the key. */
-const EXTENSION_BY_CONTENT_TYPE: Readonly<Record<string, string>> = {
-  "application/pdf": ".pdf",
-  "image/jpeg": ".jpg",
-  "image/png": ".png",
-  "image/webp": ".webp",
-};
-
 const KEY_FILE_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.[a-z0-9]+$/iu;
 
 /** True when the value is one of the `0049` document types. */
@@ -94,7 +87,7 @@ export function isKycDocumentType(value: string): value is KycDocumentType {
  * is display only - the key is generated here, never taken from the client.
  */
 export function kycStorageKey(companyId: string, documentType: KycDocumentType, contentType: string): string {
-  const extension = EXTENSION_BY_CONTENT_TYPE[contentType];
+  const extension = storageExtensionFor(contentType);
 
   if (extension === undefined) {
     throw new StorageError("invalid_input", "the content type has no storage extension");

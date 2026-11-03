@@ -10,6 +10,14 @@ import { createHash, randomUUID } from "node:crypto";
 import type { z } from "zod";
 import type { RestClient } from "../auth/rest.ts";
 import {
+  assertBrandingKeyForCompany,
+  brandingStorageKey,
+  createBrandingDownloadUrl,
+  currentBrandingAsset,
+  parseBrandingStorageKey,
+  uploadBrandingAsset,
+} from "./branding.ts";
+import {
   archiveKycDocument,
   assertKycKeyForCompany,
   createKycDownloadUrl,
@@ -64,6 +72,7 @@ import {
 import {
   FILE_PURPOSES,
   MAX_OBJECT_BYTES,
+  storageExtensionFor,
   SIGNED_URL_DEFAULT_TTL_SECONDS,
   SIGNED_URL_MAX_TTL_SECONDS,
   SIGNED_URL_MIN_TTL_SECONDS,
@@ -1177,6 +1186,135 @@ async function checkKycCategory(): Promise<void> {
   expectEqual(archived.status, "archived", "a verified kyc document archives");
 }
 
+async function checkBrandingCategory(): Promise<void> {
+  expectEqual(storageExtensionFor("image/webp"), ".webp", "webp gets its extension");
+  expectEqual(storageExtensionFor("image/svg+xml"), undefined, "svg gets none");
+
+  // the key layout and its parser
+  const key = brandingStorageKey(COMPANY_ID, "image/png");
+  expect(key.startsWith(`${COMPANY_ID}/logo/`), "the branding key carries the tenant prefix and the logo segment");
+  expect(key.endsWith(".png"), "and the extension of the verified type");
+  expectEqual(validateObjectKey(key), key, "the branding key passes the port validation");
+  expectEqual(parseBrandingStorageKey(key)?.companyId, COMPANY_ID, "the parser reads the tenant back");
+  expectEqual(parseBrandingStorageKey(`${COMPANY_ID}/kyc/identity_document/x.png`), null, "a kyc key is not a branding key");
+  expect(isStorageError(rejectionOfSync(() => assertBrandingKeyForCompany(key, "018f2b8a-4444-4c2d-9c3e-000000000002"))), "a key of another tenant is refused");
+  expect(isStorageError(rejectionOfSync(() => brandingStorageKey(COMPANY_ID, "image/svg+xml"))), "svg has no key extension and is refused");
+
+  // the end-to-end upload of a verified logo
+  const db: FilesDb = { rows: [], inserts: [], updates: [], queries: [] };
+  const audit = createInMemoryAuditTrail();
+  const adapter = new FakeAdapter("s3");
+  const dependencies = {
+    rest: createFilesRest(db),
+    audit,
+    adapter,
+    encryption: createFileEncryption(ENCRYPTION_ENV),
+    now: () => NOW,
+  };
+
+  const first = await uploadBrandingAsset(dependencies, {
+    companyId: COMPANY_ID,
+    uploadedBy: ACTOR_ID,
+    fileName: "logo.png",
+    declaredType: "image/png",
+    bytes: PNG_BYTES,
+  });
+
+  expectEqual(first.verdict.decision, "verified", "a png declared as png verifies");
+  expectEqual(first.record.status, "ready", "the row lands ready");
+  expectEqual(first.record.purpose, "company_logo", "as a branding asset");
+  expect(first.record.storage_key.startsWith(`${COMPANY_ID}/logo/`), "under the tenant logo path");
+  expectEqual(first.stored.provider, "s3", "through the active adapter of the fixture");
+  expectEqual(first.archived.length, 0, "the first logo archives nothing");
+  expectEqual(adapter.calls[0]?.op, "upload", "the adapter stored the envelope");
+
+  // the second verified logo becomes the current one and archives the previous
+  const second = await uploadBrandingAsset(dependencies, {
+    companyId: COMPANY_ID,
+    uploadedBy: ACTOR_ID,
+    fileName: "logo-v2.png",
+    declaredType: "image/png",
+    bytes: PNG_BYTES,
+  });
+  expectEqual(second.record.status, "ready", "the new logo is ready");
+  expectEqual(second.archived.length, 1, "the previous live logo is archived");
+  expectEqual(second.archived[0]?.id, first.record.id, "by id");
+  const oldRow = await getFileRecord({ rest: dependencies.rest, audit, now: () => NOW }, { companyId: COMPANY_ID, fileId: first.record.id });
+  expectEqual(oldRow.status, "archived", "the old row reads archived");
+
+  const current = await currentBrandingAsset(dependencies, { companyId: COMPANY_ID });
+  expectEqual(current.id, second.record.id, "the current logo is the newest verified one");
+
+  // download url: the current logo without a file id, or a given row
+  const url = await createBrandingDownloadUrl(dependencies, { companyId: COMPANY_ID });
+  expectEqual(url.record.id, second.record.id, "the url is for the current logo");
+  expect(url.url.includes(`ttl=${SIGNED_URL_DEFAULT_TTL_SECONDS}`), "with the default ttl");
+  expectEqual(url.expiresAt, new Date(NOW + SIGNED_URL_DEFAULT_TTL_SECONDS * 1000).toISOString(), "and its expiry");
+
+  const byId = await createBrandingDownloadUrl(dependencies, { companyId: COMPANY_ID, fileId: first.record.id, expiresInSeconds: 60 });
+  expectEqual(byId.record.id, first.record.id, "a given row (archived history included)");
+  expect(byId.url.includes("ttl=60"), "with the asked ttl");
+
+  // refusals
+  const noLogo = await rejectionOf(() => createBrandingDownloadUrl(dependencies, { companyId: "018f2b8a-4444-4c2d-9c3e-000000000002" }));
+  expect(isAppError(noLogo) && (noLogo as AppError).code === "RESOURCE_NOT_FOUND", "a merchant without a logo gets a 404");
+
+  const lied = await uploadBrandingAsset(dependencies, {
+    companyId: COMPANY_ID,
+    uploadedBy: ACTOR_ID,
+    fileName: "logo.jpg",
+    declaredType: "image/jpeg",
+    bytes: PNG_BYTES,
+  });
+  expectEqual(lied.verdict.decision, "quarantined", "a png declared as jpeg is quarantined");
+  expectEqual(lied.record.status, "quarantined", "and the row says so");
+  expect(lied.record.storage_key.endsWith(".png"), "keyed by the detected type");
+  expectEqual(lied.archived.length, 0, "a quarantined upload does not replace the current logo");
+
+  const denied = await rejectionOf(() => createBrandingDownloadUrl(dependencies, { companyId: COMPANY_ID, fileId: lied.record.id }));
+  expect(isAppError(denied) && (denied as AppError).code === "PERMISSION_DENIED", "a quarantined asset is never served");
+
+  const svg = await rejectionOf(() =>
+    uploadBrandingAsset(dependencies, {
+      companyId: COMPANY_ID,
+      uploadedBy: ACTOR_ID,
+      fileName: "logo.svg",
+      declaredType: "image/svg+xml",
+      bytes: new TextEncoder().encode("<svg></svg>"),
+    }),
+  );
+  expect(isAppError(svg) && (svg as AppError).code === "VALIDATION_FAILED", "svg is a 422 for logos too");
+
+  const tooBig = await rejectionOf(() =>
+    uploadBrandingAsset(dependencies, {
+      companyId: COMPANY_ID,
+      uploadedBy: ACTOR_ID,
+      fileName: "huge.png",
+      declaredType: "image/png",
+      bytes: new Uint8Array(2_097_152 + 1),
+    }),
+  );
+  expect(isAppError(tooBig) && (tooBig as AppError).code === "VALIDATION_FAILED", "a logo over the 2 MB policy ceiling is a 422");
+  expectEqual(db.inserts.length, 3, "only the three real uploads stored rows");
+
+  // a kyc row is not a branding download
+  const kycKey = kycStorageKey(COMPANY_ID, "identity_document", "application/pdf");
+  const kycSealed = createFileEncryption(ENCRYPTION_ENV).seal(PDF_BYTES, { companyId: COMPANY_ID, purpose: "kyc_document" });
+  const kycRecord = await recordUploadedFile(
+    { rest: dependencies.rest, audit, now: () => NOW },
+    {
+      companyId: COMPANY_ID,
+      uploadedBy: ACTOR_ID,
+      purpose: "kyc_document",
+      contentType: "application/pdf",
+      stored: { provider: "s3", bucket: "kd-solution-it-files", key: kycKey, byteSize: kycSealed.ciphertextBytes },
+      sealed: kycSealed,
+    },
+  );
+  const notBranding = await rejectionOf(() => createBrandingDownloadUrl(dependencies, { companyId: COMPANY_ID, fileId: kycRecord.id }));
+  expect(isAppError(notBranding) && (notBranding as AppError).code === "VALIDATION_FAILED", "a kyc document is not a branding download");
+}
+
 async function checkSources(): Promise<void> {
   const paths = [
     "lib/storage/types.ts",
@@ -1189,6 +1327,7 @@ async function checkSources(): Promise<void> {
     "lib/storage/encryption.ts",
     "lib/storage/records.ts",
     "lib/storage/kyc.ts",
+    "lib/storage/branding.ts",
     "lib/storage/verify.ts",
     "lib/storage/README.md",
   ];
@@ -1269,6 +1408,12 @@ async function checkSources(): Promise<void> {
   expect(kyc.includes("createKycDownloadUrl"), "and the signed url flow is one call");
   expect(kyc.includes("PERMISSION_DENIED"), "a pending or quarantined file is never served");
 
+  const branding = await readRepositoryFile("lib/storage/branding.ts");
+  expect(branding.includes('"/logo/"') || branding.includes("BRANDING_KEY_SEGMENT = \"logo\""), "the branding key layout carries the tenant prefix and the logo segment");
+  expect(branding.includes("assertBrandingKeyForCompany"), "the tenant check runs on the read path too");
+  expect(branding.includes("company_logo"), "the category purpose is company_logo");
+  expect(branding.includes("archiveFile"), "a new verified logo archives the previous one");
+
   const http = await readRepositoryFile("lib/storage/http.ts");
   expect(http.includes('redirect: "error"'), "redirects are errors");
   expect(http.includes("checkOutboundUrl"), "every url is checked against the outbound policy");
@@ -1286,6 +1431,7 @@ async function main(): Promise<void> {
   await checkEncryptedOperations();
   await checkRecords();
   await checkKycCategory();
+  await checkBrandingCategory();
   await checkSources();
 
   if (failures.length > 0) {
@@ -1303,7 +1449,7 @@ async function main(): Promise<void> {
   process.stdout.write(
     `storage gate passed: ${checks} checks, ${STORAGE_ADAPTER_NAMES.length} adapter names (supabase + s3 wired), ` +
       `${STORAGE_ERROR_CODES.length} error codes, files sealed aes-256-gcm (${FILE_ENCRYPTION_KEY_ID}), ` +
-      `${FILE_PURPOSES.length} purposes, kyc category with tenant paths, signed urls ${SIGNED_URL_DEFAULT_TTL_SECONDS}s default / ${SIGNED_URL_MAX_TTL_SECONDS}s max\n`,
+      `${FILE_PURPOSES.length} purposes, kyc + branding categories, signed urls ${SIGNED_URL_DEFAULT_TTL_SECONDS}s default / ${SIGNED_URL_MAX_TTL_SECONDS}s max\n`,
   );
 }
 
