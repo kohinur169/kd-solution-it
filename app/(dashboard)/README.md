@@ -136,6 +136,19 @@ Every read is scoped to the caller company and every write is audit logged.
   an account already exists, never which signal matched) and the provisioning run returns
   `blocked: true` without writing a row. `checkSignupIdentity` is the signup-stage entry point for
   the auth-owned signup flow. No new route, no new page.
+- STEP 099 runs section 13's merchant account lifecycle: `services/kyc/account-lifecycle.ts` keeps the
+  append-only `0111` `merchant_account_events` log (suspension with its reason and required
+  reactivation documents, reactivation request and decision, closure request and closure) and writes
+  the owners' `0003` status, which is what `lib/auth/session.ts` reads on every request. A closure
+  records the verified payout bank account, the hold release instant (the merchant's risk tier hold
+  days) and the chargeback hold release instant (the `chargeback.hold_days` platform setting seeded
+  by `0111`, 180 days), places the chargeback-liability reserve of the remaining `merchant_payable`
+  balance as a `0043` `holds` row of reason `closure`, schedules the remainder payout through the
+  delayed `merchant_account.closure_payout` job, restricts every verified `0054` sub-merchant and
+  queues the saved card token deletion (`services/submerchant/card-tokens.ts`,
+  `submerchant.delete_card_tokens`, recorded as a `card_tokens_deleted` event - the provider call
+  itself belongs to the adapter STEPs). Merchant screen `/onboarding/account`, office queue
+  `/onboarding/account-review`, five block-owned routes under `app/api/onboarding/account-*`.
 
 ## The reader
 

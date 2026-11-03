@@ -116,6 +116,39 @@ import {
   IDENTITY_SIGNALS,
 } from "./duplicate-check.ts";
 import {
+  ACCOUNT_MANAGE_ROLES,
+  CHARGEBACK_HOLD_DAYS_DEFAULT,
+  CHARGEBACK_HOLD_DAYS_SETTING,
+  CLOSURE_PAYOUT_JOB,
+  CLOSURE_PAYOUT_REQUESTED_AUDIT_ACTION,
+  closeAccountBodySchema,
+  closurePayoutJobPayloadSchema,
+  closeMerchantAccount,
+  decideReactivation,
+  HOLDS_TABLE,
+  LEDGER_ACCOUNTS_TABLE,
+  LEDGER_ENTRIES_TABLE,
+  MERCHANT_ACCOUNT_EVENTS_TABLE,
+  MERCHANT_PAYABLE_ACCOUNT_CODE,
+  PAYOUTS_TABLE,
+  PLATFORM_SETTINGS_TABLE,
+  readAccountReviewQueue,
+  readMerchantAccountState,
+  requestAccountClosure,
+  requestReactivation,
+  runClosurePayout,
+  suspendAccountBodySchema,
+  suspendMerchant,
+} from "./account-lifecycle.ts";
+import {
+  CARD_TOKENS_DELETED_EVENT,
+  deleteCardTokensJobIdempotencyKey,
+  deleteCardTokensJobPayloadSchema,
+  runCardTokenDeletion,
+  SUBMERCHANT_CARD_TOKENS_DELETED_AUDIT_ACTION,
+  SUBMERCHANT_DELETE_CARD_TOKENS_JOB,
+} from "../submerchant/card-tokens.ts";
+import {
   decideKycSubmission,
   fourEyeProblems,
   KYC_DECISION_AUDIT_ACTION,
@@ -993,7 +1026,8 @@ async function checkMigrationSet(): Promise<void> {
   expectEqual(numbers.includes("0108"), true, "STEP 092's is too");
   expectEqual(numbers.includes("0109"), true, "STEP 097's is too");
   expectEqual(numbers.includes("0110"), true, "STEP 098's is too");
-  expectEqual(Math.max(...numbers.map((number) => Number.parseInt(number, 10))), 110, "the set ends at 0110");
+  expectEqual(numbers.includes("0111"), true, "STEP 099's is too");
+  expectEqual(Math.max(...numbers.map((number) => Number.parseInt(number, 10))), 111, "the set ends at 0111");
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -1288,6 +1322,8 @@ interface UserRowShape {
   email: string;
   phone: string | null;
   full_name: string;
+  status?: string;
+  version?: number;
   created_at: string;
 }
 
@@ -1296,6 +1332,11 @@ interface BankAccountRowShape {
   id: string;
   company_id: string;
   account_fingerprint: string;
+  status?: string;
+  bank_name?: string;
+  account_last_four?: string;
+  country?: string;
+  version?: number;
   created_at: string;
 }
 
@@ -1313,6 +1354,86 @@ interface DuplicateCaseRowShape {
   resolution?: string | null;
   version?: number;
   updated_at?: string;
+  created_at: string;
+}
+
+/** One row of `0111`, as the fake store holds it. */
+interface AccountEventRowShape {
+  id: string;
+  company_id: string;
+  event: string;
+  reason?: string | null;
+  detail?: string | null;
+  required_documents?: readonly string[] | null;
+  actor_user_id?: string | null;
+  kyc_submission_id?: string | null;
+  payout_bank_account_id?: string | null;
+  hold_release_at?: string | null;
+  chargeback_hold_release_at?: string | null;
+  version?: number;
+  updated_at?: string;
+  created_at: string;
+}
+
+/** One row of `0043` holds, as the fake store holds it. */
+interface FundHoldRowShape {
+  id: string;
+  company_id: string;
+  payment_id: string | null;
+  settlement_id: string | null;
+  amount_minor: string;
+  currency: string;
+  reason: string;
+  status: string;
+  placed_at: string;
+  release_due_at: string;
+  version?: number;
+  updated_at?: string;
+  created_at: string;
+}
+
+/** One row of `0045` payouts, as the fake store holds it. */
+interface PayoutRowShape {
+  id: string;
+  company_id: string;
+  settlement_id: string | null;
+  amount_minor: string;
+  currency: string;
+  platform_fee_minor: number;
+  status: string;
+  requested_by: string;
+  destination_bank_name: string | null;
+  destination_last_four: string | null;
+  destination_country: string | null;
+  is_remainder: boolean;
+  note: string | null;
+  version?: number;
+  updated_at?: string;
+  created_at: string;
+}
+
+/** One row of `0040` ledger accounts. */
+interface LedgerAccountRowShape {
+  id: string;
+  company_id: string | null;
+  account_code: string;
+  created_at: string;
+}
+
+/** One row of `0041` ledger entries. */
+interface LedgerEntryRowShape {
+  id: string;
+  company_id: string;
+  account_id: string;
+  entry_side: string;
+  amount_minor: number;
+  created_at: string;
+}
+
+/** One row of `0080` platform settings. */
+interface SettingRowShape {
+  setting_key: string;
+  value: unknown;
   created_at: string;
 }
 
@@ -1372,6 +1493,12 @@ interface BusinessDatabase {
   readonly userRows: UserRowShape[];
   readonly bankRows: BankAccountRowShape[];
   readonly caseRows: DuplicateCaseRowShape[];
+  readonly eventRows: AccountEventRowShape[];
+  readonly fundHoldRows: FundHoldRowShape[];
+  readonly payoutRows: PayoutRowShape[];
+  readonly ledgerAccountRows: LedgerAccountRowShape[];
+  readonly ledgerEntryRows: LedgerEntryRowShape[];
+  readonly settingRows: SettingRowShape[];
   readonly queries: string[];
   readonly inserts: { readonly table: string; readonly row: Readonly<Record<string, unknown>> }[];
   readonly updates: {
@@ -1445,6 +1572,12 @@ function createBusinessDatabase(
   userRows: readonly UserRowShape[] = defaultUserRows(),
   bankRows: readonly BankAccountRowShape[] = [],
   caseRows: readonly DuplicateCaseRowShape[] = [],
+  eventRows: readonly AccountEventRowShape[] = [],
+  fundHoldRows: readonly FundHoldRowShape[] = [],
+  payoutRows: readonly PayoutRowShape[] = [],
+  ledgerAccountRows: readonly LedgerAccountRowShape[] = [],
+  ledgerEntryRows: readonly LedgerEntryRowShape[] = [],
+  settingRows: readonly SettingRowShape[] = defaultSettingRows(),
 ): BusinessDatabase {
   return {
     profileRows: [...profileRows],
@@ -1468,6 +1601,12 @@ function createBusinessDatabase(
     userRows: [...userRows].map((row) => ({ ...row })),
     bankRows: [...bankRows].map((row) => ({ ...row })),
     caseRows: [...caseRows].map((row) => ({ ...row })),
+    eventRows: [...eventRows].map((row) => ({ ...row })),
+    fundHoldRows: [...fundHoldRows].map((row) => ({ ...row })),
+    payoutRows: [...payoutRows].map((row) => ({ ...row })),
+    ledgerAccountRows: [...ledgerAccountRows].map((row) => ({ ...row })),
+    ledgerEntryRows: [...ledgerEntryRows].map((row) => ({ ...row })),
+    settingRows: [...settingRows].map((row) => ({ ...row })),
     queries: [],
     inserts: [],
     updates: [],
@@ -1499,6 +1638,19 @@ function defaultUserRows(): UserRowShape[] {
       email: "owner@example.test",
       phone: "+8801000000001",
       full_name: "Owner One",
+      status: "active",
+      version: 1,
+      created_at: "2026-11-01T08:00:00.000Z",
+    },
+  ];
+}
+
+/** The `0080` settings the gate works against: the `0111` chargeback period seed. */
+function defaultSettingRows(): SettingRowShape[] {
+  return [
+    {
+      setting_key: CHARGEBACK_HOLD_DAYS_SETTING,
+      value: CHARGEBACK_HOLD_DAYS_DEFAULT,
       created_at: "2026-11-01T08:00:00.000Z",
     },
   ];
@@ -1834,7 +1986,7 @@ function createBusinessStore(database: BusinessDatabase): RestClient {
           matched = matched.filter((row) => row.company_id === wantedCompany);
         }
 
-        for (const column of ["id", "provider_id"] as const) {
+        for (const column of ["id", "provider_id", "status"] as const) {
           const eqPart = parts.find((part) => part.startsWith(`${column}=eq.`));
 
           if (eqPart !== undefined) {
@@ -1969,7 +2121,7 @@ function createBusinessStore(database: BusinessDatabase): RestClient {
         const limit = limitOf(parts);
         const capped = limit === null ? matched : matched.slice(0, limit);
         const withDefaults = capped.map((row) => ({
-          ...(table === "users" ? { phone: null } : {}),
+          ...(table === "users" ? { phone: null, status: "active", version: 1 } : {}),
           ...(table === DUPLICATE_CASES_TABLE
             ? {
                 matched_company_id: null,
@@ -1982,6 +2134,81 @@ function createBusinessStore(database: BusinessDatabase): RestClient {
                 updated_at: row["created_at"],
               }
             : {}),
+          ...row,
+        }));
+
+        return Promise.resolve(withDefaults.map((row) => schema.parse(row)));
+      }
+
+      // STEP 099: the `0111` lifecycle events, the `0045` payouts, the `0040`/`0041` ledger and the
+      // `0080` settings - read with plain eq filters, across companies where the office queue does.
+      if (
+        table === MERCHANT_ACCOUNT_EVENTS_TABLE ||
+        table === PAYOUTS_TABLE ||
+        table === LEDGER_ACCOUNTS_TABLE ||
+        table === LEDGER_ENTRIES_TABLE ||
+        table === PLATFORM_SETTINGS_TABLE
+      ) {
+        const parts = query.split("&");
+
+        if (!parts.includes("deleted_at=is.null")) {
+          return Promise.reject(new Error(`the ${table} read is not over live rows: ${query}`));
+        }
+
+        const allRows = (
+          table === MERCHANT_ACCOUNT_EVENTS_TABLE
+            ? database.eventRows
+            : table === PAYOUTS_TABLE
+              ? database.payoutRows
+              : table === LEDGER_ACCOUNTS_TABLE
+                ? database.ledgerAccountRows
+                : table === LEDGER_ENTRIES_TABLE
+                  ? database.ledgerEntryRows
+                  : database.settingRows
+        ) as unknown as readonly Record<string, unknown>[];
+        let matched = eqFilter(allRows, parts);
+
+        const ordered = parts.find((part) => part.startsWith("order="));
+
+        if (ordered === "order=created_at.asc" || ordered === "order=created_at.desc") {
+          // Ties on created_at (the fake clock is fixed) break by insertion order, newest last for
+          // asc and newest first for desc, the way a real sequence would behave.
+          const indexed = matched.map((row, index) => ({ row, index }));
+          const descending = ordered === "order=created_at.desc";
+
+          indexed.sort((left, right) => {
+            const byTime = String(left.row["created_at"]).localeCompare(String(right.row["created_at"]));
+
+            if (byTime !== 0) {
+              return descending ? -byTime : byTime;
+            }
+
+            return descending ? right.index - left.index : left.index - right.index;
+          });
+          matched = indexed.map((entry) => entry.row);
+        }
+
+        const limit = limitOf(parts);
+        const capped = limit === null ? matched : matched.slice(0, limit);
+        const withDefaults = capped.map((row) => ({
+          ...(table === MERCHANT_ACCOUNT_EVENTS_TABLE
+            ? {
+                reason: null,
+                detail: null,
+                required_documents: null,
+                actor_user_id: null,
+                kyc_submission_id: null,
+                payout_bank_account_id: null,
+                hold_release_at: null,
+                chargeback_hold_release_at: null,
+                version: 1,
+                updated_at: row["created_at"],
+              }
+            : {}),
+          ...(table === PAYOUTS_TABLE
+            ? { version: 1, updated_at: row["created_at"], settlement_id: null, platform_fee_minor: 0, requested_by: "", destination_bank_name: null, destination_last_four: null, destination_country: null, is_remainder: false, note: null }
+            : {}),
+          ...(table === PLATFORM_SETTINGS_TABLE ? {} : {}),
           ...row,
         }));
 
@@ -2336,6 +2563,82 @@ function createBusinessStore(database: BusinessDatabase): RestClient {
         return Promise.resolve();
       }
 
+      // STEP 099: the `0111` lifecycle events, the `0043` closure hold and the `0045` closure payout.
+      if (table === MERCHANT_ACCOUNT_EVENTS_TABLE || table === HOLDS_TABLE || table === PAYOUTS_TABLE) {
+        for (const row of rows) {
+          database.inserts.push({ table, row: { ...row } });
+
+          const id = `018f2b8a-0000-4c2d-9c3e-${String(database.inserts.length).padStart(12, "0")}`;
+          const created = row["created_at"] ?? new Date(NOW).toISOString();
+          const createdText = typeof created === "string" ? created : new Date(NOW).toISOString();
+
+          if (table === MERCHANT_ACCOUNT_EVENTS_TABLE) {
+            database.eventRows.push({
+              id,
+              company_id: String(row["company_id"] ?? ""),
+              event: String(row["event"] ?? ""),
+              reason: typeof row["reason"] === "string" ? row["reason"] : null,
+              detail: typeof row["detail"] === "string" ? row["detail"] : null,
+              required_documents: Array.isArray(row["required_documents"])
+                ? (row["required_documents"] as readonly string[])
+                : null,
+              actor_user_id: typeof row["actor_user_id"] === "string" ? row["actor_user_id"] : null,
+              kyc_submission_id: typeof row["kyc_submission_id"] === "string" ? row["kyc_submission_id"] : null,
+              payout_bank_account_id:
+                typeof row["payout_bank_account_id"] === "string" ? row["payout_bank_account_id"] : null,
+              hold_release_at: typeof row["hold_release_at"] === "string" ? row["hold_release_at"] : null,
+              chargeback_hold_release_at:
+                typeof row["chargeback_hold_release_at"] === "string" ? row["chargeback_hold_release_at"] : null,
+              version: 1,
+              updated_at: createdText,
+              created_at: createdText,
+            });
+          }
+
+          if (table === HOLDS_TABLE) {
+            database.fundHoldRows.push({
+              id,
+              company_id: String(row["company_id"] ?? ""),
+              payment_id: typeof row["payment_id"] === "string" ? row["payment_id"] : null,
+              settlement_id: typeof row["settlement_id"] === "string" ? row["settlement_id"] : null,
+              amount_minor: String(row["amount_minor"] ?? "0"),
+              currency: String(row["currency"] ?? "USD"),
+              reason: String(row["reason"] ?? ""),
+              status: String(row["status"] ?? "active"),
+              placed_at: String(row["placed_at"] ?? createdText),
+              release_due_at: String(row["release_due_at"] ?? createdText),
+              version: 1,
+              updated_at: createdText,
+              created_at: createdText,
+            });
+          }
+
+          if (table === PAYOUTS_TABLE) {
+            database.payoutRows.push({
+              id,
+              company_id: String(row["company_id"] ?? ""),
+              settlement_id: typeof row["settlement_id"] === "string" ? row["settlement_id"] : null,
+              amount_minor: String(row["amount_minor"] ?? "0"),
+              currency: String(row["currency"] ?? "USD"),
+              platform_fee_minor: Number(row["platform_fee_minor"] ?? 0),
+              status: String(row["status"] ?? "requested"),
+              requested_by: String(row["requested_by"] ?? ""),
+              destination_bank_name: typeof row["destination_bank_name"] === "string" ? row["destination_bank_name"] : null,
+              destination_last_four:
+                typeof row["destination_last_four"] === "string" ? row["destination_last_four"] : null,
+              destination_country: typeof row["destination_country"] === "string" ? row["destination_country"] : null,
+              is_remainder: Boolean(row["is_remainder"] ?? false),
+              note: typeof row["note"] === "string" ? row["note"] : null,
+              version: 1,
+              updated_at: createdText,
+              created_at: createdText,
+            });
+          }
+        }
+
+        return Promise.resolve();
+      }
+
       if (table === PAYMENT_HOLDS_TABLE) {
         for (const row of rows) {
           database.inserts.push({ table, row: { ...row } });
@@ -2534,6 +2837,38 @@ function createBusinessStore(database: BusinessDatabase): RestClient {
         return Promise.resolve();
       }
 
+      // STEP 099: the `0003` users status the lifecycle writes - conditional on id, company, current
+      // status and version; a row that moved on simply does not match, as PostgREST answers it.
+      if (table === "users") {
+        const parts = query.split("&");
+
+        if (!parts.includes("deleted_at=is.null")) {
+          return Promise.reject(new Error(`the users update is not over live rows: ${query}`));
+        }
+
+        const idPart = parts.find((part) => part.startsWith("id=eq."));
+        const statusPart = parts.find((part) => part.startsWith("status=eq."));
+        const versionPart = parts.find((part) => part.startsWith("version=eq."));
+        const wantedId = idPart === undefined ? null : decodeURIComponent(idPart.slice("id=eq.".length));
+        const wantedStatus = statusPart === undefined ? null : decodeURIComponent(statusPart.slice("status=eq.".length));
+        const wantedVersion = versionPart === undefined ? null : Number(versionPart.slice("version=eq.".length));
+
+        for (const row of database.userRows) {
+          if (
+            row.company_id === wanted &&
+            (wantedId === null || row.id === wantedId) &&
+            (wantedStatus === null || (row.status ?? "active") === wantedStatus) &&
+            (wantedVersion === null || (row.version ?? 1) === wantedVersion)
+          ) {
+            for (const [key, value] of Object.entries(values)) {
+              (row as unknown as Record<string, unknown>)[key] = value;
+            }
+          }
+        }
+
+        return Promise.resolve();
+      }
+
       if (table === SUBMERCHANT_PROVISIONS_TABLE) {
         const parts = query.split("&");
 
@@ -2542,8 +2877,10 @@ function createBusinessStore(database: BusinessDatabase): RestClient {
         }
 
         const idPart = parts.find((part) => part.startsWith("id=eq."));
+        const statusPart = parts.find((part) => part.startsWith("status=eq."));
         const versionPart = parts.find((part) => part.startsWith("version=eq."));
         const wantedId = idPart === undefined ? null : decodeURIComponent(idPart.slice("id=eq.".length));
+        const wantedStatus = statusPart === undefined ? null : decodeURIComponent(statusPart.slice("status=eq.".length));
         const wantedVersion =
           versionPart === undefined ? null : Number(versionPart.slice("version=eq.".length));
 
@@ -2551,6 +2888,7 @@ function createBusinessStore(database: BusinessDatabase): RestClient {
           if (
             row.company_id === wanted &&
             (wantedId === null || row.id === wantedId) &&
+            (wantedStatus === null || row.status === wantedStatus) &&
             (wantedVersion === null || (row.version ?? 1) === wantedVersion)
           ) {
             if (database.provisionRace && wantedVersion !== null) {
@@ -8967,11 +9305,11 @@ async function checkSubmerchantSync(): Promise<void> {
 
   registerSubmerchantJobs(registry);
 
-  expectEqual(registry.size, 2, "provision and sync are registered");
+  expectEqual(registry.size, 3, "provision, sync and token deletion are registered");
   expectEqual(registry.has(SUBMERCHANT_PROVISION_JOB), true, "the provision job of STEP 094");
   expectEqual(registry.has(SUBMERCHANT_SYNC_JOB), true, "the sync job of this STEP");
   registerSubmerchantJobs(registry);
-  expectEqual(registry.size, 2, "registering twice is a no-op");
+  expectEqual(registry.size, 3, "registering twice is a no-op");
 
   const jobDatabase = syncSeededDatabase();
   webhookEventOf(jobDatabase, { id: EVENT_VERIFIED });
@@ -9446,6 +9784,8 @@ function duplicateSeededDatabase(): BusinessDatabase {
     email: "other@example.test",
     phone: DUPLICATE_PHONE,
     full_name: "Owner Two",
+    status: "active",
+    version: 1,
     created_at: "2026-11-01T08:05:00.000Z",
   });
 
@@ -9732,6 +10072,576 @@ async function checkDuplicateIdentitySources(): Promise<void> {
   expect(forward.includes("duplicate_cases_default_deny"), "and carries the default-deny policy");
 }
 
+/* -------------------------------------------------------------------------------------------------
+ * STEP 099: the merchant account lifecycle of section 13 - suspension, reactivation, closure with
+ * the saved card token deletion and the chargeback period fund hold.
+ */
+
+const ACCOUNT_EVENTS_TABLE = MERCHANT_ACCOUNT_EVENTS_TABLE;
+
+const BANK_ACCOUNT_ID = "018f2b8a-5555-4c2d-9c3e-000000000001";
+const LEDGER_ACCOUNT_ID = "018f2b8a-6666-4c2d-9c3e-000000000001";
+const PROVISION_ID_A = "018f2b8a-7777-4c2d-9c3e-000000000001";
+const REACTIVATION_SUBMISSION_ID = "018f2b8a-8888-4c2d-9c3e-000000000001";
+const MS_PER_DAY_99 = 86_400_000;
+
+/** A database whose COMPANY_A is fully set up: profile with a high-risk MCC, a verified bank, a
+ *  `merchant_payable` account with 80 USD in it, one approved submission with an accepted document,
+ * and one verified sub-merchant provision. */
+function lifecycleSeededDatabase(): BusinessDatabase {
+  const database = createBusinessDatabase(
+    [businessRow({ company_id: COMPANY_A, mcc_code: "5999", tax_id: "TIN-LIFE-1" })],
+    [],
+    [
+      { id: "018f2b8a-0000-4c2d-9c3e-0000000000f1", code: "5999", title: "Misc Food", risk_tier: "high", is_active: true, version: 1 },
+      ...defaultMccRows(),
+    ],
+    defaultCountryRows(),
+    [
+      {
+        id: REACTIVATION_SUBMISSION_ID,
+        company_id: COMPANY_A,
+        status: "approved",
+        verification_method: "manual",
+        submitted_at: "2026-11-01T10:00:00.000Z",
+        submitted_by: OWNER_ID,
+        decided_at: "2026-11-01T10:30:00.000Z",
+        decision_reason: null,
+        version: 3,
+        created_at: "2026-11-01T09:00:00.000Z",
+      },
+    ],
+    [
+      {
+        id: "018f2b8a-9999-4c2d-9c3e-000000000001",
+        company_id: COMPANY_A,
+        submission_id: REACTIVATION_SUBMISSION_ID,
+        document_type: "bank_statement",
+        storage_key: "kyc/018f2b8a-4444-4c2d-9c3e-000000000001/bank.pdf",
+        content_sha256: "c".repeat(64),
+        content_type: "application/pdf",
+        byte_size: 1024,
+        issued_at: null,
+        expires_at: null,
+        status: "accepted",
+        created_at: "2026-11-01T09:30:00.000Z",
+      },
+    ],
+    [],
+    [],
+    defaultCriteriaRow(),
+    [
+      { id: "018f2b8a-0000-4c2d-9c3e-0000000000e3", tier: "high", extra_reserve_percent: "10", hold_days: 30, updated_by: null, version: 1, updated_at: "2026-11-01T09:00:00.000Z", created_at: "2026-11-01T09:00:00.000Z" },
+      ...defaultTierRows().filter((row) => row.tier !== "high"),
+    ],
+  );
+
+  database.bankRows.push({
+    id: BANK_ACCOUNT_ID,
+    company_id: COMPANY_A,
+    account_fingerprint: "d".repeat(64),
+    status: "verified",
+    bank_name: "Test Bank",
+    account_last_four: "4321",
+    country: "BD",
+    version: 1,
+    created_at: "2026-11-01T08:10:00.000Z",
+  });
+
+  database.ledgerAccountRows.push({
+    id: LEDGER_ACCOUNT_ID,
+    company_id: COMPANY_A,
+    account_code: MERCHANT_PAYABLE_ACCOUNT_CODE,
+    created_at: "2026-11-01T08:00:00.000Z",
+  });
+
+  database.ledgerEntryRows.push(
+    { id: "018f2b8a-aaaa-4c2d-9c3e-000000000001", company_id: COMPANY_A, account_id: LEDGER_ACCOUNT_ID, entry_side: "credit", amount_minor: 1_000_000, created_at: "2026-11-01T12:00:00.000Z" },
+    { id: "018f2b8a-aaaa-4c2d-9c3e-000000000002", company_id: COMPANY_A, account_id: LEDGER_ACCOUNT_ID, entry_side: "debit", amount_minor: 200_000, created_at: "2026-11-01T12:05:00.000Z" },
+  );
+
+  database.provisionRows.push({
+    id: PROVISION_ID_A,
+    company_id: COMPANY_A,
+    kyc_submission_id: REACTIVATION_SUBMISSION_ID,
+    provider_id: "018f2b8a-0000-4c2d-9c3e-0000000000aa",
+    provider_key: "nmi",
+    mode: "test",
+    master_account_ref: "master-1",
+    provider_submerchant_id: "sub-1",
+    status: "verified",
+    charges_enabled: true,
+    payouts_enabled: true,
+    requested_at: "2026-11-01T11:00:00.000Z",
+    next_attempt_at: null,
+    version: 2,
+    updated_at: "2026-11-01T11:00:00.000Z",
+    created_at: "2026-11-01T11:00:00.000Z",
+  });
+
+  return database;
+}
+
+/** A job runtime whose two STEP 099 jobs are registered against a memory queue. */
+function lifecycleJobs(): { readonly registry: JobRegistry; readonly queue: ReturnType<typeof createInMemoryJobQueue> } {
+  const registry = new JobRegistry();
+
+  registry.register({
+    name: CLOSURE_PAYOUT_JOB,
+    payloadSchema: closurePayoutJobPayloadSchema,
+    handler: async () => {},
+  });
+  registry.register({
+    name: SUBMERCHANT_DELETE_CARD_TOKENS_JOB,
+    payloadSchema: deleteCardTokensJobPayloadSchema,
+    handler: async () => {},
+  });
+
+  return { registry, queue: createInMemoryJobQueue() };
+}
+
+async function checkAccountLifecycleGate(): Promise<void> {
+  // ---- the vocabulary and the roles
+  expectEqual(ACCOUNT_EVENTS_TABLE, "merchant_account_events", "the service names the 0111 table");
+  expectEqual(HOLDS_TABLE, "holds", "the 0043 hold table is named");
+  expectEqual(PAYOUTS_TABLE, "payouts", "the 0045 payout table is named");
+  expectEqual(LEDGER_ACCOUNTS_TABLE, "ledger_accounts", "the 0040 account table is named");
+  expectEqual(LEDGER_ENTRIES_TABLE, "ledger_entries", "the 0041 entry table is named");
+  expectEqual(PLATFORM_SETTINGS_TABLE, "platform_settings", "the 0080 settings table is named");
+  expectEqual(CHARGEBACK_HOLD_DAYS_SETTING, "chargeback.hold_days", "the chargeback period setting is named");
+  expectEqual(CHARGEBACK_HOLD_DAYS_DEFAULT, 180, "the seeded chargeback period is 180 days");
+  expect(ACCOUNT_MANAGE_ROLES.includes("compliance_kyc") && ACCOUNT_MANAGE_ROLES.includes("finance_ops"), "the office roles include compliance_kyc and finance_ops");
+  expectEqual(CLOSURE_PAYOUT_JOB, "merchant_account.closure_payout", "the delayed payout job is named");
+  expectEqual(SUBMERCHANT_DELETE_CARD_TOKENS_JOB, "submerchant.delete_card_tokens", "the token deletion job is named");
+  expect(suspendAccountBodySchema.safeParse({ company_id: COMPANY_A, reason: "risk" }).success, "the suspend body accepts a reason without documents");
+  expect(!suspendAccountBodySchema.safeParse({ company_id: COMPANY_A, reason: "nope" }).success, "an unknown reason is refused");
+  expect(!suspendAccountBodySchema.safeParse({ company_id: "not-a-uuid", reason: "risk" }).success, "a non-uuid company is refused");
+  expect(closeAccountBodySchema.safeParse({ company_id: COMPANY_A }).success, "the close body works without a bank account id");
+
+  // ---- a fresh company reads as active, and the roles are enforced
+  const freshAudit = createInMemoryAuditTrail();
+  const fresh = createBusinessDatabase();
+  const freshDeps = { ...dependenciesOf(fresh, freshAudit) };
+
+  const freshState = await readMerchantAccountState({ actor: owner }, freshDeps);
+  expectEqual(freshState.state, "active", "a company with no events is active");
+  expectEqual(freshState.reactivationReady, false, "and has no submission in review yet");
+
+  expect(
+    (await rejectionOf(() => readAccountReviewQueue({ actor: owner }, freshDeps)))?.code === "PERMISSION_DENIED",
+    "an owner cannot read the office queue",
+  );
+  expect(
+    (await rejectionOf(() => suspendMerchant({ actor: owner, body: { company_id: COMPANY_A, reason: "risk" } }, freshDeps)))?.code === "PERMISSION_DENIED",
+    "an owner cannot suspend",
+  );
+  expect(
+    (await rejectionOf(() => suspendMerchant({ actor: desk, body: { company_id: "nope", reason: "risk" } }, freshDeps)))?.code === "VALIDATION_FAILED",
+    "a malformed company id is a validation failure",
+  );
+
+  // ---- suspension
+  const audit = createInMemoryAuditTrail();
+  const database = lifecycleSeededDatabase();
+  const deps = { ...dependenciesOf(database, audit) };
+  const jobs = lifecycleJobs();
+
+  const suspended = await suspendMerchant(
+    { actor: desk, body: { company_id: COMPANY_A, reason: "risk", required_documents: ["utility bill", "bank statement"] } },
+    deps,
+  );
+  expectEqual(suspended.state, "suspended", "the suspension answers suspended");
+  expectEqual(suspended.usersSuspended, 1, "and moved the owner user");
+  expectEqual(database.userRows[0]?.status, "suspended", "the 0003 status is suspended, which is what locks the session");
+  expectEqual(database.eventRows.length, 1, "one event row is written");
+  expectEqual(database.eventRows[0]?.event, "suspended", "as a suspension");
+  expectEqual(database.eventRows[0]?.reason, "risk", "with the reason");
+  expectDeepEqual(database.eventRows[0]?.required_documents, ["utility bill", "bank statement"], "and the required documents");
+  expect(
+    audit.entries.some((entry) => entry.action === "merchant_account.suspended" && entry.companyId === COMPANY_A),
+    "the suspension is audited",
+  );
+
+  expect(
+    (await rejectionOf(() => suspendMerchant({ actor: desk, body: { company_id: COMPANY_A, reason: "risk" } }, deps)))?.code === "CONFLICT",
+    "a second suspension conflicts",
+  );
+
+  const suspendedState = await readMerchantAccountState({ actor: owner }, deps);
+  expectEqual(suspendedState.state, "suspended", "the merchant reads suspended");
+  expectEqual(suspendedState.reason, "risk", "with the reason");
+  expectDeepEqual(suspendedState.requiredDocuments, ["utility bill", "bank statement"], "and the required documents");
+  expectEqual(suspendedState.reactivationReady, true, "an approved submission is in the pipeline, so reactivation can be requested");
+
+  const queue = await readAccountReviewQueue({ actor: desk }, deps);
+  expectEqual(queue.rows.length, 1, "the office queue lists the suspended account");
+  expectEqual(queue.rows[0]?.state, "suspended", "as suspended");
+  expectEqual(queue.rows[0]?.companyId, COMPANY_A, "for the right merchant");
+  expect(
+    audit.entries.some((entry) => entry.action === "merchant_account.read_by_office"),
+    "the office read is audited",
+  );
+
+  // ---- reactivation request and decision
+  expect(
+    (await rejectionOf(() => requestReactivation({ actor: otherOwner }, { ...dependenciesOf(createBusinessDatabase(), createInMemoryAuditTrail()) })))?.code === "CONFLICT",
+    "an active account cannot request reactivation",
+  );
+
+  const requested = await requestReactivation({ actor: owner }, deps);
+  expectEqual(requested.state, "reactivation_requested", "the request answers that state");
+  expectEqual(requested.kycSubmissionId, REACTIVATION_SUBMISSION_ID, "naming the submission in review");
+  expectEqual(database.eventRows[database.eventRows.length - 1]?.event, "reactivation_requested", "the event is recorded");
+  expect(
+    (await rejectionOf(() => requestReactivation({ actor: owner }, deps)))?.code === "CONFLICT",
+    "a repeated request conflicts",
+  );
+
+  const queueAfterRequest = await readAccountReviewQueue({ actor: desk }, deps);
+  expectEqual(queueAfterRequest.rows[0]?.state, "reactivation_requested", "the queue shows the pending request");
+
+  // A submission that is not approved cannot reactivate.
+  const notApproved = lifecycleSeededDatabase();
+  notApproved.submissionRows[0] = { ...notApproved.submissionRows[0] as SubmissionRowShape, status: "submitted" };
+  await suspendMerchant({ actor: desk, body: { company_id: COMPANY_A, reason: "manual" } }, { ...dependenciesOf(notApproved, createInMemoryAuditTrail()) });
+  await requestReactivation({ actor: owner }, { ...dependenciesOf(notApproved, createInMemoryAuditTrail()) });
+  expect(
+    (await rejectionOf(() => decideReactivation({ actor: desk, body: { company_id: COMPANY_A } }, { ...dependenciesOf(notApproved, createInMemoryAuditTrail()) })))?.code === "CONFLICT",
+    "a submission that is not approved conflicts",
+  );
+
+  // A submission with a rejected document cannot reactivate either.
+  const rejectedDoc = lifecycleSeededDatabase();
+  rejectedDoc.documentRows[0] = { ...rejectedDoc.documentRows[0] as DocumentRowShape, status: "rejected", rejection_reason: "illegible" };
+  const rejectedDeps = { ...dependenciesOf(rejectedDoc, createInMemoryAuditTrail()) };
+  await suspendMerchant({ actor: desk, body: { company_id: COMPANY_A, reason: "manual" } }, rejectedDeps);
+  await requestReactivation({ actor: owner }, rejectedDeps);
+  expect(
+    (await rejectionOf(() => decideReactivation({ actor: desk, body: { company_id: COMPANY_A } }, rejectedDeps)))?.code === "CONFLICT",
+    "a rejected document on the submission conflicts",
+  );
+
+  const reactivated = await decideReactivation({ actor: desk, body: { company_id: COMPANY_A } }, deps);
+  expectEqual(reactivated.state, "active", "the decision answers active");
+  expectEqual(reactivated.usersReactivated, 1, "and moved the owner user back");
+  expectEqual(database.userRows[0]?.status, "active", "the 0003 status is active again");
+  expectEqual(database.eventRows[database.eventRows.length - 1]?.event, "reactivated", "the event is recorded");
+  expect(
+    (await rejectionOf(() => decideReactivation({ actor: desk, body: { company_id: COMPANY_A } }, deps)))?.code === "CONFLICT",
+    "deciding again conflicts as already active",
+  );
+
+  // ---- closure request and closure
+  const closureRequested = await requestAccountClosure({ actor: owner, body: { note: "Leaving the platform" } }, deps);
+  expectEqual(closureRequested.state, "closure_requested", "the closure request answers that state");
+  expectEqual(database.eventRows[database.eventRows.length - 1]?.detail, "Leaving the platform", "with the note");
+  expect(
+    (await rejectionOf(() => closeMerchantAccount({ actor: desk, body: { company_id: COMPANY_B } }, deps)))?.code === "CONFLICT",
+    "closing an active account without a request conflicts",
+  );
+  expect(
+    (await rejectionOf(() => closeMerchantAccount({ actor: desk, body: { company_id: COMPANY_A, payout_bank_account_id: "018f2b8a-5555-4c2d-9c3e-000000000099" } }, deps)))?.code === "VALIDATION_FAILED",
+    "an unknown bank account is a validation failure",
+  );
+
+  const financeDesk = actorOf(["finance_ops"], null, { userId: OFFICE_ID });
+  const closeDeps = { ...deps, jobs };
+  const closed = await closeMerchantAccount({ actor: financeDesk, body: { company_id: COMPANY_A } }, closeDeps);
+  expectEqual(closed.state, "closed", "the closure answers closed");
+  expectEqual(closed.payoutBankAccountId, BANK_ACCOUNT_ID, "using the company's verified bank account");
+
+  // The schedule: hold period from the risk tier (30 days), chargeback period from the setting (180 days).
+  const holdRelease = Date.parse(closed.holdReleaseAt);
+  const chargebackRelease = Date.parse(closed.chargebackHoldReleaseAt);
+  expectEqual(holdRelease - NOW, 30 * MS_PER_DAY_99, "the payout goes out after the merchant's 30 day hold period");
+  expectEqual(chargebackRelease - NOW, 180 * MS_PER_DAY_99, "the chargeback funds stay held for the 180 day chargeback period");
+  expect(chargebackRelease > holdRelease, "the chargeback instant is after the payout instant");
+
+  // The balance is 80 USD (1_000_000 - 200_000 minor); the high tier reserves 10%, so 8 USD stays
+  // held and 72 USD is scheduled for the bank.
+  expectEqual(closed.reserveHeldMinor, "80000", "the reserve is 10 percent of the 80 USD balance");
+  expectEqual(closed.payoutMinor, "720000", "the rest is scheduled for the payout");
+  expectEqual(closed.usersClosed, 1, "and the owner user is closed");
+  expectEqual(database.userRows[0]?.status, "closed", "the 0003 status is closed");
+  expectEqual(closed.provisionsRestricted, 1, "the verified provision is restricted");
+  expectEqual(database.provisionRows[0]?.status, "restricted", "in the store");
+  expectEqual(database.provisionRows[0]?.charges_enabled, false, "with charges off");
+  expectEqual(database.provisionRows[0]?.payouts_enabled, false, "and payouts off");
+  expectEqual(closed.tokenDeletionsQueued, 1, "and the token deletion is queued");
+
+  const closedEvent = database.eventRows.find((row) => row.event === "closed");
+  expect(closedEvent !== undefined, "the closed event is recorded");
+  expectEqual(closedEvent?.payout_bank_account_id, BANK_ACCOUNT_ID, "naming the payout bank account");
+  expectEqual(closedEvent?.hold_release_at, closed.holdReleaseAt, "and the hold release instant");
+  expectEqual(closedEvent?.chargeback_hold_release_at, closed.chargebackHoldReleaseAt, "and the chargeback hold instant");
+
+  expectEqual(database.fundHoldRows.length, 1, "one 0043 hold is placed");
+  expectEqual(database.fundHoldRows[0]?.reason, "closure", "as a closure hold");
+  expectEqual(database.fundHoldRows[0]?.status, "active", "still active");
+  expectEqual(database.fundHoldRows[0]?.amount_minor, "80000", "holding the chargeback liability part");
+  expectEqual(database.fundHoldRows[0]?.release_due_at, closed.chargebackHoldReleaseAt, "until the chargeback period ends");
+
+  expect(
+    audit.entries.some((entry) => entry.action === "merchant_account.closed" && entry.companyId === COMPANY_A),
+    "the closure is audited",
+  );
+
+  // The two jobs: the delayed payout and the immediate token deletion.
+  const farFuture = NOW + 400 * MS_PER_DAY_99;
+  const first = await jobs.queue.reserve({ leaseDurationMs: 60_000, now: farFuture });
+  const second = await jobs.queue.reserve({ leaseDurationMs: 60_000, now: farFuture });
+  expectEqual(first?.name, SUBMERCHANT_DELETE_CARD_TOKENS_JOB, "the token deletion is queued at once");
+  expectEqual(first?.availableAtEpochMs, NOW, "with no delay");
+  expectEqual((first?.payload as { provision_id?: string })?.provision_id, PROVISION_ID_A, "for the restricted provision");
+  expectEqual(first?.idempotencyKey, deleteCardTokensJobIdempotencyKey(PROVISION_ID_A), "under its idempotency key");
+  expectEqual(second?.name, CLOSURE_PAYOUT_JOB, "the payout job is queued");
+  expectEqual(second?.availableAtEpochMs, holdRelease, "delayed to the end of the hold period");
+  const payoutPayload = second?.payload as { amount_minor?: string; closure_event_id?: string; payout_bank_account_id?: string };
+  expectEqual(payoutPayload?.amount_minor, "720000", "carrying the remainder amount");
+  expectEqual(payoutPayload?.closure_event_id, closed.eventId, "and the closure event");
+  expectEqual(payoutPayload?.payout_bank_account_id, BANK_ACCOUNT_ID, "and the bank account");
+
+  // A repeated close conflicts; the merchant screen reads the closed state with the schedule.
+  expect(
+    (await rejectionOf(() => closeMerchantAccount({ actor: desk, body: { company_id: COMPANY_A } }, closeDeps)))?.code === "CONFLICT",
+    "closing twice conflicts",
+  );
+  const closedState = await readMerchantAccountState({ actor: owner }, deps);
+  expectEqual(closedState.state, "closed", "the merchant reads closed");
+  expectEqual(closedState.holdReleaseAt, closed.holdReleaseAt, "with the payout instant");
+  expectEqual(closedState.chargebackHoldReleaseAt, closed.chargebackHoldReleaseAt, "and the chargeback hold instant");
+
+  // ---- the delayed payout job writes the 0045 row, idempotently
+  const payoutRun = await runClosurePayout(
+    { company_id: COMPANY_A, closure_event_id: closed.eventId, payout_bank_account_id: BANK_ACCOUNT_ID, amount_minor: "720000" },
+    deps,
+  );
+  expectEqual(payoutRun.alreadyRequested, false, "the first payout run writes the row");
+  expectEqual(database.payoutRows.length, 1, "the payout job writes one 0045 row");
+  expectEqual(database.payoutRows[0]?.status, "requested", "as requested");
+  expectEqual(database.payoutRows[0]?.amount_minor, "720000", "for the remainder");
+  expectEqual(database.payoutRows[0]?.requested_by, OFFICE_ID, "by the closing actor");
+  expectEqual(database.payoutRows[0]?.destination_bank_name, "Test Bank", "to the verified bank");
+  expectEqual(database.payoutRows[0]?.destination_last_four, "4321", "last four");
+  expectEqual(database.payoutRows[0]?.is_remainder, false, "above the 100 USD floor, so not a remainder");
+  expect(
+    audit.entries.some((entry) => entry.action === CLOSURE_PAYOUT_REQUESTED_AUDIT_ACTION),
+    "the payout request is audited",
+  );
+  const payoutAgain = await runClosurePayout(
+    { company_id: COMPANY_A, closure_event_id: closed.eventId, payout_bank_account_id: BANK_ACCOUNT_ID, amount_minor: "720000" },
+    deps,
+  );
+  expectEqual(payoutAgain.alreadyRequested, true, "a repeated run converges");
+  expectEqual(database.payoutRows.length, 1, "without a second row");
+  expect(
+    (await rejectionOf(() => runClosurePayout(
+      { company_id: COMPANY_A, closure_event_id: "018f2b8a-0000-4c2d-9c3e-000000000fff", payout_bank_account_id: BANK_ACCOUNT_ID, amount_minor: "1" },
+      deps,
+    )))?.code === "CONFLICT",
+    "a payload naming a non-closed event conflicts",
+  );
+
+  // ---- the token deletion job records the 0111 event, idempotently
+  const deletion = await runCardTokenDeletion({ company_id: COMPANY_A, provision_id: PROVISION_ID_A }, deps);
+  expectEqual(deletion.alreadyRecorded, false, "the first run records it");
+  const tokenEvent = database.eventRows.find((row) => row.event === CARD_TOKENS_DELETED_EVENT);
+  expect(tokenEvent !== undefined, "as a card_tokens_deleted event");
+  expectEqual(tokenEvent?.actor_user_id, null, "with a null actor, it is a system event");
+  expect(
+    audit.entries.some((entry) => entry.action === SUBMERCHANT_CARD_TOKENS_DELETED_AUDIT_ACTION && entry.entityId === PROVISION_ID_A),
+    "audited against the provision row",
+  );
+  const deletionAgain = await runCardTokenDeletion({ company_id: COMPANY_A, provision_id: PROVISION_ID_A }, deps);
+  expectEqual(deletionAgain.alreadyRecorded, true, "a redelivered job converges");
+  expect(
+    (await rejectionOf(() => runCardTokenDeletion({ company_id: COMPANY_A, provision_id: "018f2b8a-7777-4c2d-9c3e-000000000099" }, deps)))?.code === "CONFLICT",
+    "a provision that is not restricted conflicts",
+  );
+
+  // A pending provision is refused: only closure restricts it first.
+  const pending = lifecycleSeededDatabase();
+  pending.provisionRows[0] = { ...pending.provisionRows[0] as ProvisionRowShape, status: "pending" };
+  expect(
+    (await rejectionOf(() => runCardTokenDeletion({ company_id: COMPANY_A, provision_id: PROVISION_ID_A }, { ...dependenciesOf(pending, createInMemoryAuditTrail()) })))?.code === "CONFLICT",
+    "a pending provision's tokens are not deleted",
+  );
+}
+
+/** ---- STEP 099 sources: the files exist, are ASCII, and the wirings are where the gate reads them. */
+async function checkAccountLifecycleSources(): Promise<void> {
+  const paths = [
+    "services/kyc/account-lifecycle.ts",
+    "services/submerchant/card-tokens.ts",
+    "app/api/onboarding/account-suspend/route.ts",
+    "app/api/onboarding/account-reactivate-request/route.ts",
+    "app/api/onboarding/account-reactivate-decide/route.ts",
+    "app/api/onboarding/account-close-request/route.ts",
+    "app/api/onboarding/account-close/route.ts",
+    "app/(dashboard)/onboarding/account/page.tsx",
+    "app/(dashboard)/onboarding/account/account-form.tsx",
+    "app/(dashboard)/onboarding/account-review/page.tsx",
+    "app/(dashboard)/onboarding/account-review/account-review-queue.tsx",
+    "migrations/0111_merchant_account_events.sql",
+    "migrations/0111_merchant_account_events.down.sql",
+  ];
+
+  for (const path of paths) {
+    const source = await readRepositoryFile(path);
+    expect(source.length > 0, `${path} exists`);
+    expect(!/[^\u0009\u000a\u000d\u0020-\u007e]/u.test(source), `${path} is ASCII only`);
+    const pathComment = path.endsWith(".sql") ? `-- path: ${path}` : `// path: ${path}`;
+    expect(source.startsWith(pathComment), `${path} starts with its path comment`);
+  }
+
+  const service = await readRepositoryFile("services/kyc/account-lifecycle.ts");
+  expect(service.includes('MERCHANT_ACCOUNT_EVENTS_TABLE = "merchant_account_events"'), "the service names the 0111 table");
+  expect(service.includes("ACCOUNT_MANAGE_ROLES"), "the office roles are declared");
+  expect(service.includes('CLOSURE_PAYOUT_JOB = "merchant_account.closure_payout"'), "the payout job is declared");
+  expect(service.includes("enqueueCardTokenDeletion"), "the closure queues the token deletion");
+  expect(service.includes('reason: "closure"'), "the closure hold uses the 0043 closure reason");
+  expect(service.includes("merchant_payable"), "the balance is read from the merchant_payable account");
+
+  const tokens = await readRepositoryFile("services/submerchant/card-tokens.ts");
+  expect(tokens.includes('SUBMERCHANT_DELETE_CARD_TOKENS_JOB = "submerchant.delete_card_tokens"'), "the token job is named");
+  expect(tokens.includes('CARD_TOKENS_DELETED_EVENT = "card_tokens_deleted"'), "the event it writes is named");
+
+  const sync = await readRepositoryFile("services/submerchant/provision-sync.ts");
+  expect(sync.includes("registerDeleteCardTokensJob(registry)"), "the token job is registered with the other sub-merchant jobs");
+
+  const csrf = await readRepositoryFile("lib/security/csrf.ts");
+  for (const path of [
+    "/api/onboarding/account-suspend",
+    "/api/onboarding/account-reactivate-request",
+    "/api/onboarding/account-reactivate-decide",
+    "/api/onboarding/account-close-request",
+    "/api/onboarding/account-close",
+  ]) {
+    expect(csrf.includes(`"${path}"`), `${path} is on the CSRF protected list`);
+    const route = await readRepositoryFile(`app/api/onboarding${path.slice("/api/onboarding".length)}/route.ts`);
+    expectEqual(route.split("requireCsrfToken(").length - 1, 1, `${path} checks the token exactly once`);
+    expect(
+      route.indexOf("requireCsrfToken(") < route.indexOf("readRequestActor("),
+      `${path} checks the token before it looks the session up`,
+    );
+  }
+
+  const migrationFiles = (await readdir(new URL("migrations/", repositoryRoot))).map((name) => name);
+  expect(migrationFiles.includes("0111_merchant_account_events.sql"), "the 0111 forward file exists");
+  expect(migrationFiles.includes("0111_merchant_account_events.down.sql"), "and its rollback");
+
+  const forward = await readRepositoryFile("migrations/0111_merchant_account_events.sql");
+  expect(forward.includes("create table public.merchant_account_events"), "the forward creates the table");
+  expect(forward.includes("merchant_account_events_default_deny"), "with its default-deny policy");
+  expect(forward.includes("merchant_account_events_guard_state"), "and its guard");
+  expect(forward.includes("'card_tokens_deleted'"), "the token deletion event is in the vocabulary");
+  expect(forward.includes("'chargeback.hold_days'"), "the chargeback period seed is in the file");
+  expect(forward.includes("chargeback_hold_release_at > hold_release_at"), "the chargeback instant is checked after the payout instant");
+
+  const down = await readRepositoryFile("migrations/0111_merchant_account_events.down.sql");
+  expect(down.includes("drop table if exists public.merchant_account_events"), "the rollback drops the table");
+  expect(down.includes("chargeback.hold_days"), "and removes the seeded setting");
+
+  const statusPage = await readRepositoryFile("app/(dashboard)/onboarding/status/page.tsx");
+  expect(statusPage.includes('href="/onboarding/account"'), "the status screen links to the account screen");
+}
+
+/** ---- STEP 099 catalog: every sentence of the merchant account screen is used, and every key it names exists. */
+async function checkAccountCatalog(): Promise<void> {
+  const block = en.onboardingAccount as unknown as Record<string, unknown>;
+  const page = await readRepositoryFile("app/(dashboard)/onboarding/account/page.tsx");
+  const form = await readRepositoryFile("app/(dashboard)/onboarding/account/account-form.tsx");
+  const sources = `${page}\n${form}`;
+
+  const flat: string[] = [];
+
+  const walk = (node: Record<string, unknown>, prefix: string): void => {
+    for (const [key, value] of Object.entries(node)) {
+      const path = `${prefix}.${key}`;
+
+      if (typeof value === "string") {
+        flat.push(path);
+      } else if (typeof value === "object" && value !== null) {
+        walk(value as Record<string, unknown>, path);
+      }
+    }
+  };
+
+  walk(block, "onboardingAccount");
+
+  expect(flat.length >= 25, "the account screen has its own block of copy");
+
+  for (const path of flat) {
+    expect(sources.includes(`"${path}"`), `the copy key ${path} is used by the screen`);
+  }
+
+  const referenced = [...sources.matchAll(/"(onboardingAccount\.[A-Za-z.]+)"/gu)].map((match) => match[1]);
+
+  for (const path of new Set(referenced)) {
+    expect(path !== undefined && flat.includes(path), `the screen names no missing key (${String(path)})`);
+  }
+
+  for (const templated of ["sinceLine", "payoutAtLine", "chargebackHoldLine"]) {
+    expectEqual(
+      sources.includes(`getMessage("onboardingAccount.${templated}")`),
+      false,
+      `${templated} is never rendered without its values`,
+    );
+    expect(
+      sources.includes(`formatMessage("onboardingAccount.${templated}"`),
+      `and is rendered through formatMessage`,
+    );
+  }
+}
+
+/** ---- STEP 099 catalog: the office account review screen's copy block. */
+async function checkAccountReviewCatalog(): Promise<void> {
+  const block = en.onboardingAccountReview as unknown as Record<string, unknown>;
+  const page = await readRepositoryFile("app/(dashboard)/onboarding/account-review/page.tsx");
+  const panel = await readRepositoryFile("app/(dashboard)/onboarding/account-review/account-review-queue.tsx");
+  const sources = `${page}\n${panel}`;
+
+  const flat: string[] = [];
+
+  const walk = (node: Record<string, unknown>, prefix: string): void => {
+    for (const [key, value] of Object.entries(node)) {
+      const path = `${prefix}.${key}`;
+
+      if (typeof value === "string") {
+        flat.push(path);
+      } else if (typeof value === "object" && value !== null) {
+        walk(value as Record<string, unknown>, path);
+      }
+    }
+  };
+
+  walk(block, "onboardingAccountReview");
+
+  expect(flat.length >= 25, "the account review screen has its own block of copy");
+
+  for (const path of flat) {
+    expect(sources.includes(`"${path}"`), `the copy key ${path} is used by the screen`);
+  }
+
+  const referenced = [...sources.matchAll(/"(onboardingAccountReview\.[A-Za-z.]+)"/gu)].map((match) => match[1]);
+
+  for (const path of new Set(referenced)) {
+    expect(path !== undefined && flat.includes(path), `the screen names no missing key (${String(path)})`);
+  }
+
+  for (const templated of ["companyLine", "atLine", "requiredDocsLine"]) {
+    expectEqual(
+      sources.includes(`getMessage("onboardingAccountReview.${templated}")`),
+      false,
+      `${templated} is never rendered without its values`,
+    );
+    expect(
+      sources.includes(`formatMessage("onboardingAccountReview.${templated}"`),
+      `and is rendered through formatMessage`,
+    );
+  }
+}
+
 async function main(): Promise<void> {
   checkVocabulary();
   await checkRefusals();
@@ -9795,6 +10705,10 @@ async function main(): Promise<void> {
   await checkDocumentRequestsSources();
   await checkDuplicateIdentityGate();
   await checkDuplicateIdentitySources();
+  await checkAccountLifecycleGate();
+  await checkAccountLifecycleSources();
+  await checkAccountCatalog();
+  await checkAccountReviewCatalog();
   await checkKycCatalog();
   await checkStatusCatalog();
   await checkReviewCatalog();
@@ -9823,7 +10737,7 @@ async function main(): Promise<void> {
     `onboarding gate passed: ${checks} checks, ${ONBOARDING_STEPS.length} steps, ` +
       `${ONBOARDING_OWNER_ROLES.length} role, ${BUSINESS_PROFILE_FIELDS.length} business fields, ` +
       `${PROCESSOR_REQUIREMENT_LIST.length} processors, ${BUSINESS_PROFILE_TABLE} table, ` +
-      `${MCC_CODES_TABLE} vocabulary, ${COUNTRIES_TABLE} list, submerchant profile, kyc pack, underwriting criteria, merchant limits, payment holds, submerchant provisioning, webhook sync, document requests, duplicate checks\n`,
+      `${MCC_CODES_TABLE} vocabulary, ${COUNTRIES_TABLE} list, submerchant profile, kyc pack, underwriting criteria, merchant limits, payment holds, submerchant provisioning, webhook sync, document requests, duplicate checks, account lifecycle\n`,
   );
 }
 

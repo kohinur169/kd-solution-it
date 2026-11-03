@@ -4,6 +4,7 @@ import { getAuthRuntime } from "../../lib/auth/runtime.ts";
 import { AppError } from "../../lib/errors/app-error.ts";
 import type { ErrorDetail } from "../../lib/errors/app-error.ts";
 import { enqueueJob, type JobRegistry } from "../../lib/jobs/registry.ts";
+import { registerDeleteCardTokensJob } from "./card-tokens.ts";
 import type { JobQueue } from "../../lib/jobs/queue.ts";
 import type { EnqueueResult, JobDefinition } from "../../lib/jobs/types.ts";
 import {
@@ -328,10 +329,11 @@ export function registerSubmerchantSyncJob(registry: JobRegistry): void {
   }
 }
 
-/** Register both sub-merchant jobs (provision of STEP 094, sync of this STEP) once. */
+/** Register the sub-merchant jobs (provision of STEP 094, sync of STEP 095, token deletion of STEP 099) once. */
 export function registerSubmerchantJobs(registry: JobRegistry): void {
   registerSubmerchantProvisionJob(registry);
   registerSubmerchantSyncJob(registry);
+  registerDeleteCardTokensJob(registry);
 }
 
 /**

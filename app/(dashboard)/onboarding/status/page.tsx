@@ -215,6 +215,9 @@ export default async function OnboardingStatusPage(): Promise<ReactNode> {
               <Link className={linkClasses} href="/onboarding/documents">
                 {getMessage("onboardingStatus.documentsLink")}
               </Link>
+              <Link className={linkClasses} href="/onboarding/account">
+                {getMessage("onboardingStatus.accountLink")}
+              </Link>
             </>
           )}
           <Link className={linkClasses} href="/sessions">
