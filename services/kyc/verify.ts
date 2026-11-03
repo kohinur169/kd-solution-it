@@ -107,6 +107,24 @@ import {
   reviewKycDocument,
 } from "./kyc-review.ts";
 import {
+  MCC_CODE_ENTITY,
+  readMerchantUnderwritingSummary,
+  readUnderwritingMccOverview,
+  readUnderwritingSettings,
+  setMccRiskTier,
+  UNDERWRITING_CRITERIA_AUDIT_ACTION,
+  UNDERWRITING_CRITERIA_TABLE,
+  UNDERWRITING_MANAGE_ROLES,
+  UNDERWRITING_MCC_TIER_AUDIT_ACTION,
+  UNDERWRITING_READ_AUDIT_ACTION,
+  UNDERWRITING_READ_ROLES,
+  UNDERWRITING_RISK_TIERS_TABLE,
+  UNDERWRITING_RISK_TIER_AUDIT_ACTION,
+  UNDERWRITING_RISK_TIER_ENTITY,
+  updateUnderwritingCriteria,
+  updateUnderwritingRiskTier,
+} from "./underwriting.ts";
+import {
   assertProvisionable,
   PROCESSOR_PROFILE_AUDIT_ACTION,
   PROCESSOR_PROFILE_AUDIT_ENTITY,
@@ -896,8 +914,9 @@ async function checkMigrationSet(): Promise<void> {
   expectEqual(numbers.includes("0103"), true, "STEP 080's is too");
   expectEqual(numbers.includes("0104"), true, "STEP 081's is too");
   expectEqual(numbers.includes("0105"), true, "STEP 082's is too");
-  expectEqual(numbers.includes("0106"), false, "and nothing beyond them");
-  expectEqual(Math.max(...numbers.map((number) => Number.parseInt(number, 10))), 105, "the set ends at 0105");
+  expectEqual(numbers.includes("0106"), true, "STEP 090's is too");
+  expectEqual(numbers.includes("0107"), false, "and nothing beyond them");
+  expectEqual(Math.max(...numbers.map((number) => Number.parseInt(number, 10))), 106, "the set ends at 0106");
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -930,19 +949,74 @@ interface BusinessRowShape {
 
 /** One row of the `0077` vocabulary, as the fake store holds it. `deleted_at` is always null. */
 interface MccRowShape {
+  id: string;
   code: string;
   title: string;
+  risk_tier: string;
   is_active: boolean;
+  version: number;
 }
 
 /** The vocabulary the category gate works against: three active codes and one retired one. */
 function defaultMccRows(): MccRowShape[] {
   return [
-    { code: "0742", title: "Veterinary Services", is_active: true },
-    { code: "5411", title: "Grocery Stores, Supermarkets", is_active: true },
-    { code: "5812", title: "Eating places and Restaurants", is_active: true },
-    { code: "0001", title: "Retired Example Code", is_active: false },
+    { id: "018f2b8a-0000-4c2d-9c3e-0000000000c1", code: "0742", title: "Veterinary Services", risk_tier: "unassigned", is_active: true, version: 1 },
+    { id: "018f2b8a-0000-4c2d-9c3e-0000000000c2", code: "5411", title: "Grocery Stores, Supermarkets", risk_tier: "low", is_active: true, version: 1 },
+    { id: "018f2b8a-0000-4c2d-9c3e-0000000000c3", code: "5812", title: "Eating places and Restaurants", risk_tier: "unassigned", is_active: true, version: 1 },
+    { id: "018f2b8a-0000-4c2d-9c3e-0000000000c4", code: "0001", title: "Retired Example Code", risk_tier: "unassigned", is_active: false, version: 1 },
   ];
+}
+
+/** The one `0106` criteria row, as the fake store holds it: the seed of the migration. */
+interface CriteriaRowShape {
+  id: string;
+  starting_monthly_limit: string;
+  bank_statement_months: number;
+  large_transaction_hold_enabled: boolean;
+  large_transaction_hold_threshold: string;
+  updated_by: string | null;
+  version: number;
+  updated_at: string;
+  created_at: string;
+}
+
+/** One `0106` risk tier row, as the fake store holds it. */
+interface TierRowShape {
+  id: string;
+  tier: string;
+  extra_reserve_percent: string;
+  hold_days: number;
+  updated_by: string | null;
+  version: number;
+  updated_at: string;
+  created_at: string;
+}
+
+function defaultCriteriaRow(): CriteriaRowShape {
+  return {
+    id: "018f2b8a-0000-4c2d-9c3e-0000000000d1",
+    starting_monthly_limit: "1000.0000",
+    bank_statement_months: 3,
+    large_transaction_hold_enabled: true,
+    large_transaction_hold_threshold: "10000.0000",
+    updated_by: null,
+    version: 1,
+    updated_at: "2026-11-01T09:00:00.000Z",
+    created_at: "2026-11-01T09:00:00.000Z",
+  };
+}
+
+function defaultTierRows(): TierRowShape[] {
+  return ["low", "medium", "high"].map((tier, index) => ({
+    id: `018f2b8a-0000-4c2d-9c3e-0000000000e${index + 1}`,
+    tier,
+    extra_reserve_percent: "0.00",
+    hold_days: 0,
+    updated_by: null,
+    version: 1,
+    updated_at: "2026-11-01T09:00:00.000Z",
+    created_at: "2026-11-01T09:00:00.000Z",
+  }));
 }
 
 /** One row of `0048`, as the fake store holds it. */
@@ -1028,6 +1102,8 @@ interface BusinessDatabase {
   readonly onboardingRows: ProgressRowShape[];
   readonly mccRows: MccRowShape[];
   readonly countryRows: CountryRowShape[];
+  readonly criteriaRow: CriteriaRowShape | null;
+  readonly tierRows: TierRowShape[];
   readonly queries: string[];
   readonly inserts: { readonly table: string; readonly row: Readonly<Record<string, unknown>> }[];
   readonly updates: {
@@ -1036,6 +1112,8 @@ interface BusinessDatabase {
     readonly values: Readonly<Record<string, unknown>>;
   }[];
   conflictOnInsert: boolean;
+  /** When true, the criteria update branch simulates a lost race: the row moves on, the write does not land. */
+  criteriaRace: boolean;
 }
 
 function businessRow(overrides: Partial<BusinessRowShape> = {}): BusinessRowShape {
@@ -1074,6 +1152,8 @@ function createBusinessDatabase(
   documentRows: readonly DocumentRowShape[] = [],
   uboRows: readonly UboRowShape[] = [],
   screeningRows: readonly ScreeningRowShape[] = [],
+  criteriaRow: CriteriaRowShape | null = defaultCriteriaRow(),
+  tierRows: readonly TierRowShape[] = defaultTierRows(),
 ): BusinessDatabase {
   return {
     profileRows: [...profileRows],
@@ -1084,10 +1164,13 @@ function createBusinessDatabase(
     onboardingRows: [...onboardingRows],
     mccRows: [...mccRows],
     countryRows: [...countryRows],
+    criteriaRow: criteriaRow === null ? null : { ...criteriaRow },
+    tierRows: [...tierRows].map((row) => ({ ...row })),
     queries: [],
     inserts: [],
     updates: [],
     conflictOnInsert: false,
+    criteriaRace: false,
   };
 }
 
@@ -1246,6 +1329,45 @@ function createBusinessStore(database: BusinessDatabase): RestClient {
         return Promise.resolve(capped.map((row) => schema.parse(row)));
       }
 
+      // The `0106` platform tables: scoped by their own filters like the vocabulary, never by a company.
+      if (table === UNDERWRITING_CRITERIA_TABLE) {
+        if (!query.split("&").includes("deleted_at=is.null")) {
+          return Promise.reject(new Error(`the criteria read is not over live rows: ${query}`));
+        }
+
+        return Promise.resolve(
+          database.criteriaRow === null ? [] : [schema.parse(database.criteriaRow)],
+        );
+      }
+
+      if (table === UNDERWRITING_RISK_TIERS_TABLE) {
+        const parts = query.split("&");
+
+        if (!parts.includes("deleted_at=is.null")) {
+          return Promise.reject(new Error(`the tier read is not over live rows: ${query}`));
+        }
+
+        const tierFilter = parts.find((part) => part.startsWith("tier=eq."));
+        let matched = [...database.tierRows];
+
+        if (tierFilter !== undefined) {
+          const wantedTier = decodeURIComponent(tierFilter.slice("tier=eq.".length));
+          matched = matched.filter((row) => row.tier === wantedTier);
+        }
+
+        if (parts.includes("order=tier.asc")) {
+          matched = [...matched].sort((left, right) => left.tier.localeCompare(right.tier));
+        }
+
+        const limit = parts.find((part) => part.startsWith("limit="));
+        const capped =
+          limit === undefined
+            ? matched
+            : matched.slice(0, Number.parseInt(limit.slice("limit=".length), 10));
+
+        return Promise.resolve(capped.map((row) => schema.parse(row)));
+      }
+
       const wanted = scopedCompany(query);
 
       // The KYC tables of 0048-0051: company-scoped like the profile, with their own eq filters.
@@ -1335,6 +1457,19 @@ function createBusinessStore(database: BusinessDatabase): RestClient {
 
       if (table === BUSINESS_PROFILE_TABLE) {
         if (wanted === null) {
+          // The one deliberate cross-company profile read: the underwriting MCC overview of
+          // STEP 090, which counts profiles by the code they carry and selects nothing else.
+          if (query.includes("mcc_code=not.is.null")) {
+            const limit = query.split("&").find((part) => part.startsWith("limit="));
+            const matched = database.profileRows.filter((row) => row.mcc_code !== null);
+            const capped =
+              limit === undefined
+                ? matched
+                : matched.slice(0, Number.parseInt(limit.slice("limit=".length), 10));
+
+            return Promise.resolve(capped.map((row) => schema.parse({ mcc_code: row.mcc_code })));
+          }
+
           throw new Error(`the profile read is not scoped to one live company: ${query}`);
         }
 
@@ -1619,6 +1754,76 @@ function createBusinessStore(database: BusinessDatabase): RestClient {
 
         for (const row of database.uboRows) {
           if (row.company_id === wanted && (wantedId === null || row.id === wantedId)) {
+            for (const [key, value] of Object.entries(values)) {
+              (row as unknown as Record<string, unknown>)[key] = value;
+            }
+          }
+        }
+
+        return Promise.resolve();
+      }
+
+      // The `0106` criteria row: conditional on id and current version; a race moves the row on
+      // and lets the service's re-read see the mismatch.
+      if (table === UNDERWRITING_CRITERIA_TABLE) {
+        const parts = query.split("&");
+        const idPart = parts.find((part) => part.startsWith("id=eq."));
+        const versionPart = parts.find((part) => part.startsWith("version=eq."));
+        const wantedId = idPart === undefined ? null : decodeURIComponent(idPart.slice("id=eq.".length));
+        const wantedVersion =
+          versionPart === undefined ? null : Number(versionPart.slice("version=eq.".length));
+        const row = database.criteriaRow;
+
+        if (row !== null && database.criteriaRace) {
+          row.version += 5;
+        } else if (
+          row !== null &&
+          (wantedId === null || row.id === wantedId) &&
+          (wantedVersion === null || row.version === wantedVersion)
+        ) {
+          for (const [key, value] of Object.entries(values)) {
+            (row as unknown as Record<string, unknown>)[key] = value;
+          }
+        }
+
+        return Promise.resolve();
+      }
+
+      if (table === UNDERWRITING_RISK_TIERS_TABLE) {
+        const parts = query.split("&");
+        const idPart = parts.find((part) => part.startsWith("id=eq."));
+        const versionPart = parts.find((part) => part.startsWith("version=eq."));
+        const wantedId = idPart === undefined ? null : decodeURIComponent(idPart.slice("id=eq.".length));
+        const wantedVersion =
+          versionPart === undefined ? null : Number(versionPart.slice("version=eq.".length));
+
+        for (const row of database.tierRows) {
+          if (
+            (wantedId === null || row.id === wantedId) &&
+            (wantedVersion === null || row.version === wantedVersion)
+          ) {
+            for (const [key, value] of Object.entries(values)) {
+              (row as unknown as Record<string, unknown>)[key] = value;
+            }
+          }
+        }
+
+        return Promise.resolve();
+      }
+
+      if (table === MCC_CODES_TABLE) {
+        const parts = query.split("&");
+        const idPart = parts.find((part) => part.startsWith("id=eq."));
+        const versionPart = parts.find((part) => part.startsWith("version=eq."));
+        const wantedId = idPart === undefined ? null : decodeURIComponent(idPart.slice("id=eq.".length));
+        const wantedVersion =
+          versionPart === undefined ? null : Number(versionPart.slice("version=eq.".length));
+
+        for (const row of database.mccRows) {
+          if (
+            (wantedId === null || row.id === wantedId) &&
+            (wantedVersion === null || row.version === wantedVersion)
+          ) {
             for (const [key, value] of Object.entries(values)) {
               (row as unknown as Record<string, unknown>)[key] = value;
             }
@@ -5379,6 +5584,558 @@ async function checkReviewCatalog(): Promise<void> {
   }
 }
 
+/** ---- STEP 090: the underwriting criteria the compliance team sets. */
+const underwritingReadRefused: readonly (readonly [string, RequestActor])[] = [
+  ["an owner", owner],
+  ["support", actorOf(["support"], null, { userId: OFFICE_ID })],
+  ["blogger", actorOf(["blogger"], null, { userId: OFFICE_ID })],
+  ["nobody", actorOf([], null)],
+];
+
+const underwritingManageRefused: readonly (readonly [string, RequestActor])[] = [
+  ["an owner", owner],
+  ["ceo", ceoDesk],
+  ["finance_ops", actorOf(["finance_ops"], null, { userId: OFFICE_ID })],
+  ["support", actorOf(["support"], null, { userId: OFFICE_ID })],
+  ["blogger", actorOf(["blogger"], null, { userId: OFFICE_ID })],
+  ["nobody", actorOf([], null)],
+];
+
+const VALID_CRITERIA_BODY = {
+  starting_monthly_limit: "2500.00",
+  bank_statement_months: 6,
+  large_transaction_hold_enabled: false,
+  large_transaction_hold_threshold: "50000",
+};
+
+async function checkUnderwriting(): Promise<void> {
+  expectDeepEqual(
+    [...UNDERWRITING_MANAGE_ROLES],
+    ["super_admin", "compliance_kyc"],
+    "the manage roles are super_admin and compliance_kyc, section 5's compliance team",
+  );
+  expectDeepEqual(
+    [...UNDERWRITING_READ_ROLES],
+    ["ceo", "compliance_kyc", "finance_ops", "super_admin"],
+    "the read roles add the ceo and finance_ops oversight",
+  );
+
+  for (const [description, actor] of underwritingReadRefused) {
+    const database = createBusinessDatabase();
+    const refusal = await rejectionOf(() =>
+      readUnderwritingSettings({ actor }, dependenciesOf(database, createInMemoryAuditTrail())),
+    );
+
+    expectEqual(refusal?.code, "PERMISSION_DENIED", `the settings read refuses ${description}`);
+    expectEqual(database.queries.length, 0, `and reads nothing for ${description}`);
+
+    const overviewDatabase = createBusinessDatabase();
+    const overviewRefusal = await rejectionOf(() =>
+      readUnderwritingMccOverview({ actor }, dependenciesOf(overviewDatabase, createInMemoryAuditTrail())),
+    );
+
+    expectEqual(overviewRefusal?.code, "PERMISSION_DENIED", `the mcc overview refuses ${description}`);
+    expectEqual(overviewDatabase.queries.length, 0, `and reads nothing for ${description}`);
+  }
+
+  for (const [description, actor] of underwritingManageRefused) {
+    const saves: readonly (readonly [string, (deps: ReturnType<typeof dependenciesOf>) => Promise<unknown>])[] = [
+      ["the criteria save", (deps) => updateUnderwritingCriteria({ actor, body: VALID_CRITERIA_BODY }, deps)],
+      ["the tier save", (deps) => updateUnderwritingRiskTier({ actor, body: { tier: "high", extra_reserve_percent: "10", hold_days: 7 } }, deps)],
+      ["the code tier save", (deps) => setMccRiskTier({ actor, body: { code: "5812", tier: "high" } }, deps)],
+    ];
+
+    for (const [label, save] of saves) {
+      const database = createBusinessDatabase();
+      const refusal = await rejectionOf(() => save(dependenciesOf(database, createInMemoryAuditTrail())));
+
+      expectEqual(refusal?.code, "PERMISSION_DENIED", `${label} refuses ${description}`);
+      expectEqual(database.queries.length, 0, `and queries nothing for ${description}`);
+      expectEqual(database.updates.length, 0, `and writes nothing for ${description}`);
+    }
+  }
+
+  // The happy read: the seeded row, the three tier rows, one audited office read, no company filter.
+  const database = createBusinessDatabase();
+  const audit = createInMemoryAuditTrail();
+  const settings = await readUnderwritingSettings({ actor: desk }, dependenciesOf(database, audit));
+
+  expectEqual(settings.criteria.startingMonthlyLimit, "1000.0000", "the seeded starting limit");
+  expectEqual(settings.criteria.bankStatementMonths, 3, "the seeded statement period");
+  expectEqual(settings.criteria.largeHoldEnabled, true, "the seeded hold switch");
+  expectEqual(settings.criteria.largeHoldThreshold, "10000.0000", "the seeded hold threshold");
+  expectEqual(settings.tiers.length, 3, "three tier rows");
+  expectEqual(settings.tiers.map((tier) => tier.tier).join(","), "high,low,medium", "ordered by tier name");
+  expectEqual(
+    audit.entries.filter((entry) => entry.action === UNDERWRITING_READ_AUDIT_ACTION).length,
+    1,
+    "the office read is audited under underwriting.criteria_read_by_office",
+  );
+  expect(
+    database.queries.every((query) => !query.includes("company_id=eq.")),
+    "the settings reads are platform scoped: no company filter on any query",
+  );
+
+  // The merchant-safe summary: owner only, and only the statement period.
+  const summary = await readMerchantUnderwritingSummary(
+    { actor: owner },
+    dependenciesOf(createBusinessDatabase(), createInMemoryAuditTrail()),
+  );
+
+  expectEqual(summary.bankStatementPeriodMonths, 3, "the merchant summary answers the statement period");
+  expectDeepEqual(Object.keys(summary), ["bankStatementPeriodMonths"], "and nothing else");
+
+  const officeSummary = await rejectionOf(() =>
+    readMerchantUnderwritingSummary({ actor: desk }, dependenciesOf(createBusinessDatabase(), createInMemoryAuditTrail())),
+  );
+
+  expectEqual(officeSummary?.code, "PERMISSION_DENIED", "the summary is owner-only, not an office read");
+
+  const companyless = await rejectionOf(() =>
+    readMerchantUnderwritingSummary(
+      { actor: actorOf(["owner"], null) },
+      dependenciesOf(createBusinessDatabase(), createInMemoryAuditTrail()),
+    ),
+  );
+
+  expectEqual(companyless?.code, "PERMISSION_DENIED", "an owner without a company gets no summary");
+
+  // The criteria save: conditional update, version bump, updater, one audit entry.
+  const saveDatabase = createBusinessDatabase();
+  const saveAudit = createInMemoryAuditTrail();
+  const updated = await updateUnderwritingCriteria(
+    { actor: desk, body: VALID_CRITERIA_BODY },
+    dependenciesOf(saveDatabase, saveAudit),
+  );
+
+  expectEqual(updated.criteria.startingMonthlyLimit, "2500.00", "the new starting limit");
+  expectEqual(updated.criteria.bankStatementMonths, 6, "the new statement period");
+  expectEqual(updated.criteria.largeHoldEnabled, false, "the hold switch off");
+  expectEqual(updated.criteria.largeHoldThreshold, "50000", "the new threshold");
+  expectEqual(updated.criteria.version, 2, "version bumped");
+
+  const update = saveDatabase.updates.find((entry) => entry.table === UNDERWRITING_CRITERIA_TABLE);
+
+  expect(
+    update !== undefined &&
+      update.query.includes("id=eq.") &&
+      update.query.includes("version=eq.1") &&
+      update.query.includes("deleted_at=is.null"),
+    "the update is conditional on id and current version over live rows",
+  );
+  expectEqual(update?.values["updated_by"], OFFICE_ID, "the updater is recorded on the row");
+  expectEqual(
+    saveAudit.entries.filter((entry) => entry.action === UNDERWRITING_CRITERIA_AUDIT_ACTION).length,
+    1,
+    "one criteria audit entry",
+  );
+
+  const criteriaAudit = saveAudit.entries.find((entry) => entry.action === UNDERWRITING_CRITERIA_AUDIT_ACTION);
+
+  expectEqual(criteriaAudit?.payload?.["bank_statement_months"], 6, "with the new period in the payload");
+  expectEqual(criteriaAudit?.companyId, null, "on the platform chain");
+
+  // Validation refusals: every one writes nothing.
+  const badBodies: readonly (readonly [string, unknown])[] = [
+    ["a non-numeric limit", { ...VALID_CRITERIA_BODY, starting_monthly_limit: "abc" }],
+    ["a zero limit", { ...VALID_CRITERIA_BODY, starting_monthly_limit: "0" }],
+    ["a limit over the ceiling", { ...VALID_CRITERIA_BODY, starting_monthly_limit: "100000001" }],
+    ["zero months", { ...VALID_CRITERIA_BODY, bank_statement_months: 0 }],
+    ["months over 36", { ...VALID_CRITERIA_BODY, bank_statement_months: 37 }],
+    ["a missing field", { starting_monthly_limit: "100" }],
+    ["a threshold over the ceiling", { ...VALID_CRITERIA_BODY, large_transaction_hold_threshold: "1000000001" }],
+    ["a boolean as a string", { ...VALID_CRITERIA_BODY, large_transaction_hold_enabled: "yes" }],
+  ];
+
+  for (const [description, body] of badBodies) {
+    const badDatabase = createBusinessDatabase();
+    const refusal = await rejectionOf(() =>
+      updateUnderwritingCriteria({ actor: desk, body }, dependenciesOf(badDatabase, createInMemoryAuditTrail())),
+    );
+
+    expectEqual(refusal?.code, "VALIDATION_FAILED", `the criteria save refuses ${description}`);
+    expectEqual(badDatabase.updates.length, 0, `and writes nothing for ${description}`);
+  }
+
+  const rangeDatabase = createBusinessDatabase();
+  const rangeRefusal = await rejectionOf(() =>
+    updateUnderwritingCriteria(
+      { actor: desk, body: { ...VALID_CRITERIA_BODY, starting_monthly_limit: "0" } },
+      dependenciesOf(rangeDatabase, createInMemoryAuditTrail()),
+    ),
+  );
+
+  expect(
+    (rangeRefusal?.details ?? []).some((detail) => detail.rule === "out_of_range"),
+    "a range refusal names the out_of_range rule",
+  );
+
+  // A lost race: the row moves on between the read and the write, so the re-read conflicts.
+  const raceDatabase = createBusinessDatabase();
+  raceDatabase.criteriaRace = true;
+  const raceRefusal = await rejectionOf(() =>
+    updateUnderwritingCriteria({ actor: desk, body: VALID_CRITERIA_BODY }, dependenciesOf(raceDatabase, createInMemoryAuditTrail())),
+  );
+
+  expectEqual(raceRefusal?.code, "CONFLICT", "a lost race conflicts");
+  expectDeepEqual(raceRefusal?.details, [{ field: "version", rule: "stale" }], "named stale");
+
+  // The tier save: conditional update, audit, and idempotency when nothing changes.
+  const tierDatabase = createBusinessDatabase();
+  const tierAudit = createInMemoryAuditTrail();
+  const tiered = await updateUnderwritingRiskTier(
+    { actor: desk, body: { tier: "high", extra_reserve_percent: "10.00", hold_days: 7 } },
+    dependenciesOf(tierDatabase, tierAudit),
+  );
+  const highTier = tiered.tiers.find((tier) => tier.tier === "high");
+
+  expectEqual(highTier?.extraReservePercent, "10.00", "the tier's reserve saved");
+  expectEqual(highTier?.holdDays, 7, "and its hold days");
+  expectEqual(highTier?.version, 2, "version bumped");
+
+  const tierUpdate = tierDatabase.updates.find((entry) => entry.table === UNDERWRITING_RISK_TIERS_TABLE);
+
+  expect(
+    tierUpdate !== undefined && tierUpdate.query.includes("version=eq.1"),
+    "the tier update is conditional on the current version",
+  );
+  expectEqual(
+    tierAudit.entries.filter((entry) => entry.action === UNDERWRITING_RISK_TIER_AUDIT_ACTION).length,
+    1,
+    "one tier audit entry",
+  );
+  expectEqual(
+    tierAudit.entries.find((entry) => entry.action === UNDERWRITING_RISK_TIER_AUDIT_ACTION)?.entityType,
+    UNDERWRITING_RISK_TIER_ENTITY,
+    "on the tier entity",
+  );
+
+  const again = await updateUnderwritingRiskTier(
+    { actor: desk, body: { tier: "high", extra_reserve_percent: "10.00", hold_days: 7 } },
+    dependenciesOf(tierDatabase, tierAudit),
+  );
+
+  expectEqual(again.tiers.find((tier) => tier.tier === "high")?.version, 2, "re-saving the same values changes nothing");
+  expectEqual(
+    tierDatabase.updates.filter((entry) => entry.table === UNDERWRITING_RISK_TIERS_TABLE).length,
+    1,
+    "the idempotent save writes no second update",
+  );
+  expectEqual(
+    tierAudit.entries.filter((entry) => entry.action === UNDERWRITING_RISK_TIER_AUDIT_ACTION).length,
+    1,
+    "and audits nothing",
+  );
+
+  for (const [description, body] of [
+    ["an unknown tier", { tier: "critical", extra_reserve_percent: "1", hold_days: 1 }],
+    ["a reserve over 100", { tier: "low", extra_reserve_percent: "101", hold_days: 1 }],
+    ["hold days over 90", { tier: "low", extra_reserve_percent: "1", hold_days: 91 }],
+    ["negative days", { tier: "low", extra_reserve_percent: "1", hold_days: -1 }],
+  ] as const) {
+    const badTierDatabase = createBusinessDatabase();
+    const refusal = await rejectionOf(() =>
+      updateUnderwritingRiskTier({ actor: desk, body }, dependenciesOf(badTierDatabase, createInMemoryAuditTrail())),
+    );
+
+    expectEqual(refusal?.code, "VALIDATION_FAILED", `the tier save refuses ${description}`);
+    expectEqual(badTierDatabase.updates.length, 0, `and writes nothing for ${description}`);
+  }
+
+  // The code tier: set, idempotent re-set, retired conflict, unknown code, bad format.
+  const mccDatabase = createBusinessDatabase();
+  const mccAudit = createInMemoryAuditTrail();
+  const overview = await setMccRiskTier(
+    { actor: desk, body: { code: "5812", tier: "high" } },
+    dependenciesOf(mccDatabase, mccAudit),
+  );
+  const restaurants = overview.rows.find((row) => row.code === "5812");
+
+  expectEqual(restaurants?.tier, "high", "the code's tier is set in the overview");
+  expectEqual(
+    mccDatabase.mccRows.find((row) => row.code === "5812")?.version,
+    2,
+    "version bumped on the code row",
+  );
+
+  const mccUpdate = mccDatabase.updates.find((entry) => entry.table === MCC_CODES_TABLE);
+
+  expect(
+    mccUpdate !== undefined && mccUpdate.query.includes("id=eq.") && mccUpdate.query.includes("version=eq.1"),
+    "the code update is conditional on id and current version",
+  );
+
+  const mccAuditEntry = mccAudit.entries.find((entry) => entry.action === UNDERWRITING_MCC_TIER_AUDIT_ACTION);
+
+  expectEqual(mccAuditEntry?.entityType, MCC_CODE_ENTITY, "the tier change is audited on the code entity");
+  expectDeepEqual(mccAuditEntry?.payload, { code: "5812", tier: "high" }, "with the code and the tier");
+  expectEqual(mccAuditEntry?.companyId, null, "on the platform chain");
+
+  await setMccRiskTier({ actor: desk, body: { code: "5812", tier: "high" } }, dependenciesOf(mccDatabase, mccAudit));
+
+  expectEqual(
+    mccDatabase.updates.filter((entry) => entry.table === MCC_CODES_TABLE).length,
+    1,
+    "re-setting the same tier writes nothing",
+  );
+
+  const retiredRefusal = await rejectionOf(() =>
+    setMccRiskTier(
+      { actor: desk, body: { code: "0001", tier: "high" } },
+      dependenciesOf(createBusinessDatabase(), createInMemoryAuditTrail()),
+    ),
+  );
+
+  expectEqual(retiredRefusal?.code, "CONFLICT", "a retired code conflicts");
+  expectDeepEqual(retiredRefusal?.details, [{ field: "code", rule: "retired_code" }], "named retired_code");
+
+  const unknownCode = await rejectionOf(() =>
+    setMccRiskTier(
+      { actor: desk, body: { code: "9999", tier: "high" } },
+      dependenciesOf(createBusinessDatabase(), createInMemoryAuditTrail()),
+    ),
+  );
+
+  expectEqual(unknownCode?.code, "RESOURCE_NOT_FOUND", "an unknown code is not found");
+
+  const badCodeDatabase = createBusinessDatabase();
+  const badCode = await rejectionOf(() =>
+    setMccRiskTier({ actor: desk, body: { code: "12", tier: "high" } }, dependenciesOf(badCodeDatabase, createInMemoryAuditTrail())),
+  );
+
+  expectEqual(badCode?.code, "VALIDATION_FAILED", "a two digit code is refused");
+  expectEqual(badCodeDatabase.queries.length, 0, "before any query");
+
+  const cleared = await setMccRiskTier(
+    { actor: desk, body: { code: "5411", tier: "unassigned" } },
+    dependenciesOf(createBusinessDatabase(), createInMemoryAuditTrail()),
+  );
+
+  expectEqual(
+    cleared.rows.find((row) => row.code === "5411")?.tier,
+    "unassigned",
+    "a tier can be cleared back to unassigned",
+  );
+
+  // The overview: active codes only, counts across companies, ordered by count then code.
+  const overviewDatabase = createBusinessDatabase([
+    businessRow({ company_id: COMPANY_A, mcc_code: "5812" }),
+    businessRow({ company_id: COMPANY_B, mcc_code: "5812" }),
+    businessRow({ company_id: COMPANY_A, mcc_code: "0742" }),
+    businessRow({ company_id: COMPANY_A }),
+  ]);
+  const overviewAudit = createInMemoryAuditTrail();
+  const list = await readUnderwritingMccOverview({ actor: ceoDesk }, dependenciesOf(overviewDatabase, overviewAudit));
+
+  expectEqual(list.rows.length, 3, "the retired code is not listed");
+  expectEqual(list.rows[0]?.code, "5812", "the most used code first");
+  expectEqual(list.rows[0]?.profileCount, 2, "counted across companies");
+  expectEqual(list.rows[1]?.code, "0742", "then the next by count");
+  expectEqual(list.rows[1]?.profileCount, 1, "one merchant on the veterinary code");
+  expectEqual(list.rows[2]?.code, "5411", "then the unused code");
+  expectEqual(list.rows[2]?.profileCount, 0, "with zero merchants");
+  expect(
+    overviewDatabase.queries.some(
+      (query) => query.startsWith(`${BUSINESS_PROFILE_TABLE}?`) && query.includes("mcc_code=not.is.null") && !query.includes("company_id=eq."),
+    ),
+    "the overview's profile read is the one deliberate cross-company read, selecting only the code",
+  );
+  expect(
+    overviewDatabase.queries
+      .filter((query) => query.startsWith(`${MCC_CODES_TABLE}?`))
+      .every((query) => query.includes("is_active=is.true")),
+    "and the code read asks for active rows only",
+  );
+  expectEqual(
+    overviewAudit.entries.filter((entry) => entry.action === UNDERWRITING_READ_AUDIT_ACTION).length,
+    1,
+    "the overview read is audited",
+  );
+}
+
+/** ---- STEP 090 sources: the routes, the screen, the service, the migration, the merchant wiring. */
+async function checkUnderwritingSources(): Promise<void> {
+  const criteriaRoute = await readRepositoryFile("app/api/onboarding/underwriting-criteria/route.ts");
+  const tierRoute = await readRepositoryFile("app/api/onboarding/underwriting-risk-tier/route.ts");
+  const mccTierRoute = await readRepositoryFile("app/api/onboarding/underwriting-mcc-tier/route.ts");
+  const mccRoute = await readRepositoryFile("app/api/onboarding/underwriting-mcc/route.ts");
+  const page = await readRepositoryFile("app/(dashboard)/onboarding/underwriting/page.tsx");
+  const panel = await readRepositoryFile("app/(dashboard)/onboarding/underwriting/underwriting-panel.tsx");
+  const service = await readRepositoryFile("services/kyc/underwriting.ts");
+  const csrf = await readRepositoryFile("lib/security/csrf.ts");
+  const migration = await readRepositoryFile("migrations/0106_underwriting_criteria.sql");
+  const rollback = await readRepositoryFile("migrations/0106_underwriting_criteria.down.sql");
+  const documentRoute = await readRepositoryFile("app/api/onboarding/kyc-document/route.ts");
+  const documentsPage = await readRepositoryFile("app/(dashboard)/onboarding/documents/page.tsx");
+  const documentsForm = await readRepositoryFile("app/(dashboard)/onboarding/documents/documents-form.tsx");
+
+  for (const [path, source] of [
+    ["app/api/onboarding/underwriting-criteria/route.ts", criteriaRoute],
+    ["app/api/onboarding/underwriting-risk-tier/route.ts", tierRoute],
+    ["app/api/onboarding/underwriting-mcc-tier/route.ts", mccTierRoute],
+    ["app/api/onboarding/underwriting-mcc/route.ts", mccRoute],
+    ["app/(dashboard)/onboarding/underwriting/page.tsx", page],
+    ["app/(dashboard)/onboarding/underwriting/underwriting-panel.tsx", panel],
+    ["services/kyc/underwriting.ts", service],
+  ] as const) {
+    expectEqual(source.split("\n")[0], `// path: ${path}`, `${path} states its own path on its first line`);
+    expectEqual(/[^\t\n\r\x20-\x7E]/u.test(source), false, `${path} is ASCII only`);
+  }
+
+  expectEqual(criteriaRoute.includes("export const GET"), false, "the criteria route answers no GET: the screen reads server-side");
+  expect(criteriaRoute.includes("export const POST"), "and answers POST");
+  expect(criteriaRoute.includes("updateUnderwritingCriteria("), "the POST saves through the service");
+  expect(mccRoute.includes("export const GET"), "the mcc route answers GET");
+  expectEqual(mccRoute.includes("export const POST"), false, "and answers no POST");
+  expect(mccRoute.includes("readUnderwritingMccOverview("), "reading the overview through the service");
+  expectEqual(mccRoute.includes("searchParams"), false, "and takes no parameter: the list is platform scoped");
+
+  for (const [path, route, serviceCall] of [
+    ["app/api/onboarding/underwriting-criteria/route.ts", criteriaRoute, "updateUnderwritingCriteria("],
+    ["app/api/onboarding/underwriting-risk-tier/route.ts", tierRoute, "updateUnderwritingRiskTier("],
+    ["app/api/onboarding/underwriting-mcc-tier/route.ts", mccTierRoute, "setMccRiskTier("],
+  ] as const) {
+    expect(route.includes("export const POST"), `${path} answers POST`);
+    expect(route.includes("requireCsrfToken("), "the token is checked first");
+    expect(route.indexOf("requireCsrfToken(") < route.indexOf("readRequestActor("), "before the session is read");
+    expect(route.indexOf("requireCsrfToken(") < route.indexOf("request.text()"), "and before the body is read");
+    expect(route.includes("maximumBodyBytes"), "the body is bounded");
+    expect(route.includes('"cache-control": "no-store"'), "the answer is not cached");
+    expect(route.includes(serviceCall), `and the service call is ${serviceCall}`);
+    expect(
+      csrf.includes(`"${path.replace("app/api", "/api").replace("/route.ts", "")}",`),
+      `and the path is on the CSRF-protected list`,
+    );
+  }
+
+  expect(service.includes("UNDERWRITING_CRITERIA_TABLE = \"underwriting_criteria\""), "the service names the criteria table");
+  expect(service.includes("UNDERWRITING_RISK_TIERS_TABLE = \"underwriting_risk_tiers\""), "and the tiers table");
+  expect(service.includes("version=eq."), "every write is conditional on the current version");
+  expect(service.includes("deleted_at=is.null"), "and over live rows only");
+  expect(service.includes("retired_code"), "a retired code's tier conflicts");
+  expect(service.includes("mcc_code=not.is.null"), "the overview counts profiles by code across companies");
+  expect(service.includes(UNDERWRITING_CRITERIA_AUDIT_ACTION), "the criteria save is audited");
+  expect(service.includes(UNDERWRITING_RISK_TIER_AUDIT_ACTION), "the tier save is audited");
+  expect(service.includes(UNDERWRITING_MCC_TIER_AUDIT_ACTION), "the code tier save is audited");
+  expect(service.includes("export async function readMerchantUnderwritingSummary"), "and the merchant-safe summary exists");
+  expect(
+    service.includes("return { bankStatementPeriodMonths: row.bank_statement_months };"),
+    "the summary answers the statement period only",
+  );
+
+  expect(page.includes("readOwnerActor()"), "the page reads the account through the cached reader");
+  expect(page.includes("readUnderwritingSettings("), "and the settings through the service");
+  expect(page.includes("readUnderwritingMccOverview("), "and the overview through the service");
+  expect(page.includes("<SessionKeeper"), "and keeps the session rotating");
+  expect(page.includes("UnderwritingPanel"), "and hands both reads to the panel");
+  for (const state of ["signed-out", "forbidden", "unavailable", "ready"]) {
+    expect(page.includes(`"${state}"`), `the page keeps the ${state} answer apart`);
+  }
+
+  expectEqual(panel.includes('"use client"'), true, "the panel is a client component");
+  expectEqual((panel.match(/method: "POST"/gu) ?? []).length, 1, "its three saves share one POST site");
+  expectEqual((panel.match(/\.\.\.\(await csrfHeaders\(\)\)/gu) ?? []).length, 1, "with one awaited CSRF spread");
+  for (const pathConst of ["CRITERIA_PATH", "TIER_PATH", "MCC_TIER_PATH"]) {
+    expect(panel.includes(pathConst), `the panel posts to ${pathConst}`);
+  }
+  expect(panel.includes('"/api/onboarding/underwriting-criteria"'), "the criteria path");
+  expect(panel.includes('"/api/onboarding/underwriting-risk-tier"'), "the tier path");
+  expect(panel.includes('"/api/onboarding/underwriting-mcc-tier"'), "the code tier path");
+  expectEqual(panel.includes("company_id"), false, "and no company field is ever sent in a body");
+
+  expect(migration.includes("create table public.underwriting_criteria"), "the migration creates the criteria table");
+  expect(migration.includes("create table public.underwriting_risk_tiers"), "and the tiers table");
+  expect(migration.includes("business_profiles_underwriting_read"), "and the office read policy on the profiles");
+  expect(migration.includes("underwriting_criteria_manage_all"), "and the manage policy");
+  expect(migration.includes("underwriting_criteria_owner_read"), "and the owner read policy for the statement period");
+  expect(migration.includes("1000.0000"), "seeding the default starting limit");
+  expect(rollback.includes("drop table if exists public.underwriting_criteria;"), "the rollback drops the criteria table");
+  expect(rollback.includes("drop table if exists public.underwriting_risk_tiers;"), "and the tiers table");
+  expect(rollback.includes("drop policy if exists business_profiles_underwriting_read"), "and the added policy");
+
+  // The merchant wiring: the documents route enforces the stored period, the page shows it.
+  expect(documentRoute.includes("readMerchantUnderwritingSummary("), "the document route reads the compliance-set period");
+  expect(
+    documentRoute.includes("bankStatementPeriodMonths: summary.bankStatementPeriodMonths"),
+    "and hands it to the capture service",
+  );
+  expect(documentsPage.includes("readMerchantUnderwritingSummary("), "the documents page reads the summary");
+  expect(documentsPage.includes("statementPeriodMonths"), "and passes the period to the form");
+  expect(documentsForm.includes("statementPeriodMonths"), "the form checks against the passed period");
+  expectEqual(
+    documentsForm.includes("BANK_STATEMENT_DEFAULT_PERIOD_MONTHS"),
+    false,
+    "and no longer hardcodes the default: the compliance-set period is the rule",
+  );
+
+  for (const folder of ["underwriting-criteria", "underwriting-risk-tier", "underwriting-mcc-tier", "underwriting-mcc"]) {
+    expect(
+      (await readdir(new URL(`app/api/onboarding/${folder}/`, repositoryRoot))).includes("route.ts"),
+      `${folder} is a route handler of its own`,
+    );
+  }
+  expect(
+    (await readdir(new URL("app/(dashboard)/onboarding/underwriting/", repositoryRoot))).includes("page.tsx"),
+    "the underwriting screen lives in the onboarding area",
+  );
+  expect(
+    (await readdir(new URL("app/(dashboard)/onboarding/underwriting/", repositoryRoot))).includes("underwriting-panel.tsx"),
+    "with its panel beside it",
+  );
+  expect(
+    (await readdir(new URL("services/kyc/", repositoryRoot))).includes("underwriting.ts"),
+    "the underwriting service lives in services/kyc",
+  );
+}
+
+/** ---- STEP 090 catalog: every sentence of the underwriting screen is used, and every key it names exists. */
+async function checkUnderwritingCatalog(): Promise<void> {
+  const block = en.onboardingUnderwriting as unknown as Record<string, unknown>;
+  const page = await readRepositoryFile("app/(dashboard)/onboarding/underwriting/page.tsx");
+  const panel = await readRepositoryFile("app/(dashboard)/onboarding/underwriting/underwriting-panel.tsx");
+  const sources = `${page}\n${panel}`;
+
+  const flat: string[] = [];
+
+  const walk = (node: Record<string, unknown>, prefix: string): void => {
+    for (const [key, value] of Object.entries(node)) {
+      const path = `${prefix}.${key}`;
+
+      if (typeof value === "string") {
+        flat.push(path);
+      } else if (typeof value === "object" && value !== null) {
+        walk(value as Record<string, unknown>, path);
+      }
+    }
+  };
+
+  walk(block, "onboardingUnderwriting");
+
+  expect(flat.length >= 30, "the underwriting screen has its own block of copy");
+
+  for (const path of flat) {
+    expect(sources.includes(`"${path}"`), `the copy key ${path} is used by the screen`);
+  }
+
+  const referenced = [...sources.matchAll(/"(onboardingUnderwriting\.[A-Za-z.]+)"/gu)].map((match) => match[1]);
+
+  for (const path of new Set(referenced)) {
+    expect(path !== undefined && flat.includes(path), `the screen names no missing key (${String(path)})`);
+  }
+
+  for (const templated of ["showingLine", "versionLine"]) {
+    expectEqual(
+      sources.includes(`getMessage("onboardingUnderwriting.${templated}")`),
+      false,
+      `${templated} is never rendered without its values`,
+    );
+    expect(
+      sources.includes(`formatMessage("onboardingUnderwriting.${templated}"`),
+      `and is rendered through formatMessage`,
+    );
+  }
+}
+
 async function main(): Promise<void> {
   checkVocabulary();
   await checkRefusals();
@@ -5435,6 +6192,9 @@ async function main(): Promise<void> {
   await checkKycCatalog();
   await checkStatusCatalog();
   await checkReviewCatalog();
+  await checkUnderwriting();
+  await checkUnderwritingSources();
+  await checkUnderwritingCatalog();
 
   if (failures.length > 0) {
     process.stderr.write(`onboarding gate failed with ${failures.length} problem(s):\n`);
@@ -5452,7 +6212,7 @@ async function main(): Promise<void> {
     `onboarding gate passed: ${checks} checks, ${ONBOARDING_STEPS.length} steps, ` +
       `${ONBOARDING_OWNER_ROLES.length} role, ${BUSINESS_PROFILE_FIELDS.length} business fields, ` +
       `${PROCESSOR_REQUIREMENT_LIST.length} processors, ${BUSINESS_PROFILE_TABLE} table, ` +
-      `${MCC_CODES_TABLE} vocabulary, ${COUNTRIES_TABLE} list, submerchant profile, kyc pack\n`,
+      `${MCC_CODES_TABLE} vocabulary, ${COUNTRIES_TABLE} list, submerchant profile, kyc pack, underwriting criteria\n`,
   );
 }
 

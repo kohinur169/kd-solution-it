@@ -60,6 +60,17 @@ Every read is scoped to the caller company and every write is audit logged.
   `markKycSubmissionRisk` (high risk forces `four_eye_required`; decided rows are locked and
   conflict; `POST /api/onboarding/kyc-risk-mark`), the queue badges four-eye rows, and
   `fourEyeProblems` is the guard STEP 093's decision flow calls before writing a decision.
+- `onboarding/underwriting/` - STEP 090: the underwriting criteria screen for the compliance team
+  (`0106_underwriting_criteria.sql` creates the one `underwriting_criteria` row and the three
+  `underwriting_risk_tiers` rows, plus the office read policy on `business_profiles` for the MCC
+  overview; `services/kyc/underwriting.ts` reads and writes them: `readUnderwritingSettings` and
+  `readUnderwritingMccOverview` for the ceo/compliance_kyc/finance_ops/super_admin read roles,
+  `updateUnderwritingCriteria`, `updateUnderwritingRiskTier` and `setMccRiskTier` for the
+  super_admin/compliance_kyc manage roles, each a conditional version-bumped update with a re-read
+  race check and its own audit action, and `readMerchantUnderwritingSummary` answering the owner the
+  one criterion that governs their upload - the required bank statement period, which the documents
+  route now enforces server side. `POST /api/onboarding/underwriting-criteria`,
+  `/underwriting-risk-tier`, `/underwriting-mcc-tier`, `GET /api/onboarding/underwriting-mcc`).
 
 ## The reader
 

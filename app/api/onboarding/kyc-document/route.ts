@@ -12,6 +12,7 @@ import {
   saveKycDocument,
   type KycPackSnapshot,
 } from "@/services/kyc/kyc-capture";
+import { readMerchantUnderwritingSummary } from "@/services/kyc/underwriting";
 
 export const dynamic = "force-dynamic";
 
@@ -88,6 +89,14 @@ export const POST = withErrorResponse(
     }
 
     const bytes = new Uint8Array(await file.arrayBuffer());
+
+    // STEP 090: the required bank statement period is a compliance-set criterion of section 5, so
+    // the server validates the upload against the stored row, not a build-time default.
+    const summary = await readMerchantUnderwritingSummary(
+      { actor },
+      { rest: runtime.rest, audit: runtime.audit },
+    );
+
     const snapshot = await saveKycDocument(
       {
         actor,
@@ -100,7 +109,7 @@ export const POST = withErrorResponse(
           expires_at: formText(form, "expires_at"),
         },
       },
-      { rest: runtime.rest, audit: runtime.audit },
+      { rest: runtime.rest, audit: runtime.audit, bankStatementPeriodMonths: summary.bankStatementPeriodMonths },
     );
 
     logger.info("kyc document recorded", {

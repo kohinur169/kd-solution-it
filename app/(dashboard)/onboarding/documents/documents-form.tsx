@@ -9,7 +9,6 @@ import { formatMessage, getMessage } from "@/lib/i18n/messages";
 import type { MessagePath } from "@/lib/i18n/messages";
 import { csrfHeaders } from "@/lib/security/csrf-client";
 import {
-  BANK_STATEMENT_DEFAULT_PERIOD_MONTHS,
   BANK_STATEMENT_MAX_AGE_MONTHS,
   dateStringMinusMonths,
   KYC_DOCUMENT_TYPES,
@@ -116,9 +115,12 @@ interface SectionMessage {
 export function DocumentsForm({
   initial,
   issueWindow,
+  statementPeriodMonths,
 }: {
   readonly initial: KycPackSnapshot;
   readonly issueWindow: UtilityBillIssueWindow;
+  /** The required bank statement period in months, set by the compliance team (STEP 090). */
+  readonly statementPeriodMonths: number;
 }): ReactNode {
   const router = useRouter();
   const [pack, setPack] = useState<KycPackSnapshot>(initial);
@@ -237,7 +239,7 @@ export function DocumentsForm({
 
           if (expiresAt < recencyCutoff) {
             preflight["expires_at"] = ruleSentence("invalid_range");
-          } else if (monthsBetweenDates(issuedAt, expiresAt) < BANK_STATEMENT_DEFAULT_PERIOD_MONTHS) {
+          } else if (monthsBetweenDates(issuedAt, expiresAt) < statementPeriodMonths) {
             preflight["expires_at"] = ruleSentence("invalid_range");
           }
         }
@@ -451,7 +453,7 @@ export function DocumentsForm({
                       })
                     : documentType === "bank_statement"
                       ? formatMessage("onboardingDocuments.bankStatementRuleLine", {
-                          months: String(BANK_STATEMENT_DEFAULT_PERIOD_MONTHS),
+                          months: String(statementPeriodMonths),
                         })
                       : getMessage("onboardingDocuments.issuedAtHint"))}
               </span>

@@ -7,6 +7,7 @@ import { getAuthRuntime } from "@/lib/auth/runtime";
 import { AppError } from "@/lib/errors/app-error";
 import { getMessage } from "@/lib/i18n/messages";
 import { readKycPack, utilityBillIssueWindow, type KycPackSnapshot } from "@/services/kyc/kyc-capture";
+import { readMerchantUnderwritingSummary } from "@/services/kyc/underwriting";
 import { DocumentsForm } from "./documents-form";
 import { readOwnerActor } from "../owner-actor";
 
@@ -42,7 +43,7 @@ type DocumentsPageState =
   | { readonly kind: "signed-out" }
   | { readonly kind: "forbidden" }
   | { readonly kind: "unavailable" }
-  | { readonly kind: "ready"; readonly snapshot: KycPackSnapshot };
+  | { readonly kind: "ready"; readonly snapshot: KycPackSnapshot; readonly statementPeriodMonths: number };
 
 async function readDocumentsState(): Promise<DocumentsPageState> {
   const actorState = await readOwnerActor();
@@ -63,7 +64,14 @@ async function readDocumentsState(): Promise<DocumentsPageState> {
       { rest: runtime.rest, audit: runtime.audit },
     );
 
-    return { kind: "ready", snapshot };
+    // STEP 090: the required bank statement period is a compliance-set criterion; the merchant
+    // sees it here so their upload satisfies it before the server re-checks.
+    const summary = await readMerchantUnderwritingSummary(
+      { actor: actorState.actor },
+      { rest: runtime.rest, audit: runtime.audit },
+    );
+
+    return { kind: "ready", snapshot, statementPeriodMonths: summary.bankStatementPeriodMonths };
   } catch (error) {
     if (error instanceof AppError && error.code === "AUTHENTICATION_REQUIRED") {
       return { kind: "signed-out" };
@@ -99,7 +107,11 @@ export default async function OnboardingDocumentsPage(): Promise<ReactNode> {
                 ? getMessage("onboardingDocuments.stepCompleteLine")
                 : getMessage("onboardingDocuments.stepTodoLine")}
             </p>
-            <DocumentsForm initial={state.snapshot} issueWindow={ISSUE_WINDOW} />
+            <DocumentsForm
+              initial={state.snapshot}
+              issueWindow={ISSUE_WINDOW}
+              statementPeriodMonths={state.statementPeriodMonths}
+            />
           </>
         ) : (
           <p className={alertClasses} role="alert">
