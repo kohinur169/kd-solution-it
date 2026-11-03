@@ -44,6 +44,10 @@ Every read is scoped to the caller company and every write is audit logged.
   period rule: both dates are the covered period, which must end within the last month and span
   the required period (a parameter, default three months, until the office sets the underwriting
   criterion).
+- `onboarding/status/` - STEP 087: the KYC submission summary and status screen - the merchant-safe
+  summary (`readKycSummary`: status, counts, decision reason; never the verification method, a
+  provider reference, a screening result or a storage key) and the submit that moves the draft to
+  `submitted` (`submitKyc`, conditional update + audit; `POST /api/onboarding/kyc-submit`).
 
 ## The reader
 

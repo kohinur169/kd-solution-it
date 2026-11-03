@@ -121,6 +121,11 @@ export default async function OnboardingDocumentsPage(): Promise<ReactNode> {
               {getMessage("onboardingDocuments.backLink")}
             </Link>
           )}
+          {state.kind === "ready" ? (
+            <Link className={linkClasses} href="/onboarding/status">
+              {getMessage("onboardingDocuments.statusLink")}
+            </Link>
+          ) : null}
           <Link className={linkClasses} href="/sessions">
             {getMessage("onboarding.sessionsLink")}
           </Link>

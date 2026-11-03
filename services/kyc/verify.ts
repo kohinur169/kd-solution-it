@@ -71,11 +71,14 @@ import {
   KYC_DOCUMENT_MAXIMUM_BYTES,
   KYC_DOCUMENT_TYPES,
   KYC_SCREENING_AUDIT_ACTION,
+  KYC_SUBMIT_AUDIT_ACTION,
   KYC_SUBMISSIONS_TABLE,
   KYC_UPLOAD_PURPOSE,
   parseKycDocumentInput,
   parseUboInput,
   readKycPack,
+  readKycSummary,
+  submitKyc,
   runKycScreening,
   saveKycDocument,
   saveUbo,
@@ -924,6 +927,12 @@ interface SubmissionRowShape {
   company_id: string;
   status: string;
   verification_method: string;
+  submitted_at?: string | null;
+  submitted_by?: string | null;
+  decided_at?: string | null;
+  decision_reason?: string | null;
+  version?: number;
+  updated_at?: string;
   created_at: string;
 }
 
@@ -941,6 +950,7 @@ interface DocumentRowShape {
   expires_at: string | null;
   status: string;
   created_at: string;
+  rejection_reason?: string | null;
 }
 
 /** One row of `0050`. */
@@ -1254,7 +1264,23 @@ function createBusinessStore(database: BusinessDatabase): RestClient {
             ? matched
             : matched.slice(0, Number.parseInt(limit.slice("limit=".length), 10));
 
-        return Promise.resolve(capped.map((row) => schema.parse(row)));
+        // Rows seeded before a column existed still answer with the migration's default.
+        const withDefaults = capped.map((row) => ({
+          ...(table === KYC_SUBMISSIONS_TABLE
+            ? {
+                submitted_at: null,
+                submitted_by: null,
+                decided_at: null,
+                decision_reason: null,
+                version: 1,
+                updated_at: row["created_at"],
+              }
+            : {}),
+          ...(table === KYC_DOCUMENTS_TABLE ? { rejection_reason: null } : {}),
+          ...row,
+        }));
+
+        return Promise.resolve(withDefaults.map((row) => schema.parse(row)));
       }
 
       if (table === BUSINESS_PROFILE_TABLE) {
@@ -1310,6 +1336,12 @@ function createBusinessStore(database: BusinessDatabase): RestClient {
               company_id: text("company_id"),
               status: text("status") || "draft",
               verification_method: text("verification_method") || "manual",
+              submitted_at: nullable("submitted_at"),
+              submitted_by: nullable("submitted_by"),
+              decided_at: nullable("decided_at"),
+              decision_reason: nullable("decision_reason"),
+              version: Number(row["version"] ?? 1),
+              updated_at: created,
               created_at: created,
             });
           }
@@ -1327,6 +1359,7 @@ function createBusinessStore(database: BusinessDatabase): RestClient {
               issued_at: nullable("issued_at"),
               expires_at: nullable("expires_at"),
               status: text("status") || "uploaded",
+              rejection_reason: nullable("rejection_reason"),
               created_at: created,
             });
           }
@@ -1464,6 +1497,28 @@ function createBusinessStore(database: BusinessDatabase): RestClient {
           if (row.company_id === wanted) {
             row.completed_steps = values["completed_steps"] ?? row.completed_steps;
             row.current_step = String(values["current_step"] ?? row.current_step);
+          }
+        }
+
+        return Promise.resolve();
+      }
+
+      if (table === KYC_SUBMISSIONS_TABLE) {
+        const parts = query.split("&");
+        const idPart = parts.find((part) => part.startsWith("id=eq."));
+        const statusPart = parts.find((part) => part.startsWith("status=eq."));
+        const wantedId = idPart === undefined ? null : decodeURIComponent(idPart.slice("id=eq.".length));
+        const wantedStatus = statusPart === undefined ? null : decodeURIComponent(statusPart.slice("status=eq.".length));
+
+        for (const row of database.submissionRows) {
+          if (
+            row.company_id === wanted &&
+            (wantedId === null || row.id === wantedId) &&
+            (wantedStatus === null || row.status === wantedStatus)
+          ) {
+            for (const [key, value] of Object.entries(values)) {
+              (row as unknown as Record<string, unknown>)[key] = value;
+            }
           }
         }
 
@@ -3915,7 +3970,7 @@ async function checkKycRead(): Promise<void> {
 
   expectEqual(pack.submissionId, "sub-1", "the draft submission is found");
   expectEqual(pack.status, "draft", "with its status");
-  expectEqual(pack.method, "manual", "and its method");
+  expectEqual("method" in pack, false, "the pack never carries the verification method: 0048 says the merchant only reads status");
   expectEqual(pack.documents.length, 1, "the document is listed");
   expectEqual(pack.documents[0]?.documentType, "identity_document", "with its type");
   expectEqual(pack.documents[0]?.byteSize, 72, "its size");
@@ -4242,10 +4297,193 @@ async function checkKycScreening(): Promise<void> {
 }
 
 /** ---- The sources: three POST routes, the page, the form, the wizard map and the CSRF list. */
+/** ---- STEP 087: the merchant's summary and status, and the submit that moves draft -> submitted. */
+async function checkKycSummary(): Promise<void> {
+  for (const [description, actor] of refusedActors) {
+    const database = createBusinessDatabase();
+    const refusal = await rejectionOf(() =>
+      readKycSummary({ actor }, dependenciesOf(database, createInMemoryAuditTrail())),
+    );
+
+    expectEqual(refusal?.code, "PERMISSION_DENIED", `the summary refuses ${description}`);
+    expectEqual(database.queries.length, 0, `and reads nothing for ${description}`);
+  }
+
+  const empty = await readKycSummary(
+    { actor: owner },
+    dependenciesOf(createBusinessDatabase(), createInMemoryAuditTrail()),
+  );
+
+  expectEqual(empty.submissionId, null, "a merchant with no submission gets an empty summary, not a refusal");
+  expectEqual(empty.status, null, "no status yet");
+  expectEqual(empty.documentCount, 0, "no documents");
+  expectEqual(empty.ownerCount, 0, "no owners");
+  expectEqual(empty.screenedCount, 0, "nothing screened");
+  expectDeepEqual(empty.missing, ["documents", "screening"], "and both block a submit");
+  expectEqual(empty.canSubmit, false, "so it cannot submit");
+
+  // Build a real state: a document, a UBO, a screening run.
+  const database = createBusinessDatabase();
+  const audit = createInMemoryAuditTrail();
+  const deps = dependenciesOf(database, audit);
+
+  await saveKycDocument({ actor: owner, input: pngDocumentInput() }, deps);
+  await saveUbo({ actor: owner, input: VALID_UBO }, deps);
+  await runKycScreening({ actor: owner }, deps);
+
+  const summary = await readKycSummary({ actor: owner }, deps);
+
+  expectEqual(summary.status, "draft", "the open submission is the draft");
+  expectEqual(summary.documentCount, 1, "one document is counted");
+  expectEqual(summary.documents[0]?.documentType, "identity_document", "listed with its type");
+  expectEqual(summary.ownerCount, 1, "one owner");
+  expectEqual(summary.significantOwnerCount, 1, "and it is significant at 4000 bps");
+  expectEqual(summary.screenedCount, 2, "the company and the UBO were screened");
+  expectDeepEqual(summary.missing, [], "nothing blocks a submit");
+  expectEqual(summary.canSubmit, true, "so a draft with documents and screening can submit");
+
+  const serialized = JSON.stringify(summary);
+
+  expectEqual(serialized.includes("manual"), false, "the summary never names the verification method");
+  expectEqual(serialized.includes("provider_reference"), false, "never a provider reference");
+  expectEqual(serialized.includes("storage_key"), false, "never a storage key");
+  expectEqual(serialized.includes(database.documentRows[0]?.content_sha256 ?? "\u0000"), false, "never a hash");
+  expect(
+    database.queries.every(
+      (query) => query.includes(encodeURIComponent(COMPANY_A)) || query.startsWith("countries?"),
+    ),
+    "every query is scoped to the session's company or is the platform country list",
+  );
+
+  // A decided submission is shown with its reason, and cannot be submitted again.
+  const decided = createBusinessDatabase(
+    [],
+    [],
+    defaultMccRows(),
+    defaultCountryRows(),
+    [
+      {
+        id: "sub-decided",
+        company_id: COMPANY_A,
+        status: "rejected",
+        verification_method: "manual",
+        decision_reason: "the utility bill was older than three months",
+        decided_at: "2026-11-02T09:00:00.000Z",
+        created_at: "2026-11-01T08:00:00.000Z",
+      },
+    ],
+  );
+  const decidedSummary = await readKycSummary({ actor: owner }, dependenciesOf(decided, createInMemoryAuditTrail()));
+
+  expectEqual(decidedSummary.status, "rejected", "a decided submission keeps its status");
+  expectEqual(decidedSummary.decisionReason, "the utility bill was older than three months", "the merchant reads the rejection reason");
+  expectEqual(decidedSummary.decidedAt, "2026-11-02T09:00:00.000Z", "and the decided instant");
+  expectEqual(decidedSummary.canSubmit, false, "a decided submission cannot be submitted again");
+}
+
+async function checkKycSubmit(): Promise<void> {
+  for (const [description, actor] of refusedActors) {
+    const database = createBusinessDatabase();
+    const refusal = await rejectionOf(() =>
+      submitKyc({ actor }, dependenciesOf(database, createInMemoryAuditTrail())),
+    );
+
+    expectEqual(refusal?.code, "PERMISSION_DENIED", `the submit refuses ${description}`);
+    expectEqual(database.updates.length, 0, `and writes nothing for ${description}`);
+  }
+
+  // Nothing recorded at all: the submit is a validation failure, nothing written.
+  const empty = createBusinessDatabase();
+  const emptyAudit = createInMemoryAuditTrail();
+  const emptyRefusal = await rejectionOf(() => submitKyc({ actor: owner }, dependenciesOf(empty, emptyAudit)));
+
+  expectEqual(emptyRefusal?.code, "VALIDATION_FAILED", "submitting with no submission at all is a validation failure");
+  expectDeepEqual(emptyRefusal?.details, [{ field: "documents", rule: "required" }], "naming the missing documents");
+  expectEqual(empty.updates.length, 0, "and nothing is written");
+
+  // A draft with a document but no screening run: refused, named, nothing written.
+  const unscreened = createBusinessDatabase();
+  const unscreenedAudit = createInMemoryAuditTrail();
+
+  await saveKycDocument({ actor: owner, input: pngDocumentInput() }, dependenciesOf(unscreened, unscreenedAudit));
+
+  const unscreenedRefusal = await rejectionOf(() =>
+    submitKyc({ actor: owner }, dependenciesOf(unscreened, unscreenedAudit)),
+  );
+
+  expectEqual(unscreenedRefusal?.code, "VALIDATION_FAILED", "a draft without a screening run cannot be submitted");
+  expectDeepEqual(unscreenedRefusal?.details, [{ field: "screening", rule: "required" }], "naming the missing screening");
+  expectEqual(unscreened.updates.filter((update) => update.table === KYC_SUBMISSIONS_TABLE).length, 0, "and the submission row is untouched");
+
+  // The happy path: document + screening -> draft becomes submitted, audited, version bumped.
+  const database = createBusinessDatabase();
+  const audit = createInMemoryAuditTrail();
+  const deps = dependenciesOf(database, audit);
+
+  await saveKycDocument({ actor: owner, input: pngDocumentInput() }, deps);
+  await runKycScreening({ actor: owner }, deps);
+
+  const summary = await submitKyc({ actor: owner }, deps);
+  const row = database.submissionRows[0];
+
+  expectEqual(summary.status, "submitted", "the answer says submitted");
+  expectEqual(summary.canSubmit, false, "and cannot be submitted again");
+  expectEqual(row?.status, "submitted", "the row moved from draft to submitted");
+  expectEqual(row?.submitted_at, new Date(NOW).toISOString(), "with the submit instant 0048 requires");
+  expectEqual(row?.submitted_by, OWNER_ID, "and the submitter");
+  expectEqual(row?.version, 2, "the version moved, optimistic locking intact");
+
+  const update = database.updates.find((entry) => entry.table === KYC_SUBMISSIONS_TABLE);
+
+  expect(
+    update !== undefined &&
+      update.query.includes(`id=eq.${row?.id}`) &&
+      update.query.includes("status=eq.draft") &&
+      update.query.includes(`company_id=eq.${encodeURIComponent(COMPANY_A)}`),
+    "the update is conditional on the row still being this company's draft",
+  );
+  expectEqual(audit.entries.length, 3, "upload, screening and submit each audited");
+  expectEqual(audit.entries[2]?.action, KYC_SUBMIT_AUDIT_ACTION, "the submit under kyc_submission.submitted");
+  expectEqual(audit.entries[2]?.entityId, row?.id, "against the submission");
+  expectEqual(audit.entries[2]?.payload?.["status"], "submitted", "recording the new status");
+
+  // A second submit conflicts instead of rewriting.
+  const again = await rejectionOf(() => submitKyc({ actor: owner }, deps));
+
+  expectEqual(again?.code, "CONFLICT", "submitting a submitted row is a conflict");
+  expectDeepEqual(again?.details, [{ field: "status", rule: "already_submitted" }], "named as already submitted");
+  expectEqual(
+    database.updates.filter((entry) => entry.table === KYC_SUBMISSIONS_TABLE).length,
+    1,
+    "and the row is not written twice",
+  );
+
+  // Another company's draft is invisible: the submit reads nothing of it.
+  const foreign = createBusinessDatabase(
+    [],
+    [],
+    defaultMccRows(),
+    defaultCountryRows(),
+    [{ id: "sub-b", company_id: COMPANY_B, status: "draft", verification_method: "manual", created_at: "2026-11-01T08:00:00.000Z" }],
+  );
+  const foreignRefusal = await rejectionOf(() =>
+    submitKyc({ actor: owner }, dependenciesOf(foreign, createInMemoryAuditTrail())),
+  );
+
+  expectEqual(foreignRefusal?.code, "VALIDATION_FAILED", "the owner of company A cannot submit company B's draft");
+  expect(
+    foreign.queries.every((query) => query.includes(encodeURIComponent(COMPANY_A))),
+    "and every query stayed on company A",
+  );
+}
+
 async function checkKycSources(): Promise<void> {
   const documentRoute = await readRepositoryFile("app/api/onboarding/kyc-document/route.ts");
   const uboRoute = await readRepositoryFile("app/api/onboarding/kyc-ubo/route.ts");
   const screeningRoute = await readRepositoryFile("app/api/onboarding/kyc-screening/route.ts");
+  const submitRoute = await readRepositoryFile("app/api/onboarding/kyc-submit/route.ts");
+  const statusPage = await readRepositoryFile("app/(dashboard)/onboarding/status/page.tsx");
+  const statusForm = await readRepositoryFile("app/(dashboard)/onboarding/status/status-form.tsx");
   const page = await readRepositoryFile("app/(dashboard)/onboarding/documents/page.tsx");
   const form = await readRepositoryFile("app/(dashboard)/onboarding/documents/documents-form.tsx");
   const copy = await readRepositoryFile("app/(dashboard)/onboarding/step-copy.ts");
@@ -4257,8 +4495,11 @@ async function checkKycSources(): Promise<void> {
     ["app/api/onboarding/kyc-document/route.ts", documentRoute],
     ["app/api/onboarding/kyc-ubo/route.ts", uboRoute],
     ["app/api/onboarding/kyc-screening/route.ts", screeningRoute],
+    ["app/api/onboarding/kyc-submit/route.ts", submitRoute],
     ["app/(dashboard)/onboarding/documents/page.tsx", page],
     ["app/(dashboard)/onboarding/documents/documents-form.tsx", form],
+    ["app/(dashboard)/onboarding/status/page.tsx", statusPage],
+    ["app/(dashboard)/onboarding/status/status-form.tsx", statusForm],
   ] as const) {
     expectEqual(source.split("\n")[0], `// path: ${path}`, `${path} states its own path on its first line`);
     expectEqual(/[^\t\n\r\x20-\x7E]/u.test(source), false, `${path} is ASCII only`);
@@ -4268,6 +4509,7 @@ async function checkKycSources(): Promise<void> {
     ["app/api/onboarding/kyc-document/route.ts", documentRoute],
     ["app/api/onboarding/kyc-ubo/route.ts", uboRoute],
     ["app/api/onboarding/kyc-screening/route.ts", screeningRoute],
+    ["app/api/onboarding/kyc-submit/route.ts", submitRoute],
   ] as const) {
     expect(route.includes("export const POST"), `${path} answers POST`);
     expectEqual(route.includes("export const GET"), false, `${path} answers no GET`);
@@ -4288,6 +4530,7 @@ async function checkKycSources(): Promise<void> {
   expect(documentRoute.includes("KYC_DOCUMENT_MAXIMUM_BYTES"), "with the 0057 row ceiling plus form overhead as the declared limit");
   expect(uboRoute.includes("saveUbo("), "the UBO route saves through the service");
   expect(screeningRoute.includes("runKycScreening("), "the screening route runs through the service");
+  expect(submitRoute.includes("submitKyc("), "the submit route submits through the service");
   for (const route of [uboRoute, screeningRoute]) {
     expectEqual(route.includes("searchParams"), false, "no route takes a company from the query string");
     expectEqual(route.includes('"company_id"'), false, "and none reads a company field from the body");
@@ -4330,6 +4573,28 @@ async function checkKycSources(): Promise<void> {
   expect(form.includes("utilityBillRuleLine"), "and tells the merchant the rule in words");
   expect(form.includes("invalid_range"), "mapping the out-of-range rule to its sentence");
   expect(form.includes("max={issueWindow.latest}"), "and capping the date picker at today");
+  expect(capture.includes("readKycSummary"), "the service reads the merchant-safe summary");
+  expect(capture.includes("submitKyc"), "and submits the draft through the service");
+  expect(capture.includes("KYC_SUBMIT_AUDIT_ACTION"), "with its own audit action");
+  expectEqual(capture.includes("provider_reference"), false, "the service never even selects the provider reference for a merchant read");
+  expectEqual(
+    capture.includes("method: submission?.verification_method"),
+    false,
+    "and the pack no longer answers the verification method: the merchant only reads status",
+  );
+  expect(statusPage.includes("readOwnerActor()"), "the status page reads the account through the cached reader");
+  expect(statusPage.includes("readKycSummary("), "and the summary through the service");
+  expect(statusPage.includes("<SessionKeeper"), "and keeps the session rotating");
+  expect(statusPage.includes("StatusForm"), "and renders the submit form");
+  for (const state of ["signed-out", "forbidden", "unavailable", "ready"]) {
+    expect(statusPage.includes(`"${state}"`), `the status page keeps the ${state} answer apart`);
+  }
+  expect(statusPage.includes('"/onboarding/status"') || statusPage.includes("href="), "and links onward");
+  expectEqual(statusForm.includes('"use client"'), true, "the submit form is a client component");
+  expectEqual((statusForm.match(/method: "POST"/gu) ?? []).length, 1, "it sends exactly one POST");
+  expectEqual((statusForm.match(/\.\.\.\(await csrfHeaders\(\)\)/gu) ?? []).length, 1, "spreading the awaited token once");
+  expect(statusForm.includes("/api/onboarding/kyc-submit"), "to the submit route");
+  expectEqual(statusForm.includes("companyId"), false, "and sends no company in any body");
   expect(types.includes("BANK_STATEMENT_DEFAULT_PERIOD_MONTHS = 3"), "the default statement period lives in the client-safe module");
   expect(types.includes("function monthsBetweenDates"), "with the period-length helper the form and the service share");
   expect(capture.includes("bankStatementPeriodMonths"), "the service takes the required period as a parameter, the compliance criterion of section 5");
@@ -4348,7 +4613,7 @@ async function checkKycSources(): Promise<void> {
     (await readdir(new URL("app/(dashboard)/onboarding/documents/", repositoryRoot))).includes("documents-form.tsx"),
     "with its form beside it",
   );
-  for (const folder of ["kyc-document", "kyc-ubo", "kyc-screening"]) {
+  for (const folder of ["kyc-document", "kyc-ubo", "kyc-screening", "kyc-submit"]) {
     expect(
       (await readdir(new URL(`app/api/onboarding/${folder}/`, repositoryRoot))).includes("route.ts"),
       `${folder} is a route handler of its own`,
@@ -4408,6 +4673,54 @@ async function checkKycCatalog(): Promise<void> {
   }
 }
 
+/** ---- STEP 087 catalog: every sentence of the status screen is used, and every key it names exists. */
+async function checkStatusCatalog(): Promise<void> {
+  const block = en.onboardingStatus as unknown as Record<string, unknown>;
+  const page = await readRepositoryFile("app/(dashboard)/onboarding/status/page.tsx");
+  const form = await readRepositoryFile("app/(dashboard)/onboarding/status/status-form.tsx");
+  const sources = `${page}\n${form}`;
+
+  const flat: string[] = [];
+
+  const walk = (node: Record<string, unknown>, prefix: string): void => {
+    for (const [key, value] of Object.entries(node)) {
+      const path = `${prefix}.${key}`;
+
+      if (typeof value === "string") {
+        flat.push(path);
+      } else if (typeof value === "object" && value !== null) {
+        walk(value as Record<string, unknown>, path);
+      }
+    }
+  };
+
+  walk(block, "onboardingStatus");
+
+  expect(flat.length >= 20, "the status screen has its own block of copy");
+
+  for (const path of flat) {
+    expect(sources.includes(`"${path}"`), `the copy key ${path} is used by the screen`);
+  }
+
+  const referenced = [...sources.matchAll(/"(onboardingStatus\.[A-Za-z.]+)"/gu)].map((match) => match[1]);
+
+  for (const path of new Set(referenced)) {
+    expect(path !== undefined && flat.includes(path), `the screen names no missing key (${String(path)})`);
+  }
+
+  for (const templated of ["submittedAtLine", "decidedAtLine", "docCountLine", "ownerCountLine", "screenedLine"]) {
+    expectEqual(
+      sources.includes(`getMessage("onboardingStatus.${templated}")`),
+      false,
+      `${templated} is never rendered without its values`,
+    );
+    expect(
+      sources.includes(`formatMessage("onboardingStatus.${templated}"`),
+      `and is rendered through formatMessage`,
+    );
+  }
+}
+
 async function main(): Promise<void> {
   checkVocabulary();
   await checkRefusals();
@@ -4453,8 +4766,11 @@ async function main(): Promise<void> {
   await checkKycDocumentSave();
   await checkKycUboSave();
   await checkKycScreening();
+  await checkKycSummary();
+  await checkKycSubmit();
   await checkKycSources();
   await checkKycCatalog();
+  await checkStatusCatalog();
 
   if (failures.length > 0) {
     process.stderr.write(`onboarding gate failed with ${failures.length} problem(s):\n`);

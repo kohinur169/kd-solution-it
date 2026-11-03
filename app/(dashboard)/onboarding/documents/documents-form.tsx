@@ -38,6 +38,13 @@ import type { KycPackSnapshot } from "@/services/kyc/kyc-capture";
  * browser bundle.
  */
 
+/** The catalog label of one review status of a document. */
+const DOC_STATUS_LABELS: Readonly<Record<string, MessagePath>> = Object.freeze({
+  uploaded: "onboardingDocuments.docStatusUploaded",
+  accepted: "onboardingDocuments.docStatusAccepted",
+  rejected: "onboardingDocuments.docStatusRejected",
+});
+
 const UPLOAD_PATH = "/api/onboarding/kyc-document";
 const UBO_PATH = "/api/onboarding/kyc-ubo";
 const SCREENING_PATH = "/api/onboarding/kyc-screening";
@@ -499,7 +506,14 @@ export function DocumentsForm({
                       : formatMessage("onboardingDocuments.docIssuedLine", { date: document.issuedAt })}
                   </span>
                 )}
-                <span className={noteClasses}>{getMessage("onboardingDocuments.docStatusUploaded")}</span>
+                <span className={noteClasses}>
+                  {getMessage(DOC_STATUS_LABELS[document.status] ?? "onboardingDocuments.docStatusUploaded")}
+                </span>
+                {document.rejectionReason === null ? null : (
+                  <span className={noteClasses}>
+                    {formatMessage("onboardingDocuments.docRejectedLine", { reason: document.rejectionReason })}
+                  </span>
+                )}
               </li>
             ))}
           </ul>

@@ -105,6 +105,7 @@ export const KYC_DOCUMENTS_ONBOARDING_STEP: OnboardingStep = "documents";
 export const KYC_DOCUMENT_AUDIT_ACTION = "kyc_document.uploaded";
 export const UBO_AUDIT_ACTION = "ubo.captured";
 export const KYC_SCREENING_AUDIT_ACTION = "kyc_screening.ran";
+export const KYC_SUBMIT_AUDIT_ACTION = "kyc_submission.submitted";
 
 /** The audit entity all three are recorded against: the submission. */
 export const KYC_AUDIT_ENTITY = "kyc_submission";
@@ -125,6 +126,23 @@ const submissionRowSchema = z.object({
   verification_method: z.string(),
 });
 
+/**
+ * The submission as the merchant's summary reads it. The method and the provider's reference
+ * columns are deliberately not selected: `0048`'s own comment says the merchant only ever reads
+ * `status`, so the read does not even fetch the method.
+ */
+const submissionDetailRowSchema = z.object({
+  id: z.string(),
+  company_id: z.string(),
+  status: z.string(),
+  submitted_at: z.string().nullable(),
+  submitted_by: z.string().nullable(),
+  decided_at: z.string().nullable(),
+  decision_reason: z.string().nullable(),
+  version: z.coerce.number(),
+  created_at: z.string(),
+});
+
 const documentRowSchema = z.object({
   id: z.string(),
   document_type: z.string(),
@@ -135,7 +153,19 @@ const documentRowSchema = z.object({
   issued_at: z.string().nullable(),
   expires_at: z.string().nullable(),
   status: z.string(),
+  rejection_reason: z.string().nullable(),
   created_at: z.string(),
+});
+
+/** The document fields the merchant's summary shows: never the storage key, never the hash. */
+const documentSummaryRowSchema = z.object({
+  id: z.string(),
+  document_type: z.string(),
+  status: z.string(),
+  rejection_reason: z.string().nullable(),
+  issued_at: z.string().nullable(),
+  expires_at: z.string().nullable(),
+  byte_size: z.coerce.number(),
 });
 
 const uboRowSchema = z.object({
@@ -174,6 +204,7 @@ export interface KycDocumentRecord {
   readonly issuedAt: string | null;
   readonly expiresAt: string | null;
   readonly status: string;
+  readonly rejectionReason: string | null;
   readonly createdAt: string;
 }
 
@@ -193,7 +224,6 @@ export interface KycPackSnapshot {
   readonly companyId: string;
   readonly submissionId: string | null;
   readonly status: string | null;
-  readonly method: string | null;
   readonly documents: readonly KycDocumentRecord[];
   readonly ubos: readonly UboRecordView[];
   readonly countries: readonly { readonly code: string; readonly name: string }[];
@@ -864,7 +894,7 @@ export async function readKycPack(
   const [documents, screenings, countries] = await Promise.all([
     rest.select(
       KYC_DOCUMENTS_TABLE,
-      `select=id,document_type,storage_key,content_sha256,content_type,byte_size,issued_at,expires_at,status,created_at&company_id=eq.${encodeURIComponent(companyId)}&deleted_at=is.null&order=created_at.asc&limit=500`,
+      `select=id,document_type,storage_key,content_sha256,content_type,byte_size,issued_at,expires_at,status,rejection_reason,created_at&company_id=eq.${encodeURIComponent(companyId)}&deleted_at=is.null&order=created_at.asc&limit=500`,
       documentRowSchema,
     ),
     rest.select(
@@ -885,7 +915,6 @@ export async function readKycPack(
     companyId,
     submissionId: submission?.id ?? null,
     status: submission?.status ?? null,
-    method: submission?.verification_method ?? null,
     documents: documents.map((row) => ({
       id: row.id,
       documentType: row.document_type as KycDocumentType,
@@ -896,6 +925,7 @@ export async function readKycPack(
       issuedAt: row.issued_at,
       expiresAt: row.expires_at,
       status: row.status,
+      rejectionReason: row.rejection_reason,
       createdAt: row.created_at,
     })),
     ubos: uboRows.map((row) => ({
@@ -911,6 +941,210 @@ export async function readKycPack(
     screenedCount: screenings.length,
     documentsComplete: documents.length > 0,
   };
+}
+
+/* -------------------------------------------------------------------------------------------------
+ * The summary and status screen of STEP 087: what the merchant reads, and the submit.
+ * ---------------------------------------------------------------------------------------------- */
+
+/** One document as the summary lists it: type, review status and dates - never key or hash. */
+export interface KycSummaryDocument {
+  readonly id: string;
+  readonly documentType: KycDocumentType;
+  readonly status: string;
+  readonly rejectionReason: string | null;
+  readonly issuedAt: string | null;
+  readonly expiresAt: string | null;
+  readonly byteSize: number;
+}
+
+/**
+ * The merchant's KYC summary and status. Section 5 and `0048`'s own comment say the merchant only
+ * ever reads `status`: this snapshot carries no verification method, no provider reference, no
+ * screening row and no storage key or hash - only counts, statuses and the decision reason a
+ * rejection carries because the merchant reads it.
+ */
+export interface KycSummarySnapshot {
+  readonly submissionId: string | null;
+  readonly status: string | null;
+  readonly submittedAt: string | null;
+  readonly decidedAt: string | null;
+  readonly decisionReason: string | null;
+  readonly documents: readonly KycSummaryDocument[];
+  readonly documentCount: number;
+  readonly ownerCount: number;
+  readonly significantOwnerCount: number;
+  readonly screenedCount: number;
+  /** What still blocks a submit: "documents", "screening". */
+  readonly missing: readonly string[];
+  readonly canSubmit: boolean;
+}
+
+/** The latest submission of the company, any status, or null when there is none yet. */
+async function readLatestSubmission(
+  companyId: string,
+  rest: RestClient,
+): Promise<z.infer<typeof submissionDetailRowSchema> | null> {
+  const rows = await rest.select(
+    KYC_SUBMISSIONS_TABLE,
+    `select=id,company_id,status,submitted_at,submitted_by,decided_at,decision_reason,version,created_at&company_id=eq.${encodeURIComponent(companyId)}&deleted_at=is.null&order=created_at.desc&limit=1`,
+    submissionDetailRowSchema,
+  );
+
+  return rows[0] ?? null;
+}
+
+/** The merchant-facing summary of the company's KYC: counts, statuses, and what blocks a submit. */
+export async function readKycSummary(
+  input: { readonly actor: RequestActor },
+  dependencies: KycCaptureDependencies,
+): Promise<KycSummarySnapshot> {
+  const companyId = requireOwnerCompany(input.actor);
+  const rest = dependencies.rest;
+
+  const submission = await readLatestSubmission(companyId, rest);
+  const [documentRows, screenings] = await Promise.all([
+    rest.select(
+      KYC_DOCUMENTS_TABLE,
+      `select=id,document_type,status,rejection_reason,issued_at,expires_at,byte_size&company_id=eq.${encodeURIComponent(companyId)}&deleted_at=is.null&order=created_at.asc&limit=500`,
+      documentSummaryRowSchema,
+    ),
+    rest.select(
+      SANCTIONS_SCREENINGS_TABLE,
+      `select=id&company_id=eq.${encodeURIComponent(companyId)}&deleted_at=is.null&limit=500`,
+      z.object({ id: z.string() }),
+    ),
+  ]);
+
+  const uboRows =
+    submission === null
+      ? []
+      : await rest.select(
+          UBO_RECORDS_TABLE,
+          `select=id,is_significant&company_id=eq.${encodeURIComponent(companyId)}&submission_id=eq.${encodeURIComponent(submission.id)}&deleted_at=is.null&limit=500`,
+          z.object({ id: z.string(), is_significant: z.boolean() }),
+        );
+
+  const documents: readonly KycSummaryDocument[] = documentRows.map((row) => ({
+    id: row.id,
+    documentType: row.document_type as KycDocumentType,
+    status: row.status,
+    rejectionReason: row.rejection_reason,
+    issuedAt: row.issued_at,
+    expiresAt: row.expires_at,
+    byteSize: row.byte_size,
+  }));
+
+  const missing: string[] = [];
+
+  if (documents.length === 0) {
+    missing.push("documents");
+  }
+
+  if (screenings.length === 0) {
+    missing.push("screening");
+  }
+
+  return {
+    submissionId: submission?.id ?? null,
+    status: submission?.status ?? null,
+    submittedAt: submission?.submitted_at ?? null,
+    decidedAt: submission?.decided_at ?? null,
+    decisionReason: submission?.decision_reason ?? null,
+    documents,
+    documentCount: documents.length,
+    ownerCount: uboRows.length,
+    significantOwnerCount: uboRows.filter((row) => row.is_significant).length,
+    screenedCount: screenings.length,
+    missing,
+    canSubmit: submission !== null && submission.status === "draft" && missing.length === 0,
+  };
+}
+
+/**
+ * Submit the company's draft for review: draft -> submitted, with the instant and the submitter
+ * `0048` asks for, one audit entry, and the conditional update so a second submit loses the race
+ * instead of rewriting history. The screen needs at least one document and one screening run.
+ */
+export async function submitKyc(
+  input: { readonly actor: RequestActor },
+  dependencies: KycCaptureDependencies,
+): Promise<KycSummarySnapshot> {
+  const companyId = requireOwnerCompany(input.actor);
+  const rest = dependencies.rest;
+  const now = nowOf(dependencies);
+
+  const submission = await readLatestSubmission(companyId, rest);
+
+  if (submission === null) {
+    throw new AppError("VALIDATION_FAILED", { details: [{ field: "documents", rule: "required" }] });
+  }
+
+  if (submission.status !== "draft") {
+    throw new AppError("CONFLICT", { details: [{ field: "status", rule: "already_submitted" }] });
+  }
+
+  const [documentRows, screenings] = await Promise.all([
+    rest.select(
+      KYC_DOCUMENTS_TABLE,
+      `select=id&company_id=eq.${encodeURIComponent(companyId)}&deleted_at=is.null&limit=500`,
+      z.object({ id: z.string() }),
+    ),
+    rest.select(
+      SANCTIONS_SCREENINGS_TABLE,
+      `select=id&company_id=eq.${encodeURIComponent(companyId)}&deleted_at=is.null&limit=500`,
+      z.object({ id: z.string() }),
+    ),
+  ]);
+
+  const missing: ErrorDetail[] = [];
+
+  if (documentRows.length === 0) {
+    missing.push({ field: "documents", rule: "required" });
+  }
+
+  if (screenings.length === 0) {
+    missing.push({ field: "screening", rule: "required" });
+  }
+
+  if (missing.length > 0) {
+    throw new AppError("VALIDATION_FAILED", { details: missing });
+  }
+
+  // Conditional on the row still being the draft, so a second tab's submit loses the race.
+  await rest.update(
+    KYC_SUBMISSIONS_TABLE,
+    `id=eq.${encodeURIComponent(submission.id)}&company_id=eq.${encodeURIComponent(companyId)}&status=eq.draft&deleted_at=is.null`,
+    {
+      status: "submitted",
+      submitted_at: isoOf(now),
+      submitted_by: input.actor.userId,
+      updated_at: isoOf(now),
+      version: submission.version + 1,
+    },
+  );
+
+  const after = await readLatestSubmission(companyId, rest);
+
+  if (after === null || after.id !== submission.id || after.status !== "submitted") {
+    throw new AppError("CONFLICT", { details: [{ field: "status", rule: "stale" }] });
+  }
+
+  try {
+    await dependencies.audit.append({
+      action: KYC_SUBMIT_AUDIT_ACTION,
+      actorUserId: input.actor.userId,
+      entityType: KYC_AUDIT_ENTITY,
+      entityId: submission.id,
+      companyId,
+      sessionId: input.actor.sessionId,
+      payload: { submission_id: submission.id, status: "submitted" },
+    });
+  } catch {
+    // The audit sink failing must not fail the submit; the save services hold the same rule.
+  }
+
+  return readKycSummary({ actor: input.actor }, dependencies);
 }
 
 /** The UBOs of a submission; the company scope stays explicit beside the submission scope. */
