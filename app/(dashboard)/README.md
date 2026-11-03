@@ -149,6 +149,12 @@ Every read is scoped to the caller company and every write is audit logged.
   `submerchant.delete_card_tokens`, recorded as a `card_tokens_deleted` event - the provider call
   itself belongs to the adapter STEPs). Merchant screen `/onboarding/account`, office queue
   `/onboarding/account-review`, five block-owned routes under `app/api/onboarding/account-*`.
+- `clients/` - STEP 106: the client hub, create and edit screens over `services/clients/`
+  (`client-fields.ts` mirrors the `0019` checks, `clients.ts` validates with Zod, scopes every
+  query to the actor's company, enforces the per-company unique email and the address completeness
+  rule, and audits `client.created` / `client.updated` with field names only; no migration, the
+  `0019` table is the store). The forms post through `client-form.tsx`, which marks every refused
+  field at once; routes `POST /api/clients` and `GET`+`POST /api/clients/[id]`, both CSRF protected.
 
 ## The reader
 

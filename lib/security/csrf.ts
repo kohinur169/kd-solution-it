@@ -110,6 +110,8 @@ export const CSRF_PROTECTED_PATHS: readonly string[] = Object.freeze([
   "/api/onboarding/account-reactivate-decide",
   "/api/onboarding/account-close-request",
   "/api/onboarding/account-close",
+  "/api/clients",
+  "/api/clients/[id]",
 ]);
 
 /** Why a request was refused, for the log and the gate - never for the response. */
