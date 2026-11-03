@@ -25,9 +25,10 @@ import {
  * ## What this module owns
  *
  * The `clients` table is `0019`; `client-fields.ts` is the field list the form shares. This file is
- * the service over the table: `createClient`, `updateClient` and `getClient`, each taking an
- * already authenticated actor and reading the company from it - never from the body - so an edited
- * request cannot write another merchant's row. Every read and write is scoped by
+ * the service over the table: `createClient`, `updateClient`, `deleteClient` and `getClient`, each
+ * taking an already authenticated actor and reading the company from it - never from the body - so
+ * an edited request cannot write another merchant's row. The read of many rows, and the search over
+ * them, is `client-list.ts`. Every read and write is scoped by
  * `company_id=eq.<id>` in the query itself, because the service role bypasses RLS and the scoping
  * has to be in the statement.
  *
@@ -57,7 +58,10 @@ export const CLIENT_CREATED_AUDIT_ACTION = "client.created";
 /** The audit action of an edit. */
 export const CLIENT_UPDATED_AUDIT_ACTION = "client.updated";
 
-/** The audit entity of both. */
+/** The audit action of a removal. */
+export const CLIENT_DELETED_AUDIT_ACTION = "client.deleted";
+
+/** The audit entity of all three. */
 export const CLIENT_AUDIT_ENTITY = "client";
 
 /** Only the owner of a business manages its clients (section 25). */
@@ -440,4 +444,69 @@ export async function updateClient(
   });
 
   return updated;
+}
+
+/**
+ * Remove one live client of the actor's own company.
+ *
+ * ## Why this is a soft delete
+ *
+ * Section 15 asks for delete and `0019` already decided what it means: `deleted_at` marks the row and
+ * nothing is ever removed. The reason is written into that migration and holds here - an invoice sent
+ * last year names the client it was sent to, so the record has to stay explainable. The partial unique
+ * index `clients_email_key` stops counting a deleted row, which is what lets a merchant remove a
+ * mistyped entry and reuse the address, and every read of this module carries `deleted_at=is.null`,
+ * so a deleted client leaves the list, the edit screen and the search at once.
+ *
+ * ## Why it reads before it writes, and re-reads after
+ *
+ * The read is the 404: it answers `RESOURCE_NOT_FOUND` for a foreign, deleted or unknown id, so a
+ * second removal is refused rather than silently repeated, and another merchant's row is
+ * indistinguishable from one that does not exist. The write itself is scoped to the row and the
+ * company exactly as `updateClient` is, and the re-read is the proof that the row is now gone from
+ * the live set - a PostgREST update that matched nothing still reports success.
+ *
+ * ## Why the audit entry names the row and not its values
+ *
+ * A removal is the most consequential thing a merchant does to this table, so it is audited with the
+ * id, the name the row carried and the instant - enough to reconstruct what was removed without
+ * copying a client's address, tax identifier or notes into the log.
+ */
+export async function deleteClient(
+  input: { readonly actor: RequestActor; readonly clientId: string },
+  dependencies: ClientDependencies,
+): Promise<ClientSnapshot> {
+  const companyId = requireClientActor(input.actor);
+  const current = await getClient({ actor: input.actor, clientId: input.clientId }, dependencies);
+  const instant = new Date(dependencies.now?.() ?? Date.now()).toISOString();
+
+  await dependencies.rest.update(
+    CLIENTS_TABLE,
+    `id=eq.${current.id}&company_id=eq.${companyId}&deleted_at=is.null`,
+    { deleted_at: instant },
+  );
+
+  // The row must now be outside the live set. A row that is still readable means the update matched
+  // nothing, which is a race with another writer and not a successful removal.
+  const stillLive = await dependencies.rest.select(
+    CLIENTS_TABLE,
+    `id=eq.${current.id}&company_id=eq.${companyId}&deleted_at=is.null`,
+    clientRowSchema,
+  );
+
+  if (stillLive.length > 0) {
+    throw new AppError("CONFLICT", { details: [{ field: "client", rule: "already_changed" }] });
+  }
+
+  await appendTolerated(dependencies.audit, {
+    action: CLIENT_DELETED_AUDIT_ACTION,
+    actorUserId: input.actor.userId,
+    entityType: CLIENT_AUDIT_ENTITY,
+    entityId: current.id,
+    companyId,
+    sessionId: input.actor.sessionId ?? null,
+    payload: { name: current.values.name, deleted_at: instant },
+  });
+
+  return current;
 }

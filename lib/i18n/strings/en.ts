@@ -2018,6 +2018,19 @@ const catalog = {
     paginationOlder: "Older clients",
     paginationPosition: "Clients {from} to {to}",
     paginationLimit: "This is as far back as the list pages.",
+    /** Section 15's delete, from the edit screen. */
+    deleteHeading: "Remove this client",
+    deleteDescription:
+      "A removed client leaves your list and your searches. The record is kept, because an invoice already sent has to name the client it went to.",
+    deleteClient: "Remove client",
+    deleteConfirm: "Remove this client?",
+    deleteConsequence:
+      "This client will no longer appear in your list or in searches. Invoices already sent to them keep their copy of the details.",
+    deleteConfirmButton: "Yes, remove",
+    deleteCancel: "Keep client",
+    deleting: "Removing...",
+    deleteFailed: "This client could not be removed. Reload the page and try again.",
+    ruleAlreadyChanged: "This client changed in another tab. Reload the page and try again.",
   },
   email: {
     lockAlert: {

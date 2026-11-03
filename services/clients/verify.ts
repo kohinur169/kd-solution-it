@@ -9,9 +9,11 @@ import type { PlatformRole, RequestActor } from "../../lib/auth/types.ts";
 import { AppError, isAppError } from "../../lib/errors/app-error.ts";
 import {
   CLIENT_CREATED_AUDIT_ACTION,
+  CLIENT_DELETED_AUDIT_ACTION,
   CLIENT_UPDATED_AUDIT_ACTION,
   CLIENTS_TABLE,
   createClient,
+  deleteClient,
   getClient,
   updateClient,
   type ClientDependencies,
@@ -543,6 +545,82 @@ async function checkReadAndUpdate(): Promise<void> {
   expect(isAppError(foreignUpdate) && foreignUpdate.code === "RESOURCE_NOT_FOUND", "a foreign edit is a 404");
 }
 
+/* ---- the removal of one client, the third verb of section 15 line 163 ---- */
+
+async function checkDelete(): Promise<void> {
+  const db: ClientsDb = { rows: [], inserts: [], updates: [], queries: [] };
+  const audit = createInMemoryAuditTrail();
+  const dependencies = depsOf(db, audit);
+
+  const created = await createClient({ actor: owner, body: VALID_BODY }, dependencies);
+  const updatesBefore = db.updates.length;
+
+  const removed = await deleteClient({ actor: owner, clientId: created.id }, dependencies);
+
+  expectEqual(removed.id, created.id, "the removal answers the row it removed");
+  expectEqual(removed.values.name, VALID_BODY.name, "with the values it carried");
+  expectEqual(db.updates.length, updatesBefore + 1, "one update ran");
+  const lastUpdate = at(db.updates, db.updates.length - 1, "the removal update");
+  expect(
+    lastUpdate.query.includes(`company_id=eq.${COMPANY_A}`) && lastUpdate.query.includes("deleted_at=is.null"),
+    "the removal is scoped to one live row of the actor's company",
+  );
+  expectDeepEqual(Object.keys(lastUpdate.values), ["deleted_at"], "and sets the soft delete marker only");
+  expect(
+    typeof lastUpdate.values["deleted_at"] === "string" &&
+      Number.isFinite(Date.parse(String(lastUpdate.values["deleted_at"]))),
+    "to a real instant",
+  );
+
+  const lastAudit = at(audit.entries, audit.entries.length - 1, "the removal audit entry");
+  expectEqual(lastAudit.action, CLIENT_DELETED_AUDIT_ACTION, "audited as client.deleted");
+  expectEqual(lastAudit.entityType, "client", "against the client entity");
+  expectEqual(lastAudit.entityId, created.id, "naming the row");
+  expectEqual(lastAudit.companyId, COMPANY_A, "the company");
+  expectEqual(lastAudit.actorUserId, OWNER_ID, "and the actor");
+  expect(
+    !JSON.stringify(lastAudit.payload).includes("amina@example.com"),
+    "and never copying the client's email address into the log",
+  );
+
+  // the row is gone from every live read at once
+  const readAfter = await rejectionOf(() => getClient({ actor: owner, clientId: created.id }, dependencies));
+  expect(isAppError(readAfter) && readAfter.code === "RESOURCE_NOT_FOUND", "a removed client is a 404");
+
+  const listAfter = await listClients({ actor: owner, query: parseClientListQuery({}) }, listDepsOf(db));
+  expectEqual(listAfter.clients.length, 0, "and leaves the list");
+
+  const searchAfter = await listClients(
+    { actor: owner, query: parseClientListQuery({ search: "Amina" }) },
+    listDepsOf(db),
+  );
+  expectEqual(searchAfter.clients.length, 0, "and the searches");
+
+  // a second removal is refused rather than repeated
+  const auditCountBefore = audit.entries.length;
+  const second = await rejectionOf(() => deleteClient({ actor: owner, clientId: created.id }, dependencies));
+  expect(isAppError(second) && second.code === "RESOURCE_NOT_FOUND", "removing it again is a 404, not a second marker");
+  expectEqual(audit.entries.length, auditCountBefore, "and writes no second audit entry");
+
+  // another merchant cannot remove this row, and learns nothing about it
+  const other = await createClient({ actor: owner, body: { ...VALID_BODY, email: "other@example.com" } }, dependencies);
+  const foreign = await rejectionOf(() => deleteClient({ actor: otherOwner, clientId: other.id }, dependencies));
+  expect(isAppError(foreign) && foreign.code === "RESOURCE_NOT_FOUND", "a foreign removal is a 404, not the row");
+  const stillThere = await getClient({ actor: owner, clientId: other.id }, dependencies);
+  expectEqual(stillThere.id, other.id, "and the row is untouched");
+
+  // only the owner may remove, exactly as only the owner may write
+  const roleDenied = await rejectionOf(() => deleteClient({ actor: desk, clientId: other.id }, dependencies));
+  expect(isAppError(roleDenied) && roleDenied.code === "PERMISSION_DENIED", "a non-owner role may not remove a client");
+
+  const badId = await rejectionOf(() => deleteClient({ actor: owner, clientId: "not-a-uuid" }, dependencies));
+  expect(isAppError(badId) && badId.code === "VALIDATION_FAILED", "a malformed id is a 422");
+
+  // a deleted row releases its email, which is what the partial unique index of 0019 is for
+  const reuse = await createClient({ actor: owner, body: { ...VALID_BODY } }, dependencies);
+  expectEqual(reuse.values.email, VALID_BODY.email, "the address of a removed client can be used again");
+}
+
 /* ---- the paginated list with search of STEP 107 ---- */
 
 /** One client body with a distinct name, so a page can be told apart row by row. */
@@ -804,7 +882,17 @@ async function checkListSources(): Promise<void> {
   const catalog = await readRepositoryFile("lib/i18n/strings/en.ts");
   const keys = new Set<string>();
 
-  for (const source of [screen, form]) {
+  const deleteForm = await readRepositoryFile("app/(dashboard)/clients/[id]/delete-client-form.tsx");
+  expect(deleteForm.includes('method: "DELETE"'), "the removal form sends DELETE");
+  expect(deleteForm.includes("csrfHeaders("), "with the token in its headers");
+  expect(!deleteForm.includes("body:"), "and no body, because a removal has none");
+  expect(deleteForm.includes("router.push(\"/clients\")"), "navigating back to the list on success");
+  expect(
+    deleteForm.includes("setConfirming(true)") && deleteForm.includes("deleteCancel"),
+    "behind a confirmation the merchant can leave",
+  );
+
+  for (const source of [screen, form, deleteForm]) {
     for (const match of source.matchAll(/"(clients\.[a-zA-Z0-9]+)"/gu)) {
       const key = match[1];
 
@@ -833,6 +921,7 @@ async function checkSources(): Promise<void> {
     "app/api/clients/list/route.ts",
     "app/(dashboard)/clients/page.tsx",
     "app/(dashboard)/clients/client-search-form.tsx",
+    "app/(dashboard)/clients/[id]/delete-client-form.tsx",
     "app/(dashboard)/clients/new/page.tsx",
     "app/(dashboard)/clients/[id]/page.tsx",
     "app/(dashboard)/clients/client-form.tsx",
@@ -861,9 +950,25 @@ async function checkSources(): Promise<void> {
   );
 
   const editRoute = await readRepositoryFile("app/api/clients/[id]/route.ts");
-  expect(editRoute.includes("export const POST") && editRoute.includes("export const GET"), "the edit route answers GET and POST");
-  expect(!/export const (PUT|PATCH|DELETE)/u.test(editRoute), "the edit route answers no other mutation");
-  expectEqual(editRoute.split("requireCsrfToken(").length - 1, 1, "the edit route checks the token exactly once");
+  expect(
+    editRoute.includes("export const POST") && editRoute.includes("export const GET"),
+    "the edit route answers GET and POST",
+  );
+  expect(editRoute.includes("export const DELETE"), "and the removal of the same row");
+  expect(!/export const (PUT|PATCH)/u.test(editRoute), "but no partial update");
+  expect(editRoute.includes("deleteClient("), "whose removal calls the service");
+  const deleteIndex = editRoute.indexOf("export const DELETE");
+  const postIndex = editRoute.indexOf("export const POST");
+  expect(
+    editRoute.indexOf("requireCsrfToken(", deleteIndex) !== -1 &&
+      editRoute.indexOf("requireCsrfToken(", deleteIndex) < postIndex,
+    "the removal checks the token before the edit's handler begins",
+  );
+  expectEqual(
+    editRoute.split("requireCsrfToken(").length - 1,
+    2,
+    "the edit route checks the token exactly once per mutation, and it answers two",
+  );
   expect(
     editRoute.indexOf("requireCsrfToken(") < editRoute.indexOf("request.text()"),
     "the edit route checks the token before reading the body",
@@ -905,6 +1010,7 @@ async function main(): Promise<void> {
   await checkCreate();
   await checkValidation();
   await checkReadAndUpdate();
+  await checkDelete();
   await checkListPaging();
   await checkListSearch();
   await checkListTenancy();
