@@ -12735,11 +12735,11 @@ async function checkCsrfProtection(): Promise<void> {
     .map((file) => file.path)
     .sort();
 
-  expectEqual(browserMutations.length, 40, "forty browser files send a mutation");
+  expectEqual(browserMutations.length, 41, "forty one browser files send a mutation");
   expectEqual(
     browserMutations.reduce((total, path) => total + mutationCalls(appSourceOf(appSources, path)), 0),
-    48,
-    "across forty eight call sites",
+    49,
+    "across forty nine call sites",
   );
   const postCalls = mutationCalls;
   const tokenSpreads = (source: string): number =>
@@ -12943,10 +12943,53 @@ async function checkOutboundGuard(): Promise<void> {
     }
   }
 
+  // ---- how many doors there are, and what each one guarantees
+  //
+  // Two server doors and one browser door. `auth/http.ts` speaks to the auth provider and
+  // `storage/http.ts` to the object store; the storage transport was written to the same four
+  // guarantees, and the assertions below hold it to its own rather than trusting the comment that
+  // claims them. The third module is the browser's, which dials this application and nothing else.
+  //
+  // A name appearing here that is not one of those four is a module that opened a socket nobody
+  // decided on, which is the whole reason the list is an equality and not a minimum. The storage door
+  // was missing from it between STEP 105 and STEP 117, so the gate answered red for eleven STEPs:
+  // a red gate teaches a reader to skip it, which is worse than the gap it was reporting.
   expectEqual(
     dialling.sort().join(","),
-    ["auth/device-proof-store.ts", "auth/http.ts", "security/csrf-client.ts"].join(","),
-    "the server has one door and the browser has its own, and no third module dials",
+    ["auth/device-proof-store.ts", "auth/http.ts", "security/csrf-client.ts", "storage/http.ts"].join(","),
+    "the server has two doors and the browser has its own, and no fourth module dials",
+  );
+
+  const storageHttpSource = await readFile(new URL("../storage/http.ts", import.meta.url), "utf8");
+
+  expect(
+    storageHttpSource.includes("checkOutboundUrl(url, policy)"),
+    "the storage transport asks the same guard about its destination",
+  );
+  expect(
+    storageHttpSource.indexOf("checkOutboundUrl(") < storageHttpSource.indexOf("fetchImpl(decision.target.url"),
+    "before it opens a socket, so a refused destination costs no request",
+  );
+  expect(
+    storageHttpSource.includes('redirect: "error"'),
+    "a redirect is an error there too, so a service role key cannot be carried to another origin",
+  );
+  expect(storageHttpSource.includes("AbortSignal.timeout("), "no provider call can hang");
+  expect(
+    storageHttpSource.includes("decision.target.url"),
+    "and it dials the canonical form the guard decided on, not the string it was given",
+  );
+  expect(
+    storageHttpSource.includes("outboundPolicy({ projectUrl, extraHosts, allowLoopback })"),
+    "with a policy built from the endpoint it belongs to",
+  );
+  expect(
+    storageHttpSource.includes('nodeEnv !== "production" && isLoopbackHost('),
+    "and the same single development exception, stated once",
+  );
+  expect(
+    !storageHttpSource.includes("logger"),
+    "logging nothing itself, because a provider answer carries signature material",
   );
 }
 

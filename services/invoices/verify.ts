@@ -1,12 +1,32 @@
 // path: services/invoices/verify.ts
 import process from "node:process";
 import { readFile } from "node:fs/promises";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { inflateSync } from "node:zlib";
 import type { z } from "zod";
 import { createInMemoryAuditTrail, type AuditTrail } from "../../lib/auth/audit.ts";
 import type { RestClient } from "../../lib/auth/rest.ts";
 import type { PlatformRole, RequestActor } from "../../lib/auth/types.ts";
 import { AppError, isAppError } from "../../lib/errors/app-error.ts";
+import { formatMessage, getMessage } from "../../lib/i18n/messages.ts";
+import { createLogger } from "../../lib/logger/logger.ts";
+import { createInMemoryJobQueue } from "../../lib/jobs/queue.ts";
+import { JobRegistry } from "../../lib/jobs/registry.ts";
+import { JobWorker } from "../../lib/jobs/worker.ts";
+import { isFileEnvelope } from "../../lib/security/encryption.ts";
+import { UPLOAD_POLICIES } from "../../lib/security/upload.ts";
+import { createFileEncryption } from "../../lib/storage/encryption.ts";
+import {
+  DEFAULT_STORAGE_BUCKET,
+  StorageError,
+  type SignedUrl,
+  type SignedUrlInput,
+  type StorageAdapter,
+  type StorageAdapterName,
+  type StorageObjectRef,
+  type StorageUploadInput,
+  type StoredObject,
+} from "../../lib/storage/types.ts";
 import {
   INVOICE_ABANDONED_AUDIT_ACTION,
   INVOICE_CLIENT_OPTION_LIMIT,
@@ -80,6 +100,57 @@ import {
   updateInvoiceNumberSettings,
   type InvoiceNumberingDependencies,
 } from "./invoice-numbering.ts";
+import {
+  INVOICE_PDF_CONTENT_TYPE,
+  INVOICE_PDF_EXTENSION,
+  INVOICE_PDF_FONTS,
+  INVOICE_PDF_HEADER,
+  INVOICE_PDF_MARGIN,
+  INVOICE_PDF_MAXIMUM_BYTES,
+  INVOICE_PDF_PAGE_HEIGHT,
+  INVOICE_PDF_PAGE_WIDTH,
+  invoicePdfDocumentOf,
+  invoicePdfEncodedText,
+  invoicePdfLabels,
+  invoicePdfLiteral,
+  invoicePdfQuantity,
+  invoicePdfTextWidth,
+  invoicePdfUnitPrice,
+  invoicePdfUsd,
+  invoicePdfWrap,
+  renderInvoicePdf,
+  type InvoicePdfSource,
+  type InvoicePdfSourceLine,
+} from "./invoice-pdf.ts";
+import {
+  INVOICE_DOCUMENTS_TABLE,
+  INVOICE_DOCUMENT_ENTITY,
+  INVOICE_DOCUMENT_STATUSES,
+  INVOICE_DOCUMENT_TYPE,
+  INVOICE_PDF_FAILED_AUDIT_ACTION,
+  INVOICE_PDF_JOB,
+  INVOICE_PDF_KEY_SEGMENT,
+  INVOICE_PDF_NO_DOCUMENT,
+  INVOICE_PDF_PURPOSE,
+  INVOICE_PDF_RENDERED_AUDIT_ACTION,
+  INVOICE_PDF_REQUESTED_AUDIT_ACTION,
+  assertInvoicePdfKeyForInvoice,
+  createInvoicePdfJobHandler,
+  invoiceDocumentRowSchema,
+  invoicePdfFileName,
+  invoicePdfJobIdempotencyKey,
+  invoicePdfJobPayloadSchema,
+  invoicePdfStorageKey,
+  parseInvoicePdfStorageKey,
+  readInvoicePdfBytes,
+  readInvoicePdfState,
+  registerInvoicePdfJob,
+  renderInvoicePdfDocument,
+  requestInvoicePdf,
+  type InvoicePdfRequestDependencies,
+  type InvoicePdfStorageDependencies,
+  type InvoicePdfStoreDependencies,
+} from "./invoice-pdf-document.ts";
 
 /**
  * Invoice gate for STEP 112. Run with `node services/invoices/verify.ts`.
@@ -209,10 +280,19 @@ interface InvoiceDb {
   /** The merchant numbering series, one row per company, and the counters it consumes. */
   readonly numberingSettings: Array<Record<string, unknown>>;
   readonly numberingCounters: Array<Record<string, unknown>>;
+  /** `0115`: one live rendered-document row per invoice. */
+  readonly documents: Array<Record<string, unknown>>;
+  /** `0057`: the file rows a render writes, archives and reads back. */
+  readonly files: Array<Record<string, unknown>>;
   /** Every take, in order, so a test can see the sequence a merchant was actually issued. */
   readonly takenNumbers: string[];
   /** Set to make the lines insert fail, which is how the compensation path is reached. */
   failItems: boolean;
+  /**
+   * Set to make one document update lose a race: the fixture moves the row first, so the version-scoped
+   * write the service sends matches nothing and the service has to read the winner's state back.
+   */
+  raceDocumentVersion: boolean;
   inserts: Array<{ readonly table: string; readonly rows: readonly Readonly<Record<string, unknown>>[] }>;
   updates: Array<{ readonly table: string; readonly query: string; readonly values: Record<string, unknown> }>;
   /** Set while a test wants every intermediate position write checked against the unique index. */
@@ -293,8 +373,11 @@ function createDb(): InvoiceDb {
     items: [],
     numberingSettings: [],
     numberingCounters: [],
+    documents: [],
+    files: [],
     takenNumbers: [],
     failItems: false,
+    raceDocumentVersion: false,
     strictPositions: false,
     inserts: [],
     updates: [],
@@ -389,6 +472,185 @@ function databaseLineTotal(quantity: string, unitPriceMinor: bigint, discountMin
   return (product < 0n ? -rounded : rounded) - discountMinor;
 }
 
+/* ---- `0115`: the rendered-document row, modelled from the migration ---- */
+
+/** A column comparison on the wire, where a null and a missing value are the same fact. */
+function sameWire(left: unknown, right: unknown): boolean {
+  return String(left ?? "") === String(right ?? "");
+}
+
+/** The `0115` status vocabulary, transcribed from `invoice_documents_status_check`. */
+const DOCUMENT_STATUSES = ["queued", "rendering", "ready", "failed"] as const;
+
+/**
+ * The column checks of `0115`, on the values a row will hold.
+ *
+ * Transcribed from the migration's `check` constraints rather than from the service under test, so a
+ * service that writes a `ready` row without its four facts is refused by the fixture the way PostgreSQL
+ * refuses it - and an assertion that the two agree has an independent side.
+ */
+function documentCheckProblem(row: Readonly<Record<string, unknown>>): string | null {
+  const status = String(row["status"]);
+  const fileId = row["file_id"] ?? null;
+  const byteSize = row["byte_size"] ?? null;
+  const hash = row["content_sha256"] ?? null;
+  const renderedAt = row["rendered_at"] ?? null;
+  const errorCode = row["last_error_code"] ?? null;
+  const jobId = row["job_id"] ?? null;
+  const generation = Number(row["generation"]);
+  const attempts = Number(row["attempts"]);
+
+  if (row["document_type"] !== "invoice_pdf") {
+    return "invoice_documents_type_check";
+  }
+
+  if (!(DOCUMENT_STATUSES as readonly string[]).includes(status)) {
+    return "invoice_documents_status_check";
+  }
+
+  if (!Number.isInteger(generation) || generation < 0 || generation > 1_000_000) {
+    return "invoice_documents_generation_check";
+  }
+
+  if (!Number.isInteger(attempts) || attempts < 0 || attempts > 1_000) {
+    return "invoice_documents_attempts_check";
+  }
+
+  // `invoice_documents_ready_check`: only a completed render may carry a document, and it carries all of it.
+  if (status === "ready" && (fileId === null || byteSize === null || hash === null || renderedAt === null)) {
+    return "invoice_documents_ready_check";
+  }
+
+  // `invoice_documents_render_facts_check`: the four facts are all present or all absent.
+  if (
+    fileId === null !== (renderedAt === null) ||
+    fileId === null !== (byteSize === null) ||
+    fileId === null !== (hash === null)
+  ) {
+    return "invoice_documents_render_facts_check";
+  }
+
+  if (status === "failed" && errorCode === null) {
+    return "invoice_documents_failed_check";
+  }
+
+  // `invoice_documents_error_code_check`: a catalogue code, in the catalogue's own shape.
+  if (typeof errorCode === "string" && (errorCode.length < 3 || errorCode.length > 40 || !/^[A-Z][A-Z0-9_]{2,39}$/u.test(errorCode))) {
+    return "invoice_documents_error_code_check";
+  }
+
+  if (byteSize !== null && (Number(byteSize) < 1 || Number(byteSize) > 26_214_400)) {
+    return "invoice_documents_size_check";
+  }
+
+  if (typeof hash === "string" && !/^[0-9a-f]{64}$/u.test(hash)) {
+    return "invoice_documents_hash_check";
+  }
+
+  if (typeof jobId === "string" && (jobId.length < 1 || jobId.length > 64 || !/^[A-Za-z0-9._:-]+$/u.test(jobId))) {
+    return "invoice_documents_job_check";
+  }
+
+  return null;
+}
+
+/**
+ * `invoice_documents_guard_state`, as the trigger states it.
+ *
+ * Returns the reason the write would be refused, or null when the database would accept it. The fixture
+ * runs this before it applies an update, so a service that walks a status backwards, moves a generation
+ * without completing a render, or clears a failure reason on anything but a fresh request meets the same
+ * refusal here that it would meet in production.
+ */
+function documentGuardProblem(
+  before: Readonly<Record<string, unknown>>,
+  after: Readonly<Record<string, unknown>>,
+): string | null {
+  for (const column of ["company_id", "invoice_id", "document_type"] as const) {
+    if (!sameWire(before[column], after[column])) {
+      return "an invoice document keeps its merchant, its invoice and its type";
+    }
+  }
+
+  const beforeGeneration = Number(before["generation"]);
+  const generation = Number(after["generation"]);
+
+  if (generation < beforeGeneration) {
+    return "a render generation never goes backwards";
+  }
+
+  const factsMoved =
+    !sameWire(before["file_id"], after["file_id"]) ||
+    !sameWire(before["byte_size"], after["byte_size"]) ||
+    !sameWire(before["content_sha256"], after["content_sha256"]) ||
+    !sameWire(before["rendered_at"], after["rendered_at"]);
+  const arriving = before["status"] !== "ready" && after["status"] === "ready";
+
+  if (factsMoved && !arriving) {
+    return "the file facts of an invoice document change only when a render completes";
+  }
+
+  if (generation > beforeGeneration && after["status"] !== "ready") {
+    return "a render generation counts completed renders only";
+  }
+
+  // A render is dated at or after the request that produced it. The guard enforces this rather than a
+  // column check, because the row keeps the facts of the render it is replacing until the new one lands:
+  // a re-queued document legitimately carries a `rendered_at` earlier than its own `queued_at`.
+  if (
+    arriving &&
+    typeof after["rendered_at"] === "string" &&
+    Date.parse(after["rendered_at"]) < Date.parse(String(after["queued_at"]))
+  ) {
+    return "a render is dated at or after the request that produced it";
+  }
+
+  const from = String(before["status"]);
+  const to = String(after["status"]);
+  const beforeAttempts = Number(before["attempts"]);
+  const attempts = Number(after["attempts"]);
+
+  if (from === to) {
+    if (attempts < beforeAttempts) {
+      return "an attempt count never goes backwards";
+    }
+  } else if (
+    !(
+      (from === "queued" && (to === "rendering" || to === "failed")) ||
+      (from === "rendering" && (to === "ready" || to === "failed")) ||
+      (from === "failed" && (to === "queued" || to === "rendering")) ||
+      (from === "ready" && to === "queued")
+    )
+  ) {
+    return "an invoice document status walks queued, rendering, ready or failed";
+  }
+
+  if (to === "queued" && from !== "queued") {
+    if (attempts > 0) {
+      return "a fresh render request starts at zero attempts";
+    }
+  } else if (attempts < beforeAttempts) {
+    return "an attempt count never goes backwards";
+  } else if (before["last_error_code"] !== null && after["last_error_code"] === null) {
+    return "a failure reason is kept until the next render request";
+  }
+
+  if (before["deleted_at"] !== null && !sameWire(before["deleted_at"], after["deleted_at"])) {
+    return "a removed invoice document stays removed";
+  }
+
+  return null;
+}
+
+/** `0057`'s status walk, so a file row of a render cannot be pushed backwards by a fixture bug. */
+const FILE_STATUS_WALK: Readonly<Record<string, readonly string[]>> = {
+  pending: ["ready", "quarantined"],
+  ready: ["quarantined", "archived"],
+  quarantined: ["archived"],
+  archived: [],
+  deleted: [],
+};
+
 /** The tables this gate models, so a service that touched a fourth would be caught rather than guessed. */
 const MODELLED_TABLES = [
   "clients",
@@ -398,6 +660,8 @@ const MODELLED_TABLES = [
   "invoice_items",
   "invoice_number_settings",
   "invoice_number_counters",
+  "invoice_documents",
+  "files",
 ] as const;
 
 /**
@@ -443,6 +707,10 @@ function rowsOf(db: InvoiceDb, table: string): Array<Record<string, unknown>> {
       return db.numberingSettings;
     case "invoice_number_counters":
       return db.numberingCounters;
+    case "invoice_documents":
+      return db.documents;
+    case "files":
+      return db.files;
     default:
       throw new Error(`the invoice service touches no table the gate does not model: ${table}`);
   }
@@ -676,8 +944,103 @@ function createInvoiceRest(db: InvoiceDb): RestClient {
         return Promise.resolve([schema.parse(stored)]);
       }
 
+      if (table === "invoice_documents") {
+        const row = rows[0];
+
+        if (rows.length !== 1 || row === undefined) {
+          return Promise.reject(new Error("a rendered-document row is written one at a time"));
+        }
+
+        // `invoice_documents_one_live_per_invoice`: one live row per invoice, so two clicks cannot leave
+        // two documents competing to be the PDF.
+        if (
+          db.documents.some(
+            (existing) => existing["invoice_id"] === row["invoice_id"] && existing["deleted_at"] === null,
+          )
+        ) {
+          return Promise.reject(new AppError("CONFLICT", { cause: { code: "23505" } }));
+        }
+
+        // `invoice_documents_invoice_fkey` is the composite key of `0022`: the pair has to exist as a pair,
+        // so a document of another merchant's invoice is not a row the database will hold.
+        const parent = db.invoices.find(
+          (candidate) => candidate["id"] === row["invoice_id"] && candidate["company_id"] === row["company_id"],
+        );
+
+        if (parent === undefined) {
+          return Promise.reject(new AppError("VALIDATION_FAILED"));
+        }
+
+        const createdAt = new Date(NOW + db.documents.length).toISOString();
+        const stored: Record<string, unknown> = wireOf({
+          id: randomUUID(),
+          document_type: "invoice_pdf",
+          status: "queued",
+          generation: 0,
+          attempts: 0,
+          file_id: null,
+          byte_size: null,
+          content_sha256: null,
+          rendered_at: null,
+          queued_at: createdAt,
+          last_error_code: null,
+          requested_by: null,
+          job_id: null,
+          created_at: createdAt,
+          updated_at: createdAt,
+          deleted_at: null,
+          version: 1,
+          ...row,
+        });
+
+        const problem = documentCheckProblem(stored);
+
+        if (problem !== null) {
+          return Promise.reject(new AppError("VALIDATION_FAILED", { cause: { rule: problem } }));
+        }
+
+        db.documents.push(stored);
+
+        return Promise.resolve([schema.parse(stored)]);
+      }
+
+      if (table === "files") {
+        const row = rows[0];
+
+        if (rows.length !== 1 || row === undefined) {
+          return Promise.reject(new Error("a file record is written one at a time"));
+        }
+
+        // `files_storage_key_key`: one object is one row forever, soft delete included.
+        if (db.files.some((existing) => existing["storage_key"] === row["storage_key"])) {
+          return Promise.reject(new AppError("CONFLICT", { cause: { code: "23505" } }));
+        }
+
+        // `files_storage_key_check`: the key sits under the merchant's own prefix.
+        if (!String(row["storage_key"] ?? "").startsWith(`${String(row["company_id"])}/`)) {
+          return Promise.reject(new AppError("VALIDATION_FAILED"));
+        }
+
+        const createdAt = new Date(NOW + db.files.length).toISOString();
+        const stored: Record<string, unknown> = wireOf({
+          id: randomUUID(),
+          magic_byte_verified: false,
+          verified_at: null,
+          quarantined_reason: null,
+          deleted_at: null,
+          version: 1,
+          created_at: createdAt,
+          updated_at: createdAt,
+          ...row,
+        });
+
+        db.files.push(stored);
+
+        return Promise.resolve([schema.parse(stored)]);
+      }
+
       if (table !== "invoices") {
-        return Promise.reject(new Error(`return=representation is used for invoices and lines only: ${table}`));
+        return Promise.reject(new Error(`return=representation is used for invoices, lines and documents only: ${table}`));
       }
 
       for (const row of rows) {
@@ -853,6 +1216,147 @@ function createInvoiceRest(db: InvoiceDb): RestClient {
 
         Object.assign(row, wireOf(values), {
           updated_at: new Date(NOW + 30_000).toISOString(),
+          version: Number(row["version"]) + 1,
+        });
+
+        return Promise.resolve();
+      }
+
+      if (table === "invoice_documents") {
+        const parts = queryParts(query);
+        const id = parts.get("id");
+        const company = parts.get("company_id");
+        const version = parts.get("version");
+
+        if (id === undefined || company === undefined) {
+          return Promise.reject(new Error(`a document update is not scoped to one row of one company: ${query}`));
+        }
+
+        const row = db.documents.find(
+          (candidate) =>
+            candidate["id"] === id.slice(3) &&
+            candidate["company_id"] === company.slice(3) &&
+            (parts.get("deleted_at") !== "is.null" || candidate["deleted_at"] === null),
+        );
+
+        // PostgREST reports success for an update that matched nothing, which is the whole point of the
+        // version in the query: the loser of a race writes nothing and reads the winner's row back.
+        if (row === undefined) {
+          return Promise.resolve();
+        }
+
+        if (version !== undefined && String(row["version"]) !== version.slice(3)) {
+          return Promise.resolve();
+        }
+
+        // The race the optimistic lock exists for: another request moves the row first, once, so the
+        // write this service is about to send matches nothing.
+        if (db.raceDocumentVersion) {
+          db.raceDocumentVersion = false;
+
+          Object.assign(row, {
+            status: "queued",
+            attempts: 0,
+            last_error_code: null,
+            queued_at: new Date(NOW + 5_000).toISOString(),
+            updated_at: new Date(NOW + 5_000).toISOString(),
+            version: Number(row["version"]) + 1,
+          });
+
+          return Promise.resolve();
+        }
+
+        const after: Record<string, unknown> = { ...row, ...wireOf(values) };
+        const guarded = documentGuardProblem(row, after) ?? documentCheckProblem(after);
+
+        if (guarded !== null) {
+          return Promise.reject(new AppError("VALIDATION_FAILED", { cause: { rule: "check_violation", reason: guarded } }));
+        }
+
+        // `invoice_documents_set_row_metadata`, which is `set_row_metadata()`.
+        Object.assign(row, wireOf(values), {
+          updated_at: new Date(NOW + 10_000).toISOString(),
+          version: Number(row["version"]) + 1,
+        });
+
+        return Promise.resolve();
+      }
+
+      if (table === "files") {
+        const parts = queryParts(query);
+        const id = parts.get("id");
+        const company = parts.get("company_id");
+
+        if (id === undefined || company === undefined) {
+          return Promise.reject(new Error(`a file update is not scoped to one row of one company: ${query}`));
+        }
+
+        const row = db.files.find(
+          (candidate) =>
+            candidate["id"] === id.slice(3) &&
+            candidate["company_id"] === company.slice(3) &&
+            (parts.get("deleted_at") !== "is.null" || candidate["deleted_at"] === null),
+        );
+
+        if (row === undefined) {
+          return Promise.resolve();
+        }
+
+        const next: Record<string, unknown> = { ...row, ...wireOf(values) };
+
+        // `files_guard_state`, transcribed: the bytes' identity is frozen once the record exists.
+        for (const column of [
+          "company_id",
+          "uploaded_by",
+          "purpose",
+          "storage_provider",
+          "storage_bucket",
+          "storage_key",
+          "content_type",
+          "byte_size",
+          "content_sha256",
+          "encryption_algorithm",
+          "encryption_key_version",
+          "ciphertext_iv",
+          "ciphertext_tag",
+        ] as const) {
+          if (!sameWire(next[column], row[column])) {
+            return Promise.reject(
+              new AppError("VALIDATION_FAILED", { cause: { rule: "files_guard_state", reason: column } }),
+            );
+          }
+        }
+
+        if (row["magic_byte_verified"] === true && next["magic_byte_verified"] !== true) {
+          return Promise.reject(new AppError("VALIDATION_FAILED", { cause: { rule: "files_guard_state", reason: "magic_byte_verified" } }));
+        }
+
+        if (row["verified_at"] !== null && !sameWire(next["verified_at"], row["verified_at"])) {
+          return Promise.reject(new AppError("VALIDATION_FAILED", { cause: { rule: "files_guard_state", reason: "verified_at" } }));
+        }
+
+        if (!sameWire(next["status"], row["status"])) {
+          const allowed = FILE_STATUS_WALK[String(row["status"])] ?? [];
+
+          // A quarantined file archives only on a verdict it already carries.
+          if (
+            !allowed.includes(String(next["status"])) ||
+            (row["status"] === "quarantined" && row["magic_byte_verified"] !== true)
+          ) {
+            return Promise.reject(new AppError("VALIDATION_FAILED", { cause: { rule: "files_guard_state", reason: "status" } }));
+          }
+        }
+
+        if (row["quarantined_reason"] !== null && !sameWire(next["quarantined_reason"], row["quarantined_reason"])) {
+          return Promise.reject(new AppError("VALIDATION_FAILED", { cause: { rule: "files_guard_state", reason: "quarantined_reason" } }));
+        }
+
+        if (row["deleted_at"] !== null) {
+          return Promise.reject(new AppError("VALIDATION_FAILED", { cause: { rule: "files_guard_state", reason: "deleted" } }));
+        }
+
+        Object.assign(row, wireOf(values), {
+          updated_at: new Date(NOW + 10_000).toISOString(),
           version: Number(row["version"]) + 1,
         });
 
@@ -3693,6 +4197,1459 @@ async function checkSources(): Promise<void> {
   }
 }
 
+/* ---- STEP 117: a PDF reader ----
+ *
+ * A renderer that is asked whether it wrote a valid PDF will say yes, so the gate reads the bytes
+ * itself: it follows `startxref` to the table, checks every offset against the object header it claims,
+ * walks the catalogue to the page tree, inflates each content stream and pulls the drawn strings back
+ * out. What the assertions below compare against is therefore a reader's opinion of the file, not the
+ * writer's - the same disagreement a merchant's PDF viewer would have.
+ */
+
+interface ReadPdfPage {
+  readonly number: number;
+  readonly text: string;
+  readonly mediaBox: string | null;
+}
+
+interface ReadPdf {
+  readonly header: string;
+  readonly eof: boolean;
+  readonly startxref: number;
+  readonly xrefAtStartxref: boolean;
+  readonly size: number;
+  readonly entries: number;
+  readonly offsetsValid: boolean;
+  readonly rootObject: number;
+  readonly pageCount: number;
+  readonly pages: readonly ReadPdfPage[];
+  readonly text: string;
+  readonly creationDate: string | null;
+  readonly winAnsiFonts: number;
+  readonly trailerIds: readonly string[];
+  /** The hash of everything before the trailer, which is what a file's own identifier claims to be. */
+  readonly bodySha256: string;
+  readonly objectCount: number;
+}
+
+/** The file as bytes that survive a round trip through a Latin-1 string, which is what a PDF is. */
+function pdfRaw(bytes: Uint8Array): string {
+  return Buffer.from(bytes).toString("latin1");
+}
+
+/**
+ * One object's body.
+ *
+ * A stream is skipped by its own `/Length` rather than searched for a terminator, because compressed
+ * bytes can spell `endobj` and a reader that scans them as text will find an object that is not there.
+ */
+function pdfObjectBody(raw: string, offset: number): string {
+  const start = raw.indexOf("\n", offset) + 1;
+  const dictEnd = raw.indexOf(">>", start);
+  const dict = raw.slice(start, dictEnd < 0 ? start + 200 : dictEnd);
+  const length = /\/Length (\d+)/u.exec(dict)?.[1];
+
+  if (length === undefined) {
+    return raw.slice(start, raw.indexOf("\nendobj", start));
+  }
+
+  const dataEnd = raw.indexOf("stream\n", start) + "stream\n".length + Number(length);
+
+  return raw.slice(start, raw.indexOf("\nendobj", dataEnd));
+}
+
+/** A content stream's operators, inflated. */
+function pdfStreamText(body: string): string {
+  const start = body.indexOf("stream\n");
+
+  if (start < 0) {
+    return "";
+  }
+
+  const dataStart = start + "stream\n".length;
+  const data = Buffer.from(body.slice(dataStart, body.indexOf("\nendstream", dataStart)), "latin1");
+
+  return inflateSync(data).toString("latin1");
+}
+
+/** A literal string's escapes, as a PDF reader resolves them. */
+function pdfUnescape(literal: string): string {
+  let text = "";
+
+  for (let index = 0; index < literal.length; index += 1) {
+    const character = literal[index] ?? "";
+
+    if (character !== "\\") {
+      text += character;
+      continue;
+    }
+
+    const escaped = literal[index + 1] ?? "";
+
+    index += 1;
+
+    if (escaped === "n") {
+      text += "\n";
+    } else if (escaped === "r") {
+      text += "\r";
+    } else if (escaped === "t") {
+      text += "\t";
+    } else if (escaped === "\n") {
+      // A line break inside a literal is a continuation of the source, and draws nothing.
+      continue;
+    } else if (/^[0-7]$/u.test(escaped)) {
+      let octal = escaped;
+
+      while (octal.length < 3 && /^[0-7]$/u.test(literal[index + 1] ?? "")) {
+        index += 1;
+        octal += literal[index] ?? "";
+      }
+
+      text += String.fromCharCode(Number.parseInt(octal, 8));
+    } else {
+      text += escaped;
+    }
+  }
+
+  return text;
+}
+
+/** Every string a content stream draws, in the order it draws them. */
+function pdfDrawnText(content: string): string {
+  const drawn: string[] = [];
+  const pattern = /\(((?:\\[\s\S]|[^\\()])*)\)\s*Tj/gu;
+  let match = pattern.exec(content);
+
+  while (match !== null) {
+    drawn.push(pdfUnescape(match[1] ?? ""));
+    match = pattern.exec(content);
+  }
+
+  return drawn.join("\n");
+}
+
+/** A whole document, read from its bytes. */
+function readPdf(bytes: Uint8Array): ReadPdf {
+  const raw = pdfRaw(bytes);
+  const startxrefAt = raw.lastIndexOf("startxref");
+  const startxref = Number(/startxref\s+(\d+)/u.exec(raw.slice(startxrefAt))?.[1] ?? "-1");
+  const table = raw.slice(startxref);
+  const subsection = /^xref\s*\n(\d+) (\d+)\n/u.exec(table);
+  const offsets: Array<{ readonly number: number; readonly offset: number }> = [];
+  let entries = 0;
+  let offsetsValid = subsection !== null;
+
+  if (subsection !== null) {
+    const first = Number(subsection[1] ?? "0");
+    const count = Number(subsection[2] ?? "0");
+    let cursor = startxref + subsection[0].length;
+
+    for (let index = 0; index < count; index += 1) {
+      const entry = raw.slice(cursor, cursor + 20);
+
+      cursor += 20;
+      entries += 1;
+
+      // An entry is exactly twenty bytes and ends in `n \n` or `f \n`; a reader that cannot split it
+      // cannot find the object, which is the corruption this table exists to prevent.
+      const parsed = /^(\d{10}) (\d{5}) ([nf]) \n$/u.exec(entry);
+
+      if (parsed === null) {
+        offsetsValid = false;
+        continue;
+      }
+
+      if (parsed[3] === "n") {
+        const offset = Number(parsed[1]);
+
+        if (!raw.slice(offset, offset + 24).startsWith(`${String(first + index)} 0 obj`)) {
+          offsetsValid = false;
+        }
+
+        offsets.push({ number: first + index, offset });
+      }
+    }
+  }
+
+  const bodies = new Map<number, string>();
+
+  for (const entry of offsets) {
+    bodies.set(entry.number, pdfObjectBody(raw, entry.offset));
+  }
+
+  const rootObject = Number(/\/Root (\d+) 0 R/u.exec(table)?.[1] ?? "-1");
+  const pagesReference = Number(/\/Pages (\d+) 0 R/u.exec(bodies.get(rootObject) ?? "")?.[1] ?? "-1");
+  const kids = /\[([^\]]*)\]/u.exec(bodies.get(pagesReference) ?? "")?.[1] ?? "";
+  const pageNumbers = kids
+    .split(" ")
+    .map((piece) => Number(piece))
+    .filter((piece) => Number.isInteger(piece) && piece > 0);
+  const pages: ReadPdfPage[] = [];
+
+  for (const [index, pageNumber] of pageNumbers.entries()) {
+    const page = bodies.get(pageNumber) ?? "";
+    const contents = Number(/\/Contents (\d+) 0 R/u.exec(page)?.[1] ?? "-1");
+
+    pages.push({
+      number: index + 1,
+      text: pdfDrawnText(pdfStreamText(bodies.get(contents) ?? "")),
+      mediaBox: /\/MediaBox \[([^\]]*)\]/u.exec(page)?.[1] ?? null,
+    });
+  }
+
+  let winAnsiFonts = 0;
+
+  for (const body of bodies.values()) {
+    if (body.includes("/Encoding /WinAnsiEncoding")) {
+      winAnsiFonts += 1;
+    }
+  }
+
+  return {
+    header: /^%PDF-(\d+[.]\d+)/u.exec(raw)?.[1] ?? "",
+    eof: raw.trimEnd().endsWith("%%EOF"),
+    startxref,
+    xrefAtStartxref: table.startsWith("xref"),
+    size: Number(/\/Size (\d+)/u.exec(table)?.[1] ?? "-1"),
+    entries,
+    offsetsValid,
+    rootObject,
+    pageCount: pages.length,
+    pages,
+    text: pages.map((page) => page.text).join("\n"),
+    creationDate: /\/CreationDate \(([^)]*)\)/u.exec(bodies.get(5) ?? "")?.[1] ?? null,
+    winAnsiFonts,
+    trailerIds: [...table.matchAll(/<([0-9a-f]{64})>/gu)].map((match) => match[1] ?? ""),
+    bodySha256: createHash("sha256")
+      .update(Buffer.from(raw.slice(0, raw.indexOf("trailer", startxref)), "latin1"))
+      .digest("hex"),
+    objectCount: bodies.size,
+  };
+}
+
+/* ---- STEP 117: the rendered document ---- */
+
+const PDF_INVOICE_ID = "018f2b8a-7777-4c2d-9c3e-000000000001";
+const PDF_DUE_AT = new Date(NOW + 14 * 86_400_000).toISOString();
+
+/**
+ * The keyring the gate seals with.
+ *
+ * Derived rather than written down: no credential, test vector or otherwise, belongs in the repository,
+ * and `createFileEncryption` needs only 32 bytes of key material that nothing else has to know.
+ */
+const PDF_GATE_KEY = createHash("sha256").update("kd-solution-it invoice pdf gate").digest("base64");
+
+/** One line of `0023`, carrying the total the generated column would have stored. */
+function pdfLineOf(
+  position: number,
+  description: string,
+  quantity: string,
+  unitPriceMinor: bigint,
+  discountMinor: bigint = 0n,
+): InvoicePdfSourceLine {
+  return {
+    position,
+    description,
+    unit: "item",
+    quantity,
+    unitPriceMinor,
+    discountMinor,
+    lineTotalMinor: databaseLineTotal(quantity, unitPriceMinor, discountMinor),
+  };
+}
+
+interface PdfSourceOverrides {
+  readonly number?: string | null;
+  readonly status?: string;
+  readonly lines?: readonly InvoicePdfSourceLine[];
+  readonly discountMinor?: bigint;
+  readonly discountPercentBasisPoints?: number;
+  readonly taxMinor?: bigint;
+  readonly amountPaidMinor?: bigint;
+  readonly clientName?: string;
+  readonly clientEmail?: string | null;
+  readonly clientAddress?: string | null;
+  readonly memo?: string | null;
+  readonly issuedAt?: string | null;
+  readonly generatedAtEpochMs?: number;
+}
+
+/**
+ * One invoice, in the columns the renderer reads.
+ *
+ * The totals are the stored ones and the document prints them as stored: the renderer does no arithmetic
+ * on the invoice's money, which is what the assertions below hold it to.
+ */
+function pdfSourceOf(overrides: PdfSourceOverrides = {}): InvoicePdfSource {
+  const lines = overrides.lines ?? [
+    pdfLineOf(1, "Website design, five pages", "2.5", 1_250_000n),
+    pdfLineOf(2, "Hosting, annual", "1", 990_000n, 50_000n),
+  ];
+  const subtotal = lines.reduce((total, line) => total + line.lineTotalMinor, 0n);
+  const discount = overrides.discountMinor ?? 0n;
+  const tax = overrides.taxMinor ?? 0n;
+
+  return {
+    invoice: {
+      id: PDF_INVOICE_ID,
+      number: overrides.number === undefined ? "INV-00042" : overrides.number,
+      status: overrides.status ?? "sent",
+      currency: "USD",
+      subtotalMinor: subtotal,
+      discountMinor: discount,
+      discountPercentBasisPoints: overrides.discountPercentBasisPoints ?? 0,
+      taxMinor: tax,
+      totalMinor: subtotal - discount + tax,
+      amountPaidMinor: overrides.amountPaidMinor ?? 0n,
+      clientName: overrides.clientName ?? "Acme Ltd",
+      clientEmail: overrides.clientEmail === undefined ? "billing@acme.example" : overrides.clientEmail,
+      clientAddress:
+        overrides.clientAddress === undefined ? "12 Market Street\nAustin, TX 78701" : overrides.clientAddress,
+      memo: overrides.memo === undefined ? "Thank you for the work." : overrides.memo,
+      issuedAt: overrides.issuedAt === undefined ? new Date(NOW).toISOString() : overrides.issuedAt,
+      dueAt: PDF_DUE_AT,
+    },
+    lines,
+    generatedAtEpochMs: overrides.generatedAtEpochMs ?? NOW,
+  };
+}
+
+/**
+ * Dollars and cents, thousands separated, computed here rather than asked of the renderer.
+ *
+ * The price columns store ten-thousandths of a dollar, so the document's cents are the stored amount
+ * rounded half away from zero - the rule `0023`'s generated column applies and the rule a merchant
+ * applies in their head. This is the independent side of every money assertion below.
+ */
+function printedCents(minor: bigint): string {
+  const negative = minor < 0n;
+  const magnitude = negative ? -minor : minor;
+  const cents = (magnitude + 50n) / 100n;
+  const groups: string[] = [];
+  let dollars = (cents / 100n).toString();
+
+  while (dollars.length > 3) {
+    groups.unshift(dollars.slice(-3));
+    dollars = dollars.slice(0, -3);
+  }
+
+  groups.unshift(dollars);
+
+  return `${negative ? "-" : ""}${groups.join(",")}.${(cents % 100n).toString().padStart(2, "0")}`;
+}
+
+/** A unit price at the scale it is stored, for a price that is not a whole number of cents. */
+function printedFourDecimals(minor: bigint): string {
+  const magnitude = minor < 0n ? -minor : minor;
+
+  return `${minor < 0n ? "-" : ""}${(magnitude / 10_000n).toString()}.${(magnitude % 10_000n)
+    .toString()
+    .padStart(4, "0")}`;
+}
+
+async function checkPdfRenderer(): Promise<void> {
+  const source = pdfSourceOf({
+    discountMinor: 508_125n,
+    discountPercentBasisPoints: 1_250,
+    taxMinor: 355_688n,
+  });
+  const bytes = renderInvoicePdf(invoicePdfDocumentOf(source));
+  const read = readPdf(bytes);
+  const labels = invoicePdfLabels("12.5");
+
+  // ---- the container: what a reader checks before it draws anything ----
+  expectEqual(INVOICE_PDF_HEADER, "%PDF-1.4", "the writer's header is the version it writes");
+  expect(pdfRaw(bytes).startsWith("%PDF-1.4\n"), "the bytes open with that header");
+  expectEqual(read.header, "1.4", "and a reader agrees on the version");
+  expect(read.eof, "the file closes with %%EOF");
+  expect(read.xrefAtStartxref, "startxref points at the cross-reference table");
+  expect(read.offsetsValid, "every entry in the table points at the object header it names");
+  expectEqual(read.size, read.entries, "/Size counts the entries the table holds");
+  expectEqual(read.objectCount, read.entries - 1, "and all but the free head of the table are objects");
+  expect(read.rootObject > 0, "the trailer names a catalogue");
+  expectEqual(read.pageCount, 1, "two lines and a totals block fit one page");
+  expectEqual(
+    read.pages[0]?.mediaBox,
+    `0 0 ${String(INVOICE_PDF_PAGE_WIDTH)} ${String(INVOICE_PDF_PAGE_HEIGHT)}`,
+    "the page is US Letter",
+  );
+  expectEqual(read.winAnsiFonts, INVOICE_PDF_FONTS.length, "both faces declare WinAnsiEncoding");
+  expectEqual(read.creationDate, "D:20261104090000Z", "the file's metadata carries the instant it was dated with");
+  expectEqual(read.trailerIds.length, 2, "the trailer carries both halves of a document id");
+  expect(
+    read.trailerIds.every((id) => /^[0-9a-f]{64}$/u.test(id)),
+    "each of them a hash, not a random string",
+  );
+  expectEqual(read.trailerIds[0], read.trailerIds[1], "and the two halves agree, as a file that was never updated must");
+  expectEqual(read.trailerIds[0], read.bodySha256, "the identifier is the hash of the body it identifies");
+
+  // ---- the printed facts ----
+  const text = read.text;
+  const facts: readonly (readonly [string, string])[] = [
+    ["INV-00042", "the invoice number"],
+    [labels.title, "the document's own title"],
+    ["Acme Ltd", "the client's name"],
+    ["billing@acme.example", "the client's email"],
+    ["12 Market Street", "the first line of the client's address"],
+    ["Austin, TX 78701", "and the second"],
+    ["Website design, five pages", "a line's description"],
+    ["Hosting, annual", "and the next line's"],
+    ["2.5", "a quantity as the merchant typed it, with no trailing zeros"],
+    [printedCents(1_250_000n), "a unit price that is a whole number of cents"],
+    [printedCents(3_125_000n), "the first line's amount"],
+    [printedCents(50_000n), "the second line's discount"],
+    [printedCents(940_000n), "and its amount"],
+    [labels.subtotal, "the subtotal row"],
+    [printedCents(4_065_000n), "the subtotal the invoice stores"],
+    [labels.discount, "the discount row, naming the percentage it was resolved from"],
+    [printedCents(508_125n), "the discount the invoice stores"],
+    [labels.tax, "the tax row"],
+    [printedCents(355_688n), "the tax the invoice stores"],
+    [labels.total, "the total row"],
+    [printedCents(3_912_563n), "and the total the invoice stores"],
+    [labels.currencyNote, "the currency the amounts are in"],
+    [labels.statusWords.sent, "the status word of a sent invoice"],
+    [new Date(NOW).toISOString().slice(0, 10), "the issue date"],
+    [PDF_DUE_AT.slice(0, 10), "the due date"],
+    ["Thank you for the work.", "the memo"],
+    [labels.memo, "under its own heading"],
+    [formatMessage("invoices.pdfGeneratedAt", { instant: "2026-11-04 09:00" }), "the instant it was generated"],
+    [formatMessage("invoices.pdfPageOf", { page: 1, pages: 1 }), "and the page it is on"],
+  ];
+
+  for (const [fact, description] of facts) {
+    expect(text.includes(fact), `the document prints ${description}`);
+  }
+
+  // The column heads are the catalog's words, and the table's own columns are all of them.
+  for (const column of [
+    labels.columnLine,
+    labels.columnDescription,
+    labels.columnQuantity,
+    labels.columnUnit,
+    labels.columnUnitPrice,
+    labels.columnDiscount,
+    labels.columnAmount,
+  ]) {
+    expect(text.includes(column), `the table head names ${column}`);
+  }
+
+  // A document with no payment prints no paid and no balance row: those are facts, not decoration.
+  expect(!text.includes(labels.amountPaid), "an unpaid invoice prints no amount paid");
+  expect(!text.includes(labels.balanceDue), "and no balance due");
+
+  const partPaid = pdfSourceOf({ amountPaidMinor: 100_000n, status: "partially_paid" });
+  const paid = readPdf(renderInvoicePdf(invoicePdfDocumentOf(partPaid))).text;
+
+  expect(paid.includes(labels.amountPaid), "a part payment prints the amount paid");
+  expect(paid.includes(printedCents(100_000n)), "at the amount stored");
+  expect(paid.includes(labels.balanceDue), "and the balance due");
+  expect(
+    paid.includes(printedCents(4_065_000n - 100_000n)),
+    "which is the total less what was paid, in cents, with no float between them",
+  );
+  expect(paid.includes(labels.statusWords.partiallyPaid), "with the status word that goes with it");
+
+  // ---- a draft ----
+  const draft = readPdf(
+    renderInvoicePdf(
+      invoicePdfDocumentOf(pdfSourceOf({ number: null, status: "draft", issuedAt: null })),
+    ),
+  );
+
+  expect(draft.text.includes(labels.draftStamp), "a draft carries the stamp");
+  expect(draft.text.includes(labels.notIssued), "and says it has not been issued");
+  expect(!draft.text.includes("INV-00042"), "with no number it cannot print one");
+  expect(!text.includes(labels.draftStamp), "while an issued invoice carries no stamp");
+
+  // ---- determinism ----
+  const again = renderInvoicePdf(invoicePdfDocumentOf(source));
+
+  expectEqual(
+    Buffer.compare(Buffer.from(bytes), Buffer.from(again)),
+    0,
+    "the same document renders the same bytes, so a retry stores an identical object",
+  );
+  expect(
+    Buffer.compare(
+      Buffer.from(bytes),
+      Buffer.from(renderInvoicePdf(invoicePdfDocumentOf({ ...source, generatedAtEpochMs: NOW + 60_000 }))),
+    ) !== 0,
+    "and a later instant dates a different file",
+  );
+
+  // ---- pagination ----
+  const manyLines = Array.from({ length: 60 }, (_, index) =>
+    pdfLineOf(index + 1, `Row ${String(index + 1).padStart(2, "0")}`, "1", 100_000n),
+  );
+  const many = readPdf(renderInvoicePdf(invoicePdfDocumentOf(pdfSourceOf({ lines: manyLines }))));
+
+  expect(many.pageCount > 1, "sixty lines do not fit one page");
+  expectEqual(many.objectCount, 5 + many.pageCount * 2, "two objects per page, behind the five fixed ones");
+
+  for (const page of many.pages) {
+    expect(
+      page.text.includes(formatMessage("invoices.pdfPageOf", { page: page.number, pages: many.pageCount })),
+      `page ${String(page.number)} says which page it is of how many`,
+    );
+    expect(page.text.includes(labels.columnDescription), "and repeats the table head, so a page read alone is a table");
+    expect(
+      page.text.includes(formatMessage("invoices.pdfGeneratedAt", { instant: "2026-11-04 09:00" })),
+      "with the same generation instant on every page",
+    );
+  }
+
+  for (const line of [manyLines[0], manyLines[29], manyLines[59]]) {
+    expect(line !== undefined && many.text.includes(line.description), "every line reached a page");
+  }
+
+  // A draft of many pages stamps every page, because a page printed on its own must still say draft.
+  const manyDraft = readPdf(
+    renderInvoicePdf(
+      invoicePdfDocumentOf(pdfSourceOf({ lines: manyLines, number: null, status: "draft", issuedAt: null })),
+    ),
+  );
+
+  expect(
+    manyDraft.pages.every((page) => page.text.includes(labels.draftStamp)),
+    "a draft stamps every page it fills",
+  );
+
+  // ---- an invoice with no lines ----
+  const empty = readPdf(renderInvoicePdf(invoicePdfDocumentOf(pdfSourceOf({ lines: [] }))));
+
+  expect(empty.text.includes(labels.noLines), "an invoice with no lines says so rather than printing an empty table");
+  expect(empty.pageCount === 1, "and still fits one page");
+
+  // ---- the encoding ----
+  expectEqual(invoicePdfEncodedText("Caf\u00e9").charCodeAt(3), 0xe9, "a Latin-1 letter keeps its WinAnsi byte");
+  expectEqual(invoicePdfEncodedText("\u65e5\u672c\u8a9e"), "???", "a code point WinAnsi lacks becomes a question mark");
+  expectEqual(invoicePdfEncodedText("tab\there"), "tab?here", "and so does a control byte, rather than reaching the file as an escape");
+  expectEqual(invoicePdfEncodedText("plain").length, 5, "so an encoded string is one byte per character");
+  expectEqual(invoicePdfLiteral("a (b) \\ c"), "a \\(b\\) \\\\ c", "a literal escapes the three characters that would end it");
+
+  const awkward = readPdf(
+    renderInvoicePdf(
+      invoicePdfDocumentOf(
+        pdfSourceOf({
+          clientName: 'Smith ("Bob") & Sons',
+          lines: [pdfLineOf(1, "Repair \\ reseat (urgent)", "1", 500_000n)],
+        }),
+      ),
+    ),
+  ).text;
+
+  expect(awkward.includes('Smith ("Bob") & Sons'), "a name with quotes, parentheses and an ampersand survives the escaping");
+  expect(awkward.includes("Repair \\ reseat (urgent)"), "and so does a description with a backslash");
+
+  const accented = readPdf(
+    renderInvoicePdf(invoicePdfDocumentOf(pdfSourceOf({ clientName: "Caf\u00e9 de la Gare" }))),
+  ).text;
+
+  expect(accented.includes("Caf\u00e9 de la Gare"), "an accented name reads back as it was written");
+
+  // ---- the metrics ----
+  expectEqual(invoicePdfTextWidth("", "regular", 10), 0, "an empty string has no width");
+  expect(
+    invoicePdfTextWidth("iiii", "regular", 10) < invoicePdfTextWidth("WWWW", "regular", 10),
+    "the width comes from the face's own metrics, not from a character count",
+  );
+  expect(
+    invoicePdfTextWidth("bold", "bold", 10) !== invoicePdfTextWidth("bold", "regular", 10),
+    "and the bold face is wider than the regular one",
+  );
+
+  const column = 120;
+  const wrapped = invoicePdfWrap("Supercalifragilisticexpialidocious", "regular", 10, column);
+
+  expect(
+    wrapped.every((line) => invoicePdfTextWidth(line, "regular", 10) <= column),
+    "no wrapped line is wider than its column",
+  );
+  expectEqual(wrapped.join(""), "Supercalifragilisticexpialidocious", "and wrapping drops no character");
+  expectEqual(invoicePdfWrap("one\ntwo", "regular", 10, 500).join("|"), "one|two", "a line break in the text is honoured");
+  expect(invoicePdfWrap("short", "regular", 10, 500).length === 1, "a word that fits is not broken");
+
+  // ---- the money printers, against the gate's own ----
+  for (const minor of [0n, 5n, 50n, 99n, 100n, 12_500n, 990_000n, 3_125_000n, 125_000_000n, 1_234_567_890n]) {
+    expectEqual(invoicePdfUsd(minor), printedCents(minor), `${minor.toString()} minor units print as ${printedCents(minor)}`);
+  }
+
+  expectEqual(invoicePdfUsd(1_250_000n), "125.00", "a whole dollar amount prints two decimals");
+  expectEqual(invoicePdfUsd(125_000_000n), "12,500.00", "with the thousands separated");
+  expectEqual(invoicePdfUsd(-3_125_000n), "-312.50", "and a credit keeps its sign");
+  expectEqual(invoicePdfUsd(1n), "0.00", "one ten-thousandth of a dollar rounds to nothing, half away from zero");
+  expectEqual(invoicePdfUsd(50n), "0.01", "while half a cent rounds up");
+
+  expectEqual(invoicePdfUnitPrice(12_345n), printedFourDecimals(12_345n), "a price with a fraction of a cent keeps its scale");
+  expectEqual(invoicePdfUnitPrice(12_345n), "1.2345", "printed at four decimals");
+  expectEqual(invoicePdfUnitPrice(1_250_000n), "125.00", "and a whole-cent price at two, like every other amount");
+  expectEqual(invoicePdfQuantity("2.500"), "2.5", "a quantity prints as the merchant typed it");
+  expectEqual(invoicePdfQuantity("1.000"), "1", "with no trailing zeros on a whole one");
+  expectEqual(invoicePdfQuantity("0.125"), "0.125", "and all three decimals when it needs them");
+
+  // ---- the page geometry ----
+  expectEqual(INVOICE_PDF_MARGIN, 54, "the margin is three quarters of an inch");
+  expectEqual(INVOICE_PDF_PAGE_WIDTH - INVOICE_PDF_MARGIN * 2, 504, "which leaves seven inches of text");
+  expect(
+    invoicePdfTextWidth("Website design, five pages", "regular", 10) < INVOICE_PDF_PAGE_WIDTH - INVOICE_PDF_MARGIN * 2,
+    "and an ordinary description fits one line of it",
+  );
+
+  // ---- the ceilings ----
+  expectEqual(INVOICE_PDF_CONTENT_TYPE, "application/pdf", "the document is a PDF");
+  expectEqual(INVOICE_PDF_EXTENSION, ".pdf", "with the extension that goes with it");
+  expectEqual(
+    UPLOAD_POLICIES.invoice_pdf.allowedTypes.join(","),
+    "application/pdf",
+    "and the upload purpose accepts exactly that type",
+  );
+  expectEqual(
+    INVOICE_PDF_MAXIMUM_BYTES,
+    UPLOAD_POLICIES.invoice_pdf.maximumBytes,
+    "the renderer's ceiling is the upload policy's, so it cannot render what the platform would refuse",
+  );
+  expect(bytes.length < INVOICE_PDF_MAXIMUM_BYTES, "a real invoice is far inside it");
+
+  // A memo beyond the column the sanitizer keeps is cut, not wrapped into a second document: the
+  // merchant's own 2 000 character limit of `0022` is the limit the paper respects.
+  const longMemo = readPdf(
+    renderInvoicePdf(
+      invoicePdfDocumentOf(
+        pdfSourceOf({ memo: `${"A".repeat(1_900)}KEPTMARK${"B".repeat(300)}CUTMARK` }),
+      ),
+    ),
+  ).text;
+
+  expect(longMemo.includes("KEPTMARK"), "a memo inside the limit is printed whole");
+  expect(!longMemo.includes("CUTMARK"), "and the part beyond it is cut rather than smuggled onto the page");
+
+  const migration = await readRepositoryFile("migrations/0115_invoice_documents.sql");
+
+  expect(
+    migration.includes("byte_size between 1 and 26214400"),
+    "and 0115 bounds its row at the same ceiling",
+  );
+}
+
+/* ---- STEP 117: the document row, the queue and the object store ---- */
+
+/** An in-memory object store, so a render can be sealed, stored, replaced, archived and read back. */
+class PdfGateAdapter implements StorageAdapter {
+  readonly name: StorageAdapterName = "supabase";
+  readonly objects = new Map<string, Uint8Array>();
+  /** Set to make the provider fail, which is how the retry path is reached. */
+  failWith: StorageError | null = null;
+  uploads = 0;
+  downloads = 0;
+
+  async upload(input: StorageUploadInput): Promise<StoredObject> {
+    this.uploads += 1;
+
+    if (this.failWith !== null) {
+      throw this.failWith;
+    }
+
+    this.objects.set(`${input.bucket}/${input.key}`, input.bytes);
+
+    return { provider: this.name, bucket: input.bucket, key: input.key, byteSize: input.bytes.length };
+  }
+
+  async download(ref: StorageObjectRef): Promise<Uint8Array> {
+    this.downloads += 1;
+
+    if (this.failWith !== null) {
+      throw this.failWith;
+    }
+
+    const bytes = this.objects.get(`${ref.bucket}/${ref.key}`);
+
+    if (bytes === undefined) {
+      throw new StorageError("not_found", "the object does not exist");
+    }
+
+    return bytes;
+  }
+
+  async remove(ref: StorageObjectRef): Promise<void> {
+    this.objects.delete(`${ref.bucket}/${ref.key}`);
+  }
+
+  async createSignedUrl(input: SignedUrlInput): Promise<SignedUrl> {
+    return {
+      url: `https://storage.example/${input.bucket}/${input.key}?ttl=${String(input.expiresInSeconds)}`,
+      expiresAt: new Date(NOW + input.expiresInSeconds * 1_000).toISOString(),
+    };
+  }
+}
+
+interface PdfHarness {
+  readonly db: InvoiceDb;
+  readonly audit: ReturnType<typeof createInMemoryAuditTrail>;
+  readonly adapter: PdfGateAdapter;
+  readonly queue: ReturnType<typeof createInMemoryJobQueue>;
+  readonly registry: JobRegistry;
+  readonly worker: JobWorker;
+  readonly dependencies: InvoicePdfStorageDependencies;
+  readonly invoiceId: string;
+  readonly now: () => number;
+  /** Every line the worker logged, so the gate can read what a render says about itself. */
+  readonly logged: string[];
+  /** Move the clock, which is how a scheduled retry becomes due. */
+  advance(milliseconds: number): void;
+}
+
+/**
+ * A draft invoice, a queue, a worker and an object store, wired to one another.
+ *
+ * The gate registers its own handler under the job's own name before anything is enqueued, so the
+ * registration inside the enqueue path is the no-op it is written to be and the worker runs against this
+ * fixture instead of against the process environment - which is also the proof that a second
+ * registration does not throw.
+ */
+async function pdfHarness(lines: number = 2): Promise<PdfHarness> {
+  const db = createDb();
+  const invoice = await createInvoice(
+    {
+      actor: owner,
+      body: bodyOf({
+        lines: Array.from({ length: lines }, (_, index) => ({
+          description: `Row ${String(index + 1).padStart(2, "0")}`,
+          unit: "item",
+          quantity: "1",
+          unit_price: "10",
+        })),
+      }),
+    },
+    depsOf(db),
+  );
+
+  let clock = NOW;
+  const now = (): number => clock;
+  const audit = createInMemoryAuditTrail();
+  const adapter = new PdfGateAdapter();
+  const queue = createInMemoryJobQueue();
+  const registry = new JobRegistry();
+  const dependencies: InvoicePdfStorageDependencies = {
+    rest: createInvoiceRest(db),
+    audit,
+    adapter,
+    encryption: createFileEncryption({ ENCRYPTION_MASTER_KEY: PDF_GATE_KEY }),
+    now,
+  };
+
+  registry.register(createInvoicePdfJobHandler(() => dependencies));
+
+  // The worker logs, and a gate that let it write to the process's own stdout would drown the summary
+  // it prints. The lines are captured instead, which turns the silencing into something to assert on.
+  const logged: string[] = [];
+  const sink = {
+    write(line: string): void {
+      logged.push(line);
+    },
+  };
+
+  return {
+    db,
+    audit,
+    adapter,
+    queue,
+    registry,
+    worker: new JobWorker({ queue, registry, now, logger: createLogger({ stdout: sink, stderr: sink }) }),
+    dependencies,
+    invoiceId: invoice.id,
+    now,
+    logged,
+    advance(milliseconds) {
+      clock += milliseconds;
+    },
+  };
+}
+
+function pdfStoreDeps(harness: PdfHarness): InvoicePdfStoreDependencies {
+  return { rest: harness.dependencies.rest, audit: harness.audit, now: harness.now };
+}
+
+function pdfRequestDeps(harness: PdfHarness): InvoicePdfRequestDependencies {
+  return { ...pdfStoreDeps(harness), registry: harness.registry, queue: harness.queue };
+}
+
+/** The document row of one harness, or the fact that it has none. */
+function documentRowOf(harness: PdfHarness): Record<string, unknown> | null {
+  return harness.db.documents.find((row) => row["invoice_id"] === harness.invoiceId) ?? null;
+}
+
+/** What a direct write to the document row answers with, which is what `0115` would have answered. */
+async function documentWriteOf(
+  harness: PdfHarness,
+  values: Readonly<Record<string, unknown>>,
+): Promise<{ readonly code: string | null; readonly reason: string | null }> {
+  const row = documentRowOf(harness);
+
+  if (row === null) {
+    return { code: "no row", reason: null };
+  }
+
+  try {
+    await createInvoiceRest(harness.db).update(
+      INVOICE_DOCUMENTS_TABLE,
+      `id=eq.${String(row["id"])}&company_id=eq.${COMPANY_A}`,
+      values,
+    );
+
+    return { code: null, reason: null };
+  } catch (error) {
+    if (!isAppError(error)) {
+      return { code: "uncaught", reason: null };
+    }
+
+    const cause = error.cause;
+    const reason =
+      typeof cause === "object" && cause !== null && "reason" in cause
+        ? String((cause as { readonly reason: unknown }).reason)
+        : null;
+
+    return { code: error.code, reason };
+  }
+}
+
+/** The audit entries of one action, which is how the trail is read everywhere else in this gate. */
+function auditEntriesOf(harness: PdfHarness, action: string): ReturnType<typeof createInMemoryAuditTrail>["entries"] {
+  return harness.audit.entries.filter((entry) => entry.action === action);
+}
+
+async function checkPdfDocument(): Promise<void> {
+  const harness = await pdfHarness();
+
+  // ---- nothing rendered yet ----
+  const none = await readInvoicePdfState({ actor: owner, invoiceId: harness.invoiceId }, pdfStoreDeps(harness));
+
+  expectEqual(none.status, INVOICE_PDF_NO_DOCUMENT, "an invoice nobody asked about has no document");
+  expectEqual(none.ready, false, "so there is nothing to download");
+  expectEqual(none.documentId, null, "and no row behind it");
+  expectEqual(harness.db.documents.length, 0, "reading a state writes nothing");
+
+  // ---- who may ask ----
+  expectEqual(
+    await codeOf(() => readInvoicePdfState({ actor: otherOwner, invoiceId: harness.invoiceId }, pdfStoreDeps(harness))),
+    "RESOURCE_NOT_FOUND",
+    "another merchant's invoice is not found rather than refused, so the answer says nothing about it",
+  );
+  expectEqual(
+    await codeOf(() => readInvoicePdfState({ actor: desk, invoiceId: harness.invoiceId }, pdfStoreDeps(harness))),
+    "PERMISSION_DENIED",
+    "and a role that cannot manage invoices is refused",
+  );
+  expectEqual(
+    await codeOf(() => requestInvoicePdf({ actor: desk, invoiceId: harness.invoiceId }, pdfRequestDeps(harness))),
+    "PERMISSION_DENIED",
+    "which is also true of asking for a render",
+  );
+  expectEqual(
+    await codeOf(() => readInvoicePdfState({ actor: owner, invoiceId: "not-a-uuid" }, pdfStoreDeps(harness))),
+    "VALIDATION_FAILED",
+    "and an id that is not an id is refused before anything is read",
+  );
+
+  // ---- the request ----
+  const requested = await requestInvoicePdf({ actor: owner, invoiceId: harness.invoiceId }, pdfRequestDeps(harness));
+
+  expectEqual(requested.state.status, "queued", "a request leaves the document queued");
+  expectEqual(requested.deduplicated, false, "and it is the first one");
+  expectEqual(harness.db.documents.length, 1, "one row, because one invoice has one document");
+  expectEqual(documentRowOf(harness)?.["status"], "queued", "which is what the row says");
+  expectEqual(documentRowOf(harness)?.["document_type"], INVOICE_DOCUMENT_TYPE, "of the only type 0115 allows");
+  expectEqual(documentRowOf(harness)?.["generation"], 0, "no render has completed");
+  expectEqual(documentRowOf(harness)?.["attempts"], 0, "and none has been tried");
+  expectEqual(documentRowOf(harness)?.["requested_by"], OWNER_ID, "the row remembers who asked");
+  expectEqual(documentRowOf(harness)?.["file_id"], null, "with no file behind it yet");
+  expect(requested.jobId !== null && requested.jobId.length > 0, "and there is a job to do it");
+
+  const requestedEntries = auditEntriesOf(harness, INVOICE_PDF_REQUESTED_AUDIT_ACTION);
+
+  expectEqual(requestedEntries.length, 1, "the request is audited once");
+  expectEqual(at(requestedEntries, 0, "the request entry").entityType, INVOICE_DOCUMENT_ENTITY, "against the document");
+  expectEqual(at(requestedEntries, 0, "the request entry").companyId, COMPANY_A, "of the merchant who owns it");
+  expectEqual(at(requestedEntries, 0, "the request entry").actorUserId, OWNER_ID, "by the actor who asked");
+
+  // ---- a second click adds no work ----
+  const second = await requestInvoicePdf({ actor: owner, invoiceId: harness.invoiceId }, pdfRequestDeps(harness));
+
+  expectEqual(second.deduplicated, true, "a second request while one is queued adds no work");
+  expectEqual(harness.db.documents.length, 1, "and writes no second row");
+  expectEqual(second.state.status, "queued", "answering with the state that already stands");
+
+  // ---- the render, through the worker ----
+  const ran = await harness.worker.runOnce();
+
+  expectEqual(ran.ran, true, "the worker claims the job");
+  expectEqual(ran.status, "completed", "and the render completes on the first attempt");
+  expectEqual(ran.jobId, requested.jobId, "which is the job the request enqueued");
+
+  const ready = await readInvoicePdfState({ actor: owner, invoiceId: harness.invoiceId }, pdfStoreDeps(harness));
+  const row = documentRowOf(harness);
+
+  expectEqual(ready.status, "ready", "the document is ready");
+  expect(ready.ready, "so the screen offers the download");
+  expectEqual(ready.generation, 1, "one render has completed");
+  expectEqual(ready.attempts, 1, "in one attempt");
+  expectEqual(row?.["status"], "ready", "as the row says");
+  expectEqual(row?.["job_id"], ran.jobId, "and the row names the job that produced it");
+  expectEqual(ready.renderedAt, new Date(NOW).toISOString(), "dated with the instant the render ran at");
+  expect(typeof row?.["byte_size"] === "number" && Number(row?.["byte_size"]) > 0, "with the size of the document");
+  expect(/^[0-9a-f]{64}$/u.test(String(row?.["content_sha256"])), "and the hash of its bytes");
+  expectEqual(row?.["last_error_code"], null, "with no failure to report");
+
+  // ---- the file record and the object ----
+  expectEqual(harness.db.files.length, 1, "the render wrote one file record");
+  const file = at(harness.db.files, 0, "the file record");
+
+  expectEqual(file["purpose"], INVOICE_PDF_PURPOSE, "of the invoice_pdf purpose");
+  expectEqual(file["content_type"], INVOICE_PDF_CONTENT_TYPE, "and the type the magic bytes agreed with");
+  expectEqual(file["status"], "ready", "verified, as 0057 walks a file to ready");
+  expectEqual(file["magic_byte_verified"], true, "on a verdict the platform's own sniffer gave");
+  expectEqual(file["company_id"], COMPANY_A, "inside the merchant's own tenant");
+  expectEqual(file["uploaded_by"], OWNER_ID, "credited to whoever asked for the render");
+  expectEqual(row?.["file_id"], file["id"], "and the document row points at that record");
+
+  const key = String(file["storage_key"]);
+  const parsedKey = parseInvoicePdfStorageKey(key);
+
+  expect(key.startsWith(`${COMPANY_A}/${INVOICE_PDF_KEY_SEGMENT}/${harness.invoiceId}/`), "the key sits under the tenant, the purpose and the invoice");
+  expect(parsedKey !== null && parsedKey.companyId === COMPANY_A && parsedKey.invoiceId === harness.invoiceId, "which is what the key says when it is read back");
+
+  const storedObject = harness.adapter.objects.get(`${DEFAULT_STORAGE_BUCKET}/${key}`);
+
+  expect(storedObject !== undefined, "the object is in the store");
+  expect(isFileEnvelope(storedObject ?? new Uint8Array()), "and it is an encrypted envelope");
+  expect(
+    !pdfRaw(storedObject ?? new Uint8Array()).includes("%PDF-"),
+    "so no plaintext document is sitting in a provider's bucket",
+  );
+
+  // ---- the download ----
+  const download = await readInvoicePdfBytes({ actor: owner, invoiceId: harness.invoiceId }, harness.dependencies);
+  const downloadRead = readPdf(download.bytes);
+
+  expectEqual(download.contentType, INVOICE_PDF_CONTENT_TYPE, "the download is served as a PDF");
+  expectEqual(download.fileName, "invoice-draft.pdf", "named for a draft, because this invoice has no number yet");
+  expectEqual(download.byteSize, download.bytes.length, "with the size the record describes");
+  expectEqual(
+    createHash("sha256").update(download.bytes).digest("hex"),
+    download.contentSha256,
+    "and the bytes are the ones the record's hash describes",
+  );
+  expectEqual(download.contentSha256, String(row?.["content_sha256"]), "which is the hash the document row carries");
+  expectEqual(download.generation, 1, "of the first render");
+  expect(downloadRead.offsetsValid && downloadRead.eof, "what came back out of storage is a readable PDF");
+  expect(downloadRead.text.includes("Acme Ltd"), "printing the merchant's own client");
+  expect(downloadRead.text.includes("Row 01"), "and the lines the invoice holds");
+  expect(downloadRead.text.includes(printedCents(200_000n)), "with the total they add up to");
+  expectEqual(
+    at(auditEntriesOf(harness, "file.accessed"), 0, "the access entry").companyId,
+    COMPANY_A,
+    "and every access is audited, as section 21 requires",
+  );
+
+  expectEqual(
+    await codeOf(() => readInvoicePdfBytes({ actor: otherOwner, invoiceId: harness.invoiceId }, harness.dependencies)),
+    "RESOURCE_NOT_FOUND",
+    "another merchant cannot download this document",
+  );
+
+  // ---- a document that is not ready has no bytes ----
+  const pending = await pdfHarness(1);
+
+  expectEqual(
+    await codeOf(() => readInvoicePdfBytes({ actor: owner, invoiceId: pending.invoiceId }, pending.dependencies)),
+    "RESOURCE_NOT_FOUND",
+    "an invoice nobody rendered has nothing to download",
+  );
+
+  await requestInvoicePdf({ actor: owner, invoiceId: pending.invoiceId }, pdfRequestDeps(pending));
+
+  expectEqual(
+    await codeOf(() => readInvoicePdfBytes({ actor: owner, invoiceId: pending.invoiceId }, pending.dependencies)),
+    "RESOURCE_NOT_FOUND",
+    "and a document still in the queue has nothing to download either",
+  );
+
+  // ---- a re-render ----
+  issuedRow(harness.db, harness.invoiceId, "INV-00042");
+  harness.advance(60_000);
+
+  const again = await requestInvoicePdf({ actor: owner, invoiceId: harness.invoiceId }, pdfRequestDeps(harness));
+
+  expectEqual(again.state.status, "queued", "an issued invoice can be rendered again");
+  expectEqual(again.deduplicated, false, "which is new work, not a duplicate");
+  expectEqual(documentRowOf(harness)?.["attempts"], 0, "starting at zero attempts");
+
+  const reran = await harness.worker.runOnce();
+  const regenerated = await readInvoicePdfState({ actor: owner, invoiceId: harness.invoiceId }, pdfStoreDeps(harness));
+
+  expectEqual(reran.status, "completed", "and the second render completes");
+  expectEqual(regenerated.generation, 2, "counting the completed renders");
+  expectEqual(regenerated.documentId, ready.documentId, "in the same row, because one invoice has one document");
+  expectEqual(harness.db.files.length, 2, "writing a new object rather than overwriting one a client may hold");
+  expectEqual(at(harness.db.files, 0, "the first record")["status"], "archived", "and archiving the render it replaces");
+  expectEqual(at(harness.db.files, 1, "the second record")["status"], "ready", "so the new one is the live one");
+  expect(
+    String(at(harness.db.files, 0, "the first record")["storage_key"]) !==
+      String(at(harness.db.files, 1, "the second record")["storage_key"]),
+    "at a key of its own",
+  );
+  expectEqual(
+    auditEntriesOf(harness, INVOICE_PDF_RENDERED_AUDIT_ACTION).length,
+    2,
+    "with an audit entry for each render",
+  );
+
+  const namedAgain = await readInvoicePdfBytes({ actor: owner, invoiceId: harness.invoiceId }, harness.dependencies);
+
+  expectEqual(namedAgain.fileName, "invoice-INV-00042.pdf", "named for the number once the invoice has one");
+  expect(readPdf(namedAgain.bytes).text.includes("INV-00042"), "and printing it");
+  expect(!readPdf(namedAgain.bytes).text.includes("DRAFT"), "with no draft stamp on an issued invoice");
+
+  // ---- an attempt that finds the work done ----
+  const payload = invoicePdfJobPayloadSchema.parse({
+    invoice_id: harness.invoiceId,
+    company_id: COMPANY_A,
+    document_id: regenerated.documentId,
+    requested_by: OWNER_ID,
+  });
+  const shortCircuit = await renderInvoicePdfDocument(payload, harness.dependencies);
+
+  expect(shortCircuit.alreadyRendered, "an attempt whose lease expired after the render landed is finished, not repeated");
+  expectEqual(shortCircuit.generation, 2, "and it reports the render that exists");
+  expectEqual(harness.db.files.length, 2, "writing no third object");
+
+  // ---- a payload of another merchant ----
+  const foreign = await codeOf(() =>
+    renderInvoicePdfDocument(
+      { ...payload, company_id: COMPANY_B },
+      { ...harness.dependencies, rest: createInvoiceRest(harness.db) },
+    ),
+  );
+
+  expectEqual(foreign, "RESOURCE_NOT_FOUND", "a payload naming another merchant reads nothing");
+  expectEqual(harness.db.documents.length, 1, "and writes nothing");
+
+  // ---- the failure path ----
+  const failing = await pdfHarness(1);
+
+  await requestInvoicePdf({ actor: owner, invoiceId: failing.invoiceId }, pdfRequestDeps(failing));
+  failing.adapter.failWith = new StorageError("unavailable", "the provider is not answering");
+
+  const failedRun = await failing.worker.runOnce();
+
+  expectEqual(failedRun.status, "retrying", "a provider outage is worth another attempt");
+
+  const failed = await readInvoicePdfState({ actor: owner, invoiceId: failing.invoiceId }, pdfStoreDeps(failing));
+
+  expectEqual(failed.status, "failed", "and the document says so");
+  expectEqual(failed.lastErrorCode, "DEPENDENCY_FAILED", "with the catalog's retryable code, not the provider's words");
+  expectEqual(failed.attempts, 1, "having counted the attempt");
+  expectEqual(failed.generation, 0, "and no render behind it");
+  expectEqual(failing.db.files.length, 0, "so a failed render leaves no file record");
+  expectEqual(failing.adapter.objects.size, 0, "and no object in the store");
+
+  const failedEntries = auditEntriesOf(failing, INVOICE_PDF_FAILED_AUDIT_ACTION);
+
+  expectEqual(failedEntries.length, 1, "the failure is audited");
+  expectEqual(at(failedEntries, 0, "the failure entry").payload["code"], "DEPENDENCY_FAILED", "with the code");
+  expectEqual(at(failedEntries, 0, "the failure entry").payload["invoice_id"], failing.invoiceId, "and the invoice");
+  expect(
+    !JSON.stringify(failing.audit.entries).includes("the provider is not answering"),
+    "but never the provider's own message, which is not the trail's to keep",
+  );
+
+  // ---- the recovery ----
+  failing.adapter.failWith = null;
+  await requestInvoicePdf({ actor: owner, invoiceId: failing.invoiceId }, pdfRequestDeps(failing));
+
+  const requeued = await readInvoicePdfState({ actor: owner, invoiceId: failing.invoiceId }, pdfStoreDeps(failing));
+
+  expectEqual(requeued.status, "queued", "a merchant can ask again after a failure");
+  expectEqual(requeued.lastErrorCode, null, "and the fresh request clears the reason");
+  expectEqual(requeued.attempts, 0, "with the attempt count starting over");
+
+  failing.advance(15 * 60_000);
+
+  const drained = await failing.worker.drain(5);
+
+  expectEqual(drained.failed, 0, "no attempt fails once the provider answers");
+
+  const recovered = await readInvoicePdfState({ actor: owner, invoiceId: failing.invoiceId }, pdfStoreDeps(failing));
+
+  expectEqual(recovered.status, "ready", "and the document arrives");
+  expectEqual(recovered.generation, 1, "as the first render to complete");
+  expect(recovered.attempts >= 1, "with the attempts it took still visible on the row");
+
+  // ---- a request that loses a race ----
+  const racing = await pdfHarness(1);
+
+  await requestInvoicePdf({ actor: owner, invoiceId: racing.invoiceId }, pdfRequestDeps(racing));
+  await racing.worker.runOnce();
+  racing.db.raceDocumentVersion = true;
+
+  const raced = await requestInvoicePdf({ actor: owner, invoiceId: racing.invoiceId }, pdfRequestDeps(racing));
+
+  expectEqual(raced.deduplicated, true, "a request whose row moved under it adopts the winner's state");
+  expectEqual(racing.db.documents.length, 1, "and still writes no second row");
+
+  // ---- 0115's own guard, as the fixture models it ----
+  const guarded = await pdfHarness(1);
+
+  await requestInvoicePdf({ actor: owner, invoiceId: guarded.invoiceId }, pdfRequestDeps(guarded));
+  await guarded.worker.runOnce();
+
+  expectEqual(documentRowOf(guarded)?.["status"], "ready", "the harness is in the state the refusals below start from");
+  expectEqual((await documentWriteOf(guarded, { status: "rendering" })).code, "VALIDATION_FAILED", "a ready document does not walk back to rendering");
+  expectEqual(
+    (await documentWriteOf(guarded, { status: "rendering" })).reason,
+    "an invoice document status walks queued, rendering, ready or failed",
+    "which is the trigger's own refusal",
+  );
+  expectEqual((await documentWriteOf(guarded, { generation: 0 })).code, "VALIDATION_FAILED", "and a generation never falls");
+  expectEqual(
+    (await documentWriteOf(guarded, { rendered_at: null })).reason,
+    "the file facts of an invoice document change only when a render completes",
+    "nor do the facts of a render move except at the instant one completes",
+  );
+  expectEqual((await documentWriteOf(guarded, { company_id: COMPANY_B })).code, "VALIDATION_FAILED", "and the identity is frozen");
+
+  const queuedGuard = await pdfHarness(1);
+
+  await requestInvoicePdf({ actor: owner, invoiceId: queuedGuard.invoiceId }, pdfRequestDeps(queuedGuard));
+
+  expectEqual(
+    (await documentWriteOf(queuedGuard, { generation: 1 })).reason,
+    "a render generation counts completed renders only",
+    "a queued document cannot claim a render it has not finished",
+  );
+  expectEqual(
+    (await documentWriteOf(queuedGuard, { status: "failed" })).reason,
+    "invoice_documents_failed_check",
+    "and a failure without a code is not a row 0115 accepts",
+  );
+  expectEqual(
+    (await documentWriteOf(queuedGuard, { status: "ready" })).reason,
+    "an invoice document status walks queued, rendering, ready or failed",
+    "nor does a document reach ready without being claimed first",
+  );
+  expectEqual(
+    (await documentWriteOf(queuedGuard, { status: "rendering", attempts: 1 })).code,
+    null,
+    "a worker claims the queued document",
+  );
+  expectEqual(
+    (await documentWriteOf(queuedGuard, { status: "ready" })).reason,
+    "invoice_documents_ready_check",
+    "and cannot complete it without the four facts of the render",
+  );
+  expectEqual(
+    (
+      await documentWriteOf(queuedGuard, {
+        status: "ready",
+        generation: 1,
+        file_id: randomUUID(),
+        byte_size: 4_096,
+        content_sha256: "a".repeat(64),
+        rendered_at: new Date(NOW).toISOString(),
+      })
+    ).code,
+    null,
+    "while a completed render carrying all four is accepted",
+  );
+  expectEqual(
+    (await documentWriteOf(queuedGuard, { rendered_at: new Date(NOW - 86_400_000).toISOString() })).reason,
+    "the file facts of an invoice document change only when a render completes",
+    "and the facts it wrote are then frozen",
+  );
+
+  // ---- the key and name helpers ----
+  const keyOf = invoicePdfStorageKey(COMPANY_A, harness.invoiceId);
+
+  expect(keyOf.startsWith(`${COMPANY_A}/${INVOICE_PDF_KEY_SEGMENT}/${harness.invoiceId}/`), "a generated key is scoped to the tenant and the invoice");
+  expect(keyOf.endsWith(INVOICE_PDF_EXTENSION), "and names a PDF");
+  expectEqual(parseInvoicePdfStorageKey(`${COMPANY_B}/${INVOICE_PDF_KEY_SEGMENT}/${harness.invoiceId}/x.pdf`), null, "a key whose file is not a generated name is not one of ours");
+  expectEqual(parseInvoicePdfStorageKey(`${COMPANY_A}/kyc_document/${harness.invoiceId}/x.pdf`), null, "and neither is a key of another purpose");
+  expectEqual(parseInvoicePdfStorageKey("nope"), null, "nor a string that is not a key at all");
+  expectEqual(
+    await codeOf(async () => assertInvoicePdfKeyForInvoice(keyOf, COMPANY_B, harness.invoiceId)),
+    "PERMISSION_DENIED",
+    "so a record pointing at another merchant's key is refused",
+  );
+
+  expectEqual(invoicePdfFileName(null), "invoice-draft.pdf", "a draft is named as a draft");
+  expectEqual(invoicePdfFileName("INV-00042"), "invoice-INV-00042.pdf", "and a numbered invoice as its number");
+
+  const injected = invoicePdfFileName('INV"; DROP TABLE invoices; --');
+
+  expect(!/[",;\r\n ]/u.test(injected), "a number cannot inject a Content-Disposition header");
+  expect(injected.endsWith(".pdf"), "and still names a PDF");
+  expect(injected.length <= 80, "inside the length a header can carry");
+
+  // ---- the job itself ----
+  expectEqual(INVOICE_PDF_JOB, "invoice.pdf.render", "the job is named for what it does");
+  expect(harness.registry.has(INVOICE_PDF_JOB), "and it is registered under that name");
+
+  // Registration is idempotent, so any entry point can ask for it and a second ask is not a crash.
+  const fresh = new JobRegistry();
+
+  registerInvoicePdfJob(fresh);
+  registerInvoicePdfJob(fresh);
+  registerInvoicePdfJob(harness.registry);
+
+  expect(fresh.has(INVOICE_PDF_JOB), "a fresh registry ends up holding the job");
+  expectEqual(
+    invoicePdfJobIdempotencyKey(PDF_INVOICE_ID, 3),
+    `invoice.pdf.render:${PDF_INVOICE_ID}:3`,
+    "with an idempotency key of the document and the version that asked",
+  );
+  expect(
+    !invoicePdfJobPayloadSchema.safeParse({
+      invoice_id: harness.invoiceId,
+      company_id: COMPANY_A,
+      document_id: PDF_INVOICE_ID,
+      requested_by: null,
+      extra: "no",
+    }).success,
+    "and a payload that carries anything else is refused",
+  );
+  expect(
+    !invoicePdfJobPayloadSchema.safeParse({ invoice_id: "nope", company_id: COMPANY_A, document_id: PDF_INVOICE_ID, requested_by: null }).success,
+    "as is one whose ids are not ids",
+  );
+  expectEqual(INVOICE_DOCUMENT_STATUSES.join(","), "queued,rendering,ready,failed", "the four states a document can be in");
+}
+
+/* ---- STEP 117: the sources ---- */
+
+async function checkPdfSources(): Promise<void> {
+  /** The source with its comment lines removed, so a comment naming a symbol cannot satisfy a check. */
+  const codeOf = (source: string): string =>
+    source
+      .split("\n")
+      .filter((line) => {
+        const trimmed = line.trim();
+
+        return !trimmed.startsWith("*") && !trimmed.startsWith("//") && !trimmed.startsWith("/*") && !trimmed.startsWith("--");
+      })
+      .join("\n");
+
+  const owned: readonly string[] = [
+    "services/invoices/invoice-pdf.ts",
+    "services/invoices/invoice-pdf-document.ts",
+    "services/invoices/invoice-pdf-state.ts",
+    "app/api/invoices/[id]/pdf/route.ts",
+    "app/api/invoices/[id]/pdf/download/route.ts",
+    "app/(dashboard)/invoices/invoice-pdf-panel.tsx",
+    "migrations/0115_invoice_documents.sql",
+    "migrations/0115_invoice_documents.down.sql",
+  ];
+
+  for (const path of owned) {
+    const source = await readRepositoryFile(path);
+    const comment = path.endsWith(".sql") ? `-- path: ${path}` : `// path: ${path}`;
+
+    expect(source.length > 0, `${path} exists`);
+    expect(source.split("\n", 1)[0]?.trim() === comment, `${path} starts with its path comment`);
+    expect(
+      !/[^\u0009\u000a\u000d\u0020-\u007e]/u.test(source.replaceAll("\ufeff", "")),
+      `${path} is ASCII only`,
+    );
+  }
+
+  // ---- no new dependency: the document is written here ----
+  const renderer = await readRepositoryFile("services/invoices/invoice-pdf.ts");
+  const declared = JSON.parse(await readRepositoryFile("package.json")) as {
+    readonly dependencies?: Readonly<Record<string, string>>;
+    readonly devDependencies?: Readonly<Record<string, string>>;
+  };
+  const installed = new Set([
+    ...Object.keys(declared.dependencies ?? {}),
+    ...Object.keys(declared.devDependencies ?? {}),
+  ]);
+  const specifiers = [...renderer.matchAll(/from "([^"]+)"/gu)].map((match) => match[1] ?? "");
+
+  expect(specifiers.length > 0, "the renderer imports what it needs");
+
+  for (const specifier of specifiers) {
+    const isOwn = specifier.startsWith("node:") || specifier.startsWith(".");
+    const pkg = specifier.split("/")[0] ?? "";
+
+    expect(isOwn || installed.has(pkg), `the renderer adds no package of its own: ${specifier}`);
+  }
+
+  const documentService = codeOf(await readRepositoryFile("services/invoices/invoice-pdf-document.ts"));
+
+  for (const [name, code] of [
+    ["services/invoices/invoice-pdf.ts", codeOf(renderer)],
+    ["services/invoices/invoice-pdf-document.ts", documentService],
+  ] as const) {
+    expect(!/parseFloat/u.test(code), `${name} never parses a float`);
+    expect(!/process\.env/u.test(code), `${name} reads no environment of its own`);
+    // The markers the structure gate forbids, spelled with a class between their letters so that this
+    // file does not itself contain the thing it is looking for.
+    expect(
+      !/T[O]DO|F[I]XME|X[X]X|lorem[ ]ipsum|coming[ ]soon|console[.]log|placeholder/u.test(code),
+      `${name} leaves nothing unfinished`,
+    );
+  }
+
+  // The money is integers end to end. The one rounding in the renderer is of a PDF coordinate, which
+  // the format itself defines as a real number, and it never sees an amount.
+  const rendererCode = codeOf(renderer);
+  const roundSites = rendererCode.split("Math.round").length - 1;
+  const coordinateFormatter = /function points\(value: number\): string \{[^}]*\}/u.exec(rendererCode)?.[0] ?? "";
+
+  expectEqual(roundSites, 1, "the renderer rounds exactly once");
+  expect(coordinateFormatter.includes("Math.round"), "and it is the formatter of a page coordinate");
+  expect(!/minor|cents|amount/u.test(coordinateFormatter), "on a line that never sees an amount");
+
+  for (const money of [
+    "function centsOf",
+    "function printCents",
+    "function groupDigits",
+    "export function invoicePdfUsd",
+    "export function invoicePdfUnitPrice",
+  ]) {
+    const start = rendererCode.indexOf(money);
+
+    expect(start >= 0, `${money} is where the gate expects it`);
+
+    const body = rendererCode.slice(start, rendererCode.indexOf("\n}", start));
+
+    expect(!/Number\(|parseFloat|Math[.]round/u.test(body), `${money} computes an amount in integers only`);
+  }
+
+  // The money crosses the render boundary as text, because a PDF is a document and a bigint is not JSON.
+  expect(documentService.includes("readPrintableInvoice"), "the render reads the invoice through one function");
+  expect(
+    !/rest\.select\(\s*"invoices"[\s\S]{0,400}for \(const/u.test(documentService),
+    "and it reads the lines in one query, not one per line",
+  );
+
+  // ---- the routes ----
+  const requestSource = codeOf(await readRepositoryFile("app/api/invoices/[id]/pdf/route.ts"));
+  // The state read and the request share a path, so the token is judged inside the handler that needs
+  // one: a GET of one's own document has nothing to defend and must not be made to carry a token.
+  const request = requestSource.slice(requestSource.indexOf("export const POST"));
+
+  expect(requestSource.includes("export const GET") && requestSource.includes("export const POST"), "the state and the request share a path");
+  expect(request.includes("requireCsrfToken("), "the request checks the token");
+  expect(request.indexOf("requireCsrfToken(") < request.indexOf("readRequestActor("), "before it looks the session up");
+  expect(!request.includes("request.text()"), "and reads no body, because there is nothing to send");
+  expect(request.includes("after("), "the render happens after the answer, not inside it");
+  expect(request.includes("runOnce()"), "one claimed job, never a loop that would make a request into a worker");
+  expect(request.includes("202"), "so a request answers accepted rather than done");
+  expect(!requestSource.includes("renderInvoicePdf("), "and the handler draws no document itself");
+  expect(requestSource.includes('dynamic = "force-dynamic"'), "with no prerendered state");
+  expect(requestSource.includes('"cache-control": "no-store"'), "and nothing cached");
+  expect(!requestSource.slice(0, requestSource.indexOf("export const POST")).includes("requireCsrfToken("), "while the state read needs no token");
+
+  const download = codeOf(await readRepositoryFile("app/api/invoices/[id]/pdf/download/route.ts"));
+
+  expect(download.includes("export const GET"), "the download is a read");
+  expect(!download.includes("export const POST") && !download.includes("export const DELETE"), "that mutates nothing");
+  expect(!download.includes("requireCsrfToken("), "so it needs no token");
+  expect(download.includes("attachment; filename="), "it serves an attachment, never a document the browser will run");
+  expect(download.includes('"x-content-type-options": "nosniff"'), "which is never sniffed");
+  expect(download.includes('"cache-control": "no-store"'), "and never cached");
+  expect(download.includes('dynamic = "force-dynamic"'), "with no prerendered bytes");
+
+  const csrf = await readRepositoryFile("lib/security/csrf.ts");
+
+  expect(csrf.includes('"/api/invoices/[id]/pdf"'), "the request route is on the protected list");
+  expect(!csrf.includes('"/api/invoices/[id]/pdf/download"'), "and a read of one's own document is not");
+
+  // ---- the panel ----
+  const panel = await readRepositoryFile("app/(dashboard)/invoices/invoice-pdf-panel.tsx");
+
+  expectEqual(panel.split('method: "POST"').length - 1, 1, "the panel sends one mutation");
+  expectEqual(panel.split("csrfHeaders(").length - 1, 1, "carrying the token on it");
+  expect(panel.includes("download"), "and it links the download rather than posting for it");
+  expect(panel.includes("flex-col") && panel.includes("sm:flex-row"), "one column on a phone and two from sm up");
+  expect(panel.includes("flex-wrap"), "with controls that wrap rather than shrink");
+  expect(panel.includes("focus-visible:ring-2"), "every control reachable by keyboard");
+  expect(panel.includes('role="status"') && panel.includes('role="alert"'), "and announced to a screen reader");
+  expect(!/#[0-9a-fA-F]{3,8}\b/u.test(panel), "no colour literal, so the theme decides light and dark");
+  expect(panel.includes("text-muted-foreground") && panel.includes("border-border"), "in the theme's own tokens");
+
+  const screens = await readRepositoryFile("app/(dashboard)/invoices/invoice-screens.tsx");
+
+  expect(screens.includes("<InvoicePdfPanel"), "the editor screen carries the panel");
+  expect(screens.includes("readInvoicePdfState("), "and reads its state on the server");
+
+  // ---- the browser bundle ----
+  //
+  // The panel is a client component and the document service is server only: it renders through
+  // node:zlib, seals through the file encryption and stores through the adapter registry. A browser file
+  // that imported so much as one constant from it would ship all of that, so the state's words live in a
+  // module of their own and the panel reaches nothing else.
+  const stateModule = await readRepositoryFile("services/invoices/invoice-pdf-state.ts");
+
+  expect(!stateModule.includes("import "), "the state vocabulary imports nothing, so a browser can carry it");
+  expect(panel.includes('from "@/services/invoices/invoice-pdf-state"'), "and the panel imports it from there");
+  expect(!panel.includes("invoice-pdf-document"), "never from the server module that produces it");
+  expect(!panel.includes("invoice-pdf\""), "and never from the renderer");
+
+  for (const specifier of [...panel.matchAll(/from "([^"]+)"/gu)].map((match) => match[1] ?? "")) {
+    expect(
+      specifier === "react" ||
+        specifier === "@/lib/i18n/messages" ||
+        specifier === "@/lib/security/csrf-client" ||
+        specifier === "@/services/invoices/invoice-pdf-state",
+      `the panel imports nothing a browser cannot carry: ${specifier}`,
+    );
+  }
+
+  // ---- the migration, and the columns the code names ----
+  const migration = await readRepositoryFile("migrations/0115_invoice_documents.sql");
+
+  expect(migration.includes("invoice_documents_default_deny"), "the table is default deny");
+  expect(migration.includes("using (false)") && migration.includes("with check (false)"), "in both directions");
+  expect(migration.includes("execute function public.invoice_documents_guard_state()"), "with its guard attached");
+  expect(
+    migration.includes("references public.invoices (id, company_id)"),
+    "and a composite foreign key, so a document cannot name another merchant's invoice",
+  );
+  expect(migration.includes("where deleted_at is null"), "with one live row per invoice");
+
+  for (const column of Object.keys(invoiceDocumentRowSchema.shape)) {
+    expect(
+      new RegExp(`^ {2}${column} `, "mu").test(migration),
+      `0115 creates the column the document row reads: ${column}`,
+    );
+  }
+
+  const down = await readRepositoryFile("migrations/0115_invoice_documents.down.sql");
+
+  expect(down.includes("drop table if exists public.invoice_documents"), "the rollback drops the table");
+  expect(down.includes("drop function if exists public.invoice_documents_guard_state()"), "and the function it created");
+
+  // ---- the catalog ----
+  const strings = await readRepositoryFile("lib/i18n/strings/en.ts");
+
+  for (const key of ["pdfPageOf", "pdfGeneratedAt", "pdfDiscountPercent", "pdfPanelReady", "pdfPanelFailureReference"]) {
+    expect(strings.includes(`${key}:`), `the catalog carries the parameterised string ${key}`);
+  }
+
+  expectEqual(
+    formatMessage("invoices.pdfPageOf", { page: 2, pages: 5 }),
+    "Page 2 of 5",
+    "which reads as a page of its document",
+  );
+  expectEqual(
+    formatMessage("invoices.pdfDiscountPercent", { percent: "12.5" }),
+    "Discount (12.5%)",
+    "and a percentage discount names its percentage",
+  );
+  expectEqual(getMessage("invoices.pdfFileStem"), "invoice", "the file name a merchant's download carries");
+}
+
 /* ---- the run ---- */
 
 async function run(): Promise<void> {
@@ -3712,7 +5669,10 @@ async function run(): Promise<void> {
   await checkDiscountEngine();
   await checkDiscountCreate();
   await checkDiscountUpdate();
+  await checkPdfRenderer();
+  await checkPdfDocument();
   await checkSources();
+  await checkPdfSources();
 
   if (failures.length > 0) {
     process.stderr.write(`invoice gate failed with ${String(failures.length)} problem(s):\n`);
@@ -3727,8 +5687,8 @@ async function run(): Promise<void> {
   }
 
   process.stdout.write(
-    `invoice gate passed: ${String(checks)} checks, 0022/0023, draft, ` +
-      `${String(INVOICE_MAXIMUM_LINES)} lines, half-away-from-zero rounding\n`,
+    `invoice gate passed: ${String(checks)} checks, 0022/0023/0115, draft, ` +
+      `${String(INVOICE_MAXIMUM_LINES)} lines, half-away-from-zero rounding, PDF as a background job\n`,
   );
 }
 

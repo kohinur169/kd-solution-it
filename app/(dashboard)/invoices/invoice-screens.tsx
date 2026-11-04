@@ -3,6 +3,9 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import type { ReactNode } from "react";
 import { SessionKeeper } from "@/components/auth/session-keeper";
+import type { RestClient } from "@/lib/auth/rest";
+import type { AuditTrail } from "@/lib/auth/audit";
+import type { RequestActor } from "@/lib/auth/types";
 import { getAuthRuntime } from "@/lib/auth/runtime";
 import { AppError } from "@/lib/errors/app-error";
 import { getMessage } from "@/lib/i18n/messages";
@@ -12,8 +15,14 @@ import {
   type InvoiceClientOptions,
   type InvoiceSnapshot,
 } from "@/services/invoices/invoices";
+import {
+  INVOICE_PDF_NO_DOCUMENT,
+  readInvoicePdfState,
+  type InvoicePdfState,
+} from "@/services/invoices/invoice-pdf-document";
 import { readOwnerActor } from "../onboarding/owner-actor";
 import { InvoiceForm } from "./invoice-form";
+import { InvoicePdfPanel } from "./invoice-pdf-panel";
 import { getInvoiceNumberSettings, type InvoiceNumberSettings } from "@/services/invoices/invoice-numbering";
 import { NumberingForm } from "./numbering/numbering-form";
 import { InvoiceLineEditor } from "./invoice-line-editor";
@@ -112,7 +121,50 @@ function refusalSentence(state: ScreenState): string {
 }
 
 /**
- * One draft, with its line editor.
+ * The document state the panel opens with.
+ *
+ * This screen exists to edit lines, and a deployment whose `0115` has not been applied yet would fail
+ * the whole page for a panel that has nothing to say. The read is therefore kept apart from the invoice
+ * read: a failure here opens the panel in its "could not be read" state, which is a different sentence
+ * from "no PDF has been made yet", and the merchant's first press of the button is what finds out.
+ */
+interface PdfPanelState {
+  readonly state: InvoicePdfState;
+  readonly readFailed: boolean;
+}
+
+async function readPdfPanelState(
+  rest: RestClient,
+  audit: AuditTrail,
+  actor: RequestActor,
+  invoiceId: string,
+): Promise<PdfPanelState> {
+  const none: InvoicePdfState = {
+    invoiceId,
+    status: INVOICE_PDF_NO_DOCUMENT,
+    documentId: null,
+    generation: 0,
+    attempts: 0,
+    byteSize: null,
+    renderedAt: null,
+    queuedAt: null,
+    lastErrorCode: null,
+    ready: false,
+    version: null,
+  };
+
+  try {
+    return {
+      state: await readInvoicePdfState({ actor, invoiceId }, { rest, audit }),
+      readFailed: false,
+    };
+  } catch {
+    return { state: none, readFailed: true };
+  }
+}
+
+/**
+ * One draft, with its line editor and the state of its PDF.
  *
  * ## Why the refusal states are the create screen's own
  *
@@ -126,6 +178,11 @@ function refusalSentence(state: ScreenState): string {
  * A draft is the only thing this STEP can edit, but an invoice that has been sent is not a 404 - it
  * exists, and its lines are visible. The pages differ only in whether the controls are offered, which the
  * editor decides from the status rather than this screen hiding the document.
+ *
+ * ## Why the PDF panel is read after the invoice and not beside it
+ *
+ * The invoice is the reason the page exists, so its failure is the page's failure. The document state is
+ * a panel's, and `readPdfPanelState` keeps its own failure to itself.
  */
 export async function InvoiceEditorScreen({
   invoiceId,
@@ -133,7 +190,13 @@ export async function InvoiceEditorScreen({
   readonly invoiceId: string;
 }): Promise<ReactNode> {
   const actorState = await readOwnerActor();
-  let state: { readonly kind: "ready"; readonly invoice: InvoiceSnapshot } | { readonly kind: string } = {
+  let state:
+    | {
+        readonly kind: "ready";
+        readonly invoice: InvoiceSnapshot;
+        readonly pdf: PdfPanelState;
+      }
+    | { readonly kind: string } = {
     kind: "unavailable",
   };
 
@@ -143,12 +206,15 @@ export async function InvoiceEditorScreen({
     const runtime = getAuthRuntime();
 
     try {
+      const invoice = await getInvoice(
+        { actor: actorState.actor, invoiceId },
+        { rest: runtime.rest, audit: runtime.audit },
+      );
+
       state = {
         kind: "ready",
-        invoice: await getInvoice(
-          { actor: actorState.actor, invoiceId },
-          { rest: runtime.rest, audit: runtime.audit },
-        ),
+        invoice,
+        pdf: await readPdfPanelState(runtime.rest, runtime.audit, actorState.actor, invoiceId),
       };
     } catch (error) {
       state =
@@ -193,6 +259,12 @@ export async function InvoiceEditorScreen({
               </div>
             </dl>
             <InvoiceLineEditor invoice={state.invoice} />
+            <InvoicePdfPanel
+              invoiceId={state.invoice.id}
+              initial={state.pdf.state}
+              draft={state.invoice.status === "draft"}
+              readFailed={state.pdf.readFailed}
+            />
           </>
         ) : (
           <p className="text-sm text-destructive" role="alert">
