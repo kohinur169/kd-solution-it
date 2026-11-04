@@ -9866,12 +9866,13 @@ async function checkSessionRotation(): Promise<void> {
   // lists, STEP 079's onboarding wizard, the STEP 080-099 onboarding screens (the merchant
   // account screen and the office account review queue of STEP 099 included) and the STEP 106
   // client hub, new and edit screens, the STEP 108 catalogue screens - which are one component mounted
-  // at four paths - the STEP 110 client import screen and the STEP 111 catalogue import screen, which
-  // is likewise one component at two paths; each keeps the token rotating while the person reads it.
+  // at four paths - the STEP 110 client import screen, the STEP 111 catalogue import screen, which is
+  // likewise one component at two paths, and the STEP 112 invoice create screen; each keeps the token
+  // rotating while the person reads it.
   // The office half is one of them because reading another account's sessions must not leave the
   // reader's own token unrotated, and the wizard is one because a merchant may sit on it for a
   // while.
-  expectEqual(keepers.length, 24, "every signed-in page keeps its session rotating");
+  expectEqual(keepers.length, 25, "every signed-in page keeps its session rotating");
 }
 
 /**
@@ -12725,11 +12726,11 @@ async function checkCsrfProtection(): Promise<void> {
     .map((file) => file.path)
     .sort();
 
-  expectEqual(browserMutations.length, 35, "thirty five browser files send a mutation");
+  expectEqual(browserMutations.length, 36, "thirty six browser files send a mutation");
   expectEqual(
     browserMutations.reduce((total, path) => total + (appSourceOf(appSources, path).split('method: "POST"').length - 1), 0),
-    39,
-    "across thirty nine call sites",
+    40,
+    "across forty call sites",
   );
   const postCalls = (source: string): number => source.split('method: "POST"').length - 1;
   const tokenSpreads = (source: string): number =>
