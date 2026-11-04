@@ -9865,11 +9865,12 @@ async function checkSessionRotation(): Promise<void> {
   // The settings screen, the new device confirmation, the step-up screen, STEP 054's two session
   // lists, STEP 079's onboarding wizard, the STEP 080-099 onboarding screens (the merchant
   // account screen and the office account review queue of STEP 099 included) and the STEP 106
-  // client hub, new and edit screens; each keeps the token rotating while the person reads it.
+  // client hub, new and edit screens, and the STEP 108 catalogue screens - which are one component
+  // mounted at four paths; each keeps the token rotating while the person reads it.
   // The office half is one of them because reading another account's sessions must not leave the
   // reader's own token unrotated, and the wizard is one because a merchant may sit on it for a
   // while.
-  expectEqual(keepers.length, 21, "every signed-in page keeps its session rotating");
+  expectEqual(keepers.length, 22, "every signed-in page keeps its session rotating");
 }
 
 /**
@@ -12608,6 +12609,34 @@ async function checkCsrfProtection(): Promise<void> {
     "and the list names exactly those routes",
   );
 
+  /**
+   * The source a protected route is judged by: its own file, plus any file it builds its handler from.
+   *
+   * A route that re-exports the handler of another route - the way `/api/services` re-exports
+   * `/api/products`' handler for the second catalogue - holds no `requireCsrfToken` of its own, and
+   * judging it alone would fail a route whose token check is one file away. So an import of another
+   * `route` module is followed once: exactly one file in the chain must check the token, which is the
+   * property this section is about.
+   */
+  const routeChain = (path: string): string => {
+    const own = appSourceOf(appSources, `${path}/route.ts`);
+
+    for (const match of own.matchAll(/from "([^"]*\/route)"/gu)) {
+      const tail = (match[1] ?? "")
+        .split("/")
+        .filter((part) => part !== "" && part !== "." && part !== "..");
+      const target = appSources.find(
+        (candidate) => candidate.path !== `${path}/route.ts` && candidate.path.endsWith(`/${tail.join("/")}.ts`),
+      );
+
+      if (target !== undefined) {
+        return `${own}\n${target.source}`;
+      }
+    }
+
+    return own;
+  };
+
   for (const path of CSRF_PROTECTED_PATHS) {
     const routePath = `${path.replace("/api/", "")}/route.ts`;
     const source = routePath.startsWith("office/")
@@ -12617,7 +12646,7 @@ async function checkCsrfProtection(): Promise<void> {
         : appSourceOf(appSources, `/api/${routePath}`);
 
     expect(source.length > 0, `${path} exists on disk`);
-    expectEqual(source.split("requireCsrfToken(").length - 1, 1, `${path} checks the token exactly once`);
+    expectEqual(routeChain(path).split("requireCsrfToken(").length - 1, 1, `${path} checks the token exactly once`);
     expect(
       source.indexOf("requireCsrfToken(") < source.indexOf("readRequestActor(") ||
         !source.includes("readRequestActor("),
@@ -12643,11 +12672,11 @@ async function checkCsrfProtection(): Promise<void> {
     .map((file) => file.path)
     .sort();
 
-  expectEqual(browserMutations.length, 32, "thirty two browser files send a mutation");
+  expectEqual(browserMutations.length, 33, "thirty three browser files send a mutation");
   expectEqual(
     browserMutations.reduce((total, path) => total + (appSourceOf(appSources, path).split('method: "POST"').length - 1), 0),
-    36,
-    "across thirty six call sites",
+    37,
+    "across thirty seven call sites",
   );
   const postCalls = (source: string): number => source.split('method: "POST"').length - 1;
   const tokenSpreads = (source: string): number =>
