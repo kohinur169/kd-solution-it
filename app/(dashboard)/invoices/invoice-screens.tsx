@@ -14,6 +14,8 @@ import {
 } from "@/services/invoices/invoices";
 import { readOwnerActor } from "../onboarding/owner-actor";
 import { InvoiceForm } from "./invoice-form";
+import { getInvoiceNumberSettings, type InvoiceNumberSettings } from "@/services/invoices/invoice-numbering";
+import { NumberingForm } from "./numbering/numbering-form";
 import { InvoiceLineEditor } from "./invoice-line-editor";
 
 /**
@@ -205,10 +207,82 @@ export async function InvoiceEditorScreen({
           <Link className={linkClasses} href="/clients">
             {getMessage("invoices.clientsLink")}
           </Link>
+          {/* The series settings are one click from the editor, which is where a merchant notices they want
+              to change them: while looking at a draft that has no number yet. */}
+          <Link className={linkClasses} href="/invoices/numbering">
+            {getMessage("invoices.numberingLink")}
+          </Link>
           <Link className={linkClasses} href="/">
             {getMessage("invoices.homeLink")}
           </Link>
         </nav>
+      </div>
+    </main>
+  );
+}
+
+/**
+ * Section 16's numbering settings screen.
+ *
+ * ## Why the four refusals are the create screen's own
+ *
+ * Signed out, not an owner, the numbering unavailable and a merchant who has simply never saved a series are
+ * four different facts, and the first three are answered by the same codes the invoice screens already word.
+ * A merchant with no series yet is **not** an error: `getInvoiceNumberSettings` answers the defaults, and the
+ * form opens on `INV` / 1 / five digits, ready to be changed. That is the state a new merchant is in, and it
+ * has to look like a starting point rather than a missing row.
+ */
+export async function InvoiceNumberingScreen(): Promise<ReactNode> {
+  const actorState = await readOwnerActor();
+  let state: { readonly kind: "ready"; readonly settings: InvoiceNumberSettings } | { readonly kind: string } = {
+    kind: "unavailable",
+  };
+
+  if (actorState.kind === "anonymous") {
+    state = { kind: "signed-out" };
+  } else if (actorState.kind === "actor") {
+    const runtime = getAuthRuntime();
+
+    try {
+      state = {
+        kind: "ready",
+        settings: await getInvoiceNumberSettings(
+          { actor: actorState.actor },
+          { rest: runtime.rest, audit: runtime.audit },
+        ),
+      };
+    } catch (error) {
+      state =
+        error instanceof AppError && error.code === "AUTHENTICATION_REQUIRED"
+          ? { kind: "signed-out" }
+          : error instanceof AppError && error.code === "PERMISSION_DENIED"
+            ? { kind: "forbidden" }
+            : { kind: "unavailable" };
+    }
+  }
+
+  return (
+    <main className="min-h-dvh bg-background px-4 py-8 text-foreground sm:px-6 lg:px-8">
+      <SessionKeeper />
+      <div className="mx-auto flex w-full max-w-2xl flex-col gap-6">
+        <header className="flex flex-col gap-2">
+          <p className="text-sm font-medium text-muted-foreground">{getMessage("invoices.editorEyebrow")}</p>
+          <h1 className="text-2xl font-semibold tracking-tight sm:text-3xl">{getMessage("invoices.numberingTitle")}</h1>
+          <p className="text-sm text-muted-foreground">{getMessage("invoices.numberingDescription")}</p>
+        </header>
+
+        {"settings" in state && state.settings !== undefined ? (
+          <>
+            <p className="rounded-md border border-border p-3 text-xs text-muted-foreground">
+              {getMessage("invoices.numberingOneSeries")}
+            </p>
+            <NumberingForm settings={state.settings} />
+          </>
+        ) : (
+          <p className="text-sm text-destructive" role="alert">
+            {refusalSentence(state as ScreenState)}
+          </p>
+        )}
       </div>
     </main>
   );

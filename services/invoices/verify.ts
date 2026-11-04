@@ -69,6 +69,17 @@ import {
   selectInvoiceTotals,
 } from "./invoice-discount.ts";
 import { priceFromMinor, priceToMinor } from "../products/price.ts";
+import {
+  INVOICE_NUMBER_SETTINGS_UPDATED_AUDIT_ACTION,
+  getInvoiceNumberSettings,
+  normaliseInvoiceNumberPrefix,
+  parseInvoiceNumberSettings,
+  parseNextNumber,
+  printInvoiceNumber,
+  takeInvoiceNumber,
+  updateInvoiceNumberSettings,
+  type InvoiceNumberingDependencies,
+} from "./invoice-numbering.ts";
 
 /**
  * Invoice gate for STEP 112. Run with `node services/invoices/verify.ts`.
@@ -195,6 +206,11 @@ interface InvoiceDb {
   readonly services: Array<Record<string, unknown>>;
   readonly invoices: Array<Record<string, unknown>>;
   readonly items: Array<Record<string, unknown>>;
+  /** The merchant numbering series, one row per company, and the counters it consumes. */
+  readonly numberingSettings: Array<Record<string, unknown>>;
+  readonly numberingCounters: Array<Record<string, unknown>>;
+  /** Every take, in order, so a test can see the sequence a merchant was actually issued. */
+  readonly takenNumbers: string[];
   /** Set to make the lines insert fail, which is how the compensation path is reached. */
   failItems: boolean;
   inserts: Array<{ readonly table: string; readonly rows: readonly Readonly<Record<string, unknown>>[] }>;
@@ -275,6 +291,9 @@ function createDb(): InvoiceDb {
     ],
     invoices: [],
     items: [],
+    numberingSettings: [],
+    numberingCounters: [],
+    takenNumbers: [],
     failItems: false,
     strictPositions: false,
     inserts: [],
@@ -371,7 +390,42 @@ function databaseLineTotal(quantity: string, unitPriceMinor: bigint, discountMin
 }
 
 /** The tables this gate models, so a service that touched a fourth would be caught rather than guessed. */
-const MODELLED_TABLES = ["clients", "products", "services", "invoices", "invoice_items"] as const;
+const MODELLED_TABLES = [
+  "clients",
+  "products",
+  "services",
+  "invoices",
+  "invoice_items",
+  "invoice_number_settings",
+  "invoice_number_counters",
+] as const;
+
+/**
+ * `invoice_number_last_used`, as SQL computes it: the largest numeric tail among a merchant's live numbers.
+ *
+ * Written once here rather than twice inside the rpc stub, and written from the SQL rather than from the
+ * module under test, so a comparison between the two is a comparison and not a tautology. A number with no
+ * trailing digits - a hand-corrected invoice, one imported from another system - contributes nothing.
+ */
+function highestPrinted(db: InvoiceDb, companyId: string): bigint {
+  let highest = 0n;
+
+  for (const row of db.invoices) {
+    const number = row["number"];
+
+    if (row["company_id"] !== companyId || row["deleted_at"] !== null || typeof number !== "string") {
+      continue;
+    }
+
+    const tail = /([0-9]+)$/u.exec(number)?.[1];
+
+    if (tail !== undefined && BigInt(tail) > highest) {
+      highest = BigInt(tail);
+    }
+  }
+
+  return highest;
+}
 
 function rowsOf(db: InvoiceDb, table: string): Array<Record<string, unknown>> {
   switch (table) {
@@ -385,6 +439,10 @@ function rowsOf(db: InvoiceDb, table: string): Array<Record<string, unknown>> {
       return db.invoices;
     case "invoice_items":
       return db.items;
+    case "invoice_number_settings":
+      return db.numberingSettings;
+    case "invoice_number_counters":
+      return db.numberingCounters;
     default:
       throw new Error(`the invoice service touches no table the gate does not model: ${table}`);
   }
@@ -459,6 +517,31 @@ function createInvoiceRest(db: InvoiceDb): RestClient {
     },
     insert(table: string, rows: readonly Readonly<Record<string, unknown>>[]): Promise<void> {
       db.inserts.push({ table, rows });
+
+      // `0114`'s settings row is created on the merchant's first save rather than at sign-up.
+      if (table === "invoice_number_settings") {
+        for (const row of rows) {
+          // `wireOf` is what a REST round trip does to the row: a bigint leaves as decimal text, so the
+          // fixture stores text rather than the caller's bigint and the reader validates what it would see.
+          const created: Record<string, unknown> = wireOf({
+            id: randomUUID(),
+            created_at: new Date(NOW + db.numberingSettings.length).toISOString(),
+            updated_at: new Date(NOW + db.numberingSettings.length).toISOString(),
+            deleted_at: null,
+            version: 1,
+            ...row,
+          });
+
+          // `invoice_number_settings_company_key`.
+          if (db.numberingSettings.some((candidate) => candidate["company_id"] === created["company_id"])) {
+            return Promise.reject(new AppError("CONFLICT"));
+          }
+
+          db.numberingSettings.push(created);
+        }
+
+        return Promise.resolve();
+      }
 
       if (table !== "invoice_items") {
         return Promise.reject(new Error(`the invoice service inserts lines by themselves: ${table}`));
@@ -752,6 +835,30 @@ function createInvoiceRest(db: InvoiceDb): RestClient {
         return Promise.resolve();
       }
 
+      // `0114`'s settings row, updated on a merchant's later save. Scoped to the company as every other
+      // write here is, so a query that forgot the scope would update nothing rather than the wrong row.
+      if (table === "invoice_number_settings") {
+        const parts = queryParts(query);
+        const id = parts.get("id")?.slice(3);
+        const company = parts.get("company_id")?.slice(3);
+        const row = db.numberingSettings.find(
+          (candidate) => candidate["id"] === id && candidate["company_id"] === company,
+        );
+
+        if (row === undefined) {
+          return Promise.reject(
+            new Error(`an invoice_number_settings update is not scoped to one row of one company: ${query}`),
+          );
+        }
+
+        Object.assign(row, wireOf(values), {
+          updated_at: new Date(NOW + 30_000).toISOString(),
+          version: Number(row["version"]) + 1,
+        });
+
+        return Promise.resolve();
+      }
+
       if (table !== "invoices") {
         return Promise.reject(new Error(`the invoice service updates no other table: ${table}`));
       }
@@ -815,8 +922,83 @@ function createInvoiceRest(db: InvoiceDb): RestClient {
 
       return Promise.resolve();
     },
-    rpc(): Promise<never> {
-      return Promise.reject(new Error("the invoice service calls no rpc"));
+    rpc(functionName: string, arguments_: Readonly<Record<string, unknown>> = {}): Promise<unknown> {
+      // `0114`'s two functions, modelled from the SQL rather than by calling the module under test, so an
+      // assertion comparing the two has an independent side.
+      if (functionName === "invoice_number_last_used") {
+        // PostgREST answers a scalar function with the scalar itself.
+        return Promise.resolve(highestPrinted(db, String(arguments_["p_company_id"] ?? "")).toString());
+      }
+
+      if (functionName === "take_invoice_number") {
+        const company = String(arguments_["p_company_id"] ?? "");
+        const at = Date.parse(String(arguments_["p_at"] ?? ""));
+
+        if (!Number.isFinite(at)) {
+          return Promise.reject(new AppError("VALIDATION_FAILED"));
+        }
+
+        const settings = db.numberingSettings.find(
+          (row) => row["company_id"] === company && row["deleted_at"] === null,
+        );
+        const prefix = typeof settings?.["prefix"] === "string" ? settings["prefix"] : "INV";
+        const next = settings === undefined ? 1n : BigInt(String(settings["next_number"]));
+        const padding = settings === undefined ? 5 : Number(settings["padding"]);
+        const yearly = settings?.["yearly"] === true;
+        const resetMonth = settings === undefined ? null : (settings["reset_month"] as number | null);
+
+        // `invoice_number_period`, restated: the series rolls over in the reset month.
+        const month = new Date(at).getUTCMonth() + 1;
+        const year = new Date(at).getUTCFullYear();
+        const period =
+          !yearly ? 0 : month >= (resetMonth ?? 1) ? year : year - 1;
+
+        // The clamp `0114` applies: a fresh counter starts above the highest number already printed, so a
+        // merchant with imported history is not blocked from issuing at all.
+        const startAt = highestPrinted(db, company) + 1n > next ? highestPrinted(db, company) + 1n : next;
+
+        let counter = db.numberingCounters.find((row) => row["company_id"] === company);
+
+        if (counter === undefined) {
+          counter = {
+            id: randomUUID(),
+            company_id: company,
+            period_key: period,
+            last_number: String(startAt),
+            deleted_at: null,
+            version: 1,
+          };
+          db.numberingCounters.push(counter);
+        } else if (Number(counter["period_key"]) === period) {
+          counter["last_number"] = (BigInt(String(counter["last_number"])) + 1n).toString();
+        } else {
+          // A counter from an earlier period restarts at the merchant's `next_number`, which is what the
+          // `else excluded.last_number` branch of the `on conflict` does.
+          counter["period_key"] = period;
+          counter["last_number"] = startAt.toString();
+        }
+
+        const taken = BigInt(String(counter["last_number"]));
+
+        // The take refuses a number already printed, exactly as the function's `check_violation` does.
+        const lastUsed = highestPrinted(db, company);
+
+        if (taken <= lastUsed) {
+          return Promise.reject(new AppError("VALIDATION_FAILED", { cause: { rule: "reused" } }));
+        }
+
+        const printed = `${prefix}-${taken.toString().padStart(padding, "0")}`;
+
+        if (printed.length < 3 || printed.length > 40 || !/^[A-Z0-9][A-Z0-9._/-]{2,39}$/u.test(printed)) {
+          return Promise.reject(new AppError("VALIDATION_FAILED", { cause: { rule: "unprintable" } }));
+        }
+
+        db.takenNumbers.push(printed);
+
+        return Promise.resolve([{ number: printed, sequence_number: taken.toString(), period_key: period }]);
+      }
+
+      return Promise.reject(new Error(`the invoice service calls no rpc named ${functionName}`));
     },
   };
 }
@@ -2611,6 +2793,364 @@ async function checkDiscountUpdate(): Promise<void> {
   expect(JSON.stringify(audited.entries).includes("Line 1") === false, "and never any line's text");
 }
 
+/* ---- 10d. invoice numbering per merchant (STEP 115) ---- */
+
+/**
+ * Mark a draft as issued with a given number.
+ *
+ * `0022`'s `invoices_issue_check` allows a number only on a document that has left draft, so a fixture that
+ * wanted "a merchant who has already printed INV-00090" has to move the row the way the system would: status,
+ * number and issue instant together. The row's money is untouched.
+ */
+function issuedRow(db: InvoiceDb, invoiceId: string, number: string): void {
+  const row = db.invoices.find((candidate) => candidate["id"] === invoiceId);
+
+  if (row === undefined) {
+    throw new Error("gate fixture: the invoice to issue is not in the database");
+  }
+
+  row["status"] = "sent";
+  row["number"] = number;
+  row["issued_at"] = new Date(NOW).toISOString();
+}
+
+/** Numbering dependencies over the invoice fixture. */
+function numberingDepsOf(db: InvoiceDb, audit: AuditTrail = createInMemoryAuditTrail()): InvoiceNumberingDependencies {
+  return { rest: createInvoiceRest(db), audit, now: () => NOW };
+}
+
+async function checkNumberingPrinting(): Promise<void> {
+  // ---- the printed form
+  expectEqual(
+    printInvoiceNumber({ prefix: "INV", sequenceNumber: 1n, padding: 5 }),
+    "INV-00001",
+    "a number is the prefix, a separator and the padded counter",
+  );
+  expectEqual(
+    printInvoiceNumber({ prefix: "ACME", sequenceNumber: 1234n, padding: 3 }),
+    "ACME-1234",
+    "a counter longer than the padding is printed in full rather than truncated",
+  );
+  expect(
+    printInvoiceNumber({ prefix: "INV", sequenceNumber: 100_000n, padding: 5 }) === "INV-100000",
+    "so the hundred thousandth invoice is unique, which a truncation would not be",
+  );
+
+  // Every printed number satisfies `0022`'s own check, which is what makes this policy worth having.
+  const printedPattern = /^[A-Z0-9][A-Z0-9._/-]{2,39}$/u;
+
+  expect(
+    printedPattern.test(printInvoiceNumber({ prefix: "INV", sequenceNumber: 1n, padding: 5 })),
+    "and satisfies 0022's number check",
+  );
+
+  // ---- the prefix
+  expectEqual(normaliseInvoiceNumberPrefix("  acme  "), "ACME", "the prefix is trimmed and upper cased");
+  expectEqual(normaliseInvoiceNumberPrefix("INV-"), "INV", "a typed trailing separator is trimmed, not printed twice");
+  expectEqual(normaliseInvoiceNumberPrefix("ACME.CO/2026"), "ACME.CO/2026", "the separators 0022 accepts are allowed inside");
+  expectEqual(normaliseInvoiceNumberPrefix("IN V"), null, "a space is refused, because 0022 would refuse the number");
+  expectEqual(normaliseInvoiceNumberPrefix("-INV"), null, "and a prefix may not start with a separator");
+  expectEqual(normaliseInvoiceNumberPrefix("ABCDEFGHIJKLM"), null, "nor be longer than twelve characters");
+
+  // ---- the next number
+  expectEqual(parseNextNumber("1"), 1n, "one is a next number");
+  expectEqual(parseNextNumber("0007"), 7n, "a zero padded value is read as its number");
+  expectEqual(parseNextNumber("0"), null, "zero is not, because a number prints from one");
+  expectEqual(parseNextNumber("-3"), null, "nor is a negative");
+  expectEqual(parseNextNumber("1.5"), null, "nor a fraction");
+  expectEqual(parseNextNumber(""), null, "nor nothing");
+}
+
+async function checkNumberingTake(): Promise<void> {
+  const db = createDb();
+  const deps = numberingDepsOf(db);
+
+  // ---- the first issue of a merchant who never opened the screen
+  const first = await takeInvoiceNumber({ actor: owner }, deps);
+
+  expectEqual(first.number, "INV-00001", "the default series starts at one");
+  expectEqual(first.sequenceNumber, "1", "and reports the counter it consumed");
+  expectEqual(first.periodKey, 0, "in the unreset series");
+
+  const second = await takeInvoiceNumber({ actor: owner }, deps);
+
+  expectEqual(second.number, "INV-00002", "the next take is the next number");
+  expectDeepEqual(db.takenNumbers, ["INV-00001", "INV-00002"], "and no number is issued twice");
+
+  // ---- a merchant's series is its own
+  const otherDb = createDb();
+  const otherFirst = await takeInvoiceNumber({ actor: otherOwner }, numberingDepsOf(otherDb));
+
+  expectEqual(otherFirst.number, "INV-00001", "another merchant counts its own series from its own start");
+  expectEqual(
+    at(otherDb.numberingCounters, 0, "the other merchant's counter")["company_id"],
+    COMPANY_B,
+    "in a row of its own",
+  );
+
+  // ---- the merchant's own prefix, padding and next number
+  const configured = createDb();
+
+  configured.numberingSettings.push({
+    id: randomUUID(),
+    company_id: COMPANY_A,
+    prefix: "KD",
+    next_number: "1000",
+    padding: 6,
+    yearly: false,
+    reset_month: null,
+    created_at: new Date(NOW).toISOString(),
+    updated_at: new Date(NOW).toISOString(),
+    deleted_at: null,
+    version: 1,
+  });
+
+  const configuredTake = await takeInvoiceNumber({ actor: owner }, numberingDepsOf(configured));
+
+  expectEqual(configuredTake.number, "KD-001000", "the merchant's prefix and padding are used");
+  expectEqual(configuredTake.sequenceNumber, "1000", "starting at the number they set");
+
+  // ---- the yearly reset moves the counter back to the merchant's next number
+  const yearly = createDb();
+
+  yearly.numberingSettings.push({
+    id: randomUUID(),
+    company_id: COMPANY_A,
+    prefix: "INV",
+    next_number: "1",
+    padding: 4,
+    yearly: true,
+    reset_month: 1,
+    created_at: new Date(NOW).toISOString(),
+    updated_at: new Date(NOW).toISOString(),
+    deleted_at: null,
+    version: 1,
+  });
+
+  // The fixture clock is fixed, so the two takes are in the same period and the second increments.
+  expectEqual((await takeInvoiceNumber({ actor: owner }, numberingDepsOf(yearly))).number, "INV-0001", "a yearly series starts at one");
+  expectEqual((await takeInvoiceNumber({ actor: owner }, numberingDepsOf(yearly))).number, "INV-0002", "and counts up inside its year");
+
+  // A counter left in an earlier period restarts, which is the `else` branch of the `on conflict`.
+  at(yearly.numberingCounters, 0, "the counter")["period_key"] = 1999;
+  at(yearly.numberingCounters, 0, "the counter")["last_number"] = "900";
+
+  const afterReset = await takeInvoiceNumber({ actor: owner }, numberingDepsOf(yearly));
+
+  expectEqual(afterReset.number, "INV-0001", "a new period restarts at the merchant's next number, not where last year ended");
+
+  // ---- a number already printed is never reissued
+  const reused = await draftWith(1);
+
+  issuedRow(reused.db, reused.invoiceId, "INV-00042");
+
+  const afterPrinted = await takeInvoiceNumber({ actor: owner }, numberingDepsOf(reused.db));
+
+  expectEqual(
+    afterPrinted.number,
+    "INV-00043",
+    "a merchant with printed history starts above it rather than reissuing a number they already sent",
+  );
+
+  // And a counter that would land on a printed number is refused rather than silently skipping.
+  const blocked = await draftWith(1);
+
+  issuedRow(blocked.db, blocked.invoiceId, "INV-00001");
+
+  const afterBlocked = await takeInvoiceNumber({ actor: owner }, numberingDepsOf(blocked.db));
+
+  expectEqual(
+    afterBlocked.number,
+    "INV-00002",
+    "and the clamp moves past a single printed number too, rather than refusing the merchant forever",
+  );
+
+  // ---- tenancy and role
+  expectEqual(
+    await lineCodeOf(() => takeInvoiceNumber({ actor: actorOf(["finance_ops"], COMPANY_A, { userId: OFFICE_ID }) }, numberingDepsOf(createDb()))),
+    "PERMISSION_DENIED",
+    "an office role may not take a merchant's number",
+  );
+
+  expectEqual(
+    await lineCodeOf(() =>
+      takeInvoiceNumber({ actor: owner, companyId: COMPANY_B }, numberingDepsOf(createDb())),
+    ),
+    "RESOURCE_NOT_FOUND",
+    "and a caller cannot take a number for a company that is not its own",
+  );
+}
+
+async function checkNumberingSettings(): Promise<void> {
+  // ---- a merchant who never saved anything reads the defaults
+  const fresh = createDb();
+  const defaults = await getInvoiceNumberSettings({ actor: owner }, numberingDepsOf(fresh));
+
+  expectEqual(defaults.prefix, "INV", "the default prefix is INV");
+  expectEqual(defaults.nextNumber, "1", "the default next number is one");
+  expectEqual(defaults.padding, 5, "the default padding is five");
+  expectEqual(defaults.previewNumber, "INV-00001", "and the preview shows what the next invoice will print");
+  expectEqual(defaults.lastUsedNumber, "0", "with nothing printed yet");
+
+  // ---- a saved series reads back, with a preview that reflects it
+  const db = createDb();
+  const parsed = await parseInvoiceNumberSettings(
+    { prefix: "ACME", next_number: "250", padding: 6, yearly: true, reset_month: 4 },
+    { companyId: COMPANY_A, rest: createInvoiceRest(db) },
+  );
+
+  expectEqual(parsed.prefix, "ACME", "the prefix is normalised");
+  expectEqual(parsed.nextNumber, 250n, "and the next number parsed");
+
+  const audit = createInMemoryAuditTrail();
+  const saved = await updateInvoiceNumberSettings({ actor: owner, settings: parsed }, numberingDepsOf(db, audit));
+
+  expectEqual(saved.previewNumber, "ACME-000250", "the preview is the number the next invoice will carry");
+  expectEqual(saved.resetMonth, 4, "the reset month is stored");
+  expectEqual(at(db.numberingSettings, 0, "the settings row")["yearly"], true, "and the row is created on the first save");
+
+  const update = db.updates.filter((entry) => entry.table === "invoice_number_settings");
+
+  expectEqual(update.length, 0, "the first save is an insert, not an update of a row that is not there");
+
+  // A second save updates rather than inserting a duplicate.
+  const second = await parseInvoiceNumberSettings(
+    { prefix: "ACME", next_number: "300", padding: 6, yearly: false, reset_month: null },
+    { companyId: COMPANY_A, rest: createInvoiceRest(db) },
+  );
+
+  await updateInvoiceNumberSettings({ actor: owner, settings: second }, numberingDepsOf(db, audit));
+
+  expectEqual(at(db.numberingSettings, 0, "the settings row")["next_number"], "300", "a second save updates the same row");
+  expectEqual(db.numberingSettings.length, 1, "so a merchant has exactly one series");
+
+  // ---- refusals, each naming the field the screen marks
+  const refusals = await (async (): Promise<readonly { readonly field?: unknown; readonly rule?: unknown }[]> => {
+    try {
+      await parseInvoiceNumberSettings({ prefix: "", next_number: "", padding: 0 }, { companyId: COMPANY_A, rest: createInvoiceRest(createDb()) });
+
+      return [];
+    } catch (error) {
+      return isAppError(error) ? error.details : [];
+    }
+  })();
+
+  expectDeepEqual(
+    refusals.map((detail) => detail.field),
+    ["prefix", "next_number", "padding"],
+    "every problem is reported at once, in the order the screen shows them",
+  );
+
+  expectEqual(
+    (await refusalOfAsync(() =>
+      parseInvoiceNumberSettings({ prefix: "INV", next_number: "1", padding: 12 }, { companyId: COMPANY_A, rest: createInvoiceRest(createDb()) }),
+    ))[0]?.rule,
+    "too_large",
+    "a padding of twelve is refused as too large",
+  );
+
+  expectEqual(
+    (await refusalOfAsync(() =>
+      parseInvoiceNumberSettings({ prefix: "INV", next_number: "1", padding: 5, yearly: true }, { companyId: COMPANY_A, rest: createInvoiceRest(createDb()) }),
+    ))[0]?.rule,
+    "required",
+    "a yearly series without a reset month is refused",
+  );
+
+  expectEqual(
+    (await refusalOfAsync(() =>
+      parseInvoiceNumberSettings({ prefix: "INV", next_number: "1", padding: 5, yearly: false, reset_month: 3 }, { companyId: COMPANY_A, rest: createInvoiceRest(createDb()) }),
+    ))[0]?.field,
+    "reset_month",
+    "and a month on a series that never resets is refused rather than ignored",
+  );
+
+  // ---- the floor: a next number below one already printed
+  const printed = await draftWith(1);
+
+  issuedRow(printed.db, printed.invoiceId, "INV-00090");
+
+  const floor = await (async (): Promise<readonly { readonly field?: unknown; readonly rule?: unknown }[]> => {
+    try {
+      await parseInvoiceNumberSettings({ prefix: "INV", next_number: "50", padding: 5 }, { companyId: COMPANY_A, rest: createInvoiceRest(printed.db) });
+
+      return [];
+    } catch (error) {
+      return isAppError(error) ? error.details : [];
+    }
+  })();
+
+  expectDeepEqual(
+    floor,
+    [{ field: "next_number", rule: "too_small" }],
+    "a next number below the highest printed number is refused, because it would reissue it",
+  );
+
+  // The highest printed number is reported, so the screen can tell the merchant which value is safe.
+  const readBack = await getInvoiceNumberSettings({ actor: owner }, numberingDepsOf(printed.db));
+
+  expectEqual(readBack.lastUsedNumber, "90", "and the last number used is read from the invoices, not the counter");
+
+  // ---- tenancy and role
+  // Tenancy here is not a 404: every merchant has a series of its own, and the isolation is that the read
+  // is scoped to the actor's company. A separate merchant therefore reads their own defaults, never the
+  // first merchant's saved prefix - and the gate checks the scope by reading through the other actor.
+  const isolated = createDb();
+
+  isolated.numberingSettings.push({
+    id: randomUUID(),
+    company_id: COMPANY_A,
+    prefix: "ACME",
+    next_number: "250",
+    padding: 6,
+    yearly: false,
+    reset_month: null,
+    created_at: new Date(NOW).toISOString(),
+    updated_at: new Date(NOW).toISOString(),
+    deleted_at: null,
+    version: 1,
+  });
+
+  const otherView = await getInvoiceNumberSettings({ actor: otherOwner }, numberingDepsOf(isolated));
+
+  expectEqual(otherView.prefix, "INV", "another merchant reads their own defaults, never the first merchant's prefix");
+  expect(otherView.previewNumber !== "ACME-000250", "so one merchant's numbering cannot leak into another's screen");
+
+  // And the read really was scoped: the query the fixture saw named the other merchant's company.
+  const otherQuery = at(
+    isolated.queries.filter((query) => query.startsWith("invoice_number_settings?")),
+    0,
+    "the settings read",
+  );
+
+  expect(otherQuery.includes(`company_id=eq.${COMPANY_B}`), "because the read is scoped to the actor's own company");
+  expectEqual(
+    await lineCodeOf(() =>
+      updateInvoiceNumberSettings(
+        { actor: actorOf(["support"], COMPANY_A, { userId: OFFICE_ID }), settings: { prefix: "X", nextNumber: 1n, padding: 5, yearly: false, resetMonth: null } },
+        numberingDepsOf(createDb()),
+      ),
+    ),
+    "PERMISSION_DENIED",
+    "and a support role may not change a merchant's numbering",
+  );
+
+  // ---- the audit entry records the policy, and never a number's owner text
+  const entries = audit.entries.filter((entry) => entry.action === INVOICE_NUMBER_SETTINGS_UPDATED_AUDIT_ACTION);
+
+  expectEqual(entries.length, 2, "each save writes one entry");
+  expectEqual(
+    (at(entries, 0, "the first entry").payload as Readonly<Record<string, unknown>>)["prefix"],
+    "ACME",
+    "naming the prefix that was set",
+  );
+  expectEqual(
+    (at(entries, 0, "the first entry").payload as Readonly<Record<string, unknown>>)["next_number"],
+    "250",
+    "and the next number",
+  );
+}
+
 /* ---- 11. the line editor's sources ---- */
 
 async function checkLineSources(): Promise<void> {
@@ -2818,6 +3358,92 @@ async function checkLineSources(): Promise<void> {
     "while 0023 is left exactly as it was, because migrations are append-only",
   );
   expect(!previous.includes("discount_basis"), "and knows nothing of the basis a later STEP added");
+
+  // ---- the numbering UI and route (STEP 115)
+
+  for (const path of [
+    "app/(dashboard)/invoices/numbering/page.tsx",
+    "app/(dashboard)/invoices/numbering/numbering-form.tsx",
+  ]) {
+    const source = await readRepositoryFile(path);
+
+    expect(source.length > 0, `${path} exists`);
+    expect(source.split("\n", 1)[0]?.trim() === `// path: ${path}`, `${path} starts with its path comment`);
+    expect(!/[^\u0009\u000a\u000d\u0020-\u007e]/u.test(source.replaceAll("\ufeff", "")), `${path} is ASCII only`);
+  }
+
+  const numberingRoute = await readRepositoryFile("app/api/invoices/numbering/route.ts");
+  const numberingRouteCode = codeOf(numberingRoute);
+
+  expect(numberingRouteCode.includes("export const GET"), "the route reads the series");
+  expect(numberingRouteCode.includes("export const POST"), "and writes it");
+  // The file holds both verbs, so the ordering has to be read inside the POST rather than from the top of
+  // the module: the GET legitimately reads the session before the POST's token check appears at all.
+  const postStart = numberingRouteCode.indexOf("export const POST");
+  const postBody = postStart === -1 ? "" : numberingRouteCode.slice(postStart);
+
+  expect(
+    postBody.indexOf("requireCsrfToken(") !== -1 &&
+      postBody.indexOf("requireCsrfToken(") < postBody.indexOf("readRequestActor("),
+    "the write checks the token before it reads the session",
+  );
+  expect(
+    numberingRouteCode.slice(0, postStart).includes("readRequestActor(") &&
+      !numberingRouteCode.slice(0, postStart).includes("requireCsrfToken("),
+    "while the read needs no token, because it changes nothing",
+  );
+
+  const numberingCsrf = await readRepositoryFile("lib/security/csrf.ts");
+
+  expect(numberingCsrf.includes('"/api/invoices/numbering"'), "the numbering write is on the CSRF protected list");
+
+  const numberingForm = await readRepositoryFile("app/(dashboard)/invoices/numbering/numbering-form.tsx");
+  const numberingFormCode = codeOf(numberingForm);
+
+  expect(numberingFormCode.includes("csrfHeaders("), "the form carries the token");
+  expect(numberingFormCode.includes("previewOf("), "and previews the number as it is typed");
+  expect(numberingFormCode.includes("lastUsedNumber"), "while showing the number already used, which is the floor");
+  expect(!/parseFloat/u.test(numberingFormCode), "with no amount passing through a float");
+
+  const numberingScreens = await readRepositoryFile("app/(dashboard)/invoices/invoice-screens.tsx");
+
+  expect(numberingScreens.includes("InvoiceNumberingScreen"), "the screen is exported");
+  expect(numberingScreens.includes('href="/invoices/numbering"'), "and linked, so the settings are reachable");
+
+  // ---- the migration's own facts
+  const numberingMigration = await readRepositoryFile("migrations/0114_invoice_numbering.sql");
+
+  expect(numberingMigration.includes("create table public.invoice_number_settings"), "0114 creates the series");
+  expect(numberingMigration.includes("create table public.invoice_number_counters"), "and the counter it consumes");
+  expect(
+    numberingMigration.includes("insert into public.invoice_number_counters as counter"),
+    "the counter is taken by an insert rather than by a read and a write",
+  );
+  expect(
+    numberingMigration.includes("on conflict (company_id) do update"),
+    "which is what serialises two concurrent issues on the row",
+  );
+  expect(
+    numberingMigration.includes("start_at := greatest(settings_row.next_number, last_used + 1)"),
+    "and a fresh counter starts above anything the merchant has already printed",
+  );
+  expect(
+    numberingMigration.includes("invoice_number_settings_company_key unique (company_id)"),
+    "one series per merchant is a constraint, not a convention",
+  );
+  expect(
+    numberingMigration.includes("enable row level security"),
+    "the new tables are locked down like every other",
+  );
+
+  const numberingDown = await readRepositoryFile("migrations/0114_invoice_numbering.down.sql");
+
+  expect(numberingDown.includes("drop table if exists public.invoice_number_counters"), "the rollback drops the counter");
+  expect(numberingDown.includes("drop table if exists public.invoice_number_settings"), "and the settings");
+  expect(
+    !numberingDown.includes("update public.invoices") && !numberingDown.includes("drop table if exists public.invoices"),
+    "while leaving the invoices that already carry numbers exactly as they are",
+  );
 
   // The migration's own facts, restated where the gate can see them.
   const itemsMigration = await readRepositoryFile("migrations/0023_invoice_items.sql");
@@ -3080,6 +3706,9 @@ async function run(): Promise<void> {
   await checkLineAudit();
   await checkLineOrder();
   await checkLineSources();
+  await checkNumberingPrinting();
+  await checkNumberingTake();
+  await checkNumberingSettings();
   await checkDiscountEngine();
   await checkDiscountCreate();
   await checkDiscountUpdate();
