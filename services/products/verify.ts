@@ -9,16 +9,29 @@ import type { PlatformRole, RequestActor } from "../../lib/auth/types.ts";
 import { AppError, isAppError } from "../../lib/errors/app-error.ts";
 import {
   CATALOGUE_CREATED_AUDIT_ACTION,
+  CATALOGUE_DELETED_AUDIT_ACTION,
   CATALOGUE_MANAGE_ROLES,
   CATALOGUE_RULES,
   CATALOGUE_UPDATED_AUDIT_ACTION,
   catalogueRowSchema,
   createCatalogueEntry,
+  deleteCatalogueEntry,
   getCatalogueEntry,
   updateCatalogueEntry,
   type CatalogueDependencies,
   type CatalogueSnapshot,
 } from "./catalogue.ts";
+import {
+  CATALOGUE_LIST_MAXIMUM_OFFSET,
+  CATALOGUE_LIST_PAGE_SIZE,
+  CATALOGUE_LIST_ORDER,
+  CATALOGUE_SEARCH_MAXIMUM_LENGTH,
+  catalogueListColumnsOf,
+  catalogueListQueryOf,
+  catalogueListRowSchema,
+  listCatalogueEntries,
+  parseCatalogueListQuery,
+} from "./catalogue-list.ts";
 import {
   CATALOGUE_CODE_COLUMN,
   CATALOGUE_FIELD_LIMITS,
@@ -212,7 +225,87 @@ function createCatalogueRest(db: CatalogueDb): RestClient {
         matched = matched.filter((row) => row["deleted_at"] === null);
       }
 
-      return Promise.resolve(matched.map((row) => schema.parse(row)));
+      // `or=(name.ilike.*term*,...)`: a substring match against each named column, case insensitively,
+      // which is what PostgREST's `ilike` with `*` on both sides asks the database for.
+      const or = parts.get("or");
+
+      if (or !== undefined) {
+        const body = or.replace(/^\(/u, "").replace(/\)$/u, "").replace(/%2C/gu, ",");
+        const clauses = body.split(",").map((clause) => {
+          const [column = "", operator = "", ...rest] = clause.split(".");
+          const pattern = decodeURIComponent(rest.join(".")).replace(/^\*/u, "").replace(/\*$/u, "");
+
+          return { column, operator, needle: pattern.toLowerCase() };
+        });
+
+        matched = matched.filter((row) =>
+          clauses.some((clause) => {
+            if (clause.operator !== "ilike") {
+              throw new Error(`the catalogue list searched with an operator the gate does not model: ${clause.operator}`);
+            }
+
+            const value = row[clause.column];
+
+            return typeof value === "string" && value.toLowerCase().includes(clause.needle);
+          }),
+        );
+      }
+
+      // `order=created_at.desc,id.desc`: the order the page index stores.
+      const order = parts.get("order");
+
+      if (order !== undefined) {
+        const keys = order.split(",").map((spec) => {
+          const [column = "", direction = "asc"] = spec.split(".");
+
+          return { column, descending: direction === "desc" };
+        });
+
+        matched = [...matched].sort((left, right) => {
+          for (const key of keys) {
+            const a = String(left[key.column] ?? "");
+            const b = String(right[key.column] ?? "");
+            const comparison = a < b ? -1 : a > b ? 1 : 0;
+
+            if (comparison !== 0) {
+              return key.descending ? -comparison : comparison;
+            }
+          }
+
+          return 0;
+        });
+      }
+
+      const offset = parts.get("offset");
+      const limit = parts.get("limit");
+
+      if (offset !== undefined) {
+        matched = matched.slice(Number.parseInt(offset, 10));
+      }
+
+      if (limit !== undefined) {
+        matched = matched.slice(0, Number.parseInt(limit, 10));
+      }
+
+      // `select=a,b,code:sku` - the alias is the one thing the projection has to model, because the
+      // list reads a product's `sku` under the name `code` so one row shape covers both tables.
+      const selection = parts.get("select");
+      const projected =
+        selection === undefined
+          ? matched
+          : matched.map((row) => {
+              const values: Record<string, unknown> = {};
+
+              for (const spec of selection.split(",")) {
+                const [alias = "", source] = spec.includes(":") ? spec.split(":") : [spec, spec];
+
+                values[alias] = row[source ?? alias] ?? null;
+              }
+
+              return values;
+            });
+
+      return Promise.resolve(projected.map((row) => schema.parse(row)));
     },
     insert(): Promise<never> {
       return Promise.reject(new Error("the catalogue service inserts with return=representation only"));
@@ -703,6 +796,368 @@ async function checkUpdate(kind: CatalogueKind): Promise<void> {
   expect(isAppError(roleDenied) && roleDenied.code === "PERMISSION_DENIED", `${kind}: a non-owner role may not edit`);
 }
 
+/* ---- STEP 109: the paginated list and the search ---- */
+
+/** Seed one catalogue with `count` entries whose names, codes and timestamps are distinct and ordered. */
+async function seed(
+  db: CatalogueDb,
+  kind: CatalogueKind,
+  companyActor: RequestActor,
+  count: number,
+  prefix: string,
+): Promise<readonly CatalogueSnapshot[]> {
+  const created: CatalogueSnapshot[] = [];
+
+  for (let index = 0; index < count; index += 1) {
+    const codeColumn = CATALOGUE_CODE_COLUMN[kind];
+    const body =
+      kind === "product"
+        ? {
+            name: `${prefix} lamp ${String(index).padStart(2, "0")}`,
+            sku: `${prefix.toUpperCase()}-${String(index).padStart(2, "0")}`,
+            description: index % 2 === 0 ? "with a warm white bulb" : null,
+            unit_price: `${String(index + 1)}.50`,
+            currency: "USD",
+            unit: "item",
+          }
+        : {
+            name: `${prefix} hour ${String(index).padStart(2, "0")}`,
+            code: `${prefix.toUpperCase()}-${String(index).padStart(2, "0")}`,
+            description: index % 2 === 0 ? "advisory work" : null,
+            unit_price: `${String(index + 1)}.25`,
+            currency: "USD",
+            unit: "hour",
+          };
+
+    expect(
+      typeof (body as Record<string, unknown>)[codeColumn] === "string",
+      `${kind}: the seed names a code`,
+    );
+
+    created.push(await createCatalogueEntry({ actor: companyActor, kind, body }, depsOf(db)));
+  }
+
+  return created;
+}
+
+/** The ids of one page, in the order it printed them. */
+function idsOf(page: { readonly entries: readonly { readonly id: string }[] }): readonly string[] {
+  return page.entries.map((entry) => entry.id);
+}
+
+async function checkList(kind: CatalogueKind): Promise<void> {
+  const db = createDb();
+  const dependencies = depsOf(db);
+  const created = await seed(db, kind, owner, 30, "bench");
+
+  const first = await listCatalogueEntries(
+    { actor: owner, kind, query: parseCatalogueListQuery({}) },
+    dependencies,
+  );
+
+  expectEqual(first.kind, kind, `${kind}: the page names its catalogue`);
+  expectEqual(first.entries.length, CATALOGUE_LIST_PAGE_SIZE, `${kind}: a full page is one page size`);
+  expectEqual(first.pageSize, CATALOGUE_LIST_PAGE_SIZE, `${kind}: and says so`);
+  expectEqual(first.offset, 0, `${kind}: the first page starts at the newest row`);
+  expectEqual(first.pageNumber, 1, `${kind}: and is page one`);
+  expectEqual(first.previousOffset, null, `${kind}: with nothing newer to go back to`);
+  expectEqual(first.nextOffset, CATALOGUE_LIST_PAGE_SIZE, `${kind}: and a next page to go on to`);
+
+  // newest first, which is the order products_page_idx / services_page_idx stores
+  const newestFirst = [...created].reverse().map((entry) => entry.id);
+
+  expectDeepEqual(idsOf(first), newestFirst.slice(0, CATALOGUE_LIST_PAGE_SIZE), `${kind}: the page is newest first`);
+
+  const second = await listCatalogueEntries(
+    { actor: owner, kind, query: parseCatalogueListQuery({ offset: String(CATALOGUE_LIST_PAGE_SIZE) }) },
+    dependencies,
+  );
+
+  expectEqual(second.offset, CATALOGUE_LIST_PAGE_SIZE, `${kind}: the second page starts where the first ended`);
+  expectEqual(second.pageNumber, 2, `${kind}: and is page two`);
+  expectEqual(second.previousOffset, 0, `${kind}: with a newer page behind it`);
+  expectEqual(second.nextOffset, null, `${kind}: and nothing after the last row`);
+  expectEqual(second.entries.length, 30 - CATALOGUE_LIST_PAGE_SIZE, `${kind}: the short page is the last one`);
+
+  // the two pages do not overlap and together are the whole catalogue
+  const seen = new Set([...idsOf(first), ...idsOf(second)]);
+
+  expectEqual(seen.size, 30, `${kind}: two pages cover every entry exactly once`);
+
+  // the price is printed by the one function allowed to format an amount
+  const priced = at(first.entries, 0, `${kind} first row`);
+
+  expect(/^\d+[.]\d{4}$/u.test(priced.unitPrice), `${kind}: the price prints exactly four decimals`);
+  expectEqual(priceToMinor(priced.unitPrice), priced.unitPriceMinor, `${kind}: and prints back to the amount it was read from`);
+  expectEqual(priced.currency, "USD", `${kind}: and its currency`);
+  expectEqual(typeof priced.unitPriceMinor, "bigint", `${kind}: the minor units stay a bigint`);
+
+  // the code column is the kind's own, read under one name
+  expect(priced.code !== null, `${kind}: the code is on the row`);
+  expect(priced.code !== null && priced.code.startsWith("BENCH-"), `${kind}: and is the code that was written`);
+
+  // a page past the end is empty rather than an error
+  const beyond = await listCatalogueEntries(
+    { actor: owner, kind, query: parseCatalogueListQuery({ offset: "2000" }) },
+    dependencies,
+  );
+
+  expectEqual(beyond.entries.length, 0, `${kind}: a page past the end holds no rows`);
+  expectEqual(beyond.nextOffset, null, `${kind}: and offers no next page`);
+
+  // the query is the index's order and the tenant's own rows
+  const lastQuery = at(db.queries, db.queries.length - 1, `${kind} last query`);
+
+  expect(lastQuery.includes("order=created_at.desc,id.desc"), `${kind}: the query asks for the index order`);
+  expect(lastQuery.includes(`company_id=eq.${COMPANY_A}`), `${kind}: scoped to the actor's company`);
+  expect(lastQuery.includes("deleted_at=is.null"), `${kind}: live rows only`);
+  expect(lastQuery.includes("limit=26"), `${kind}: one row more than the page, to prove a next page exists`);
+  expect(!lastQuery.includes("count"), `${kind}: and no count, which would be a second scan`);
+
+  // only the owner reads the catalogue
+  for (const roles of [["compliance_kyc"], ["finance_ops"], ["support"], ["ceo"], ["super_admin"], ["blogger"]] as const) {
+    const refused = await rejectionOf(() =>
+      listCatalogueEntries(
+        {
+          actor: actorOf([...roles], COMPANY_A, { userId: OFFICE_ID }),
+          kind,
+          query: parseCatalogueListQuery({}),
+        },
+        dependencies,
+      ),
+    );
+
+    expect(isAppError(refused) && refused.code === "PERMISSION_DENIED", `${kind}: the role ${roles[0]} may not list the catalogue`);
+  }
+
+  // and another merchant's rows are not in this one's page
+  const otherPage = await listCatalogueEntries(
+    { actor: otherOwner, kind, query: parseCatalogueListQuery({}) },
+    depsOf(db),
+  );
+
+  expectEqual(otherPage.entries.length, 0, `${kind}: another merchant sees none of these rows`);
+
+  // the two catalogues never read each other's rows
+  const crossed = await listCatalogueEntries(
+    { actor: owner, kind: kind === "product" ? "service" : "product", query: parseCatalogueListQuery({}) },
+    depsOf(db),
+  );
+
+  expectEqual(crossed.entries.length, 0, `${kind}: the other catalogue holds none of these rows`);
+}
+
+async function checkSearch(kind: CatalogueKind): Promise<void> {
+  const db = createDb();
+  const dependencies = depsOf(db);
+  const codeColumn = CATALOGUE_CODE_COLUMN[kind];
+
+  await createCatalogueEntry(
+    {
+      actor: owner,
+      kind,
+      body:
+        kind === "product"
+          ? { name: "Brass desk lamp", sku: "LAMP-BR-01", description: "warm white bulb", unit_price: "42.50", currency: "USD", unit: "item" }
+          : { name: "Brass polish hour", code: "LAMP-BR-01", description: "warm white finish", unit_price: "42.50", currency: "USD", unit: "hour" },
+    },
+    dependencies,
+  );
+  await createCatalogueEntry(
+    {
+      actor: owner,
+      kind,
+      body:
+        kind === "product"
+          ? { name: "Steel bracket", sku: "BRK-02", description: null, unit_price: "9", currency: "USD", unit: "unit" }
+          : { name: "Steel fitting", code: "BRK-02", description: null, unit_price: "9", currency: "USD", unit: "unit" },
+    },
+    dependencies,
+  );
+
+  async function searchOf(term: string): Promise<readonly string[]> {
+    const page = await listCatalogueEntries(
+      { actor: owner, kind, query: parseCatalogueListQuery({ search: term }) },
+      depsOf(db),
+    );
+
+    return page.entries.map((entry) => entry.name);
+  }
+
+  // the name is searchable
+  expectDeepEqual(await searchOf("brass"), ["Brass desk lamp"].map((name) => (kind === "product" ? name : "Brass polish hour")), `${kind}: a name matches case insensitively`);
+
+  // so is the code, and so is the description
+  expectDeepEqual(await searchOf("BRK-02"), [kind === "product" ? "Steel bracket" : "Steel fitting"], `${kind}: the code matches`);
+  expectEqual((await searchOf("warm")).length, 1, `${kind}: a word in the description matches`);
+  expectEqual((await searchOf("nothing")).length, 0, `${kind}: a term nothing carries matches nothing`);
+
+  // the code colon aliases the column, so a search names the kind's own column
+  const searched = at(db.queries, db.queries.length - 1, `${kind} last search query`);
+
+  expect(searched.includes(`or=(name.ilike.`), `${kind}: the filter is an or of ilike clauses`);
+  expect(searched.includes(`${codeColumn}.ilike.`), `${kind}: including the kind's own code column`);
+  expect(searched.includes("description.ilike."), `${kind}: and the description`);
+  expect(!searched.includes("sku.ilike.") || kind === "product", `${kind}: no clause on the other catalogue's column`);
+
+  /**
+   * A term outside the alphabet is reported and dropped - the page widens to the whole catalogue - and
+   * the PostgREST structure characters never reach the filter.
+   */
+  for (const hostile of ["a,b", "a)b", "a*b", "a.b", "a:b", "a%25b", 'a"b', "a\\b"]) {
+    const query = parseCatalogueListQuery({ search: hostile });
+    const page = await listCatalogueEntries({ actor: owner, kind, query }, depsOf(db));
+    const lastSearch = at(db.queries, db.queries.length - 1, `${kind} refused-term query`);
+
+    expect(
+      query.problems.some((problem) => problem.field === "search" && problem.rule === "invalid_format") ||
+        hostile === "a.b",
+      `${kind}: the term ${JSON.stringify(hostile)} is reported`,
+    );
+    expectEqual(page.entries.length, hostile === "a.b" ? 0 : 2, `${kind}: and dropped, so the list is not narrowed by it`);
+    expect(!lastSearch.includes("or=(") || hostile === "a.b", `${kind}: no filter was built from ${JSON.stringify(hostile)}`);
+  }
+
+  // a dot is a legitimate character in a name, so it searches rather than being refused
+  expectEqual(parseCatalogueListQuery({ search: "a.b" }).problems.length, 0, `${kind}: a dot is allowed in a search`);
+
+  // an over-long term is refused as too_long rather than truncated
+  const long = parseCatalogueListQuery({ search: "x".repeat(CATALOGUE_SEARCH_MAXIMUM_LENGTH + 1) });
+
+  expectDeepEqual(long.problems, [{ field: "search", rule: "too_long" }], `${kind}: an over-long search is too_long`);
+
+  // control characters are stripped before the rule runs
+  expectEqual(parseCatalogueListQuery({ search: "brass\u0007" }).filters.search, "brass", `${kind}: a control character is removed`);
+
+  // an offset that is not a number is reported and the list starts at the newest row
+  expectDeepEqual(parseCatalogueListQuery({ offset: "abc" }).problems, [{ field: "offset", rule: "invalid_format" }], `${kind}: a malformed offset is reported`);
+  expectEqual(parseCatalogueListQuery({ offset: "abc" }).offset, 0, `${kind}: and the list starts at the newest row`);
+
+  // an offset off the page grid lands on the page that holds it
+  expectEqual(parseCatalogueListQuery({ offset: "30" }).offset, 25, `${kind}: 30 lands on the page holding it`);
+  expectEqual(parseCatalogueListQuery({ offset: "99999" }).offset, CATALOGUE_LIST_MAXIMUM_OFFSET, `${kind}: and the cap holds`);
+}
+
+/* ---- STEP 109: the removal ---- */
+
+async function checkDelete(kind: CatalogueKind): Promise<void> {
+  const db = createDb();
+  const audit = createInMemoryAuditTrail();
+  const dependencies = depsOf(db, audit);
+  const body = kind === "product" ? PRODUCT_BODY : SERVICE_BODY;
+  const created = await createCatalogueEntry({ actor: owner, kind, body }, dependencies);
+
+  const removed = await deleteCatalogueEntry(
+    { actor: owner, kind, entryId: created.id },
+    dependencies,
+  );
+
+  expectEqual(removed.id, created.id, `${kind}: the removal answers the row it removed`);
+
+  // the row is marked, not erased - an invoice line will point at it
+  const stored = at(db.rows[kind], 0, `${kind} stored row`);
+
+  expect(stored["deleted_at"] !== null, `${kind}: the row stays and is marked`);
+  expectEqual(db.rows[kind].length, 1, `${kind}: nothing was erased`);
+
+  const lastUpdate = at(db.updates, db.updates.length - 1, `${kind} removal update`);
+
+  expectDeepEqual(Object.keys(lastUpdate.values), ["deleted_at"], `${kind}: only the marker was written`);
+  expect(
+    lastUpdate.query.includes(`company_id=eq.${COMPANY_A}`) && lastUpdate.query.includes("deleted_at=is.null"),
+    `${kind}: scoped to one live row of the actor's company`,
+  );
+
+  // it is gone from the read of one row and from the list
+  const gone = await rejectionOf(() =>
+    getCatalogueEntry({ actor: owner, kind, entryId: created.id }, dependencies),
+  );
+
+  expect(isAppError(gone) && gone.code === "RESOURCE_NOT_FOUND", `${kind}: a removed row is a 404`);
+
+  const page = await listCatalogueEntries(
+    { actor: owner, kind, query: parseCatalogueListQuery({}) },
+    depsOf(db),
+  );
+
+  expectEqual(page.entries.length, 0, `${kind}: and is not on the list`);
+
+  // the audit entry names the row and never copies the description
+  const entry = at(
+    audit.entries.filter((candidate) => candidate.action === CATALOGUE_DELETED_AUDIT_ACTION[kind]),
+    0,
+    `${kind} delete audit`,
+  );
+
+  expectEqual(entry.action, `${kind}.deleted`, `${kind}: audited as the removal action`);
+  expectEqual(entry.entityId, created.id, `${kind}: naming the row`);
+  expectEqual(entry.companyId, COMPANY_A, `${kind}: and the company`);
+  expectEqual(entry.actorUserId, OWNER_ID, `${kind}: and the actor`);
+  expect(
+    !JSON.stringify(entry.payload).includes("Adjustable arm") &&
+      !JSON.stringify(entry.payload).includes("Advisory work"),
+    `${kind}: the description never reaches the audit trail`,
+  );
+
+  // removing it again is a 404, not a second marker
+  const again = await rejectionOf(() =>
+    deleteCatalogueEntry({ actor: owner, kind, entryId: created.id }, dependencies),
+  );
+
+  expect(isAppError(again) && again.code === "RESOURCE_NOT_FOUND", `${kind}: a second removal is a 404`);
+
+  // another merchant cannot remove it
+  const second = await createCatalogueEntry(
+    { actor: owner, kind, body: { ...body, [CATALOGUE_CODE_COLUMN[kind]]: "OTHER-1", name: "Other" } },
+    dependencies,
+  );
+  const foreign = await rejectionOf(() =>
+    deleteCatalogueEntry({ actor: otherOwner, kind, entryId: second.id }, dependencies),
+  );
+
+  expect(isAppError(foreign) && foreign.code === "RESOURCE_NOT_FOUND", `${kind}: a foreign removal is a 404`);
+  expect(at(db.rows[kind], 1, `${kind} second row`)["deleted_at"] === null, `${kind}: and the row is untouched`);
+
+  // a non-owner may not remove
+  const roleDenied = await rejectionOf(() =>
+    deleteCatalogueEntry(
+      { actor: actorOf(["finance_ops"], COMPANY_A, { userId: OFFICE_ID }), kind, entryId: second.id },
+      dependencies,
+    ),
+  );
+
+  expect(isAppError(roleDenied) && roleDenied.code === "PERMISSION_DENIED", `${kind}: a non-owner role may not remove`);
+
+  // the code a removed row held is free again, which is what a mistyped code needs
+  const reused = await createCatalogueEntry({ actor: owner, kind, body }, depsOf(db));
+
+  expectEqual(reused.values.code, created.values.code, `${kind}: a removed row releases its code`);
+
+  // a row that is still live after the write is a lost race, not a success
+  const racing = createDb();
+  const stuck = await seed(racing, kind, owner, 1, "race");
+  const frozen = createCatalogueRest(racing);
+  const stuckDeps = {
+    rest: {
+      ...frozen,
+      // an update that reports success and changes nothing is what a lost race looks like
+      update: (): Promise<void> => Promise.resolve(),
+    } as RestClient,
+    audit: createInMemoryAuditTrail(),
+    now: () => NOW,
+  };
+  const conflicted = await rejectionOf(() =>
+    deleteCatalogueEntry({ actor: owner, kind, entryId: at(stuck, 0, `${kind} racing row`).id }, stuckDeps),
+  );
+
+  expect(isAppError(conflicted) && conflicted.code === "CONFLICT", `${kind}: a removal that matched nothing is a CONFLICT`);
+  expectDeepEqual(
+    detailsOf(conflicted),
+    [{ field: kind, rule: "already_changed" }],
+    `${kind}: named as an entry that changed under the writer`,
+  );
+}
+
 /* ---- sources ---- */
 
 async function checkSources(): Promise<void> {
@@ -754,7 +1209,24 @@ async function checkSources(): Promise<void> {
     expect(!source.includes("request.text()"), `${routePath} hold no handler of its own`);
   }
 
-  for (const routePath of ["app/api/products/route.ts", "app/api/products/[id]/route.ts", "app/api/services/route.ts", "app/api/services/[id]/route.ts"]) {
+  // The `[id]` route answers exactly `GET`, `POST` and the STEP 109 `DELETE`; the create route answers
+  // `POST` alone. Nothing else, so no method exists here that no screen asks for.
+  for (const routePath of ["app/api/products/[id]/route.ts", "app/api/services/[id]/route.ts"]) {
+    const source = await readRepositoryFile(routePath);
+
+    expectEqual(
+      [...source.matchAll(/^export const (GET|POST|PUT|PATCH|DELETE)\b/gmu)].map((match) => match[1]).join(","),
+      "GET,POST,DELETE",
+      `${routePath} answers reads, edits and removals`,
+    );
+    expect(
+      source.includes("deleteCatalogueEntry(") === (routePath.startsWith("app/api/products/") ? true : false) ||
+        source.includes("DELETE = handlers.DELETE"),
+      `${routePath} removes through the catalogue service`,
+    );
+  }
+
+  for (const routePath of ["app/api/products/route.ts", "app/api/services/route.ts"]) {
     const source = await readRepositoryFile(routePath);
     expect(!/export const (PUT|PATCH|DELETE)/u.test(source), `${routePath} answers no other mutation`);
   }
@@ -859,6 +1331,146 @@ async function checkSources(): Promise<void> {
   // STEP 108 writes no migration: it reads the two tables `0020` and `0021` created
   const migrations = await readRepositoryFile("migrations/0020_products.sql");
   expect(migrations.includes("unit_price_minor"), "the products table is read as STEP 020 wrote it");
+
+  // ---- STEP 109: the list, the search and the removal
+
+  for (const path of [
+    "services/products/catalogue-list.ts",
+    "app/api/products/list/route.ts",
+    "app/api/services/list/route.ts",
+    "app/(dashboard)/products/catalogue-list-table.tsx",
+    "app/(dashboard)/products/catalogue-search-form.tsx",
+    "app/(dashboard)/products/delete-catalogue-form.tsx",
+  ]) {
+    const source = await readRepositoryFile(path);
+    expect(source.length > 0, `${path} exists`);
+    expect(source.split("\n", 1)[0]?.trim() === `// path: ${path}`, `${path} starts with its path comment`);
+    expect(!/[^\u0009\u000a\u000d\u0020-\u007e]/u.test(source), `${path} is ASCII only`);
+  }
+
+  const listModule = await readRepositoryFile("services/products/catalogue-list.ts");
+
+  expect(listModule.includes("requireAnyRole"), "the list applies the catalogue's role rule");
+  expect(listModule.includes("requireCompanyId"), "and takes the company from the session");
+  expect(listModule.includes("company_id=eq."), "the query is company scoped");
+  expect(listModule.includes("deleted_at=is.null"), "and reads live rows only");
+  expect(listModule.includes("priceFromMinor"), "the price is formatted by the one function allowed to");
+  expectEqual(/parseFloat|toFixed/u.test(listModule), false, "never by a float");
+  expectEqual(/\bselect\*|select=\*/u.test(listModule), false, "the page names its columns instead of asking for all");
+  expect(listModule.includes(`"order=" + CATALOGUE_LIST_ORDER`) || listModule.includes("CATALOGUE_LIST_ORDER}"), "the order is the exported constant");
+  expectEqual(CATALOGUE_LIST_ORDER, "created_at.desc,id.desc", "which is the order the page index stores");
+  expectEqual(CATALOGUE_LIST_MAXIMUM_OFFSET, 2_000, "the offset cap is two thousand");
+  expectEqual(CATALOGUE_LIST_PAGE_SIZE, 25, "a page is twenty five rows");
+  expectEqual(CATALOGUE_LIST_PAGE_SIZE + 1, 26, "and asks for one more, which is how it knows there is a next page");
+
+  // the two row schemas are one, because the select aliases the code column
+  for (const kind of CATALOGUE_KINDS) {
+    expect(
+      catalogueListColumnsOf(kind).includes(`code:${CATALOGUE_CODE_COLUMN[kind]}`),
+      `${kind}: the code column is aliased to code in the select`,
+    );
+  }
+
+  expectEqual(
+    catalogueListColumnsOf("product").length,
+    catalogueListColumnsOf("service").length,
+    "both catalogues read the same number of columns",
+  );
+
+  // the query a page runs is the exported one, and it is the same shape for both catalogues
+  const sampleQuery = catalogueListQueryOf("product", COMPANY_A, parseCatalogueListQuery({ search: "lamp" }), 26);
+
+  expect(sampleQuery.includes("company_id=eq."), "a page query is company scoped");
+  expect(sampleQuery.includes("order=created_at.desc,id.desc"), "and ordered by the index");
+  expect(sampleQuery.includes("limit=26") && sampleQuery.includes("offset=0"), "and windowed");
+  expect(sampleQuery.includes("or=(name.ilike."), "and filtered when there is a search");
+
+  // the row schema reads a bigint price through the one price schema
+  expect(
+    catalogueListRowSchema.parse({
+      id: COMPANY_A,
+      name: "Desk lamp",
+      code: "LAMP-01",
+      description: null,
+      unit_price_minor: "425000",
+      currency: "USD",
+      unit: "item",
+      created_at: new Date(NOW).toISOString(),
+      updated_at: new Date(NOW).toISOString(),
+    }).unit_price_minor === 425_000n,
+    "the list row reads a bigint price as minor units",
+  );
+
+  // the removal marks rather than erases, which is what an invoice line needs
+  const catalogueModule = await readRepositoryFile("services/products/catalogue.ts");
+
+  expect(catalogueModule.includes("deleted_at: instant"), "the removal writes the marker, not a delete");
+  expectEqual(/DELETE FROM|\bdelete\(/u.test(catalogueModule), false, "and never issues a row delete");
+  expect(catalogueModule.includes("CATALOGUE_DELETED_AUDIT_ACTION"), "it writes an audit entry");
+
+  // the two GET-only list routes are not on the protected list: a read has no token to check
+  const csrf = await readRepositoryFile("lib/security/csrf.ts");
+
+  expect(!csrf.includes('"/api/products/list"'), "the list read is not a protected path");
+  expect(!csrf.includes('"/api/services/list"'), "for either catalogue");
+  expect(csrf.includes('"/api/products/[id]"'), "while the route that answers DELETE is");
+
+  // the screens: the list is the hub, and the removal sits on the edit screen only
+  const screensSource = await readRepositoryFile("app/(dashboard)/products/catalogue-screens.tsx");
+
+  expect(screensSource.includes("listCatalogueEntries"), "the hub reads the list through the service");
+  expect(screensSource.includes("CatalogueListTable"), "and prints it as a table");
+  expect(screensSource.includes("CatalogueSearchForm"), "with the search form");
+  expect(screensSource.includes("DeleteCatalogueForm"), "the edit screen offers the removal");
+  // The removal must sit in the edit screen's `ready` branch: the branch that renders an entry is the
+  // only place a row is known, so a refusal prints no button to press.
+  const editBranch = screensSource.slice(
+    screensSource.indexOf('{state.kind === "ready" ? ('),
+    screensSource.indexOf("{state.kind === \"ready\" ? (") + 900,
+  );
+
+  expect(editBranch.includes("<DeleteCatalogueForm"), "the removal is inside the branch that read a row");
+  expect(
+    screensSource.slice(0, screensSource.indexOf('{state.kind === "ready" ? (')).includes("<DeleteCatalogueForm") === false,
+    "and is not offered outside it",
+  );
+
+  // the list gets the wider column, because six printed columns do not read in the form's width
+  expect(screensSource.includes('"table"'), "the list asks for the table width");
+  expect(screensSource.includes("max-w-5xl"), "which is wider than the forms");
+  expect(
+    (await readRepositoryFile("app/(dashboard)/products/catalogue-list-table.tsx")).includes("overflow-x-auto"),
+    "and the table scrolls sideways rather than wrapping a row onto four lines",
+  );
+
+  const deleteForm = await readRepositoryFile("app/(dashboard)/products/delete-catalogue-form.tsx");
+
+  expect(deleteForm.includes('method: "DELETE"'), "the removal sends DELETE");
+  expect(deleteForm.includes("csrfHeaders("), "carrying the CSRF token");
+  expect(!/window[.]confirm\s*\(/u.test(deleteForm), "with a confirmation in the page, not a browser dialog");
+  expect(deleteForm.includes("setConfirming(true)"), "a first press asks");
+  expect(deleteForm.includes("deleteFailed"), "and a refusal stays on the page");
+
+  // the search form is a GET form, because a search changes nothing
+  const searchForm = await readRepositoryFile("app/(dashboard)/products/catalogue-search-form.tsx");
+
+  expect(searchForm.includes('method="get"') || searchForm.includes('method="GET"'), "the search form is a GET");
+  expect(!searchForm.includes("csrfHeaders("), "so it carries no token");
+  expect(!searchForm.includes('name="offset"'), "and starts a new question at the newest entry");
+
+  // STEP 109 writes no migration either: the page indexes already exist
+  for (const [path, index] of [
+    ["migrations/0020_products.sql", "products_page_idx"],
+    ["migrations/0021_services.sql", "services_page_idx"],
+  ] as const) {
+    const source = await readRepositoryFile(path);
+
+    expect(source.includes(index), `${index} exists, which is why this STEP writes no migration`);
+    expect(
+      source.includes("(company_id, created_at desc, id desc)"),
+      `${index} stores exactly the order the list reads`,
+    );
+  }
 }
 
 async function main(): Promise<void> {
@@ -872,6 +1484,12 @@ async function main(): Promise<void> {
   await checkTenancy("service");
   await checkUpdate("product");
   await checkUpdate("service");
+  await checkList("product");
+  await checkList("service");
+  await checkSearch("product");
+  await checkSearch("service");
+  await checkDelete("product");
+  await checkDelete("service");
   await checkSources();
 
   if (failures.length > 0) {

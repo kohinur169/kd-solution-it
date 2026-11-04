@@ -75,6 +75,12 @@ export const CATALOGUE_UPDATED_AUDIT_ACTION: Readonly<Record<CatalogueKind, stri
   service: "service.updated",
 });
 
+/** The audit action of a removal, per kind. */
+export const CATALOGUE_DELETED_AUDIT_ACTION: Readonly<Record<CatalogueKind, string>> = Object.freeze({
+  product: "product.deleted",
+  service: "service.deleted",
+});
+
 /** The audit entity of a row, per kind. */
 export const CATALOGUE_AUDIT_ENTITY: Readonly<Record<CatalogueKind, string>> = Object.freeze({
   product: "product",
@@ -623,4 +629,70 @@ export async function updateCatalogueEntry(
   });
 
   return updated;
+}
+
+/**
+ * Remove one live row of the kind, keeping it.
+ *
+ * ## Why the row stays
+ *
+ * `0020` and `0021` both carry `deleted_at`, and an invoice line from STEP 112 will point at the entry
+ * it quoted. Erasing the row would either break that line or take a copy of the whole entry with it;
+ * marking it removes the entry from the catalogue and leaves history able to say what was sold. The
+ * partial unique indexes count live rows only, so the merchant can enter the same code again
+ * afterwards - which is the behaviour a mistyped code needs.
+ *
+ * ## Why it reads, writes and then reads again
+ *
+ * The re-read is the point. `rest.update` reports success whether or not its filter matched, so a row
+ * removed by another tab between the read and the write would answer "removed" while the row was
+ * already gone - and a row that is *still* live after the write means the update matched nothing and
+ * the removal did not happen. Both are `CONFLICT ... already_changed` rather than a false success.
+ *
+ * ## What the audit entry carries
+ *
+ * The row's name and code, which identify it to a reader of the trail, and the instant it left the
+ * live set. Never the description: it is free text a merchant may have pasted anything into.
+ */
+export async function deleteCatalogueEntry(
+  input: { readonly actor: RequestActor; readonly kind: CatalogueKind; readonly entryId: string },
+  dependencies: CatalogueDependencies,
+): Promise<CatalogueSnapshot> {
+  const companyId = requireCatalogueActor(input.actor);
+  const current = await getCatalogueEntry(
+    { actor: input.actor, kind: input.kind, entryId: input.entryId },
+    dependencies,
+  );
+  const table = CATALOGUE_TABLES[input.kind];
+  const instant = new Date(dependencies.now?.() ?? Date.now()).toISOString();
+
+  await dependencies.rest.update(
+    table,
+    `id=eq.${current.id}&company_id=eq.${companyId}&deleted_at=is.null`,
+    { deleted_at: instant },
+  );
+
+  // The row must now be outside the live set. A row that is still readable means the update matched
+  // nothing, which is a race with another writer and not a successful removal.
+  const stillLive = await dependencies.rest.select(
+    table,
+    `${ROW_COLUMNS}&id=eq.${current.id}&company_id=eq.${companyId}&deleted_at=is.null`,
+    catalogueRowSchema,
+  );
+
+  if (stillLive.length > 0) {
+    throw new AppError("CONFLICT", { details: [{ field: input.kind, rule: "already_changed" }] });
+  }
+
+  await appendTolerated(dependencies.audit, {
+    action: CATALOGUE_DELETED_AUDIT_ACTION[input.kind],
+    actorUserId: input.actor.userId,
+    entityType: CATALOGUE_AUDIT_ENTITY[input.kind],
+    entityId: current.id,
+    companyId,
+    sessionId: input.actor.sessionId ?? null,
+    payload: { name: current.values.name, code: current.values.code, deleted_at: instant },
+  });
+
+  return current;
 }

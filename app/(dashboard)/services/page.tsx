@@ -8,7 +8,11 @@ export const metadata: Metadata = catalogueMetadata("service", "hub");
 /** Read per request, so the entry a merchant saved in another tab shows on the next load. */
 export const dynamic = "force-dynamic";
 
-/** Section 15's service catalogue: the second catalogue, rendered by the same screens. */
-export default function ServicesPage(): ReactNode {
-  return <CatalogueHub kind="service" />;
+/** Section 15's service catalogue: the paginated list with search, over the same screens. */
+export default async function ServicesPage({
+  searchParams,
+}: {
+  readonly searchParams: Promise<Record<string, string | readonly string[] | undefined>>;
+}): Promise<ReactNode> {
+  return <CatalogueHub kind="service" searchParams={await searchParams} />;
 }

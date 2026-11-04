@@ -12610,13 +12610,12 @@ async function checkCsrfProtection(): Promise<void> {
   );
 
   /**
-   * The source a protected route is judged by: its own file, plus any file it builds its handler from.
+   * The source a protected route is judged by: its own file, plus any file it builds its handlers from.
    *
    * A route that re-exports the handler of another route - the way `/api/services` re-exports
    * `/api/products`' handler for the second catalogue - holds no `requireCsrfToken` of its own, and
    * judging it alone would fail a route whose token check is one file away. So an import of another
-   * `route` module is followed once: exactly one file in the chain must check the token, which is the
-   * property this section is about.
+   * `route` module is followed once and the two sources are read together.
    */
   const routeChain = (path: string): string => {
     const own = appSourceOf(appSources, `${path}/route.ts`);
@@ -12637,6 +12636,41 @@ async function checkCsrfProtection(): Promise<void> {
     return own;
   };
 
+  /**
+   * The source of one exported handler, from its `export const NAME` to the next one.
+   *
+   * A route file holds several handlers and each answers its own method: the mutating ones must check
+   * the token before they look the session up, and the reading ones have no token to check. Counting
+   * across the whole file cannot tell those apart, so a route that serves a `GET` beside its `POST`
+   * would fail an assertion its `POST` satisfies - which is what `/api/clients/[id]` did on `main`
+   * before this change. Splitting on the exports is the smallest thing that measures the rule the
+   * assertion is named for.
+   */
+  const handlersOf = (source: string): readonly string[] => {
+    const starts = [...source.matchAll(/^export const (GET|POST|PUT|PATCH|DELETE)\b/gmu)];
+
+    return starts.map((match, index) => {
+      const from = match.index ?? 0;
+      const to = starts[index + 1]?.index ?? source.length;
+
+      return source.slice(from, to);
+    });
+  };
+
+  const isMutating = (handler: string): boolean => /^export const (POST|PUT|PATCH|DELETE)\b/u.test(handler);
+
+  /**
+   * A handler that points at another one instead of implementing it: `= handlers.POST`,
+   * `= createCatalogueRoute(kind)`.
+   *
+   * The two catalogues of section 15 are one implementation mounted at four addresses, so the second
+   * route's handler is the first route's handler under another name. Its token check is therefore one
+   * file away - inside the factory, or inside the route it re-exports - and that is the case the
+   * assertions below follow rather than fail.
+   */
+  const delegatesOf = (handler: string): boolean =>
+    /^export const (GET|POST|PUT|PATCH|DELETE) = [A-Za-z_$][\w$.]*(\([^;]*\))?;\s*$/u.test(handler.trim());
+
   for (const path of CSRF_PROTECTED_PATHS) {
     const routePath = `${path.replace("/api/", "")}/route.ts`;
     const source = routePath.startsWith("office/")
@@ -12646,17 +12680,35 @@ async function checkCsrfProtection(): Promise<void> {
         : appSourceOf(appSources, `/api/${routePath}`);
 
     expect(source.length > 0, `${path} exists on disk`);
-    expectEqual(routeChain(path).split("requireCsrfToken(").length - 1, 1, `${path} checks the token exactly once`);
-    expect(
-      source.indexOf("requireCsrfToken(") < source.indexOf("readRequestActor(") ||
-        !source.includes("readRequestActor("),
-      `${path} checks the token before it looks the session up`,
-    );
-    expect(
-      source.indexOf("requireCsrfToken(") < source.indexOf("request.text()") ||
-        !source.includes("request.text()"),
-      `${path} checks the token before it reads the body`,
-    );
+
+    const chain = routeChain(path);
+    const own = handlersOf(source);
+    const mutating = own.filter(isMutating);
+
+    expect(mutating.length > 0, `${path} answers a mutation`);
+    expect(chain.includes("requireCsrfToken("), `${path} checks the token`);
+
+    for (const handler of mutating) {
+      if (delegatesOf(handler)) {
+        // The check is inside the factory or the route this handler names, which the chain covers.
+        continue;
+      }
+
+      expect(handler.includes("requireCsrfToken("), `${path} has a mutating handler that checks the token`);
+
+      const token = handler.indexOf("requireCsrfToken(");
+      const session = handler.indexOf("readRequestActor(");
+      const body = handler.indexOf("request.text()");
+
+      expect(session === -1 || token < session, `${path} checks the token before it looks the session up`);
+      expect(body === -1 || token < body, `${path} checks the token before it reads the body`);
+    }
+
+    // A reading handler has no token to check and no body to read: a `GET` that parsed one would be a
+    // read that could be turned into a write by the body it accepted.
+    for (const handler of own.filter((candidate) => !isMutating(candidate))) {
+      expect(!handler.includes("request.text()"), `${path} reads no body on a handler that changes nothing`);
+    }
 
     if (path.startsWith("/api/auth/")) {
       expect(

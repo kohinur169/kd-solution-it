@@ -7,6 +7,7 @@ import { withErrorResponse } from "@/lib/errors/respond";
 import { logger } from "@/lib/logger/logger";
 import { requireCsrfToken } from "@/lib/security/csrf";
 import {
+  deleteCatalogueEntry,
   getCatalogueEntry,
   updateCatalogueEntry,
   type CatalogueSnapshot,
@@ -21,7 +22,7 @@ const maximumBodyBytes = 16_384;
 const KIND: CatalogueKind = "product";
 
 interface CatalogueBody {
-  readonly status: "ok" | "updated";
+  readonly status: "ok" | "updated" | "deleted";
   readonly entry: CatalogueSnapshot;
 }
 
@@ -30,7 +31,7 @@ function entryIdOf(params: Promise<{ readonly id: string }>): Promise<string> {
 }
 
 /**
- * One row of a catalogue over HTTP: `GET` reads it for the edit form, `POST` edits it.
+ * One row of a catalogue over HTTP: `GET` reads it, `POST` edits it, `DELETE` removes it.
  *
  * ## Why the id comes from the path, not the body
  *
@@ -127,10 +128,52 @@ export function createCatalogueEntryRoute(kind: CatalogueKind) {
     },
   );
 
-  return { GET, POST };
+  /**
+   * Remove one entry, keeping the row.
+   *
+   * A removal is a mutation, so it carries the CSRF token like every other write of this block and the
+   * check comes first. There is no body: the path names the row. The service marks it (`0020`/`0021`
+   * carry `deleted_at` because an invoice line will point at this entry), so the answer says the entry
+   * left the catalogue rather than that it was erased.
+   */
+  const DELETE = withErrorResponse(
+    async (
+      request: Request,
+      context: { readonly params: Promise<{ readonly id: string }> },
+    ): Promise<NextResponse<CatalogueBody>> => {
+      requireCsrfToken(request, { secure: getAuthRuntime().cookiePolicy.secure });
+
+      const runtime = getAuthRuntime();
+      const actor = await readRequestActor(request.headers.get("cookie"), {
+        directory: runtime.directory,
+        cookiePolicy: runtime.cookiePolicy,
+        sessions: runtime.sessions,
+        audit: runtime.audit,
+      });
+
+      const entry = await deleteCatalogueEntry(
+        { actor, kind, entryId: await entryIdOf(context.params) },
+        { rest: runtime.rest, audit: runtime.audit },
+      );
+
+      logger.info(`${kind} deleted`, {
+        userId: actor.userId,
+        companyId: entry.companyId,
+        entryId: entry.id,
+      });
+
+      return NextResponse.json(
+        { status: "deleted", entry },
+        { status: 200, headers: { "cache-control": "no-store" } },
+      );
+    },
+  );
+
+  return { GET, POST, DELETE };
 }
 
 const handlers = createCatalogueEntryRoute(KIND);
 
 export const GET = handlers.GET;
 export const POST = handlers.POST;
+export const DELETE = handlers.DELETE;
