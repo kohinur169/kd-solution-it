@@ -261,7 +261,7 @@ const INVOICE_ITEM_COLUMNS =
  * checked, and the merchant would fix one box per save on a list of twenty rows. Strict, so a key an
  * invoice does not have is reported rather than silently dropped.
  */
-const lineSchema = z
+export const invoiceLineInputSchema = z
   .object({
     description: z.string(),
     unit: z.string(),
@@ -288,7 +288,7 @@ export const invoiceCreateSchema = z
     memo: z.string().nullish(),
     discount: z.string().nullish(),
     tax: z.string().nullish(),
-    lines: z.array(lineSchema),
+    lines: z.array(invoiceLineInputSchema),
   })
   .strict();
 
@@ -303,7 +303,14 @@ interface InvoiceInput {
   readonly lines: readonly ParsedLine[];
 }
 
-interface ParsedLine {
+/**
+ * One line's values, parsed and converted.
+ *
+ * Exported, with `parseInvoiceLine` below, for the line editor: an edited line must be judged by exactly
+ * these seven rules, and a second parser in `invoice-lines.ts` would be the drift this codebase keeps
+ * designing away from. The type is the seam - it carries thousandths and minor units, never text.
+ */
+export interface ParsedLine {
   readonly description: string;
   readonly unit: InvoiceUnit;
   readonly quantityThousandths: bigint;
@@ -346,7 +353,7 @@ function detailPath(index: number | null, field: string): string {
  * one box per save on a list of twenty rows. Each is evaluated, the first rule per field wins.
  */
 function parseLine(
-  raw: z.infer<typeof lineSchema>,
+  raw: z.infer<typeof invoiceLineInputSchema>,
   index: number,
 ): { readonly line: ParsedLine | null; readonly problems: readonly ErrorDetail[] } {
   const problems: ErrorDetail[] = [];
@@ -435,6 +442,46 @@ function parseLine(
     },
     problems: [],
   };
+}
+
+/**
+ * Parse one line from an editor's body, naming every broken field of it.
+ *
+ * The field names are bare - `unit_price`, not `lines[0].unit_price` - because an editor writes one line
+ * and the screen has only one set of boxes to mark. The rules are `parseLine`'s, unchanged: the same
+ * helper the create path runs over every line of a new invoice.
+ */
+export function parseInvoiceLine(body: unknown): ParsedLine {
+  const attempt = invoiceLineInputSchema.safeParse(body);
+
+  if (!attempt.success) {
+    const problems: ErrorDetail[] = [];
+
+    for (const issue of attempt.error.issues) {
+      const field = String(issue.path[0] ?? "line");
+
+      if (!problems.some((problem) => problem.field === field)) {
+        problems.push({ field, rule: "invalid_format" });
+      }
+    }
+
+    throw new AppError("VALIDATION_FAILED", { details: problems });
+  }
+
+  const parsed = parseLine(attempt.data, 0);
+
+  if (parsed.line === null) {
+    // The problems came back under `lines[0].field`; the editor wants the bare field, so the prefix is
+    // stripped here rather than making the caller know how the create path names its rows.
+    throw new AppError("VALIDATION_FAILED", {
+      details: parsed.problems.map((problem) => ({
+        field: problem.field.replace(/^lines\[0\][.]/u, ""),
+        rule: problem.rule,
+      })),
+    });
+  }
+
+  return parsed.line;
 }
 
 /** The currency a body names, or the only one the platform bills in when it names none. */

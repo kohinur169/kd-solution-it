@@ -22,6 +22,17 @@ import {
   type InvoiceDependencies,
 } from "./invoices.ts";
 import {
+  INVOICE_LINE_ADDED_AUDIT_ACTION,
+  INVOICE_LINE_REMOVED_AUDIT_ACTION,
+  INVOICE_LINE_UPDATED_AUDIT_ACTION,
+  addInvoiceLine,
+  invoiceLineRowSchema,
+  removeInvoiceLine,
+  updateInvoiceLine,
+  type InvoiceLineDependencies,
+} from "./invoice-lines.ts";
+import { parseInvoiceLine, type ParsedLine } from "./invoices.ts";
+import {
   INVOICE_CREATED_STATUS,
   INVOICE_DEFAULT_UNIT,
   INVOICE_ITEM_DESCRIPTION_LIMITS,
@@ -275,6 +286,30 @@ function wireOf(row: Readonly<Record<string, unknown>>): Record<string, unknown>
 }
 
 /**
+ * `invoice_items_sync_totals`, and `invoices_derive_total` after it.
+ *
+ * The trigger recomputes the parent's subtotal from the live lines on every row change and then the
+ * invoice's own trigger derives the total. The fixture performs both, because every line write in this
+ * service relies on them and none of them sends a total.
+ */
+function syncSubtotal(db: InvoiceDb, invoiceId: string): void {
+  const parent = db.invoices.find((row) => row["id"] === invoiceId);
+
+  if (parent === undefined) {
+    return;
+  }
+
+  const subtotal = db.items
+    .filter((row) => row["invoice_id"] === invoiceId && row["deleted_at"] === null)
+    .reduce((total, row) => total + BigInt(String(row["line_total_minor"])), 0n);
+
+  parent["subtotal_minor"] = subtotal.toString();
+  parent["total_minor"] = (
+    subtotal - BigInt(String(parent["discount_minor"])) + BigInt(String(parent["tax_minor"]))
+  ).toString();
+}
+
+/**
  * `(quantity * unit_price_minor)::bigint`, as PostgreSQL computes it.
  *
  * The fixture does not call the module's own function for this, because an assertion that asked the
@@ -459,8 +494,65 @@ function createInvoiceRest(db: InvoiceDb): RestClient {
     ): Promise<readonly TRow[]> {
       db.inserts.push({ table, rows });
 
+      if (table === "invoice_items") {
+        // The editor adds one line per request and reads it back for its generated total.
+        const row = rows[0];
+
+        if (rows.length !== 1 || row === undefined) {
+          return Promise.reject(new Error("a line is added one at a time"));
+        }
+
+        const parent = db.invoices.find((candidate) => candidate["id"] === row["invoice_id"]);
+
+        if (parent === undefined || parent["company_id"] !== row["company_id"]) {
+          return Promise.reject(new AppError("VALIDATION_FAILED"));
+        }
+
+        // The draft lock, as `invoice_items_sync_totals` states it.
+        if (parent["status"] !== "draft") {
+          return Promise.reject(new AppError("CONFLICT"));
+        }
+
+        const unitPriceMinor = BigInt(String(row["unit_price_minor"]));
+        const discountMinor = BigInt(String(row["discount_minor"] ?? "0"));
+        const lineTotal = databaseLineTotal(String(row["quantity"]), unitPriceMinor, discountMinor);
+        const position = Number(row["position"]);
+
+        // `invoice_items_position_key` and `invoice_items_position_check`.
+        if (position < 1 || db.items.some((existing) => existing["invoice_id"] === row["invoice_id"] && existing["deleted_at"] === null && existing["position"] === position)) {
+          return Promise.reject(new AppError("CONFLICT"));
+        }
+
+        for (const column of ["product_id", "service_id"] as const) {
+          const reference = row[column];
+
+          if (typeof reference === "string") {
+            const catalogue = column === "product_id" ? db.products : db.services;
+
+            if (!catalogue.some((entry) => entry["id"] === reference && entry["company_id"] === row["company_id"])) {
+              return Promise.reject(new AppError("VALIDATION_FAILED"));
+            }
+          }
+        }
+
+        const stored: Record<string, unknown> = {
+          id: randomUUID(),
+          deleted_at: null,
+          version: 1,
+          created_at: new Date(NOW + db.items.length).toISOString(),
+          updated_at: new Date(NOW + db.items.length).toISOString(),
+          line_total_minor: lineTotal.toString(),
+          ...wireOf(row),
+        };
+
+        db.items.push(stored);
+        syncSubtotal(db, String(row["invoice_id"]));
+
+        return Promise.resolve([schema.parse(stored)]);
+      }
+
       if (table !== "invoices") {
-        return Promise.reject(new Error(`return=representation is used for invoices only: ${table}`));
+        return Promise.reject(new Error(`return=representation is used for invoices and lines only: ${table}`));
       }
 
       for (const row of rows) {
@@ -522,6 +614,76 @@ function createInvoiceRest(db: InvoiceDb): RestClient {
     update(table: string, query: string, values: Readonly<Record<string, unknown>>): Promise<void> {
       db.updates.push({ table, query, values: { ...values } });
 
+      if (table === "invoice_items") {
+        const parts = queryParts(query);
+        const id = parts.get("id");
+        const company = parts.get("company_id");
+        const invoice = parts.get("invoice_id");
+        const liveOnly = parts.get("deleted_at") === "is.null";
+
+        if (id === undefined || company === undefined) {
+          return Promise.reject(new Error(`a line update is not scoped to one row of one company: ${query}`));
+        }
+
+        const row = db.items.find(
+          (candidate) =>
+            candidate["id"] === id.slice(3) &&
+            candidate["company_id"] === company.slice(3) &&
+            (invoice === undefined || candidate["invoice_id"] === invoice.slice(3)) &&
+            (!liveOnly || candidate["deleted_at"] === null),
+        );
+
+        if (row === undefined) {
+          return Promise.resolve();
+        }
+
+        const parent = db.invoices.find((candidate) => candidate["id"] === row["invoice_id"]);
+
+        // The draft lock, as the trigger states it: a line of an issued invoice cannot move.
+        if (parent !== undefined && parent["status"] !== "draft") {
+          return Promise.reject(new AppError("CONFLICT"));
+        }
+
+        // The unique index, over the live rows of one invoice.
+        const nextPosition = values["position"];
+
+        if (typeof nextPosition === "number") {
+          if (nextPosition < 1) {
+            return Promise.reject(new AppError("VALIDATION_FAILED"));
+          }
+
+          const clash = db.items.some(
+            (candidate) =>
+              candidate !== row &&
+              candidate["invoice_id"] === row["invoice_id"] &&
+              candidate["deleted_at"] === null &&
+              candidate["position"] === nextPosition,
+          );
+
+          if (clash) {
+            return Promise.reject(new AppError("CONFLICT"));
+          }
+        }
+
+        const merged: Record<string, unknown> = { ...row, ...wireOf(values) };
+
+        if (values["quantity"] !== undefined || values["unit_price_minor"] !== undefined || values["discount_minor"] !== undefined) {
+          merged["line_total_minor"] = databaseLineTotal(
+            String(merged["quantity"]),
+            BigInt(String(merged["unit_price_minor"])),
+            BigInt(String(merged["discount_minor"] ?? "0")),
+          ).toString();
+        }
+
+        Object.assign(row, merged, {
+          updated_at: new Date(NOW + 20_000).toISOString(),
+          version: Number(row["version"]) + 1,
+        });
+        syncSubtotal(db, String(row["invoice_id"]));
+
+        return Promise.resolve();
+      }
+
       if (table !== "invoices") {
         return Promise.reject(new Error(`the invoice service updates no other table: ${table}`));
       }
@@ -574,6 +736,31 @@ function createInvoiceRest(db: InvoiceDb): RestClient {
 
 function depsOf(db: InvoiceDb, audit: AuditTrail = createInMemoryAuditTrail()): InvoiceDependencies {
   return { rest: createInvoiceRest(db), audit, now: () => NOW };
+}
+
+/** The same fixture, for the line editor's narrower dependency type. */
+function lineDepsOf(db: InvoiceDb, audit: AuditTrail = createInMemoryAuditTrail()): InvoiceLineDependencies {
+  return { rest: createInvoiceRest(db), audit, now: () => NOW };
+}
+
+/** The live lines of an invoice, read straight from the fixture, for assertions about the stored order. */
+async function readLiveLinesForTest(db: InvoiceDb, invoiceId: string) {
+  return createInvoiceRest(db).select(
+    "invoice_items",
+    `select=id,company_id,invoice_id,position,description,unit,quantity,unit_price_minor,discount_minor,line_total_minor,product_id,service_id,created_at,updated_at,deleted_at,version&invoice_id=eq.${invoiceId}&company_id=eq.${at(db.invoices, 0, "the invoice")["company_id"] as string}&deleted_at=is.null&order=position.asc`,
+    invoiceLineRowSchema,
+  );
+}
+
+/** The error code a line write answered with, or null when it succeeded. */
+async function lineCodeOf(run: () => Promise<unknown>): Promise<string | null> {
+  try {
+    await run();
+
+    return null;
+  } catch (error) {
+    return isAppError(error) ? error.code : "not-an-app-error";
+  }
 }
 
 /** A body with one good line, which every case below starts from and perturbs. */
@@ -1366,6 +1553,435 @@ async function checkSelectors(): Promise<void> {
   expectEqual(at(filled.lines, 0, "the filled line").productId, null, "and claims no product");
 }
 
+/* ---- 9. the line editor: add, edit, remove (STEP 113) ---- */
+
+/** Build a draft with `count` lines, and hand back the database so the test can read it. */
+async function draftWith(count: number): Promise<{ readonly db: InvoiceDb; readonly invoiceId: string }> {
+  const db = createDb();
+  const invoice = await createInvoice(
+    {
+      actor: owner,
+      body: bodyOf({
+        lines: Array.from({ length: count }, (_, index) => ({
+          description: `Line ${String(index + 1)}`,
+          unit: "item",
+          quantity: "1",
+          unit_price: "10",
+        })),
+      }),
+    },
+    depsOf(db),
+  );
+
+  return { db, invoiceId: invoice.id };
+}
+
+/** One parsed line, through the create path's own parser. */
+function parsedLine(overrides: Readonly<Record<string, unknown>> = {}): ParsedLine {
+  return parseInvoiceLine({
+    description: "Consulting",
+    unit: "hour",
+    quantity: "2.5",
+    unit_price: "125.00",
+    discount: "",
+    ...overrides,
+  });
+}
+
+async function checkLineEditor(): Promise<void> {
+  // Adding a line appends at the end of a dense list, and the database totals it.
+  const { db, invoiceId } = await draftWith(2);
+  const line = await addInvoiceLine(
+    { actor: owner, invoiceId, line: parsedLine() },
+    lineDepsOf(db),
+  );
+
+  expectEqual(line.position, 3, "a new line takes the position after the last");
+  expectEqual(line.quantity, "2.5", "and prints the quantity it was given");
+  expectEqual(line.unitPrice, "125.0000", "and the price");
+  expectEqual(line.lineTotalMinor, "3125000", "with the total the database generated");
+
+  const parent = at(db.invoices, 0, "the invoice");
+
+  // Two lines at 10.00 each, then one at 2.5 hours and 125.00: 200000 + 3125000.
+  expectEqual(parent["subtotal_minor"], "3325000", "and the parent's subtotal now sums three lines");
+
+  // The service sent no total: the sum is the trigger's.
+  const sentLine = at(at(db.inserts, db.inserts.length - 1, "the line insert").rows, 0, "the line row");
+
+  for (const column of ["line_total_minor", "deleted_at", "version", "id"]) {
+    expect(!Object.hasOwn(sentLine, column), `an added line sends no ${column}`);
+  }
+
+  expectEqual(sentLine["quantity"], "2.5", "the quantity crosses the wire as the decimal the column stores");
+
+  // The count ceiling is enforced before the write.
+  const full = await draftWith(INVOICE_MAXIMUM_LINES);
+  const tooMany = await refusalOf(() =>
+    addInvoiceLine({ actor: owner, invoiceId: full.invoiceId, line: parsedLine() }, lineDepsOf(full.db)),
+  );
+
+  expectEqual(at(tooMany, 0, "the ceiling refusal").field, "lines", "a full invoice refuses another line");
+  expectEqual(at(tooMany, 0, "the ceiling refusal").rule, "too_many", "as too_many");
+  expectEqual(full.db.items.length, INVOICE_MAXIMUM_LINES, "and writes nothing");
+
+  // An edit replaces the whole line and revalidates with the create path's rules.
+  const editing = await draftWith(2);
+  const second = at(
+    await readLiveLinesForTest(editing.db, editing.invoiceId),
+    1,
+    "the second line",
+  );
+  const edited = await updateInvoiceLine(
+    {
+      actor: owner,
+      invoiceId: editing.invoiceId,
+      lineId: second.id,
+      line: parsedLine({ description: "Revised", quantity: "3", unit_price: "20.00" }),
+    },
+    lineDepsOf(editing.db),
+  );
+
+  expectEqual(edited.description, "Revised", "an edit replaces the description");
+  expectEqual(edited.position, second.position, "and leaves the position alone");
+  expectEqual(edited.lineTotalMinor, "600000", "with a total the database recomputed");
+  expectEqual(
+    at(editing.db.invoices, 0, "the invoice")["subtotal_minor"],
+    "700000",
+    "and the subtotal follows: 10 + 60",
+  );
+
+  // "Full discount support": a line may be discounted to zero, and past its gross it is refused.
+  const free = await updateInvoiceLine(
+    {
+      actor: owner,
+      invoiceId: editing.invoiceId,
+      lineId: second.id,
+      line: parsedLine({ quantity: "1", unit_price: "20.00", discount: "20.00" }),
+    },
+    lineDepsOf(editing.db),
+  );
+
+  expectEqual(free.lineTotalMinor, "0", "a discount equal to the line makes it free");
+  expectEqual(free.discount, "20.0000", "and is reported as the merchant typed it");
+
+  const overDiscount = await refusalOf(() =>
+    updateInvoiceLine(
+      {
+        actor: owner,
+        invoiceId: editing.invoiceId,
+        lineId: second.id,
+        line: parsedLine({ quantity: "1", unit_price: "20.00", discount: "20.01" }),
+      },
+      lineDepsOf(editing.db),
+    ),
+  );
+
+  expectEqual(at(overDiscount, 0, "the discount refusal").field, "discount", "a discount past the line names discount");
+  expectEqual(at(overDiscount, 0, "the discount refusal").rule, "too_large", "as too_large");
+
+  // The bare field names the editor needs, not the create path's `lines[0].` prefix.
+  for (const [description, body, field] of [
+    ["a blank description", { description: "  " }, "description"],
+    ["an unknown unit", { unit: "stone" }, "unit"],
+    ["a zero quantity", { quantity: "0" }, "quantity"],
+    ["a fourth decimal", { quantity: "1.2345" }, "quantity"],
+    ["a price that is not a price", { unit_price: "free" }, "unit_price"],
+    ["both catalogue references", { product_id: PRODUCT_A, service_id: SERVICE_A }, "service_id"],
+  ] as const) {
+    const details = await refusalOf(() =>
+      updateInvoiceLine(
+        { actor: owner, invoiceId: editing.invoiceId, lineId: second.id, line: parsedLine(body) },
+        lineDepsOf(editing.db),
+      ),
+    );
+
+    expectEqual(at(details, 0, description).field, field, `the editor refuses ${description} by bare field name`);
+    expect(!String(at(details, 0, description).field).startsWith("lines["), `and not as a create path row for ${description}`);
+  }
+
+  // A removal soft deletes the row and closes the gap.
+  const removing = await draftWith(3);
+  const before = await readLiveLinesForTest(removing.db, removing.invoiceId);
+  const result = await removeInvoiceLine(
+    { actor: owner, invoiceId: removing.invoiceId, lineId: at(before, 0, "the first line").id },
+    lineDepsOf(removing.db),
+  );
+
+  expectEqual(result.lines.length, 2, "two lines survive");
+  expectDeepEqual(
+    result.lines.map((entry) => entry.position),
+    [1, 2],
+    "and the positions are dense again, not 2 and 3",
+  );
+  expectDeepEqual(
+    result.lines.map((entry) => entry.description),
+    ["Line 2", "Line 3"],
+    "in the order they were written",
+  );
+  expectEqual(removing.db.items.length, 3, "the removed row stays in the table");
+  expect(
+    at(removing.db.items, 0, "the removed row")["deleted_at"] !== null,
+    "as a soft delete, because a draft may have been exported",
+  );
+  expectEqual(
+    at(removing.db.invoices, 0, "the invoice")["subtotal_minor"],
+    "200000",
+    "and the subtotal is the two survivors: 10 + 10",
+  );
+
+  // The last line cannot be removed: an invoice with no lines is not a document `0022` can total.
+  const lonely = await draftWith(1);
+  const last = await refusalOf(() =>
+    removeInvoiceLine(
+      { actor: owner, invoiceId: lonely.invoiceId, lineId: String(at(lonely.db.items, 0, "the only line")["id"]) },
+      lineDepsOf(lonely.db),
+    ),
+  );
+
+  expectEqual(at(last, 0, "the last line refusal").field, "lines", "the last line is refused");
+  expectEqual(at(last, 0, "the last line refusal").rule, "empty", "as empty");
+  expectEqual(lonely.db.items.length, 1, "and nothing is removed");
+
+  // A line of another invoice under the path is a 404, not an edit.
+  const twoDrafts = await draftWith(1);
+  const otherInvoice = await createInvoice(
+    { actor: owner, body: bodyOf({ lines: [{ description: "Elsewhere", unit: "item", quantity: "1", unit_price: "5" }] }) },
+    depsOf(twoDrafts.db),
+  );
+  const foreignLine = at(
+    await readLiveLinesForTest(twoDrafts.db, otherInvoice.id),
+    0,
+    "the other invoice's line",
+  );
+
+  expectEqual(
+    await lineCodeOf(() =>
+      updateInvoiceLine(
+        { actor: owner, invoiceId: twoDrafts.invoiceId, lineId: foreignLine.id, line: parsedLine() },
+        lineDepsOf(twoDrafts.db),
+      ),
+    ),
+    "RESOURCE_NOT_FOUND",
+    "a line named under the wrong invoice is not found",
+  );
+
+  expectEqual(
+    await lineCodeOf(() =>
+      removeInvoiceLine(
+        { actor: owner, invoiceId: twoDrafts.invoiceId, lineId: foreignLine.id },
+        lineDepsOf(twoDrafts.db),
+      ),
+    ),
+    "RESOURCE_NOT_FOUND",
+    "and cannot be removed through the wrong invoice either",
+  );
+
+  // A line id that belongs to another merchant is the same 404, never a 403 that confirms it exists.
+  expectEqual(
+    await lineCodeOf(() =>
+      updateInvoiceLine(
+        { actor: otherOwner, invoiceId, lineId: second.id, line: parsedLine() },
+        lineDepsOf(editing.db),
+      ),
+    ),
+    "RESOURCE_NOT_FOUND",
+    "another merchant's invoice is not found, so neither is its line",
+  );
+
+  // The role applies: it is the invoice's own list, not a second one.
+  for (const roles of [["compliance_kyc"], ["finance_ops"], ["support"], ["ceo"], ["super_admin"], ["blogger"]] as const) {
+    expectEqual(
+      await lineCodeOf(() =>
+        addInvoiceLine(
+          { actor: actorOf([...roles], COMPANY_A, { userId: OFFICE_ID }), invoiceId, line: parsedLine() },
+          lineDepsOf(db),
+        ),
+      ),
+      "PERMISSION_DENIED",
+      `the role ${roles[0]} may not add a line`,
+    );
+  }
+
+  // The draft lock: an invoice that has left draft refuses every line write, and says why.
+  const issued = await draftWith(2);
+  const issuedLine = at(await readLiveLinesForTest(issued.db, issued.invoiceId), 0, "the first line");
+
+  at(issued.db.invoices, 0, "the issued invoice")["status"] = "sent";
+
+  for (const [description, run] of [
+    ["add", () => addInvoiceLine({ actor: owner, invoiceId: issued.invoiceId, line: parsedLine() }, lineDepsOf(issued.db))],
+    [
+      "edit",
+      () =>
+        updateInvoiceLine(
+          { actor: owner, invoiceId: issued.invoiceId, lineId: issuedLine.id, line: parsedLine() },
+          lineDepsOf(issued.db),
+        ),
+    ],
+    ["remove", () => removeInvoiceLine({ actor: owner, invoiceId: issued.invoiceId, lineId: issuedLine.id }, lineDepsOf(issued.db))],
+  ] as const) {
+    expectEqual(await lineCodeOf(run), "CONFLICT", `a sent invoice refuses a line ${description}`);
+  }
+
+  expectEqual(
+    at(issued.db.items, 0, "the untouched line")["description"],
+    "Line 1",
+    "and nothing about the issued document changed",
+  );
+}
+
+/* ---- 10. the line editor's audit trail ---- */
+
+async function checkLineAudit(): Promise<void> {
+  const db = createDb();
+  const audit = createInMemoryAuditTrail();
+  const invoice = await createInvoice(
+    {
+      actor: owner,
+      body: bodyOf({ lines: [{ description: "Secret work", unit: "item", quantity: "1", unit_price: "10" }] }),
+    },
+    depsOf(db, audit),
+  );
+  const before = audit.entries.length;
+  const added = await addInvoiceLine(
+    { actor: owner, invoiceId: invoice.id, line: parsedLine({ description: "Private note" }) },
+    lineDepsOf(db, audit),
+  );
+
+  const addedEntries = audit.entries.slice(before).filter((entry) => entry.action === INVOICE_LINE_ADDED_AUDIT_ACTION);
+
+  expectEqual(addedEntries.length, 1, "adding a line writes one entry");
+  expectEqual(at(addedEntries, 0, "the add entry").entityId, added.id, "naming the line");
+  expectEqual(at(addedEntries, 0, "the add entry").companyId, COMPANY_A, "and the company");
+  expectEqual(at(addedEntries, 0, "the add entry").actorUserId, OWNER_ID, "and the actor");
+
+  const afterAdd = audit.entries.length;
+
+  await updateInvoiceLine(
+    { actor: owner, invoiceId: invoice.id, lineId: added.id, line: parsedLine({ description: "Revised note" }) },
+    lineDepsOf(db, audit),
+  );
+  await removeInvoiceLine(
+    { actor: owner, invoiceId: invoice.id, lineId: added.id },
+    lineDepsOf(db, audit),
+  );
+
+  const later = audit.entries.slice(afterAdd);
+
+  expectDeepEqual(
+    later.map((entry) => entry.action),
+    [INVOICE_LINE_UPDATED_AUDIT_ACTION, INVOICE_LINE_REMOVED_AUDIT_ACTION],
+    "an edit and a removal each write their own entry",
+  );
+
+  // The trail never carries what the line said: a description is free text a merchant pasted.
+  const serialised = JSON.stringify(audit.entries);
+
+  for (const secret of ["Secret work", "Private note", "Revised note"]) {
+    expect(!serialised.includes(secret), `the trail never repeats the line text ${JSON.stringify(secret)}`);
+  }
+
+  // `shifted` is the fact an investigation needs about a removal, and it is a count.
+  const removedEntry = later[1];
+
+  expectEqual(
+    removedEntry === undefined ? null : (removedEntry.payload as Readonly<Record<string, unknown>>)["shifted"],
+    0,
+    "and a removal says how many rows it moved up",
+  );
+}
+
+/* ---- 11. the line editor's sources ---- */
+
+async function checkLineSources(): Promise<void> {
+  const codeOf = (source: string): string =>
+    source
+      .split("\n")
+      .filter((line) => {
+        const trimmed = line.trim();
+
+        return !trimmed.startsWith("*") && !trimmed.startsWith("//") && !trimmed.startsWith("/*");
+      })
+      .join("\n");
+
+  for (const path of [
+    "services/invoices/invoice-lines.ts",
+    "app/api/invoices/[id]/lines/route.ts",
+    "app/api/invoices/[id]/lines/[lineId]/route.ts",
+  ]) {
+    const source = await readRepositoryFile(path);
+
+    expect(source.length > 0, `${path} exists`);
+    expect(source.split("\n", 1)[0]?.trim() === `// path: ${path}`, `${path} starts with its path comment`);
+    expect(!/[^\u0009\u000a\u000d\u0020-\u007e]/u.test(source.replaceAll("\ufeff", "")), `${path} is ASCII only`);
+  }
+
+  const lines = await readRepositoryFile("services/invoices/invoice-lines.ts");
+  const linesCode = codeOf(lines);
+
+  // The rules are the create path's, not a second copy. The service takes an already-parsed line and the
+  // route is what parses it, with `parseInvoiceLine` - the create path's own entry point.
+  expect(!linesCode.includes("function parseLine"), "the line service defines no second parser");
+  expect(linesCode.includes("ParsedInvoiceLine"), "it takes the create path's parsed line type instead");
+
+  const addRoute = await readRepositoryFile("app/api/invoices/[id]/lines/route.ts");
+  const editRoute = await readRepositoryFile("app/api/invoices/[id]/lines/[lineId]/route.ts");
+
+  expect(addRoute.includes("parseInvoiceLine("), "the add route parses with the create path's parser");
+  expect(editRoute.includes("parseInvoiceLine("), "and so does the edit route");
+  expect(!/parseFloat|Number\(/u.test(linesCode), "no amount passes through a float parse");
+
+  // The totals are the database's.
+  expect(!linesCode.includes("subtotal_minor"), "the editor never writes a subtotal");
+
+  // A row the editor sends: the fields of `rowOfLine`. Neither carries a money total, because the
+  // generated column and the trigger own both.
+  // The end anchor is the function that follows the builder, not a comment that names it earlier.
+  const rowOfLineBlock = linesCode.slice(
+    linesCode.indexOf("function rowOfLine("),
+    linesCode.indexOf("function highestPosition("),
+  );
+
+  expect(rowOfLineBlock.length > 0, "the row builder is where the gate expects it");
+  expect(!rowOfLineBlock.includes("line_total_minor"), "a line row carries no generated total");
+  expect(!rowOfLineBlock.includes("total_minor"), "and no invoice total");
+
+  // The add is one insert, and a removal's compaction is bounded by the rows after it.
+  expect(linesCode.includes("insertReturning("), "a line is added by one returning insert");
+  expect(linesCode.includes("deleted_at: new Date("), "and removed by a soft delete");
+
+  // The routes check the token before the session and before the body.
+  for (const path of ["app/api/invoices/[id]/lines/route.ts", "app/api/invoices/[id]/lines/[lineId]/route.ts"]) {
+    const source = codeOf(await readRepositoryFile(path));
+
+    expect(source.includes("requireCsrfToken("), `${path} checks the token`);
+    expect(
+      source.indexOf("requireCsrfToken(") < source.indexOf("readRequestActor("),
+      `${path} checks it before the session`,
+    );
+    expect(source.includes("PAYLOAD_TOO_LARGE"), `${path} bounds the body`);
+  }
+
+  const csrf = await readRepositoryFile("lib/security/csrf.ts");
+
+  expect(csrf.includes('"/api/invoices/[id]/lines"'), "the lines route is on the protected list");
+  expect(csrf.includes('"/api/invoices/[id]/lines/[lineId]"'), "and so is the single line route");
+
+  // The migration's own facts, restated where the gate can see them.
+  const itemsMigration = await readRepositoryFile("migrations/0023_invoice_items.sql");
+
+  expect(
+    itemsMigration.includes("create unique index invoice_items_position_key"),
+    "position is unique per invoice over the live rows",
+  );
+  expect(itemsMigration.includes("constraint invoice_items_position_check check (position >= 1)"), "and at least one");
+  expect(
+    itemsMigration.includes("if state is distinct from 'draft' then"),
+    "the trigger refuses a line write on anything but a draft",
+  );
+}
+
 /* ---- 8. the sources ---- */
 
 async function checkSources(): Promise<void> {
@@ -1607,6 +2223,9 @@ async function run(): Promise<void> {
   await checkCompensation();
   await checkAudit();
   await checkSelectors();
+  await checkLineEditor();
+  await checkLineAudit();
+  await checkLineSources();
   await checkSources();
 
   if (failures.length > 0) {
