@@ -9865,11 +9865,14 @@ async function checkSessionRotation(): Promise<void> {
   // The settings screen, the new device confirmation, the step-up screen, STEP 054's two session
   // lists, STEP 079's onboarding wizard, the STEP 080-099 onboarding screens (the merchant
   // account screen and the office account review queue of STEP 099 included) and the STEP 106
-  // client hub, new and edit screens; each keeps the token rotating while the person reads it.
+  // client hub, new and edit screens, the STEP 108 catalogue screens - which are one component mounted
+  // at four paths - the STEP 110 client import screen, the STEP 111 catalogue import screen, which is
+  // likewise one component at two paths, and the STEP 112 invoice create screen; each keeps the token
+  // rotating while the person reads it.
   // The office half is one of them because reading another account's sessions must not leave the
   // reader's own token unrotated, and the wizard is one because a merchant may sit on it for a
   // while.
-  expectEqual(keepers.length, 21, "every signed-in page keeps its session rotating");
+  expectEqual(keepers.length, 25, "every signed-in page keeps its session rotating");
 }
 
 /**
@@ -12608,6 +12611,68 @@ async function checkCsrfProtection(): Promise<void> {
     "and the list names exactly those routes",
   );
 
+  /**
+   * The source a protected route is judged by: its own file, plus any file it builds its handlers from.
+   *
+   * A route that re-exports the handler of another route - the way `/api/services` re-exports
+   * `/api/products`' handler for the second catalogue - holds no `requireCsrfToken` of its own, and
+   * judging it alone would fail a route whose token check is one file away. So an import of another
+   * `route` module is followed once and the two sources are read together.
+   */
+  const routeChain = (path: string): string => {
+    const own = appSourceOf(appSources, `${path}/route.ts`);
+
+    for (const match of own.matchAll(/from "([^"]*\/route)"/gu)) {
+      const tail = (match[1] ?? "")
+        .split("/")
+        .filter((part) => part !== "" && part !== "." && part !== "..");
+      const target = appSources.find(
+        (candidate) => candidate.path !== `${path}/route.ts` && candidate.path.endsWith(`/${tail.join("/")}.ts`),
+      );
+
+      if (target !== undefined) {
+        return `${own}\n${target.source}`;
+      }
+    }
+
+    return own;
+  };
+
+  /**
+   * The source of one exported handler, from its `export const NAME` to the next one.
+   *
+   * A route file holds several handlers and each answers its own method: the mutating ones must check
+   * the token before they look the session up, and the reading ones have no token to check. Counting
+   * across the whole file cannot tell those apart, so a route that serves a `GET` beside its `POST`
+   * would fail an assertion its `POST` satisfies - which is what `/api/clients/[id]` did on `main`
+   * before this change. Splitting on the exports is the smallest thing that measures the rule the
+   * assertion is named for.
+   */
+  const handlersOf = (source: string): readonly string[] => {
+    const starts = [...source.matchAll(/^export const (GET|POST|PUT|PATCH|DELETE)\b/gmu)];
+
+    return starts.map((match, index) => {
+      const from = match.index ?? 0;
+      const to = starts[index + 1]?.index ?? source.length;
+
+      return source.slice(from, to);
+    });
+  };
+
+  const isMutating = (handler: string): boolean => /^export const (POST|PUT|PATCH|DELETE)\b/u.test(handler);
+
+  /**
+   * A handler that points at another one instead of implementing it: `= handlers.POST`,
+   * `= createCatalogueRoute(kind)`.
+   *
+   * The two catalogues of section 15 are one implementation mounted at four addresses, so the second
+   * route's handler is the first route's handler under another name. Its token check is therefore one
+   * file away - inside the factory, or inside the route it re-exports - and that is the case the
+   * assertions below follow rather than fail.
+   */
+  const delegatesOf = (handler: string): boolean =>
+    /^export const (GET|POST|PUT|PATCH|DELETE) = [A-Za-z_$][\w$.]*(\([^;]*\))?;\s*$/u.test(handler.trim());
+
   for (const path of CSRF_PROTECTED_PATHS) {
     const routePath = `${path.replace("/api/", "")}/route.ts`;
     const source = routePath.startsWith("office/")
@@ -12617,17 +12682,35 @@ async function checkCsrfProtection(): Promise<void> {
         : appSourceOf(appSources, `/api/${routePath}`);
 
     expect(source.length > 0, `${path} exists on disk`);
-    expectEqual(source.split("requireCsrfToken(").length - 1, 1, `${path} checks the token exactly once`);
-    expect(
-      source.indexOf("requireCsrfToken(") < source.indexOf("readRequestActor(") ||
-        !source.includes("readRequestActor("),
-      `${path} checks the token before it looks the session up`,
-    );
-    expect(
-      source.indexOf("requireCsrfToken(") < source.indexOf("request.text()") ||
-        !source.includes("request.text()"),
-      `${path} checks the token before it reads the body`,
-    );
+
+    const chain = routeChain(path);
+    const own = handlersOf(source);
+    const mutating = own.filter(isMutating);
+
+    expect(mutating.length > 0, `${path} answers a mutation`);
+    expect(chain.includes("requireCsrfToken("), `${path} checks the token`);
+
+    for (const handler of mutating) {
+      if (delegatesOf(handler)) {
+        // The check is inside the factory or the route this handler names, which the chain covers.
+        continue;
+      }
+
+      expect(handler.includes("requireCsrfToken("), `${path} has a mutating handler that checks the token`);
+
+      const token = handler.indexOf("requireCsrfToken(");
+      const session = handler.indexOf("readRequestActor(");
+      const body = handler.indexOf("request.text()");
+
+      expect(session === -1 || token < session, `${path} checks the token before it looks the session up`);
+      expect(body === -1 || token < body, `${path} checks the token before it reads the body`);
+    }
+
+    // A reading handler has no token to check and no body to read: a `GET` that parsed one would be a
+    // read that could be turned into a write by the body it accepted.
+    for (const handler of own.filter((candidate) => !isMutating(candidate))) {
+      expect(!handler.includes("request.text()"), `${path} reads no body on a handler that changes nothing`);
+    }
 
     if (path.startsWith("/api/auth/")) {
       expect(
@@ -12638,18 +12721,27 @@ async function checkCsrfProtection(): Promise<void> {
   }
 
   // ---- the client: every browser file that mutates carries the header
+  //
+  // A mutation is not only a POST. A `DELETE` changes state and needs the same token, and until STEP 113
+  // the two browser files that only ever deleted (`clients/[id]`, `products/[id]`) were counted by
+  // neither check: a file with no POST never entered this list, so nothing asserted it carried the
+  // token. The line editor is the first file that posts *and* deletes, which is what surfaced the gap.
+  // Counting every mutating method closes it, and the two delete-only files are now covered.
+  const MUTATION_METHODS = ['method: "POST"', 'method: "DELETE"'] as const;
+  const mutationCalls = (source: string): number =>
+    MUTATION_METHODS.reduce((total, marker) => total + source.split(marker).length - 1, 0);
   const browserMutations = appSources
-    .filter((file) => file.source.includes('method: "POST"'))
+    .filter((file) => mutationCalls(file.source) > 0)
     .map((file) => file.path)
     .sort();
 
-  expectEqual(browserMutations.length, 32, "thirty two browser files send a mutation");
+  expectEqual(browserMutations.length, 40, "forty browser files send a mutation");
   expectEqual(
-    browserMutations.reduce((total, path) => total + (appSourceOf(appSources, path).split('method: "POST"').length - 1), 0),
-    36,
-    "across thirty six call sites",
+    browserMutations.reduce((total, path) => total + mutationCalls(appSourceOf(appSources, path)), 0),
+    48,
+    "across forty eight call sites",
   );
-  const postCalls = (source: string): number => source.split('method: "POST"').length - 1;
+  const postCalls = mutationCalls;
   const tokenSpreads = (source: string): number =>
     (source.match(/\.\.\.csrf\b/gu)?.length ?? 0) + (source.match(/\.\.\.\(await csrfHeaders\(\)\)/gu)?.length ?? 0);
 

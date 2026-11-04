@@ -6,7 +6,7 @@ import { readRequestActor } from "@/lib/auth/request-actor";
 import { getAuthRuntime } from "@/lib/auth/runtime";
 import { logger } from "@/lib/logger/logger";
 import { requireCsrfToken } from "@/lib/security/csrf";
-import { getClient, updateClient, type ClientSnapshot } from "@/services/clients/clients";
+import { deleteClient, getClient, updateClient, type ClientSnapshot } from "@/services/clients/clients";
 
 export const dynamic = "force-dynamic";
 
@@ -14,12 +14,13 @@ export const dynamic = "force-dynamic";
 const maximumBodyBytes = 16_384;
 
 interface ClientBody {
-  readonly status: "ok" | "updated";
+  readonly status: "ok" | "updated" | "deleted";
   readonly client: ClientSnapshot;
 }
 
 /**
- * One client of the signed in merchant, over HTTP: `GET` reads it for the edit form, `POST` edits it.
+ * One client of the signed in merchant, over HTTP: `GET` reads it for the edit form, `POST` edits it,
+ * `DELETE` removes it.
  *
  * ## The order of the checks on the write
  *
@@ -31,7 +32,16 @@ interface ClientBody {
  * ## Why the id comes from the path, not the body
  *
  * The body names only the fields it changes; the row it changes is the path's. A request that posts
- * an id in the body cannot make the service update a different row than the URL names.
+ * an id in the body cannot make the service update a different row than the URL names. `DELETE`
+ * carries no body at all for the same reason.
+ *
+ * ## Why the removal is a `DELETE` with a token
+ *
+ * A removal changes a row, so it is a mutation and it carries the CSRF token exactly like the edit
+ * above - the path is already on `CSRF_PROTECTED_PATHS`, and the browser sends the token in the
+ * `x-csrf-token` header rather than in a body there is nothing to put one in. The service soft
+ * deletes: the row is marked and kept, because an invoice from last year must still name the client
+ * it was sent to.
  */
 function clientIdOf(params: Promise<{ readonly id: string }>): Promise<string> {
   return params.then((resolved) => decodeURIComponent(resolved.id));
@@ -54,6 +64,35 @@ export const GET = withErrorResponse(
 
     return NextResponse.json(
       { status: "ok", client },
+      { status: 200, headers: { "cache-control": "no-store" } },
+    );
+  },
+);
+
+export const DELETE = withErrorResponse(
+  async (request: Request, context: { readonly params: Promise<{ readonly id: string }> }): Promise<NextResponse<ClientBody>> => {
+    requireCsrfToken(request, { secure: getAuthRuntime().cookiePolicy.secure });
+    const runtime = getAuthRuntime();
+    const actor = await readRequestActor(request.headers.get("cookie"), {
+      directory: runtime.directory,
+      cookiePolicy: runtime.cookiePolicy,
+      sessions: runtime.sessions,
+      audit: runtime.audit,
+    });
+
+    const client = await deleteClient(
+      { actor, clientId: await clientIdOf(context.params) },
+      { rest: runtime.rest, audit: runtime.audit },
+    );
+
+    logger.info("client deleted", {
+      userId: actor.userId,
+      companyId: client.companyId,
+      clientId: client.id,
+    });
+
+    return NextResponse.json(
+      { status: "deleted", client },
       { status: 200, headers: { "cache-control": "no-store" } },
     );
   },

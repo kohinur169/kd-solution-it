@@ -1,0 +1,57 @@
+# path: .github/workflows/step-116-connectivity.yml
+# Non-mutating preflight only; this does not certify STEP 116 or run migrations.
+name: STEP 116 disposable Supabase connectivity
+on:
+  push:
+    branches:
+      - arena/5fa2593d-kd-solution-it
+    paths:
+      - .github/workflows/step-116-connectivity.yml
+  workflow_dispatch:
+permissions: {}
+jobs:
+  connectivity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check disposable Supabase Auth HTTP access
+        env:
+          TEST_SUPABASE_URL: ${{ secrets.SUPABASE_TEST_URL }}
+          TEST_SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_TEST_ANON_KEY }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import sys
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          url = os.environ.get('TEST_SUPABASE_URL', '').strip()
+          key = os.environ.get('TEST_SUPABASE_ANON_KEY', '').strip()
+          if not url or not key:
+              print('Required test URL or anonymous key is missing.')
+              sys.exit(1)
+          parsed = urllib.parse.urlsplit(url)
+          if (parsed.scheme != 'https' or parsed.hostname != 'matxfyiivvubfipesjog.supabase.co'
+                  or parsed.port not in (None, 443) or parsed.username or parsed.password
+                  or parsed.path not in ('', '/') or parsed.query or parsed.fragment):
+              print('Test URL is not the explicitly approved disposable project origin.')
+              sys.exit(1)
+          request = urllib.request.Request(
+              url.rstrip('/') + '/auth/v1/health',
+              headers={'apikey': key, 'Authorization': 'Bearer ' + key},
+          )
+          try:
+              with urllib.request.urlopen(request, timeout=15) as response:
+                  status = response.status
+          except urllib.error.HTTPError as error:
+              print('Supabase Auth health returned HTTP ' + str(error.code) + '.')
+              sys.exit(1)
+          except (urllib.error.URLError, TimeoutError):
+              print('Supabase Auth endpoint could not be reached.')
+              sys.exit(1)
+          if status != 200:
+              print('Supabase Auth health returned unexpected HTTP status.')
+              sys.exit(1)
+          print('Disposable project Auth endpoint is reachable (HTTP 200).')
+          PY

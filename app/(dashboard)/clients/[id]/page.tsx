@@ -9,6 +9,7 @@ import { getMessage } from "@/lib/i18n/messages";
 import { getClient, type ClientSnapshot } from "@/services/clients/clients";
 import { readOwnerActor } from "../../onboarding/owner-actor";
 import { ClientForm } from "../client-form";
+import { DeleteClientForm } from "./delete-client-form";
 
 export const metadata: Metadata = {
   title: getMessage("clients.editTitle"),
@@ -103,6 +104,10 @@ export default async function EditClientPage({
                   : getMessage("clients.unavailable")}
           </p>
         )}
+
+        {state.kind === "ready" ? (
+          <DeleteClientForm clientId={state.client.id} clientName={state.client.values.name ?? ""} />
+        ) : null}
 
         <nav className="flex flex-col gap-2 border-t border-border pt-4 text-sm">
           {state.kind === "signed-out" ? (

@@ -155,6 +155,30 @@ Every read is scoped to the caller company and every write is audit logged.
   rule, and audits `client.created` / `client.updated` with field names only; no migration, the
   `0019` table is the store). The forms post through `client-form.tsx`, which marks every refused
   field at once; routes `POST /api/clients` and `GET`+`POST /api/clients/[id]`, both CSRF protected.
+- `clients/page.tsx` - STEP 107: the same screen becomes section 15's paginated list with search.
+  `services/clients/client-list.ts` is the read of many rows: `parseClientListQuery` sanitises the
+  term, enforces its alphabet (letters, digits, marks, spaces and `. ' - _ @ +` - everything PostgREST
+  reads as structure is absent) and lands the offset on the page grid inside a cap, reporting what it
+  dropped instead of rewriting it; `listClients` selects eight printed columns of the actor's live
+  rows, orders them `created_at desc, id desc` the way `0019`'s `clients_page_idx` stores them, asks
+  for one row more than it shows so "is there another page" costs no second count, and applies the
+  phrase as one case insensitive substring against name, company name, email and phone. 25 per page,
+  offset capped at 2000. The screen reads `search` and `offset` from the address bar (a plain GET
+  form, so the list is bookmarkable and needs no token), prints the service's problems beside the
+  rows, and words signed out / not an owner / unavailable apart. `GET /api/clients/list` is the read
+  over HTTP - no CSRF token, session from the cookie, `no-store`. No migration: `0019` already
+  indexes the page; the search is a scan of one merchant's own live rows.
+- `clients/[id]/page.tsx` + `delete-client-form.tsx` - STEP 107 also completes section 15 line 163's
+  third verb, which no STEP in the plan owned: the removal. `deleteClient` in `services/clients/clients.ts`
+  reads the row first (so a foreign, deleted or unknown id is a 404 and a second removal is refused
+  rather than repeated), writes `deleted_at` as a **soft delete** - `0019` keeps the row because a sent
+  invoice must still name its client, and the partial unique index releases the email for reuse - then
+  re-reads to prove the row left the live set (`CONFLICT already_changed` if another writer won the
+  race) and audits `client.deleted` with the id, the name and the instant, never the address or notes.
+  `DELETE /api/clients/[id]` is the mutation: the path is already CSRF protected and the token travels
+  in the header because the request has no body. The screen behind the edit form asks for confirmation
+  in the page (not `window.confirm`), says what removal means in words, and keeps the client on screen
+  if the removal is refused.
 
 ## The reader
 
