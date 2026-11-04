@@ -1,6 +1,7 @@
 // path: app/(dashboard)/invoices/invoice-form.tsx
 "use client";
 
+import Link from "next/link";
 import { useEffect, useState, type FormEvent, type ReactNode } from "react";
 import { formatMessage, getMessage } from "@/lib/i18n/messages";
 import type { MessagePath } from "@/lib/i18n/messages";
@@ -366,6 +367,14 @@ export function InvoiceForm({ clients, clientsTruncated, defaultDueDate }: Invoi
             <dd>{saved.dueAt.slice(0, 10)}</dd>
           </div>
         </dl>
+        {/* A draft is written in two passes: the document here, then the lines one at a time. Sending the
+            merchant straight to the editor is what makes that second pass reachable at all. */}
+        <Link
+          className="w-fit rounded-md bg-foreground px-4 py-2 text-sm font-medium text-background focus-visible:ring-2 focus-visible:ring-primary"
+          href={`/invoices/${saved.id}`}
+        >
+          {getMessage("invoices.viewInvoice")}
+        </Link>
       </section>
     );
   }

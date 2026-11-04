@@ -7,11 +7,14 @@ import { getAuthRuntime } from "@/lib/auth/runtime";
 import { AppError } from "@/lib/errors/app-error";
 import { getMessage } from "@/lib/i18n/messages";
 import {
+  getInvoice,
   listInvoiceClientOptions,
   type InvoiceClientOptions,
+  type InvoiceSnapshot,
 } from "@/services/invoices/invoices";
 import { readOwnerActor } from "../onboarding/owner-actor";
 import { InvoiceForm } from "./invoice-form";
+import { InvoiceLineEditor } from "./invoice-line-editor";
 
 /**
  * Section 16's invoice create screen.
@@ -104,6 +107,111 @@ function refusalSentence(state: ScreenState): string {
   }
 
   return getMessage("invoices.unavailable");
+}
+
+/**
+ * One draft, with its line editor.
+ *
+ * ## Why the refusal states are the create screen's own
+ *
+ * Signed out, not an owner, the store unavailable and the invoice genuinely not there are four different
+ * facts, and `getInvoice` answers the middle two with the same codes the create path does. Rather than
+ * restating the wording, this screen reuses `refusalSentence` - a merchant who has reached this page by a
+ * shared link and has no session is told to sign in, not told their invoice does not exist.
+ *
+ * ## Why a sent invoice renders the editor at all
+ *
+ * A draft is the only thing this STEP can edit, but an invoice that has been sent is not a 404 - it
+ * exists, and its lines are visible. The pages differ only in whether the controls are offered, which the
+ * editor decides from the status rather than this screen hiding the document.
+ */
+export async function InvoiceEditorScreen({
+  invoiceId,
+}: {
+  readonly invoiceId: string;
+}): Promise<ReactNode> {
+  const actorState = await readOwnerActor();
+  let state: { readonly kind: "ready"; readonly invoice: InvoiceSnapshot } | { readonly kind: string } = {
+    kind: "unavailable",
+  };
+
+  if (actorState.kind === "anonymous") {
+    state = { kind: "signed-out" };
+  } else if (actorState.kind === "actor") {
+    const runtime = getAuthRuntime();
+
+    try {
+      state = {
+        kind: "ready",
+        invoice: await getInvoice(
+          { actor: actorState.actor, invoiceId },
+          { rest: runtime.rest, audit: runtime.audit },
+        ),
+      };
+    } catch (error) {
+      state =
+        error instanceof AppError && error.code === "AUTHENTICATION_REQUIRED"
+          ? { kind: "signed-out" }
+          : error instanceof AppError && error.code === "PERMISSION_DENIED"
+            ? { kind: "forbidden" }
+            : error instanceof AppError && error.code === "RESOURCE_NOT_FOUND"
+              ? { kind: "not-found" }
+              : { kind: "unavailable" };
+    }
+  }
+
+  return (
+    <main className="min-h-dvh bg-background px-4 py-8 text-foreground sm:px-6 lg:px-8">
+      <SessionKeeper />
+      <div className="mx-auto flex w-full max-w-3xl flex-col gap-6">
+        <header className="flex flex-col gap-2">
+          <p className="text-sm font-medium text-muted-foreground">{getMessage("invoices.editorEyebrow")}</p>
+          <h1 className="text-2xl font-semibold tracking-tight sm:text-3xl">{getMessage("invoices.editTitle")}</h1>
+          <p className="text-sm text-muted-foreground">{getMessage("invoices.editDescription")}</p>
+        </header>
+
+        {"invoice" in state && state.invoice !== undefined ? (
+          <>
+            <dl className="grid grid-cols-1 gap-3 rounded-lg border border-border p-4 text-sm sm:grid-cols-2">
+              <div className="flex flex-col gap-1">
+                <dt className="text-xs text-muted-foreground">{getMessage("invoices.clientLabel")}</dt>
+                <dd className="font-medium">{state.invoice.client.name}</dd>
+              </div>
+              <div className="flex flex-col gap-1">
+                <dt className="text-xs text-muted-foreground">{getMessage("invoices.editorStatus")}</dt>
+                <dd className="font-medium">{state.invoice.status}</dd>
+              </div>
+              <div className="flex flex-col gap-1">
+                <dt className="text-xs text-muted-foreground">{getMessage("invoices.editorDueDate")}</dt>
+                <dd className="font-medium">{state.invoice.dueAt.slice(0, 10)}</dd>
+              </div>
+              <div className="flex flex-col gap-1">
+                <dt className="text-xs text-muted-foreground">{getMessage("invoices.total")}</dt>
+                <dd className="font-medium">{state.invoice.totals.total}</dd>
+              </div>
+            </dl>
+            <InvoiceLineEditor invoice={state.invoice} />
+          </>
+        ) : (
+          <p className="text-sm text-destructive" role="alert">
+            {refusalSentence(state as ScreenState)}
+          </p>
+        )}
+
+        <nav className="flex flex-col gap-2 border-t border-border pt-4 text-sm">
+          <Link className={linkClasses} href="/invoices/new">
+            {getMessage("invoices.editorNewInvoice")}
+          </Link>
+          <Link className={linkClasses} href="/clients">
+            {getMessage("invoices.clientsLink")}
+          </Link>
+          <Link className={linkClasses} href="/">
+            {getMessage("invoices.homeLink")}
+          </Link>
+        </nav>
+      </div>
+    </main>
+  );
 }
 
 export async function InvoiceCreateScreen(): Promise<ReactNode> {

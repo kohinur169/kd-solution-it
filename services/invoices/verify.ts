@@ -2192,6 +2192,62 @@ async function checkLineSources(): Promise<void> {
   expect(csrf.includes('"/api/invoices/[id]/lines"'), "the lines route is on the protected list");
   expect(csrf.includes('"/api/invoices/[id]/lines/[lineId]"'), "and so is the single line route");
 
+  // ---- the editor's UI (STEP 113 step 3)
+
+  for (const path of [
+    "app/(dashboard)/invoices/invoice-line-editor.tsx",
+    "app/(dashboard)/invoices/[id]/page.tsx",
+  ]) {
+    const source = await readRepositoryFile(path);
+
+    expect(source.length > 0, `${path} exists`);
+    expect(source.split("\n", 1)[0]?.trim() === `// path: ${path}`, `${path} starts with its path comment`);
+    expect(!/[^\u0009\u000a\u000d\u0020-\u007e]/u.test(source.replaceAll("\ufeff", "")), `${path} is ASCII only`);
+  }
+
+  const editor = await readRepositoryFile("app/(dashboard)/invoices/invoice-line-editor.tsx");
+  const editorCode = codeOf(editor);
+
+  // Every mutation carries the token, and each of the four operations has its own endpoint.
+  expect(editorCode.includes("csrfHeaders("), "the editor carries the CSRF token on every write");
+  // Three posts - save an edited line, move one, add one - and one delete.
+  expectEqual(
+    (editorCode.match(/method: "POST"/gu) ?? []).length,
+    3,
+    "it posts to save an edit, to move a line, and to add one",
+  );
+  expect(editorCode.includes('method: "DELETE"'), "and deletes to remove one");
+  expect(editorCode.includes("/lines/${lineId}/move"), "the move goes to its own path");
+  expect(editorCode.includes("/lines/${lineId}`"), "and an edit to the line's own path");
+
+  // The running amount is the engine the server stores with, not a second arithmetic.
+  expect(editorCode.includes("grossLineMinor("), "the row amount uses the shared engine");
+  expect(editorCode.includes("quantityToThousandths("), "and the shared quantity parser");
+  expect(!/parseFloat|Number\(/u.test(editorCode), "no amount passes through a float");
+
+  // The list the server answers with is adopted whole, never patched locally: positions are its decision.
+  expect(editorCode.includes("adoptLines("), "the editor adopts the list the server answers with");
+  expect(
+    editorCode.includes(".lines ?? lines"),
+    "and falls back to what it holds only when the answer carries none",
+  );
+
+  // The boundaries are disabled rather than hidden, so the control is visibly there.
+  expect(editorCode.includes("index === 0"), "move up is disabled on the first line");
+  expect(editorCode.includes("index === lines.length - 1"), "and move down on the last");
+  expect(editorCode.includes("draftLocked"), "and every control is disabled once the draft is issued");
+
+  // The screen reaches the editor, and the create form reaches the screen.
+  const screens = await readRepositoryFile("app/(dashboard)/invoices/invoice-screens.tsx");
+
+  expect(screens.includes("InvoiceLineEditor"), "the screen mounts the editor");
+  expect(screens.includes("InvoiceEditorScreen"), "as its own exported screen");
+
+  const form = await readRepositoryFile("app/(dashboard)/invoices/invoice-form.tsx");
+
+  expect(form.includes("`/invoices/${saved.id}`"), "a saved draft links to its editor, so the editor is reachable");
+  expect(!form.includes("Date.now("), "and the form still reads no clock while rendering");
+
   // The migration's own facts, restated where the gate can see them.
   const itemsMigration = await readRepositoryFile("migrations/0023_invoice_items.sql");
 

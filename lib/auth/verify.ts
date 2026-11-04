@@ -12721,18 +12721,27 @@ async function checkCsrfProtection(): Promise<void> {
   }
 
   // ---- the client: every browser file that mutates carries the header
+  //
+  // A mutation is not only a POST. A `DELETE` changes state and needs the same token, and until STEP 113
+  // the two browser files that only ever deleted (`clients/[id]`, `products/[id]`) were counted by
+  // neither check: a file with no POST never entered this list, so nothing asserted it carried the
+  // token. The line editor is the first file that posts *and* deletes, which is what surfaced the gap.
+  // Counting every mutating method closes it, and the two delete-only files are now covered.
+  const MUTATION_METHODS = ['method: "POST"', 'method: "DELETE"'] as const;
+  const mutationCalls = (source: string): number =>
+    MUTATION_METHODS.reduce((total, marker) => total + source.split(marker).length - 1, 0);
   const browserMutations = appSources
-    .filter((file) => file.source.includes('method: "POST"'))
+    .filter((file) => mutationCalls(file.source) > 0)
     .map((file) => file.path)
     .sort();
 
-  expectEqual(browserMutations.length, 36, "thirty six browser files send a mutation");
+  expectEqual(browserMutations.length, 39, "thirty nine browser files send a mutation");
   expectEqual(
-    browserMutations.reduce((total, path) => total + (appSourceOf(appSources, path).split('method: "POST"').length - 1), 0),
-    40,
-    "across forty call sites",
+    browserMutations.reduce((total, path) => total + mutationCalls(appSourceOf(appSources, path)), 0),
+    46,
+    "across forty six call sites",
   );
-  const postCalls = (source: string): number => source.split('method: "POST"').length - 1;
+  const postCalls = mutationCalls;
   const tokenSpreads = (source: string): number =>
     (source.match(/\.\.\.csrf\b/gu)?.length ?? 0) + (source.match(/\.\.\.\(await csrfHeaders\(\)\)/gu)?.length ?? 0);
 
