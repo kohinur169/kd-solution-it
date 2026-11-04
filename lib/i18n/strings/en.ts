@@ -2031,6 +2031,53 @@ const catalog = {
     deleting: "Removing...",
     deleteFailed: "This client could not be removed. Reload the page and try again.",
     ruleAlreadyChanged: "This client changed in another tab. Reload the page and try again.",
+
+    /** STEP 110: the CSV import of clients, and its per-row report. */
+    importLink: "Import from CSV",
+    importTitle: "Import clients from a CSV",
+    importDescription:
+      "Upload a comma separated file of your clients. Every row is checked the same way the form checks one, and the rows that fail are reported by line while the rest are imported.",
+    importLimits:
+      "Up to {rows} rows at a time, and {records} records in the file. The header must name a Name column; Email, Phone, Company, Address, City, Region, Postal code, Country, Tax id and Notes are read when present.",
+    importFileLabel: "CSV file",
+    importFileHint: "A .csv file exported from a spreadsheet. The first row names the columns.",
+    importChosenFile: "Chosen file: {name}",
+    importLocalTooLarge: "That file is larger than this import reads. Split it and try again.",
+    importLocalEmpty: "That file is empty.",
+    importSubmit: "Import clients",
+    importBusy: "Importing...",
+    importFailed: "The import could not be completed. Check the file and try again.",
+    importSignedOut: "Sign in with a merchant account to import clients.",
+    importUnavailable: "Your account could not be read just now. Try again in a moment.",
+    importRefusedHeading: "This file was not imported",
+    importProblemEmpty: "The file has no rows. The first row must name the columns.",
+    importProblemHeaderMissing:
+      "No column in the header is a name column. Add a Name column and import the file again.",
+    importProblemHeaderDuplicate:
+      "Two columns in the header are the same field. Keep one of each and import the file again.",
+    importProblemRowTooWide:
+      "A row has more cells than the header. A shifted row cannot be read reliably, so the file was not imported.",
+    importProblemTooManyRows:
+      "The file has more rows than this import accepts. Split it and import it in parts.",
+    importProblemTooLarge: "The file is larger than this import reads. Split it and try again.",
+    importProblemInvalidQuote:
+      "The file has a broken quotation mark, so the columns cannot be told apart. Fix the quoting and import it again.",
+    importProblemInvalidType: "That file is not a CSV. Choose a .csv file and try again.",
+    importProblemUnknown: "The file could not be read as CSV.",
+    importProblemLine: "The problem was found on line {line}.",
+    importReportHeading: "What was imported",
+    importReportSummary: "{created} rows imported, {refused} rows refused.",
+    importIgnoredColumns: "Not read from this file: {columns}.",
+    importNothingToDo: "The file had a header and no rows.",
+    importColumnLine: "Line",
+    importColumnOutcome: "Outcome",
+    importColumnDetail: "Detail",
+    importRowCreated: "Imported",
+    importRowRefused: "Refused",
+    importRuleAddressLine1: "A street address is needed once another address field is set.",
+    importRuleUnknown: "This value was refused.",
+    importGoToList: "Go to the client list",
+    importBackToClients: "Back to clients",
   },
   catalogue: {
     /** Section 15: the products a merchant sells and the services they bill. */

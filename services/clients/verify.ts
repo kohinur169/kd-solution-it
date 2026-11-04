@@ -19,6 +19,13 @@ import {
   type ClientDependencies,
 } from "./clients.ts";
 import { CLIENT_FIELDS, CLIENT_FIELD_LIMITS } from "./client-fields.ts";
+import { importClients } from "./client-import.ts";
+import {
+  MAXIMUM_CSV_CHARACTERS,
+  MAXIMUM_CSV_ROWS,
+  normaliseHeader,
+  readCsv,
+} from "./csv.ts";
 import {
   CLIENT_LIST_MAXIMUM_OFFSET,
   CLIENT_LIST_PAGE_SIZE,
@@ -355,6 +362,11 @@ function createClientsRest(db: ClientsDb): RestClient {
       return Promise.reject(new Error("the client service calls no rpc"));
     },
   };
+}
+
+/** An empty book, which is how each check starts. */
+function createDb(): ClientsDb {
+  return { rows: [], inserts: [], updates: [], queries: [] };
 }
 
 function depsOf(db: ClientsDb, audit: AuditTrail = createInMemoryAuditTrail()): ClientDependencies & { readonly audit: AuditTrail } {
@@ -1006,6 +1018,459 @@ async function checkSources(): Promise<void> {
   }
 }
 
+/* ---- STEP 110: the CSV reader ---- */
+
+/**
+ * The reader on its own, before anything about clients.
+ *
+ * These are the cases a spreadsheet actually produces, and each one is a row that a split-on-comma
+ * parser would shift. The header normalisation cases are here too, because a header matched too
+ * strictly is every column in the file being ignored.
+ */
+function checkCsv(): void {
+  /** The fields of every record but the header, for a file written inline. */
+  const rowsOf = (text: string): readonly (readonly string[])[] => {
+    const read = readCsv(text);
+
+    if (!read.ok) {
+      throw new Error(`the fixture file was refused: ${read.error.problem} on line ${String(read.error.line)}`);
+    }
+
+    return read.records.slice(1).map((record) => record.fields);
+  };
+
+  expectDeepEqual(rowsOf("name,email\nAmina,a@b.co"), [["Amina", "a@b.co"]], "a plain two column file reads");
+  expectDeepEqual(
+    rowsOf('name,notes\n"Amina, Jr",x'),
+    [["Amina, Jr", "x"]],
+    "a quoted comma stays inside its field",
+  );
+  expectDeepEqual(
+    rowsOf('name\n"A ""quoted"" note"'),
+    [['A "quoted" note']],
+    "a doubled quote is one literal quote",
+  );
+  expectDeepEqual(rowsOf('name,notes\nAmina,"one\ntwo"'), [["Amina", "one\ntwo"]], "a quoted newline stays in its field");
+  expectDeepEqual(rowsOf("name,email\r\nAmina,a@b.co\r\n"), [["Amina", "a@b.co"]], "CRLF line endings read");
+  expectDeepEqual(rowsOf("name\nAmina"), [["Amina"]], "a file with no trailing newline reads");
+  expectDeepEqual(rowsOf("name\nAmina\n"), [["Amina"]], "and one with a trailing newline reads the same");
+  expectDeepEqual(rowsOf("\ufeffname\nAmina"), [["Amina"]], "a byte-order mark is removed");
+  expectDeepEqual(rowsOf("name,email,phone\nAmina,,"), [["Amina", "", ""]], "empty cells read as empty fields");
+  expectDeepEqual(rowsOf('name\n""'), [[""]], "a quoted empty field is one empty field");
+  expectDeepEqual(rowsOf("name\nAmina\n\nBilal"), [["Amina"], ["Bilal"]], "blank lines are skipped");
+  expectDeepEqual(rowsOf("name\n  Amina  "), [["  Amina  "]], "the reader does not trim a value");
+
+  // a quoted field's own line count is what makes a refusal name the right line
+  const multiline = readCsv('name,notes\nAmina,"a\nb\nc"\nBilal,x');
+
+  const third = multiline.ok ? multiline.records[2] : undefined;
+
+  expectEqual(third?.line, 5, "a record after a three-line quoted field starts on line five");
+
+  // the four ways a file is not CSV
+  for (const [text, problem] of [
+    ['name\nSm"ith', "invalid_quote"],
+    ['name\n"a"b', "invalid_quote"],
+    ['name\n"unclosed', "invalid_quote"],
+    ["x".repeat(MAXIMUM_CSV_CHARACTERS + 1), "too_large"],
+  ] as const) {
+    const read = readCsv(text);
+
+    expect(!read.ok && read.error.problem === problem, `the file ${text.slice(0, 18)} is refused as ${problem}`);
+  }
+
+  const tooMany = readCsv(`name\n${Array.from({ length: MAXIMUM_CSV_ROWS }, () => "x").join("\n")}`);
+
+  expect(!tooMany.ok && tooMany.error.problem === "too_many_rows", "more records than the ceiling is refused as too_many_rows");
+
+  const emptyRead = readCsv("");
+
+  expect(emptyRead.ok && emptyRead.records.length === 0, "an empty file reads as no records");
+
+  // header matching: case, spacing and punctuation are dropped, nothing else is
+  expectEqual(normaliseHeader("Company Name"), "companyname", "a header drops case and space");
+  expectEqual(normaliseHeader("company_name"), "companyname", "and underscores");
+  expectEqual(normaliseHeader(" COMPANY\u00a0NAME "), "companyname", "and a non-breaking space");
+  expectEqual(normaliseHeader("E-Mail"), "email", "so E-Mail matches email");
+}
+
+/* ---- STEP 110: the import ---- */
+
+/**
+ * A file of two good rows and one bad address.
+ *
+ * Every row carries a street line because `0019`'s address rule demands one once a city is set - a
+ * rule this file exercises rather than works around, and one the "form and import agree" check below
+ * asserts from both sides.
+ */
+const IMPORT_FILE = [
+  "Name,Email,Phone,Address,City",
+  "Amina Rahman,amina@example.com,+880 1711 000001,12 Lake Road,Dhaka",
+  "Broken Row,not-an-address,,12 Lake Road,Dhaka",
+  "Bilal Khan,bilal@example.com,+880 1711 000002,4 Hill View,Chattogram",
+].join("\n");
+
+async function checkImportReport(): Promise<void> {
+  const db = createDb();
+  const audit = createInMemoryAuditTrail();
+  const outcome = await importClients({ actor: owner, text: IMPORT_FILE }, depsOf(db, audit));
+
+  expect(outcome.ok, "a file with one bad row still imports");
+
+  if (!outcome.ok) {
+    return;
+  }
+
+  const report = outcome.report;
+
+  expectEqual(report.created, 2, "the two good rows were created");
+  expectEqual(report.refused, 1, "the one bad row was refused");
+  expectEqual(report.rows.length, 3, "and every row is reported");
+  expectDeepEqual(
+    report.columns,
+    ["name", "email", "phone", "address_line1", "city"],
+    "the header named its five fields",
+  );
+
+  const refused = report.rows.find((row) => row.status === "refused");
+
+  expectEqual(refused?.line, 3, "the refused row is named by its line in the file");
+  expectDeepEqual(
+    refused?.problems,
+    [{ field: "email", rule: "invalid_format" }],
+    "with the field and the rule that refused it",
+  );
+  expectEqual(refused?.clientId, null, "a refused row names no client");
+
+  const created = report.rows.filter((row) => row.status === "created");
+
+  expectEqual(created.length, 2, "both created rows are reported as created");
+  expect(created.every((row) => row.clientId !== null), "each names the client it created");
+  expectEqual(created[0]?.name, "Amina Rahman", "and the name, so the merchant recognises it");
+
+  // the interrupted row did not stop the ones after it
+  expectEqual(db.rows.length, 2, "two rows were written");
+  expectEqual(at(db.rows, 0, "first imported row")["name"], "Amina Rahman", "the first good row");
+  expectEqual(at(db.rows, 1, "second imported row")["name"], "Bilal Khan", "and the good row after the bad one");
+
+  // a refused row is reported by field and rule, never by value
+  expect(
+    !JSON.stringify(report.rows).includes("not-an-address"),
+    "the report never repeats the value that failed",
+  );
+  expect(!JSON.stringify(report).includes("+880 1711 000001"), "nor any other value from the file");
+  expect(!JSON.stringify(report).includes("12 Lake Road"), "nor an address it imported");
+
+  // the run writes one summary entry, and each created client wrote its own
+  const actions = audit.entries.map((entry) => entry.action);
+
+  expectEqual(actions.filter((action) => action === CLIENT_CREATED_AUDIT_ACTION).length, 2, "each created client is audited");
+  expectEqual(actions.filter((action) => action === "client.imported").length, 1, "and the run has one summary entry");
+
+  const summary = at(
+    audit.entries.filter((entry) => entry.action === "client.imported"),
+    0,
+    "import summary",
+  );
+
+  expectEqual(summary.companyId, COMPANY_A, "the summary names the company");
+  expectEqual(summary.actorUserId, OWNER_ID, "and the actor");
+  const payload = summary.payload as Readonly<Record<string, unknown>>;
+
+  expectDeepEqual(
+    payload["columns"],
+    ["name", "email", "phone", "address_line1", "city"],
+    "and the fields the file supplied",
+  );
+  expectEqual(payload["created"], 2, "with how many were taken");
+  expectEqual(payload["refused"], 1, "and how many were not");
+}
+
+async function checkImportHeaders(): Promise<void> {
+  const db = createDb();
+
+  /** The outcome of importing one file, against an empty book. */
+  const importOf = async (text: string) => importClients({ actor: owner, text }, depsOf(createDb()));
+
+  // header spellings a spreadsheet actually produces
+  for (const [header, expected] of [
+    ["Name,Email", ["name", "email"]],
+    ["name,email_address", ["name", "email"]],
+    ["CLIENT NAME,E-MAIL,MOBILE", ["name", "email", "phone"]],
+    [
+      "Name,Company,Address,City,Zip,Country,VAT,Notes",
+      ["name", "company_name", "address_line1", "city", "postal_code", "country", "tax_id", "notes"],
+    ],
+    ["Name,State", ["name", "region"]],
+    ["Name,ZIP Code", ["name", "postal_code"]],
+  ] as const) {
+    const outcome = await importOf(`${header}\nAmina,a@b.co`);
+
+    expect(outcome.ok, `the header ${header} is understood`);
+    expectDeepEqual(
+      outcome.ok ? outcome.report.columns : [],
+      [...expected],
+      `the header ${header} maps to ${expected.join(",")}`,
+    );
+  }
+
+  // an unknown column is ignored rather than refused, so a re-import of an export works
+  const withExtras = await importOf("Name,Email,id,Created At\nAmina,a@b.co,abc,2026-01-01");
+
+  expect(
+    withExtras.ok && withExtras.report.ignoredColumns.length === 2,
+    "a column the import does not use is ignored and named",
+  );
+  expect(withExtras.ok && withExtras.report.created === 1, "and the row still imports");
+
+  // a file with no name column is refused once, not once per row
+  const noName = await importOf("Email,Phone\na@b.co,123456");
+
+  expect(!noName.ok && noName.problem === "header_missing", "a file with no name column is refused as header_missing");
+  expect(!noName.ok && noName.line === 1, "naming the header line");
+
+  // two columns for one field is refused, because there is no honest winner
+  const twice = await importOf("Name,Email,E-Mail\nAmina,a@b.co,c@d.co");
+
+  expect(!twice.ok && twice.problem === "header_duplicate", "two columns for one field is refused as header_duplicate");
+
+  // a row wider than the header is a shifted row
+  const wide = await importOf("Name,Email\nAmina,a@b.co,extra");
+
+  expect(!wide.ok && wide.problem === "row_too_wide", "a row wider than the header is refused as row_too_wide");
+  expect(!wide.ok && wide.line === 2, "naming the row");
+  expectEqual(db.rows.length, 0, "and nothing was written");
+
+  // a file with only a header imports nothing and refuses nothing
+  const headerOnly = await importOf("Name,Email");
+
+  expect(headerOnly.ok && headerOnly.report.created === 0 && headerOnly.report.refused === 0, "a header alone is an empty import");
+
+  // an empty file is a refusal about the file
+  const empty = await importOf("");
+
+  expect(!empty.ok && empty.problem === "empty", "an empty file is refused as empty");
+
+  // a broken quote is reported at the line it broke on
+  const broken = await importOf('Name,Email\nAmina,a@b.co\nBilal,"unclosed');
+
+  expect(!broken.ok && broken.problem === "invalid_quote", "a broken quote is refused as invalid_quote");
+  expect(!broken.ok && broken.line === 3, "naming the line it broke on");
+}
+
+async function checkImportValidation(): Promise<void> {
+  const db = createDb();
+
+  /**
+   * The same body posted through the form and through the import must be judged the same way. This is
+   * the assertion that keeps the importer from becoming a second, looser definition of a valid client.
+   */
+  const bodies: readonly (readonly [string, Record<string, string>])[] = [
+    ["a missing name", { name: "" }],
+    ["a name past its ceiling", { name: "x".repeat(121) }],
+    ["a bad address", { name: "Amina", email: "nope" }],
+    ["a bad phone", { name: "Amina", phone: "abc" }],
+    ["a city with no street line", { name: "Amina", city: "Dhaka" }],
+    ["a country that is not two letters", { name: "Amina", country: "Bangladesh" }],
+    ["a postal code of one character", { name: "Amina", postal_code: "1" }],
+    ["notes past their ceiling", { name: "Amina", notes: "x".repeat(2_001) }],
+  ];
+
+  for (const [description, body] of bodies) {
+    const direct = await rejectionOf(() => createClient({ actor: owner, body }, depsOf(createDb())));
+    const directDetails = isAppError(direct) && direct.code === "VALIDATION_FAILED" ? direct.details : [];
+
+    expect(directDetails.length > 0, `the form refuses ${description}`);
+
+    // the same values through a one-row file
+    const header = ["name", ...Object.keys(body).filter((key) => key !== "name")].join(",");
+    const values = [body["name"] ?? "", ...Object.keys(body).filter((key) => key !== "name").map((key) => body[key] ?? "")];
+    const outcome = await importClients(
+      { actor: owner, text: `${header}\n${values.map((value) => `"${value.replaceAll('"', '""')}"`).join(",")}` },
+      depsOf(db),
+    );
+
+    expect(outcome.ok, `the import reads the one row file for ${description}`);
+    expectEqual(
+      outcome.ok ? outcome.report.refused : -1,
+      1,
+      `the import refuses ${description} exactly as the form does`,
+    );
+
+    const problems = outcome.ok ? (outcome.report.rows[0]?.problems ?? []) : [];
+
+    expectDeepEqual(
+      problems.map((problem) => problem.field).sort(),
+      directDetails.map((detail) => detail.field).sort(),
+      `and names the same fields for ${description}`,
+    );
+    expectDeepEqual(
+      problems.map((problem) => problem.rule).sort(),
+      directDetails.map((detail) => detail.rule).sort(),
+      `and the same rules for ${description}`,
+    );
+  }
+
+  // a duplicate address inside one file is refused on the second row, not the whole file
+  const twice = await importClients(
+    {
+      actor: owner,
+      text: "Name,Email\nAmina,amina@example.com\nAmina Again,AMINA@example.com",
+    },
+    depsOf(db),
+  );
+
+  expect(twice.ok && twice.report.created === 1, "the first of two identical addresses is created");
+  expect(twice.ok && twice.report.refused === 1, "and the second is refused");
+  expectDeepEqual(
+    twice.ok ? (twice.report.rows[1]?.problems ?? []) : [],
+    [{ field: "email", rule: "already_used" }],
+    "naming the email as already used, case insensitively",
+  );
+  expect(twice.ok && twice.report.rows[1]?.line === 3, "on the line that caused it");
+
+  // an existing client of the same merchant is a row refusal, so the rest of the file still lands
+  const existing = await createClient(
+    { actor: owner, body: { name: "Already Here", email: "taken@example.com" } },
+    depsOf(db),
+  );
+  const mixed = await importClients(
+    { actor: owner, text: "Name,Email\nNew One,new@example.com\nTaken,taken@example.com" },
+    depsOf(db),
+  );
+
+  expect(existing.id.length > 0, "the fixture client exists");
+  expect(mixed.ok && mixed.report.created === 1, "a file naming an existing client still imports the rest");
+  expectDeepEqual(
+    mixed.ok ? (mixed.report.rows[1]?.problems ?? []) : [],
+    [{ field: "email", rule: "already_used" }],
+    "and reports the clash on that row",
+  );
+}
+
+async function checkImportTenancy(): Promise<void> {
+  const db = createDb();
+  const file = "Name,Email\nAmina,amina@example.com";
+
+  // only the owner may import, exactly as only the owner may create
+  for (const roles of [["compliance_kyc"], ["finance_ops"], ["support"], ["ceo"], ["super_admin"], ["blogger"]] as const) {
+    const refused = await rejectionOf(() =>
+      importClients(
+        { actor: actorOf([...roles], COMPANY_A, { userId: OFFICE_ID }), text: file },
+        depsOf(createDb()),
+      ),
+    );
+
+    expect(isAppError(refused) && refused.code === "PERMISSION_DENIED", `the role ${roles[0]} may not import clients`);
+  }
+
+  const platformAccount = await rejectionOf(() =>
+    importClients({ actor: desk, text: file }, depsOf(createDb())),
+  );
+
+  expect(isAppError(platformAccount), "an account with no company cannot import into one");
+
+  // everything created belongs to the actor's company and nothing else
+  const imported = await importClients({ actor: owner, text: file }, depsOf(db));
+
+  expect(imported.ok && imported.report.created === 1, "the owner imports one client");
+  expectEqual(db.rows.length, 1, "one row was written");
+  expectEqual(at(db.rows, 0, "imported row")["company_id"], COMPANY_A, "scoped to the actor's company");
+
+  // another merchant importing the same file gets their own client, because the index is per company
+  const other = await importClients({ actor: otherOwner, text: file }, depsOf(db));
+
+  expect(other.ok && other.report.created === 1, "another merchant imports the same address into their own book");
+  expectEqual(db.rows.length, 2, "which is a second row, not an overwrite");
+
+  // and the one import wrote one summary entry on its own company's chain
+  expectEqual(
+    at(db.rows, 1, "second row")["company_id"],
+    COMPANY_B,
+    "the second row belongs to the second merchant",
+  );
+}
+
+async function checkImportSources(): Promise<void> {
+  for (const path of [
+    "services/clients/csv.ts",
+    "services/clients/client-import.ts",
+    "app/api/clients/import/route.ts",
+    "app/(dashboard)/clients/import/client-import-form.tsx",
+    "app/(dashboard)/clients/import/page.tsx",
+  ]) {
+    const source = await readRepositoryFile(path);
+
+    expect(source.length > 0, `${path} exists`);
+    expect(source.split("\n", 1)[0]?.trim() === `// path: ${path}`, `${path} starts with its path comment`);
+    expect(!/[^\u0009\u000a\u000d\u0020-\u007e]/u.test(source.replaceAll("\ufeff", "")), `${path} is ASCII only`);
+  }
+
+  const importModule = await readRepositoryFile("services/clients/client-import.ts");
+
+  // the importer validates by calling the same service, never by reading a row of its own
+  expect(importModule.includes("createClient("), "every row goes through createClient");
+  expectEqual(/insertReturning\(/u.test(importModule), false, "the import opens no insert of its own");
+  expectEqual(/CLIENTS_TABLE/u.test(importModule), false, "and names no table");
+  expect(importModule.includes("requireAnyRole\(") === false, "so it states no role of its own either");
+
+  // a refused row does not stop the run, and an outage does
+  expect(importModule.includes("catch (error)"), "a row failure is caught per row");
+  expect(importModule.includes("throw error"), "and a failure that is not the row's stops the run");
+
+  // the reader is written here, not taken from a package
+  const packageJson = JSON.parse(await readRepositoryFile("package.json")) as {
+    readonly dependencies?: Readonly<Record<string, string>>;
+  };
+  const dependencies = Object.keys(packageJson.dependencies ?? {});
+
+  expect(
+    !dependencies.some((name) => /csv|papaparse|parse-csv/u.test(name)),
+    "no CSV package is a dependency: the reader is in services/clients/csv.ts",
+  );
+
+  const route = await readRepositoryFile("app/api/clients/import/route.ts");
+
+  expect(route.includes("requireCsrfToken("), "the import route checks the token");
+  expect(
+    route.indexOf("requireCsrfToken(") < route.indexOf("readRequestActor("),
+    "before it looks the session up",
+  );
+  expect(
+    route.indexOf("requireCsrfToken(") < route.indexOf("const bodyText = await request.text()"),
+    "and before it reads the body",
+  );
+  expect(route.includes("PAYLOAD_TOO_LARGE"), "it bounds the body");
+  expect(
+    route.includes('{ field: "file", rule: "invalid_type" }'),
+    "and refuses a body that is not CSV, naming the field and the rule",
+  );
+  expect(
+    !route.includes('throw new AppError("UNSUPPORTED_MEDIA_TYPE"'),
+    "without borrowing a shared sentence that claims the endpoint takes JSON",
+  );
+  expect(route.includes('"cache-control": "no-store"'), "and is never cached");
+
+  // the list is the way in: a merchant with a spreadsheet finds the import where the clients are
+  const listPage = await readRepositoryFile("app/(dashboard)/clients/page.tsx");
+
+  expect(listPage.includes('href="/clients/import"'), "the client list links to the import");
+  expect(listPage.includes("clients.importLink"), "with its own label in the catalog");
+
+  const csrf = await readRepositoryFile("lib/security/csrf.ts");
+
+  expect(csrf.includes('"/api/clients/import"'), "the import route is on the protected list");
+
+  // the screen posts a file through the one form, with the token
+  const form = await readRepositoryFile("app/(dashboard)/clients/import/client-import-form.tsx");
+
+  expect(form.includes('method: "POST"'), "the form posts");
+  expect(form.includes("csrfHeaders("), "carrying the CSRF token");
+  expect(form.includes("type=\"file\"") || form.includes('type="file"'), "it takes a file");
+  expect(form.includes("accept="), "of the types it accepts");
+  expect(form.includes("report.rows") || form.includes("rows.map"), "and prints the report row by row");
+}
+
 async function main(): Promise<void> {
   await checkCreate();
   await checkValidation();
@@ -1015,6 +1480,12 @@ async function main(): Promise<void> {
   await checkListSearch();
   await checkListTenancy();
   await checkListSources();
+  checkCsv();
+  await checkImportReport();
+  await checkImportHeaders();
+  await checkImportValidation();
+  await checkImportTenancy();
+  await checkImportSources();
   await checkSources();
 
   if (failures.length > 0) {

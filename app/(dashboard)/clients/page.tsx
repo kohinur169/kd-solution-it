@@ -115,6 +115,9 @@ const linkClasses =
 const primaryLinkClasses =
   "w-fit rounded-md bg-foreground px-4 py-2 text-sm font-medium text-background focus-visible:ring-2 focus-visible:ring-primary";
 
+const secondaryLinkClasses =
+  "w-fit rounded-md border border-border px-4 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted focus-visible:ring-2 focus-visible:ring-primary";
+
 const pagerLinkClasses =
   "rounded-md border border-border px-4 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted focus-visible:ring-2 focus-visible:ring-primary";
 
@@ -161,9 +164,16 @@ export default async function ClientsPage({
           <>
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
               <ClientSearchForm filters={{ search: page.search }} problems={page.problems} />
-              <Link className={primaryLinkClasses} href="/clients/new">
-                {getMessage("clients.addClient")}
-              </Link>
+              <div className="flex flex-wrap items-center gap-2">
+                <Link className={primaryLinkClasses} href="/clients/new">
+                  {getMessage("clients.addClient")}
+                </Link>
+                {/* Section 15's CSV import: a merchant with a spreadsheet goes here rather than adding
+                    forty clients by hand. */}
+                <Link className={secondaryLinkClasses} href="/clients/import">
+                  {getMessage("clients.importLink")}
+                </Link>
+              </div>
             </div>
 
             {page.problems.some((problem) => problem.field === "offset") ? (
