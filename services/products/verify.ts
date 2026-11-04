@@ -33,7 +33,13 @@ import {
   parseCatalogueListQuery,
 } from "./catalogue-list.ts";
 import {
+  CATALOGUE_IMPORT_MAXIMUM_ROWS,
+  importCatalogueEntries,
+} from "./catalogue-import.ts";
+import {
   CATALOGUE_CODE_COLUMN,
+  CATALOGUE_CURRENCIES,
+  CATALOGUE_DEFAULT_UNIT,
   CATALOGUE_FIELD_LIMITS,
   CATALOGUE_TABLES,
   CATALOGUE_UNITS,
@@ -1158,6 +1164,537 @@ async function checkDelete(kind: CatalogueKind): Promise<void> {
   );
 }
 
+/* ---- STEP 111: the CSV import ---- */
+
+/**
+ * A price list of four rows: two good, one bad price, one bad unit.
+ *
+ * The unit column is deliberately blank on the row that lands, because a blank unit taking the
+ * catalogue's default is one of the things this import decides for itself - and the two catalogues
+ * disagree on that default, so a stated `item` would hide the decision.
+ */
+const IMPORT_FILE = [
+  "Name,SKU,Price,Unit,Description",
+  "Desk lamp,LAMP-01,42.50,,Adjustable arm",
+  "Side table,TABLE-01,19.999,,A small table",
+  "Bad price,BAD-01,1 200,item,",
+  "Bad unit,BAD-02,10,stone,",
+].join("\n");
+
+async function checkImportReport(kind: CatalogueKind): Promise<void> {
+  const db = createDb();
+  const audit = createInMemoryAuditTrail();
+  const outcome = await importCatalogueEntries(
+    { actor: owner, kind, text: IMPORT_FILE },
+    depsOf(db, audit),
+  );
+
+  expect(outcome.ok, `${kind}: a file with two bad rows still imports the good ones`);
+
+  if (!outcome.ok) {
+    return;
+  }
+
+  const report = outcome.report;
+
+  expectEqual(report.kind, kind, `${kind}: the report names its catalogue`);
+  expectEqual(report.created, 2, `${kind}: the two good rows were created`);
+  expectEqual(report.refused, 2, `${kind}: the two bad rows were refused`);
+  expectEqual(report.rows.length, 4, `${kind}: and every row is reported`);
+  expectDeepEqual(
+    report.columns,
+    ["name", "code", "unit_price", "unit", "description"],
+    `${kind}: the header named its five fields, with the code normalised to one name`,
+  );
+
+  // the refusals name the right line and the right field
+  expectDeepEqual(
+    at(report.rows, 2, `${kind} third row`).problems,
+    [{ field: "unit_price", rule: "invalid_format" }],
+    `${kind}: a price with a separator is refused as invalid_format`,
+  );
+  expectDeepEqual(
+    at(report.rows, 3, `${kind} fourth row`).problems,
+    [{ field: "unit", rule: "invalid_format" }],
+    `${kind}: a unit outside the list is refused as invalid_format`,
+  );
+  expectEqual(at(report.rows, 2, `${kind} third row`).line, 4, `${kind}: the refusal names the file's line`);
+  expectEqual(at(report.rows, 0, `${kind} first row`).name, "Desk lamp", `${kind}: a created row names the entry`);
+
+  // the price reached the row through the reader, at scale four, with no float anywhere
+  const first = at(db.rows[kind], 0, `${kind} first stored row`);
+
+  // the row crosses the wire as text, which is how a bigint survives JSON: 425000, never 4250.00
+  expectEqual(first["unit_price_minor"], "425000", `${kind}: 42.50 is written as 425000 minor units`);
+  expectEqual(
+    at(db.rows[kind], 1, `${kind} second stored row`)["unit_price_minor"],
+    "199990",
+    `${kind}: 19.999 is written as 199990, which is what the scale keeps`,
+  );
+
+  // a blank unit takes the catalogue's own default, from the migration
+  expectEqual(first["unit"], CATALOGUE_DEFAULT_UNIT[kind], `${kind}: a blank unit takes the default`);
+
+  // the code landed in the kind's own column
+  expectEqual(
+    first[CATALOGUE_CODE_COLUMN[kind]],
+    "LAMP-01",
+    `${kind}: the code is stored in the catalogue's own column`,
+  );
+
+  // each created row wrote its own audit entry, and the run wrote one summary
+  const created = audit.entries.filter((entry) => entry.action === CATALOGUE_CREATED_AUDIT_ACTION[kind]);
+  const summaries = audit.entries.filter((entry) => entry.action === "catalogue.imported");
+
+  expectEqual(created.length, 2, `${kind}: each created entry is audited`);
+  expectEqual(summaries.length, 1, `${kind}: and the run has one summary entry`);
+
+  const summary = at(summaries, 0, `${kind} import summary`);
+  const payload = summary.payload as Readonly<Record<string, unknown>>;
+
+  expectEqual(summary.companyId, COMPANY_A, `${kind}: the summary names the company`);
+  expectEqual(summary.actorUserId, OWNER_ID, `${kind}: and the actor`);
+  expectEqual(payload["kind"], kind, `${kind}: and the catalogue`);
+  expectEqual(payload["created"], 2, `${kind}: with how many were taken`);
+  expectEqual(payload["refused"], 2, `${kind}: and how many were not`);
+
+  // the report never repeats a value from the file, beyond the name of a row it created
+  expect(
+    !JSON.stringify(report.rows).includes("1 200"),
+    `${kind}: the report never repeats the price that failed`,
+  );
+  expect(
+    !JSON.stringify(report).includes("Adjustable arm"),
+    `${kind}: nor a description it imported`,
+  );
+}
+
+async function checkImportDefaults(kind: CatalogueKind): Promise<void> {
+  // name and price alone is the smallest useful file, and the two defaults fill the rest
+  const minimal = await importCatalogueEntries(
+    { actor: owner, kind, text: "Name,Price\nConsulting hour,125" },
+    depsOf(createDb()),
+  );
+
+  expect(minimal.ok && minimal.report.created === 1, `${kind}: a name and a price are enough`);
+  expectDeepEqual(
+    minimal.ok ? minimal.report.columns : [],
+    ["name", "unit_price"],
+    `${kind}: and the header needed nothing else`,
+  );
+
+  // a stated unit and currency win over the defaults
+  const stated = createDb();
+  const explicit = await importCatalogueEntries(
+    { actor: owner, kind, text: "Name,Price,Unit,Currency\nSetup,99,day,USD" },
+    depsOf(stated),
+  );
+
+  expect(explicit.ok && explicit.report.created === 1, `${kind}: a stated unit and currency import`);
+  expectEqual(at(stated.rows[kind], 0, `${kind} stated row`)["unit"], "day", `${kind}: the stated unit wins`);
+
+  // a currency the platform does not charge in is refused rather than replaced
+  const badCurrency = await importCatalogueEntries(
+    { actor: owner, kind, text: "Name,Price,Currency\nSetup,99,EUR" },
+    depsOf(createDb()),
+  );
+
+  expectDeepEqual(
+    badCurrency.ok ? (badCurrency.report.rows[0]?.problems ?? []) : [],
+    [{ field: "currency", rule: "invalid_format" }],
+    `${kind}: a currency the platform does not charge in is refused`,
+  );
+
+  // the price is the one thing an import cannot guess, so a file without it is refused once
+  const noPrice = await importCatalogueEntries(
+    { actor: owner, kind, text: "Name,SKU\nDesk lamp,LAMP-01" },
+    depsOf(createDb()),
+  );
+
+  expect(
+    !noPrice.ok && noPrice.problem === "header_missing_price",
+    `${kind}: a file with no price column is refused as header_missing_price`,
+  );
+}
+
+async function checkImportHeaders(kind: CatalogueKind): Promise<void> {
+  /** The outcome of importing one file, against an empty catalogue. */
+  const importOf = async (text: string) =>
+    importCatalogueEntries({ actor: owner, kind, text }, depsOf(createDb()));
+
+  // The header spellings a spreadsheet actually produces, including the price aliases. Each case brings
+  // its own value line: a row wider than its own header is `row_too_wide`, so a shared line would test
+  // the fixture rather than the header.
+  for (const [header, values, expected] of [
+    ["Name,Price", "Desk lamp,42.50", ["name", "unit_price"]],
+    ["PRODUCT NAME,UNIT PRICE", "Desk lamp,42.50", ["name", "unit_price"]],
+    ["name,rate", "Desk lamp,42.50", ["name", "unit_price"]],
+    ["Title,Selling Price,UOM", "Desk lamp,42.50,item", ["name", "unit_price", "unit"]],
+    ["Item,SKU,Price,Details", "Desk lamp,LAMP-01,42.50,warm white", ["name", "code", "unit_price", "description"]],
+    [
+      "Service,Code,Amount,Unit of Measure,Currency",
+      "Setup,SET-1,42.50,hour,USD",
+      ["name", "code", "unit_price", "unit", "currency"],
+    ],
+  ] as const) {
+    const outcome = await importOf(`${header}\n${values}`);
+
+    expect(outcome.ok, `${kind}: the header ${header} is understood`);
+    expectDeepEqual(
+      outcome.ok ? outcome.report.columns : [],
+      [...expected],
+      `${kind}: the header ${header} maps to ${expected.join(",")}`,
+    );
+  }
+
+  // an unknown column is ignored and named, so a re-import of an export works
+  const withExtras = await importOf("Name,Price,id,Created At\nDesk lamp,42.50,abc,2026-01-01");
+
+  expect(
+    withExtras.ok && withExtras.report.ignoredColumns.length === 2,
+    `${kind}: a column the import does not use is ignored and named`,
+  );
+
+  // a file with no name column, and one with two price columns
+  const noName = await importOf("SKU,Price\nLAMP-01,42.50");
+
+  expect(!noName.ok && noName.problem === "header_missing", `${kind}: a file with no name column is refused`);
+  expect(!noName.ok && noName.line === 1, `${kind}: naming the header line`);
+
+  const twoPrices = await importOf("Name,Price,Unit Price\nDesk lamp,42.50,40");
+
+  expect(
+    !twoPrices.ok && twoPrices.problem === "header_duplicate",
+    `${kind}: two price columns are refused as header_duplicate`,
+  );
+
+  // a row wider than the header is a shifted row
+  const wide = await importOf("Name,Price\nDesk lamp,42.50,item");
+
+  expect(!wide.ok && wide.problem === "row_too_wide", `${kind}: a row wider than the header is refused`);
+  expect(!wide.ok && wide.line === 2, `${kind}: naming the row`);
+
+  // a file past the row ceiling is refused before any row is written
+  const tooMany = await importOf(
+    `Name,Price\n${Array.from({ length: CATALOGUE_IMPORT_MAXIMUM_ROWS + 1 }, () => "Desk lamp,1").join("\n")}`,
+  );
+
+  expect(
+    !tooMany.ok && tooMany.problem === "too_many_rows",
+    `${kind}: a file past the row ceiling is refused as too_many_rows`,
+  );
+
+  // a header alone is an empty import; an empty file is a refusal about the file
+  const headerOnly = await importOf("Name,Price");
+
+  expect(
+    headerOnly.ok && headerOnly.report.created === 0 && headerOnly.report.refused === 0,
+    `${kind}: a header alone is an empty import`,
+  );
+
+  const empty = await importOf("");
+
+  expect(!empty.ok && empty.problem === "empty", `${kind}: an empty file is refused as empty`);
+
+  // a broken quote names the line it broke on
+  const broken = await importOf('Name,Price\nDesk lamp,42.50\n"unclosed,1');
+
+  expect(!broken.ok && broken.problem === "invalid_quote", `${kind}: a broken quote is refused`);
+  expect(!broken.ok && broken.line === 3, `${kind}: naming the line it broke on`);
+}
+
+/**
+ * The form and the import must judge one body the same way.
+ *
+ * This is the assertion that keeps the importer from becoming a second, looser definition of a valid
+ * catalogue row - the same assertion STEP 110's gate makes for clients, applied to the two things a
+ * catalogue adds: a price and a unit.
+ */
+async function checkImportAgreement(kind: CatalogueKind): Promise<void> {
+  const codeColumn = CATALOGUE_CODE_COLUMN[kind];
+
+  const bodies: readonly (readonly [string, Record<string, string>])[] = [
+    ["a missing name", { name: "", unit_price: "10" }],
+    ["a name past its ceiling", { name: "x".repeat(161), unit_price: "10" }],
+    ["a price that is not a price", { name: "Desk lamp", unit_price: "free" }],
+    ["a price with a comma", { name: "Desk lamp", unit_price: "1,200" }],
+    ["a price past the ceiling", { name: "Desk lamp", unit_price: "999999999999.9999" }],
+    ["a price with five decimals", { name: "Desk lamp", unit_price: "1.23456" }],
+    ["a negative price", { name: "Desk lamp", unit_price: "-5" }],
+    ["a unit outside the list", { name: "Desk lamp", unit_price: "10", unit: "stone" }],
+    ["a currency the platform cannot charge", { name: "Desk lamp", unit_price: "10", currency: "EUR" }],
+    ["a code with a space", { name: "Desk lamp", unit_price: "10", [codeColumn]: "LA MP" }],
+    ["a code starting with a hyphen", { name: "Desk lamp", unit_price: "10", [codeColumn]: "-LAMP" }],
+    ["a description past its ceiling", { name: "Desk lamp", unit_price: "10", description: "x".repeat(2_001) }],
+  ];
+
+  for (const [description, body] of bodies) {
+    // A CSV cell may be absent and the import fills it; a form body may not, and the screen sends the
+    // default its select shows. So the two are given the same defaults before they are compared, which
+    // keeps this honest about what it is proving: the values that are present are judged identically.
+    const complete = {
+      unit: CATALOGUE_DEFAULT_UNIT[kind],
+      currency: CATALOGUE_CURRENCIES[0],
+      ...body,
+    };
+
+    const direct = await rejectionOf(() =>
+      createCatalogueEntry({ actor: owner, kind, body: complete }, depsOf(createDb())),
+    );
+    const directDetails = isAppError(direct) && direct.code === "VALIDATION_FAILED" ? direct.details : [];
+
+    expect(directDetails.length > 0, `${kind}: the form refuses ${description}`);
+
+    // the same values through a one-row file, quoted so a comma inside one cannot shift the row
+    const fields = Object.keys(complete);
+    const header = fields.join(",");
+    const values = fields.map((field) => `"${(complete[field as keyof typeof complete] ?? "").replaceAll('"', '""')}"`);
+
+    const outcome = await importCatalogueEntries(
+      { actor: owner, kind, text: `${header}\n${values.join(",")}` },
+      depsOf(createDb()),
+    );
+
+    expect(outcome.ok, `${kind}: the import reads the one row file for ${description}`);
+    expectEqual(
+      outcome.ok ? outcome.report.refused : -1,
+      1,
+      `${kind}: the import refuses ${description} exactly as the form does`,
+    );
+
+    const problems = outcome.ok ? (outcome.report.rows[0]?.problems ?? []) : [];
+
+    expectDeepEqual(
+      problems.map((problem) => problem.field).sort(),
+      directDetails.map((detail) => detail.field).sort(),
+      `${kind}: and names the same fields for ${description}`,
+    );
+    expectDeepEqual(
+      problems.map((problem) => problem.rule).sort(),
+      directDetails.map((detail) => detail.rule).sort(),
+      `${kind}: and the same rules for ${description}`,
+    );
+  }
+}
+
+async function checkImportDuplicates(kind: CatalogueKind): Promise<void> {
+  const db = createDb();
+  const codeColumn = CATALOGUE_CODE_COLUMN[kind];
+
+  // a code used twice inside one file: the first lands, the second is refused on its own line
+  const twice = await importCatalogueEntries(
+    { actor: owner, kind, text: `Name,${codeColumn},Price\nDesk lamp,LAMP-01,42.50\nDesk lamp again,lamp-01,40` },
+    depsOf(db),
+  );
+
+  expect(twice.ok && twice.report.created === 1, `${kind}: the first of two identical codes is created`);
+  expect(twice.ok && twice.report.refused === 1, `${kind}: and the second is refused`);
+  expectDeepEqual(
+    twice.ok ? (twice.report.rows[1]?.problems ?? []) : [],
+    [{ field: codeColumn, rule: "already_used" }],
+    `${kind}: naming the code as already used, case insensitively`,
+  );
+  expect(twice.ok && twice.report.rows[1]?.line === 3, `${kind}: on the line that caused it`);
+
+  // an entry the merchant already has is a row refusal, so the rest of the file still lands
+  await createCatalogueEntry(
+    { actor: owner, kind, body: { name: "Existing", [codeColumn]: "TAKEN-1", unit_price: "1", currency: "USD", unit: CATALOGUE_DEFAULT_UNIT[kind] } },
+    depsOf(db),
+  );
+
+  const mixed = await importCatalogueEntries(
+    { actor: owner, kind, text: `Name,${codeColumn},Price\nNew One,NEW-1,10\nClash,TAKEN-1,20` },
+    depsOf(db),
+  );
+
+  expect(mixed.ok && mixed.report.created === 1, `${kind}: a file naming an existing entry still imports the rest`);
+  expectDeepEqual(
+    mixed.ok ? (mixed.report.rows[1]?.problems ?? []) : [],
+    [{ field: codeColumn, rule: "already_used" }],
+    `${kind}: and reports the clash on that row`,
+  );
+}
+
+async function checkImportTenancy(kind: CatalogueKind): Promise<void> {
+  const db = createDb();
+  const file = "Name,Price\nDesk lamp,42.50";
+
+  // only the owner may import, exactly as only the owner may create
+  for (const roles of [["compliance_kyc"], ["finance_ops"], ["support"], ["ceo"], ["super_admin"], ["blogger"]] as const) {
+    const refused = await rejectionOf(() =>
+      importCatalogueEntries(
+        { actor: actorOf([...roles], COMPANY_A, { userId: OFFICE_ID }), kind, text: file },
+        depsOf(createDb()),
+      ),
+    );
+
+    expect(
+      isAppError(refused) && refused.code === "PERMISSION_DENIED",
+      `${kind}: the role ${roles[0]} may not import the catalogue`,
+    );
+  }
+
+  const platformAccount = await rejectionOf(() =>
+    importCatalogueEntries({ actor: desk, kind, text: file }, depsOf(createDb())),
+  );
+
+  expect(isAppError(platformAccount), `${kind}: an account with no company cannot import into one`);
+
+  // everything created belongs to the actor's company, and another merchant's import is their own
+  const imported = await importCatalogueEntries({ actor: owner, kind, text: file }, depsOf(db));
+
+  expect(imported.ok && imported.report.created === 1, `${kind}: the owner imports one entry`);
+  expectEqual(at(db.rows[kind], 0, `${kind} imported row`)["company_id"], COMPANY_A, `${kind}: scoped to the actor's company`);
+
+  const other = await importCatalogueEntries({ actor: otherOwner, kind, text: file }, depsOf(db));
+
+  expect(other.ok && other.report.created === 1, `${kind}: another merchant imports the same file`);
+  expectEqual(at(db.rows[kind], 1, `${kind} second row`)["company_id"], COMPANY_B, `${kind}: into their own company`);
+  expectEqual(db.rows[kind].length, 2, `${kind}: which is a second row, not an overwrite`);
+}
+
+async function checkImportSources(): Promise<void> {
+  for (const path of [
+    "services/products/catalogue-import.ts",
+    "app/api/products/import/route.ts",
+    "app/api/services/import/route.ts",
+    "app/(dashboard)/products/catalogue-import-form.tsx",
+    "app/(dashboard)/products/catalogue-import-screen.tsx",
+    "app/(dashboard)/products/import/page.tsx",
+    "app/(dashboard)/services/import/page.tsx",
+  ]) {
+    const source = await readRepositoryFile(path);
+
+    expect(source.length > 0, `${path} exists`);
+    expect(source.split("\n", 1)[0]?.trim() === `// path: ${path}`, `${path} starts with its path comment`);
+    expect(!/[^\u0009\u000a\u000d\u0020-\u007e]/u.test(source.replaceAll("\ufeff", "")), `${path} is ASCII only`);
+  }
+
+  /** The source with its comment lines removed, so a comment naming a symbol cannot satisfy a check. */
+  const codeOf = (source: string): string =>
+    source
+      .split("\n")
+      .filter((line) => {
+        const trimmed = line.trim();
+
+        return !trimmed.startsWith("*") && !trimmed.startsWith("//") && !trimmed.startsWith("/*");
+      })
+      .join("\n");
+
+  const importModule = await readRepositoryFile("services/products/catalogue-import.ts");
+  const importCode = codeOf(importModule);
+
+  // the importer validates by calling the same service, never by writing a row of its own
+  expect(importModule.includes("createCatalogueEntry("), "every row goes through createCatalogueEntry");
+  expectEqual(/insertReturning\(/u.test(importModule), false, "the import opens no insert of its own");
+  expectEqual(/CATALOGUE_TABLES/u.test(importModule), false, "and names no table");
+  expect(importModule.includes("requireAnyRole\(") === false, "so it states no role of its own either");
+
+  // money never passes through a float, and the price is not parsed here at all
+  expectEqual(/parseFloat|Number\(/u.test(importCode), false, "no amount passes through a float parse");
+  expectEqual(/priceToMinor/u.test(importCode), false, "the price is not even converted here: the service does it");
+
+  // the reader is STEP 110's, reused rather than copied
+  expect(importModule.includes('from "../clients/csv.ts"'), "the reader is STEP 110's csv module");
+
+  const csvModule = await readRepositoryFile("services/clients/csv.ts");
+  const secondReader = await readRepositoryFile("services/products/catalogue-import.ts");
+
+  expect(!secondReader.includes("function readCsv"), "and is not reimplemented here");
+  expect(csvModule.includes("export function readCsv"), "which still exports the one reader");
+
+  // a refused row does not stop the run, and an outage does
+  expect(importModule.includes("catch (error)"), "a row failure is caught per row");
+  expect(importModule.includes("throw error"), "and a failure that is not the row's stops the run");
+
+  // the routes: one factory, and the second route is the factory called with the other catalogue
+  for (const routePath of ["app/api/products/import/route.ts", "app/api/services/import/route.ts"]) {
+    const source = await readRepositoryFile(routePath);
+
+    expect(source.includes("createCatalogueImportRoute"), `${routePath} builds its handler from the factory`);
+  }
+
+  const serviceRoute = codeOf(await readRepositoryFile("app/api/services/import/route.ts"));
+
+  expect(
+    !serviceRoute.includes("request.text()") && !serviceRoute.includes("requireCsrfToken"),
+    "the service import route holds no handler of its own: it delegates to the factory",
+  );
+
+  const route = await readRepositoryFile("app/api/products/import/route.ts");
+
+  expect(route.includes("requireCsrfToken("), "the import route checks the token");
+  expect(
+    route.indexOf("requireCsrfToken(") < route.indexOf("readRequestActor("),
+    "before it looks the session up",
+  );
+  expect(
+    route.indexOf("requireCsrfToken(") < route.indexOf("const bodyText = await request.text()"),
+    "and before it reads the body",
+  );
+  expect(route.includes("PAYLOAD_TOO_LARGE"), "it bounds the body");
+  expect(
+    route.includes('{ field: "file", rule: "invalid_type" }'),
+    "and refuses a body that is not CSV, naming the field and the rule",
+  );
+  expect(
+    !route.includes('throw new AppError("UNSUPPORTED_MEDIA_TYPE"'),
+    "without borrowing a shared sentence that claims the endpoint takes JSON",
+  );
+
+  const csrf = await readRepositoryFile("lib/security/csrf.ts");
+
+  expect(csrf.includes('"/api/products/import"'), "the product import route is on the protected list");
+  expect(csrf.includes('"/api/services/import"'), "and so is the service import route");
+
+  // the screens post a file through the one form, with the token
+  const form = await readRepositoryFile("app/(dashboard)/products/catalogue-import-form.tsx");
+
+  expect(form.includes('method: "POST"'), "the form posts");
+  expect(form.includes("csrfHeaders("), "carrying the CSRF token");
+  expect(form.includes('type="file"'), "it takes a file");
+  expect(form.includes("accept="), "of the types it accepts");
+  expect(form.includes("report.rows"), "and prints the report row by row");
+  expect(form.includes("catalogue.ruleTooLarge"), "and words the price ceiling's refusal");
+
+  // the list is the way in, for both catalogues
+  const screens = await readRepositoryFile("app/(dashboard)/products/catalogue-screens.tsx");
+
+  expect(screens.includes("${path}/import"), "the list links to the import");
+  expect(screens.includes("catalogue.importLinkProducts"), "with the product's label");
+  expect(screens.includes("catalogue.importLinkServices"), "and the service's");
+
+  // the screen prints its limits from the service, so no number is typed twice
+  const screen = await readRepositoryFile("app/(dashboard)/products/catalogue-import-screen.tsx");
+
+  expect(screen.includes("CATALOGUE_IMPORT_MAXIMUM_ROWS"), "the screen prints the row ceiling it enforces");
+  expect(screen.includes("MAXIMUM_CSV_ROWS"), "and the reader's own record ceiling");
+  expect(screen.includes("CATALOGUE_DEFAULT_UNIT[kind]"), "and the default unit of the catalogue it imports");
+
+  // and the form refuses an oversized file before uploading it, using the same body bound
+  const importForm = await readRepositoryFile("app/(dashboard)/products/catalogue-import-form.tsx");
+
+  expect(importForm.includes("MAXIMUM_FILE_BYTES"), "the form bounds the file it will upload");
+  expect(importForm.includes("catalogue.importLocalTooLarge"), "and says so in the merchant's words");
+  expectEqual(
+    importForm.includes("3_145_728"),
+    true,
+    "with the ceiling as the route's own body bound times three, so the two agree",
+  );
+
+  // STEP 111 writes no migration: the import writes the two tables 0020 and 0021 describe
+  const productsMigration = await readRepositoryFile("migrations/0020_products.sql");
+
+  expect(
+    productsMigration.includes("unit_price_minor bigint"),
+    "the imported price lands in the column 0020 declares",
+  );
+  expect(
+    productsMigration.includes("unit in ('item', 'unit', 'hour', 'day', 'week', 'month', 'project')"),
+    "and the unit list the import fills from is the migration's own",
+  );
+}
+
 /* ---- sources ---- */
 
 async function checkSources(): Promise<void> {
@@ -1490,6 +2027,19 @@ async function main(): Promise<void> {
   await checkSearch("service");
   await checkDelete("product");
   await checkDelete("service");
+  await checkImportReport("product");
+  await checkImportReport("service");
+  await checkImportDefaults("product");
+  await checkImportDefaults("service");
+  await checkImportHeaders("product");
+  await checkImportHeaders("service");
+  await checkImportAgreement("product");
+  await checkImportAgreement("service");
+  await checkImportDuplicates("product");
+  await checkImportDuplicates("service");
+  await checkImportTenancy("product");
+  await checkImportTenancy("service");
+  await checkImportSources();
   await checkSources();
 
   if (failures.length > 0) {

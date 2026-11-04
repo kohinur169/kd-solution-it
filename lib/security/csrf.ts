@@ -115,8 +115,10 @@ export const CSRF_PROTECTED_PATHS: readonly string[] = Object.freeze([
   "/api/clients/import",
   "/api/products",
   "/api/products/[id]",
+  "/api/products/import",
   "/api/services",
   "/api/services/[id]",
+  "/api/services/import",
 ]);
 
 /** Why a request was refused, for the log and the gate - never for the response. */

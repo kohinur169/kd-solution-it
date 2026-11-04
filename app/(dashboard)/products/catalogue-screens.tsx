@@ -276,9 +276,18 @@ export async function CatalogueHub({
         <>
           <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <CatalogueSearchForm filters={{ search: page.search }} kind={kind} problems={page.problems} />
-            <Link className={primaryLinkClasses} href={`${path}/new`}>
-              {getMessage(kind === "product" ? "catalogue.addProduct" : "catalogue.addService")}
-            </Link>
+            <div className="flex flex-wrap items-center gap-2">
+              <Link className={primaryLinkClasses} href={`${path}/new`}>
+                {getMessage(kind === "product" ? "catalogue.addProduct" : "catalogue.addService")}
+              </Link>
+              {/* Section 15's CSV import: a merchant with a price list goes here rather than adding
+                  forty rows by hand. */}
+              <Link className={pagerLinkClasses} href={`${path}/import`}>
+                {getMessage(
+                  kind === "product" ? "catalogue.importLinkProducts" : "catalogue.importLinkServices",
+                )}
+              </Link>
+            </div>
           </div>
 
           {page.problems.some((problem) => problem.field === "offset") ? (
