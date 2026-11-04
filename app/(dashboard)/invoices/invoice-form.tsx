@@ -14,6 +14,11 @@ import {
   type InvoiceUnit,
 } from "@/services/invoices/invoice-fields";
 import { grossLineMinor, quantityToThousandths } from "@/services/invoices/invoice-totals";
+import {
+  percentDiscountMinor,
+  percentToBasisPoints,
+  type DiscountBasis,
+} from "@/services/invoices/invoice-discount";
 import type {
   InvoiceCatalogueOption,
   InvoiceClientOption,
@@ -164,6 +169,9 @@ export function InvoiceForm({ clients, clientsTruncated, defaultDueDate }: Invoi
   const [dueDate, setDueDate] = useState<string>(defaultDueDate);
   const [memo, setMemo] = useState<string>("");
   const [discount, setDiscount] = useState<string>("");
+  // `amount` reads the discount box as money, `percent` reads it as a share of the subtotal. The box keeps
+  // one value and the basis gives it its meaning, which is how the body is shaped too.
+  const [discountBasis, setDiscountBasis] = useState<DiscountBasis>("amount");
   const [tax, setTax] = useState<string>("");
   const [lines, setLines] = useState<readonly LineDraft[]>([blankLine(1)]);
   const [errors, setErrors] = useState<Readonly<Record<string, string>>>({});
@@ -254,7 +262,19 @@ export function InvoiceForm({ clients, clientsTruncated, defaultDueDate }: Invoi
   const subtotalMinor = lineAmounts.every((amount): amount is bigint => amount !== null)
     ? lineAmounts.reduce((total, amount) => total + amount, 0n)
     : null;
-  const invoiceDiscountMinor = discount.trim().length === 0 ? 0n : priceToMinor(discount);
+  // The discount box means one of two things, and the running total has to resolve it either way. A
+  // percentage is resolved against the subtotal **on the screen**, with the same function the server uses, so
+  // the merchant never reads one total before saving and another after.
+  const discountBasisPoints =
+    discountBasis === "percent" ? percentToBasisPoints(discount) : null;
+  const invoiceDiscountMinor =
+    discountBasis === "percent"
+      ? subtotalMinor === null || discountBasisPoints === null
+        ? null
+        : percentDiscountMinor({ subtotalMinor, basisPoints: discountBasisPoints })
+      : discount.trim().length === 0
+        ? 0n
+        : priceToMinor(discount);
   const taxMinor = tax.trim().length === 0 ? 0n : priceToMinor(tax);
   const totalMinor =
     subtotalMinor !== null && invoiceDiscountMinor !== null && taxMinor !== null
@@ -274,6 +294,7 @@ export function InvoiceForm({ clients, clientsTruncated, defaultDueDate }: Invoi
       due_at: dueAt ?? dueDate,
       memo,
       discount,
+      discount_basis: discountBasis,
       tax,
       lines: lines.map((line) => ({
         description: line.description,
@@ -648,8 +669,45 @@ export function InvoiceForm({ clients, clientsTruncated, defaultDueDate }: Invoi
           </div>
 
           <div className="flex flex-col gap-1">
+            <label className={labelClasses} htmlFor="invoice-discount-basis">
+              {getMessage("invoices.discountBasisLabel")}
+            </label>
+            {/*
+              Two radios rather than a select: there are two options, both are short, and the choice changes
+              the meaning of the box below it. A select hides that behind a tap on a phone.
+            */}
+            <div className="flex flex-wrap items-center gap-4">
+              <label className="flex items-center gap-2 text-sm" htmlFor="invoice-discount-amount">
+                <input
+                  checked={discountBasis === "amount"}
+                  id="invoice-discount-amount"
+                  name="discount-basis"
+                  onChange={() => {
+                    setDiscountBasis("amount");
+                    clearError("discount");
+                  }}
+                  type="radio"
+                />
+                {getMessage("invoices.discountBasisAmount")}
+              </label>
+              <label className="flex items-center gap-2 text-sm" htmlFor="invoice-discount-percent">
+                <input
+                  checked={discountBasis === "percent"}
+                  id="invoice-discount-percent"
+                  name="discount-basis"
+                  onChange={() => {
+                    setDiscountBasis("percent");
+                    clearError("discount");
+                  }}
+                  type="radio"
+                />
+                {getMessage("invoices.discountBasisPercent")}
+              </label>
+            </div>
             <label className={labelClasses} htmlFor="invoice-discount">
-              {getMessage("invoices.invoiceDiscount")}
+              {getMessage(
+                discountBasis === "percent" ? "invoices.discountPercentLabel" : "invoices.discountAmountLabel",
+              )}
             </label>
             <input
               aria-invalid={errors["discount"] !== undefined}
@@ -664,7 +722,13 @@ export function InvoiceForm({ clients, clientsTruncated, defaultDueDate }: Invoi
               value={discount}
             />
             {errors["discount"] === undefined ? (
-              <p className={hintClasses}>{getMessage("invoices.invoiceDiscountHint")}</p>
+              <p className={hintClasses}>
+                {getMessage(
+                  discountBasis === "percent"
+                    ? "invoices.discountPercentHint"
+                    : "invoices.invoiceDiscountHint",
+                )}
+              </p>
             ) : (
               errorLine("discount")
             )}

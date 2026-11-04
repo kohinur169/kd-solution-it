@@ -107,6 +107,7 @@ export function subtotalOf(lines: readonly LineAmounts[]): bigint {
   return lines.reduce((total, line) => total + lineTotalMinor(line), 0n);
 }
 
+
 /**
  * A typed quantity as thousandths, or null when it is not one.
  *

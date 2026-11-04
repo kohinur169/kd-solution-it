@@ -35,6 +35,17 @@ import {
   subtotalOf,
   thousandthsToQuantity,
 } from "./invoice-totals.ts";
+import {
+  basisPointsToColumn,
+  basisPointsToPercent,
+  DISCOUNT_DEFAULT_BASIS,
+  discountStateOf,
+  isDiscountBasis,
+  percentDiscountMinor,
+  percentToBasisPoints,
+  resolveDiscount,
+  type DiscountBasis,
+} from "./invoice-discount.ts";
 
 /**
  * Section 16's invoice create: the document of `0022` with the lines of `0023`, written as one draft.
@@ -172,6 +183,12 @@ export interface InvoiceSnapshot {
     readonly subtotalMinor: string;
     readonly discount: string;
     readonly discountMinor: string;
+    /** How the discount was expressed, so the editor can reopen the box the merchant actually filled. */
+    readonly discountBasis: DiscountBasis;
+    /** The percentage in basis points; zero unless the basis is `percent`. */
+    readonly discountPercentBasisPoints: number;
+    /** The same percentage as the text the screen prints: `12.5`, `10`, `1.25`. */
+    readonly discountPercent: string;
     readonly tax: string;
     readonly taxMinor: string;
     readonly total: string;
@@ -198,6 +215,8 @@ export const invoiceRowSchema = z.object({
   currency: z.string().length(3),
   subtotal_minor: priceColumnSchema,
   discount_minor: priceColumnSchema,
+  discount_basis: z.string(),
+  discount_percent_bp: z.number().int(),
   tax_minor: priceColumnSchema,
   total_minor: priceColumnSchema,
   amount_paid_minor: priceColumnSchema,
@@ -248,7 +267,7 @@ type InvoiceItemRow = z.infer<typeof invoiceItemRowSchema>;
 
 /** The columns a read selects, listed one by one: rule 17, and never a `*`. */
 const INVOICE_ROW_COLUMNS =
-  "select=id,company_id,client_id,number,status,currency,subtotal_minor,discount_minor,tax_minor,total_minor,amount_paid_minor,client_name,client_email,client_address,memo,issued_at,due_at,first_viewed_at,paid_at,voided_at,created_at,updated_at,deleted_at,version";
+  "select=id,company_id,client_id,number,status,currency,subtotal_minor,discount_minor,discount_basis,discount_percent_bp,tax_minor,total_minor,amount_paid_minor,client_name,client_email,client_address,memo,issued_at,due_at,first_viewed_at,paid_at,voided_at,created_at,updated_at,deleted_at,version";
 
 const INVOICE_ITEM_COLUMNS =
   "select=id,company_id,invoice_id,position,description,unit,quantity,unit_price_minor,discount_minor,line_total_minor,product_id,service_id,created_at,updated_at,deleted_at,version";
@@ -287,6 +306,9 @@ export const invoiceCreateSchema = z
     due_at: z.string(),
     memo: z.string().nullish(),
     discount: z.string().nullish(),
+    // `percent` makes `discount` a percentage rather than money. Omitted means `amount`, which is what
+    // every caller before STEP 114 sent.
+    discount_basis: z.string().nullish(),
     tax: z.string().nullish(),
     lines: z.array(invoiceLineInputSchema),
   })
@@ -299,6 +321,9 @@ interface InvoiceInput {
   readonly dueAt: string;
   readonly memo: string | null;
   readonly discountMinor: bigint;
+  /** `amount` keeps `discountMinor` as the money; `percent` makes `discountBasisPoints` the instruction. */
+  readonly discountBasis: DiscountBasis;
+  readonly discountBasisPoints: bigint;
   readonly taxMinor: bigint;
   readonly lines: readonly ParsedLine[];
 }
@@ -321,7 +346,16 @@ export interface ParsedLine {
 }
 
 /** The order fields are reported in, so a form marks the boxes top to bottom. */
-const FIELD_ORDER = ["client_id", "currency", "due_at", "memo", "discount", "tax", "lines"] as const;
+const FIELD_ORDER = [
+  "client_id",
+  "currency",
+  "due_at",
+  "memo",
+  "discount_basis",
+  "discount",
+  "tax",
+  "lines",
+] as const;
 
 /** One line's fields, in the order the line reads left to right on the screen. */
 const LINE_FIELD_ORDER = [
@@ -566,15 +600,40 @@ function parseBody(body: unknown, now: number): InvoiceInput {
     problems.push({ field: "due_at", rule: "too_large" });
   }
 
+  // The basis decides how `discount` is read: a flat amount of money, or a percentage of the subtotal.
+  // A body that sends a basis this build does not know is malformed rather than defaulted, because
+  // silently reading a percentage as dollars would overcharge every client of that merchant.
+  const basisRaw = (value.discount_basis ?? "").trim();
+  const discountBasis: DiscountBasis = basisRaw.length === 0 ? DISCOUNT_DEFAULT_BASIS : (basisRaw as DiscountBasis);
+
+  if (basisRaw.length > 0 && !isDiscountBasis(basisRaw)) {
+    problems.push({ field: "discount_basis", rule: "invalid_format" });
+  }
+
   const discountRaw = (value.discount ?? "").trim();
-  const invoiceDiscount = discountRaw.length === 0 ? 0n : priceToMinor(discountRaw);
+  const invoiceDiscount =
+    discountRaw.length === 0
+      ? 0n
+      : discountBasis === "percent"
+        ? percentToBasisPoints(discountRaw)
+        : priceToMinor(discountRaw);
 
   if (invoiceDiscount === null) {
     problems.push({
       field: "discount",
-      rule: priceProblemOf(discountRaw) === "too_large" ? "too_large" : "invalid_format",
+      rule:
+        discountBasis === "percent"
+          ? "invalid_format"
+          : priceProblemOf(discountRaw) === "too_large"
+            ? "too_large"
+            : "invalid_format",
     });
   }
+
+  // A percentage is resolved against the subtotal once the lines are known, so the money is not carried
+  // here; the basis points are. The two travel together so a row is never written with one but not the
+  // other.
+  const discountBasisPoints = discountBasis === "percent" ? (invoiceDiscount ?? 0n) : 0n;
 
   const taxRaw = (value.tax ?? "").trim();
   const taxMinor = taxRaw.length === 0 ? 0n : priceToMinor(taxRaw);
@@ -608,10 +667,20 @@ function parseBody(body: unknown, now: number): InvoiceInput {
   if (problems.length === 0 && invoiceDiscount !== null && taxMinor !== null) {
     const subtotal = subtotalOf(lines);
 
-    // `invoices_discount_check`: an invoice-level discount never exceeds what the lines add up to.
-    if (invoiceDiscount > subtotal) {
+    // `invoices_discount_check`: an invoice-level discount never exceeds what the lines add up to. A
+    // percentage is resolved first, because the resolved money is what the check actually sees; at most a
+    // hundred percent it can never exceed the subtotal, but it goes through the same function the service
+    // uses so there is exactly one answer to what a percentage is worth.
+    const resolvedDiscount = resolveDiscount({
+      basis: discountBasis,
+      basisPoints: discountBasisPoints,
+      amountMinor: invoiceDiscount,
+      subtotalMinor: subtotal,
+    });
+
+    if (resolvedDiscount > subtotal) {
       problems.push({ field: "discount", rule: "too_large" });
-    } else if (subtotal - invoiceDiscount + taxMinor < 0n) {
+    } else if (subtotal - resolvedDiscount + taxMinor < 0n) {
       problems.push({ field: "discount", rule: "too_large" });
     }
   }
@@ -629,6 +698,8 @@ function parseBody(body: unknown, now: number): InvoiceInput {
     dueAt: new Date(dueAtEpochMs).toISOString(),
     memo: sanitisedMemo === null || sanitisedMemo.length === 0 ? null : sanitisedMemo,
     discountMinor: invoiceDiscount,
+    discountBasis,
+    discountBasisPoints,
     taxMinor,
     lines,
   };
@@ -678,6 +749,35 @@ function orderDetails(problems: readonly ErrorDetail[]): readonly ErrorDetail[] 
     return rankOf(left.field) - rankOf(right.field);
   });
 }
+
+/**
+ * The `subtotal_minor` a stored invoice currently holds.
+ *
+ * Read rather than computed, and deliberately so: after `invoice_items_sync_totals` has run it is the
+ * database's answer to what the lines add up to, and a percentage discount must be a share of that number
+ * rather than of a second opinion. The read is scoped to the company as well as the id, so it cannot
+ * describe another merchant's document.
+ */
+async function readSubtotalMinor(rest: RestClient, invoiceId: string, companyId: string): Promise<bigint> {
+  const rows = await rest.select(
+    INVOICE_TABLE,
+    `select=id,subtotal_minor&id=eq.${invoiceId}&company_id=eq.${companyId}&deleted_at=is.null`,
+    invoiceSubtotalRowSchema,
+  );
+  const row = rows[0];
+
+  if (row === undefined) {
+    throw new AppError("RESOURCE_NOT_FOUND", { cause: { rule: "invoice", reason: "not_found" } });
+  }
+
+  return row.subtotal_minor;
+}
+
+/** The one column the discount resolution needs from the parent row. */
+const invoiceSubtotalRowSchema = z.object({
+  id: z.string().uuid(),
+  subtotal_minor: priceColumnSchema,
+});
 
 /** The client snapshot's single address line, joined from the book's five address columns. */
 function addressOf(values: Readonly<Record<string, string | null>>): string | null {
@@ -743,6 +843,9 @@ function snapshotOf(row: InvoiceRow, lines: readonly InvoiceItemRow[]): InvoiceS
       subtotalMinor: row.subtotal_minor.toString(),
       discount: priceFromMinor(row.discount_minor),
       discountMinor: row.discount_minor.toString(),
+      discountBasis: discountStateOf(row).basis,
+      discountPercentBasisPoints: row.discount_percent_bp,
+      discountPercent: basisPointsToPercent(BigInt(row.discount_percent_bp)),
       tax: priceFromMinor(row.tax_minor),
       taxMinor: row.tax_minor.toString(),
       total: priceFromMinor(row.total_minor),
@@ -906,11 +1009,28 @@ export async function createInvoice(
   // on the same document. Applying it here also means `invoices_derive_total` recomputes the total
   // from the two values that are now both correct.
   if (values.discountMinor > 0n) {
+    // A percentage is resolved against the subtotal the trigger has just written, so the money stored is
+    // the share the merchant asked for on the lines as they actually landed. A flat amount is the money
+    // the merchant typed. Either way the basis travels in the same update as the money, so a row never
+    // holds one without the other and `invoices_discount_basis_coherent_check` is satisfied by
+    // construction rather than by a second statement that could fail alone.
+    const resolvedDiscount =
+      values.discountBasis === "percent"
+        ? percentDiscountMinor({
+            subtotalMinor: await readSubtotalMinor(dependencies.rest, invoice.id, companyId),
+            basisPoints: values.discountBasisPoints,
+          })
+        : values.discountMinor;
+
     try {
       await dependencies.rest.update(
         INVOICE_TABLE,
         `id=eq.${invoice.id}&company_id=eq.${companyId}&status=eq.${INVOICE_CREATED_STATUS}`,
-        { discount_minor: values.discountMinor },
+        {
+          discount_minor: resolvedDiscount,
+          discount_basis: values.discountBasis,
+          discount_percent_bp: basisPointsToColumn(values.discountBasisPoints),
+        },
       );
     } catch (error) {
       await abandon(dependencies, {

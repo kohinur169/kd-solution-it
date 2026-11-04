@@ -27,8 +27,10 @@ import {
   INVOICE_LINE_UPDATED_AUDIT_ACTION,
   addInvoiceLine,
   invoiceLineRowSchema,
+  INVOICE_DISCOUNT_UPDATED_AUDIT_ACTION,
   removeInvoiceLine,
   updateInvoiceLine,
+  updateInvoiceTotals,
   type InvoiceLineDependencies,
 } from "./invoice-lines.ts";
 import {
@@ -46,12 +48,26 @@ import {
   INVOICE_UNITS,
 } from "./invoice-fields.ts";
 import {
+  grossLineMinor,
   invoiceTotalsOf,
   lineTotalMinor,
   quantityToThousandths,
   subtotalOf,
   thousandthsToQuantity,
 } from "./invoice-totals.ts";
+import {
+  DISCOUNT_BASES,
+  DISCOUNT_PERCENT_MAXIMUM_BP,
+  basisPointsToColumn,
+  basisPointsToPercent,
+  discountProblemAt,
+  discountStateOf,
+  isDiscountBasis,
+  percentDiscountMinor,
+  percentToBasisPoints,
+  resolveDiscount,
+  selectInvoiceTotals,
+} from "./invoice-discount.ts";
 import { priceFromMinor, priceToMinor } from "../products/price.ts";
 
 /**
@@ -310,10 +326,29 @@ function syncSubtotal(db: InvoiceDb, invoiceId: string): void {
     .filter((row) => row["invoice_id"] === invoiceId && row["deleted_at"] === null)
     .reduce((total, row) => total + BigInt(String(row["line_total_minor"])), 0n);
 
+  // `invoice_items_sync_totals` updates the parent, and that UPDATE is checked like any other: the three
+  // `0022` checks run against the values it is writing. The discount one is the one that can be broken by
+  // a line change - a stored flat discount larger than what the remaining lines add up to - and leaving it
+  // out of the fixture is what let the gate approve that failure mode. It raises as `check_violation`,
+  // which the fixture models as VALIDATION_FAILED, exactly as the catalogue trigger is modelled.
+  const storedDiscount = BigInt(String(parent["discount_minor"] ?? "0"));
+  const tax = BigInt(String(parent["tax_minor"] ?? "0"));
+
+  // `0113`: the same statement resolves a percentage against the subtotal it is writing, and leaves a flat
+  // amount alone. Modelled here from the stored basis rather than by calling the module's own function, so
+  // an assertion comparing the two has an independent side.
+  const discount =
+    String(parent["discount_basis"] ?? "amount") === "percent"
+      ? (subtotal * BigInt(Number(parent["discount_percent_bp"] ?? 0)) + 5_000n) / 10_000n
+      : storedDiscount;
+
+  if (discount > subtotal || tax < 0n || subtotal - discount + tax < 0n) {
+    throw new AppError("VALIDATION_FAILED", { cause: { rule: "invoice", reason: "check_violation" } });
+  }
+
   parent["subtotal_minor"] = subtotal.toString();
-  parent["total_minor"] = (
-    subtotal - BigInt(String(parent["discount_minor"])) + BigInt(String(parent["tax_minor"]))
-  ).toString();
+  parent["discount_minor"] = discount.toString();
+  parent["total_minor"] = (subtotal - discount + tax).toString();
 }
 
 /**
@@ -571,6 +606,9 @@ function createInvoiceRest(db: InvoiceDb): RestClient {
           status: "draft",
           subtotal_minor: "0",
           discount_minor: "0",
+          // `0112`'s defaults: every row written before the basis existed was a flat amount.
+          discount_basis: "amount",
+          discount_percent_bp: 0,
           tax_minor: "0",
           amount_paid_minor: "0",
           issued_at: null,
@@ -750,6 +788,25 @@ function createInvoiceRest(db: InvoiceDb): RestClient {
         return Promise.reject(new AppError("VALIDATION_FAILED"));
       }
 
+      // `0112`'s three checks. A row cannot say it is a percentage discount without a percentage, cannot
+      // carry a percentage above a hundred percent, and cannot say it is a flat amount while carrying a
+      // percentage. Without these the fixture would approve exactly the incoherent rows the columns exist
+      // to refuse.
+      const basis = String(next["discount_basis"] ?? "amount");
+      const basisPoints = Number(next["discount_percent_bp"] ?? 0);
+
+      if (basis !== "amount" && basis !== "percent") {
+        return Promise.reject(new AppError("VALIDATION_FAILED"));
+      }
+
+      if (!Number.isInteger(basisPoints) || basisPoints < 0 || basisPoints > 10_000) {
+        return Promise.reject(new AppError("VALIDATION_FAILED"));
+      }
+
+      if (!((basis === "percent" && basisPoints > 0) || (basis === "amount" && basisPoints === 0))) {
+        return Promise.reject(new AppError("VALIDATION_FAILED"));
+      }
+
       Object.assign(row, wireOf(values), {
         total_minor: (subtotal - discount + tax).toString(),
         updated_at: new Date(NOW + 10_000).toISOString(),
@@ -816,6 +873,25 @@ function bodyOf(overrides: Readonly<Record<string, unknown>> = {}): Record<strin
 }
 
 /** The details of a validation refusal, or an empty list when the call did not refuse that way. */
+/**
+ * The details of a refusal of **any** code, or an empty list.
+ *
+ * `refusalOf` above deliberately only reads `VALIDATION_FAILED`, because most of the gate is asserting that
+ * a malformed body is refused as malformed. The discount guard raises `CONFLICT` instead - the request was
+ * well formed, a stored value needs attention - so its details have to be read without that filter.
+ */
+async function refusalOfAsync(
+  run: () => Promise<unknown>,
+): Promise<readonly { readonly field?: unknown; readonly rule?: unknown }[]> {
+  try {
+    await run();
+
+    return [];
+  } catch (error) {
+    return isAppError(error) ? error.details : [];
+  }
+}
+
 async function refusalOf(run: () => Promise<unknown>): Promise<readonly { readonly field?: unknown; readonly rule?: unknown }[]> {
   try {
     await run();
@@ -2116,6 +2192,425 @@ async function checkLineOrder(): Promise<void> {
   expect(!JSON.stringify(audit.entries).includes("Line 1"), "and never the line's text");
 }
 
+/* ---- 10c. the calculation engine: basis, percentage and resolution (STEP 114) ---- */
+
+async function checkDiscountEngine(): Promise<void> {
+  // ---- a percentage is parsed by string surgery, never by a float multiply
+  expectEqual(percentToBasisPoints("10"), 1000n, "ten percent is a thousand basis points");
+  expectEqual(percentToBasisPoints("12.5"), 1250n, "twelve and a half is twelve hundred and fifty");
+  expectEqual(percentToBasisPoints("7.25"), 725n, "and two decimals are still exact");
+  expectEqual(percentToBasisPoints("0.29"), 29n, "twenty nine hundredths is twenty nine basis points");
+  expectEqual(percentToBasisPoints("10%"), 1000n, "a typed percent sign is tolerated, because the screen prints one");
+  expectEqual(percentToBasisPoints("100"), 10_000n, "a hundred percent is the ceiling and is allowed");
+  expectEqual(percentToBasisPoints("100.01"), null, "a fraction over a hundred percent is refused");
+  expectEqual(percentToBasisPoints("-5"), null, "a negative percentage is a surcharge wearing a discount's name");
+  expectEqual(percentToBasisPoints("abc"), null, "and text is not a percentage");
+  expectEqual(percentToBasisPoints(""), null, "nor is nothing at all");
+
+  // The float trap, stated as a check rather than as a comment: `Number("0.29") * 100` is not 29.
+  expect(Number("0.29") * 100 !== 29, "the float multiply this parser exists to avoid really is wrong");
+
+  // ---- the vocabulary the columns accept
+  expectDeepEqual(DISCOUNT_BASES, ["amount", "percent"], "a discount is expressed one of two ways");
+  expect(isDiscountBasis("percent"), "and the guard recognises the percentage");
+  expect(!isDiscountBasis("share"), "and refuses a word it does not know");
+  expectEqual(DISCOUNT_PERCENT_MAXIMUM_BP, 10_000, "a hundred percent is the ceiling the column states");
+
+  // The percentage reaches the column as an `integer`, which is the only way a bigint crosses JSON.
+  expectEqual(basisPointsToColumn(1250n), 1250, "1250 basis points is written as the number 1250");
+  expect(
+    (() => {
+      try {
+        basisPointsToColumn(10_001n);
+
+        return false;
+      } catch {
+        return true;
+      }
+    })(),
+    "and a value above the ceiling cannot be converted into one at all",
+  );
+
+  // A row is read back as the instruction it recorded, and an unreadable label reads as money.
+  const readBack = discountStateOf({ discount_minor: 500n, discount_basis: "percent", discount_percent_bp: 2500 });
+
+  expectEqual(readBack.basis, "percent", "a stored percentage reads as a percentage");
+  expectEqual(readBack.basisPoints, 2500n, "with its points");
+  expectEqual(
+    discountStateOf({ discount_minor: 500n, discount_basis: "amount", discount_percent_bp: 0 }).basisPoints,
+    0n,
+    "and a flat amount carries no points to misread",
+  );
+  expectEqual(
+    discountStateOf({ discount_minor: 500n, discount_basis: "nonsense", discount_percent_bp: 0 }).basis,
+    "amount",
+    "a label this build does not know reads as the flat amount every older row is",
+  );
+
+  // One resolution function answers for both bases, so a caller cannot pick the wrong one.
+  expectEqual(
+    resolveDiscount({ basis: "percent", basisPoints: 1000n, amountMinor: 999_999n, subtotalMinor: 1000n }),
+    100n,
+    "a percentage ignores the amount it was given",
+  );
+  expectEqual(
+    resolveDiscount({ basis: "amount", basisPoints: 1000n, amountMinor: 700n, subtotalMinor: 1000n }),
+    700n,
+    "and a flat amount ignores the points",
+  );
+
+  // ---- the printing direction round trips
+  expectEqual(basisPointsToPercent(1250n), "12.5", "1250 basis points prints as 12.5");
+  expectEqual(basisPointsToPercent(1000n), "10", "1000 prints without a pointless decimal");
+  expectEqual(basisPointsToPercent(125n), "1.25", "and 125 prints as a hundredth of a percent");
+  expectEqual(basisPointsToPercent(29n), "0.29", "which is the value the float would have got wrong");
+  expectEqual(percentToBasisPoints(basisPointsToPercent(725n)), 725n, "and the round trip is exact");
+
+  // ---- resolving a percentage is rounded half away from zero, in integers
+  expectEqual(percentDiscountMinor({ subtotalMinor: 1234n, basisPoints: 1000n }), 123n, "ten percent of 12.34 is 1.23");
+  expectEqual(
+    percentDiscountMinor({ subtotalMinor: 1235n, basisPoints: 1000n }),
+    124n,
+    "ten percent of 12.35 is 1.235, which rounds away from zero to 1.24 rather than down to 1.23",
+  );
+  expectEqual(percentDiscountMinor({ subtotalMinor: 0n, basisPoints: 1000n }), 0n, "an empty invoice has nothing to discount");
+  expectEqual(
+    percentDiscountMinor({ subtotalMinor: 99n, basisPoints: 10_000n }),
+    99n,
+    "a hundred percent of 0.99 is the whole 0.99, never more",
+  );
+
+  // The rounding direction has to be the same one `grossLineMinor` uses, or one document rounds two ways.
+  expectEqual(
+    grossLineMinor({ quantityThousandths: 2005n, unitPriceMinor: 1n }),
+    2n,
+    "a line's gross rounds half away from zero too, so the two roundings in one invoice agree",
+  );
+
+  // ---- the shared engine: subtotal, then the discount, then the tax
+  const selection = selectInvoiceTotals({
+    liveLines: [
+      { quantityThousandths: 2500n, unitPriceMinor: 1_250_000n, discountMinor: 0n },
+      { quantityThousandths: 1000n, unitPriceMinor: 10_000n, discountMinor: 1_000n },
+    ],
+    discount: { basis: "percent", basisPoints: 1000n, discountMinor: 0n },
+    taxMinor: 5_000n,
+  });
+
+  // 2.5 x 125.00 = 312.50, and 1.00 x 1.00 less a 0.10 line discount = 0.90, so 313.40.
+  expectEqual(selection.subtotalMinor, 3_134_000n, "the subtotal is the sum of the live lines");
+  expectEqual(selection.discountMinor, 313_400n, "the percentage is resolved against that subtotal");
+  expectEqual(selection.taxMinor, 5_000n, "the tax line passes through as it was given");
+  expectEqual(selection.totalMinor, 2_825_600n, "and the total is subtotal less discount plus tax");
+
+  // A flat amount is never re-resolved: the money is the instruction.
+  const flat = selectInvoiceTotals({
+    liveLines: [{ quantityThousandths: 1000n, unitPriceMinor: 50_000n, discountMinor: 0n }],
+    discount: { basis: "amount", basisPoints: 0n, discountMinor: 12_500n },
+    taxMinor: 0n,
+  });
+
+  expectEqual(flat.discountMinor, 12_500n, "a flat discount is taken as the money it is");
+  expectEqual(flat.totalMinor, 37_500n, "leaving the rest to pay");
+
+  // ---- the basis and the money cannot disagree
+  expectDeepEqual(
+    discountProblemAt({ basis: "amount", discountMinor: 500n, subtotalMinor: 400n }),
+    { field: "discount", rule: "too_large" },
+    "a flat discount larger than the subtotal is refused, which is what invoices_discount_check says",
+  );
+  expectEqual(
+    discountProblemAt({ basis: "percent", discountMinor: 400n, subtotalMinor: 400n }),
+    null,
+    "a percentage can never exceed the subtotal, because it is at most a hundred percent of it",
+  );
+  expectEqual(
+    discountProblemAt({ basis: "amount", discountMinor: 400n, subtotalMinor: 400n }),
+    null,
+    "and a discount equal to the subtotal is legal: it is a free invoice",
+  );
+  expectDeepEqual(
+    discountProblemAt({ basis: "amount", discountMinor: -1n, subtotalMinor: 400n }),
+    { field: "discount", rule: "invalid_format" },
+    "a negative amount is malformed rather than too large",
+  );
+}
+
+async function checkDiscountCreate(): Promise<void> {
+  // ---- a percentage discount on a new invoice resolves against the lines that landed
+  const percentDb = createDb();
+  const percent = await createInvoice(
+    { actor: owner, body: bodyOf({ discount: "10", discount_basis: "percent" }) },
+    depsOf(percentDb),
+  );
+
+  // The default body is one line of 2.5 hours at 125.00, so 312.50, and ten percent of that is 31.25.
+  expectEqual(percent.totals.subtotalMinor, "3125000", "the subtotal is the line");
+  expectEqual(percent.totals.discountBasis, "percent", "the row remembers the basis it was written with");
+  expectEqual(percent.totals.discountPercentBasisPoints, 1000, "and the percentage in basis points");
+  expectEqual(percent.totals.discountPercent, "10", "which prints back as the merchant typed it");
+  expectEqual(percent.totals.discountMinor, "312500", "the money is the share the percentage names");
+  expectEqual(percent.totals.totalMinor, "2812500", "and the total is subtotal less that share");
+
+  const percentWrite = percentDb.updates.filter((entry) => entry.table === "invoices");
+
+  expectEqual(percentWrite.length, 1, "the discount and its basis are one write");
+  expectEqual(
+    at(percentWrite, 0, "the discount write").values["discount_basis"],
+    "percent",
+    "carrying the basis with the money, so a row never holds one without the other",
+  );
+  expectEqual(at(percentWrite, 0, "the discount write").values["discount_percent_bp"], 1000, "and the points");
+
+  // A flat amount still behaves exactly as it did before this STEP.
+  const flatDb = createDb();
+  const flat = await createInvoice({ actor: owner, body: bodyOf({ discount: "12.50" }) }, depsOf(flatDb));
+
+  expectEqual(flat.totals.discountBasis, "amount", "a body that names no basis is a flat amount");
+  expectEqual(flat.totals.discountMinor, "125000", "which is the money it typed");
+  expectEqual(flat.totals.discountPercentBasisPoints, 0, "with no percentage to misread");
+
+  // ---- refusals
+  const refusals = await refusalOf(() =>
+    createInvoice({ actor: owner, body: bodyOf({ discount: "10", discount_basis: "percent" }) }, depsOf(createDb())),
+  );
+
+  expectEqual(refusals.length, 0, "ten percent is legal, so that call does not refuse");
+
+  const overHundred = await refusalOf(() =>
+    createInvoice({ actor: owner, body: bodyOf({ discount: "150", discount_basis: "percent" }) }, depsOf(createDb())),
+  );
+
+  expectDeepEqual(
+    overHundred,
+    [{ field: "discount", rule: "invalid_format" }],
+    "a percentage over a hundred is refused at the discount field",
+  );
+
+  const badBasis = await refusalOf(() =>
+    createInvoice({ actor: owner, body: bodyOf({ discount: "10", discount_basis: "share" }) }, depsOf(createDb())),
+  );
+
+  expect(
+    badBasis.some((detail) => detail.field === "discount_basis" && detail.rule === "invalid_format"),
+    "an unknown basis is refused rather than silently read as dollars",
+  );
+
+  // A hundred percent is legal and leaves nothing to pay.
+  const free = await createInvoice(
+    { actor: owner, body: bodyOf({ discount: "100", discount_basis: "percent", tax: "" }) },
+    depsOf(createDb()),
+  );
+
+  expectEqual(free.totals.discountMinor, "3125000", "a hundred percent takes the whole subtotal");
+  expectEqual(free.totals.totalMinor, "0", "and leaves a total of zero");
+}
+
+async function checkDiscountUpdate(): Promise<void> {
+  // ---- an existing draft's totals can now change at all, which they could not before this STEP
+  const { db, invoiceId } = await draftWith(2);
+  const audit = createInMemoryAuditTrail();
+
+  // draftWith makes two lines of 1 x 10.00, so 20.00.
+  const percentage = await updateInvoiceTotals(
+    { actor: owner, invoiceId, totals: { basis: "percent", basisPoints: 2_500n, amountMinor: 0n, taxMinor: 0n } },
+    lineDepsOf(db, audit),
+  );
+
+  expectEqual(percentage.subtotalMinor, 200_000n, "the subtotal is the two lines, 20.00");
+  expectEqual(percentage.discountMinor, 50_000n, "twenty five percent of 20.00 is 5.00");
+  expectEqual(percentage.totalMinor, 150_000n, "leaving 15.00 to pay");
+
+  // The stored percentage survives a change of basis in the other direction.
+  const flat = await updateInvoiceTotals(
+    { actor: owner, invoiceId, totals: { basis: "amount", basisPoints: 0n, amountMinor: 3_000n, taxMinor: 1_000n } },
+    lineDepsOf(db, audit),
+  );
+
+  expectEqual(flat.discountMinor, 3_000n, "a flat amount replaces the percentage as the money it is");
+  expectEqual(flat.taxMinor, 1_000n, "and the tax line is written in the same statement");
+  expectEqual(flat.totalMinor, 200_000n - 3_000n + 1_000n, "so the three agree on one total: 19.80");
+
+  // ---- a percentage re-resolves when the subtotal moves, and a flat amount does not
+  const { db: movingDb, invoiceId: movingId } = await draftWith(2);
+  const movingDeps = lineDepsOf(movingDb);
+
+  await updateInvoiceTotals(
+    { actor: owner, invoiceId: movingId, totals: { basis: "percent", basisPoints: 1_000n, amountMinor: 0n, taxMinor: 0n } },
+    movingDeps,
+  );
+
+  const lines = await readLiveLinesForTest(movingDb, movingId);
+
+  await removeInvoiceLine({ actor: owner, invoiceId: movingId, lineId: at(lines, 1, "the second line").id }, movingDeps);
+
+  const afterRemoval = await getInvoice({ actor: owner, invoiceId: movingId }, movingDeps);
+
+  expectEqual(afterRemoval.totals.subtotalMinor, "100000", "one line of 10.00 remains");
+  expectEqual(
+    afterRemoval.totals.discountMinor,
+    "10000",
+    "and the percentage re-resolved: ten percent of 10.00 is 1.00, not the 2.00 it was worth on 20.00",
+  );
+  expectEqual(afterRemoval.totals.totalMinor, "90000", "so the total followed it down");
+
+  // ---- the bug this STEP exists to prevent
+  //
+  // A draft carrying a flat discount, whose merchant then shrinks the lines under it. Before the guard the
+  // subtotal fell below the stored discount, `invoices_discount_check` refused the trigger's own parent
+  // update, and the line removal failed with a 500 the merchant could do nothing about. The fixture now
+  // models that check, so this asserts the refusal is a named conflict rather than an unexplained failure.
+  const { db: bugDb, invoiceId: bugId } = await draftWith(2);
+
+  await updateInvoiceTotals(
+    { actor: owner, invoiceId: bugId, totals: { basis: "amount", basisPoints: 0n, amountMinor: 150_000n, taxMinor: 0n } },
+    lineDepsOf(bugDb),
+  );
+
+  const bugLines = await readLiveLinesForTest(bugDb, bugId);
+  const removal = await lineCodeOf(() =>
+    removeInvoiceLine({ actor: owner, invoiceId: bugId, lineId: at(bugLines, 1, "the second line").id }, lineDepsOf(bugDb)),
+  );
+
+  expectEqual(
+    removal,
+    "CONFLICT",
+    "removing a line that would leave a 15.00 discount on a 10.00 invoice is refused, not a 500",
+  );
+
+  // The refusal names the discount, because that is the stored value that needs attention.
+  const details = await refusalOfAsync(() =>
+    removeInvoiceLine({ actor: owner, invoiceId: bugId, lineId: at(bugLines, 1, "the second line").id }, lineDepsOf(bugDb)),
+  );
+
+  expectDeepEqual(
+    details.map((detail) => [detail.field, detail.rule]),
+    [["discount", "too_large"]],
+    "and it says so on the discount field",
+  );
+
+  // The same draft accepts the removal once the discount is reduced, which is what makes the refusal
+  // actionable rather than a dead end.
+  await updateInvoiceTotals(
+    { actor: owner, invoiceId: bugId, totals: { basis: "amount", basisPoints: 0n, amountMinor: 50_000n, taxMinor: 0n } },
+    lineDepsOf(bugDb),
+  );
+
+  const afterReduction = await removeInvoiceLine(
+    { actor: owner, invoiceId: bugId, lineId: at(bugLines, 1, "the second line").id },
+    lineDepsOf(bugDb),
+  );
+
+  expectEqual(afterReduction.lines.length, 1, "and then it succeeds");
+
+  // A percentage discount never blocks a removal, because it is a share of whatever remains.
+  const { db: pctDb, invoiceId: pctId } = await draftWith(2);
+
+  await updateInvoiceTotals(
+    { actor: owner, invoiceId: pctId, totals: { basis: "percent", basisPoints: 5_000n, amountMinor: 0n, taxMinor: 0n } },
+    lineDepsOf(pctDb),
+  );
+
+  const pctLines = await readLiveLinesForTest(pctDb, pctId);
+  const pctRemoval = await removeInvoiceLine(
+    { actor: owner, invoiceId: pctId, lineId: at(pctLines, 1, "the second line").id },
+    lineDepsOf(pctDb),
+  );
+
+  expectEqual(pctRemoval.lines.length, 1, "a fifty percent discount does not stop a line being removed");
+
+  // ---- a flat discount above the current subtotal is refused when it is set
+  const { db: overDb, invoiceId: overId } = await draftWith(1);
+  const over = await refusalOfAsync(() =>
+    updateInvoiceTotals(
+      { actor: owner, invoiceId: overId, totals: { basis: "amount", basisPoints: 0n, amountMinor: 200_000n, taxMinor: 0n } },
+      lineDepsOf(overDb),
+    ),
+  );
+
+  expectDeepEqual(
+    over,
+    [{ field: "discount", rule: "too_large" }],
+    "a flat discount larger than the subtotal is refused at the field, before the parent is written",
+  );
+
+  // ---- tenancy, role and the draft lock
+  const { db: roleDb, invoiceId: roleId } = await draftWith(1);
+
+  expectEqual(
+    await lineCodeOf(() =>
+      updateInvoiceTotals(
+        {
+          actor: actorOf(["finance_ops"], COMPANY_A, { userId: OFFICE_ID }),
+          invoiceId: roleId,
+          totals: { basis: "amount", basisPoints: 0n, amountMinor: 100n, taxMinor: 0n },
+        },
+        lineDepsOf(roleDb),
+      ),
+    ),
+    "PERMISSION_DENIED",
+    "an office role may not change a merchant's totals",
+  );
+
+  expectEqual(
+    await lineCodeOf(() =>
+      updateInvoiceTotals(
+        {
+          actor: otherOwner,
+          invoiceId: roleId,
+          totals: { basis: "amount", basisPoints: 0n, amountMinor: 100n, taxMinor: 0n },
+        },
+        lineDepsOf(roleDb),
+      ),
+    ),
+    "RESOURCE_NOT_FOUND",
+    "and another merchant's invoice is not found at all",
+  );
+
+  const issued = await draftWith(1);
+
+  at(issued.db.invoices, 0, "the issued invoice")["status"] = "sending";
+
+  expectEqual(
+    await lineCodeOf(() =>
+      updateInvoiceTotals(
+        {
+          actor: owner,
+          invoiceId: issued.invoiceId,
+          totals: { basis: "amount", basisPoints: 0n, amountMinor: 100n, taxMinor: 0n },
+        },
+        lineDepsOf(issued.db),
+      ),
+    ),
+    "CONFLICT",
+    "a document that has left draft cannot have its totals changed",
+  );
+
+  // ---- the audit entry records the instruction and the result, and no client text
+  const audited = createInMemoryAuditTrail();
+  const auditedDraft = await draftWith(1);
+
+  await updateInvoiceTotals(
+    {
+      actor: owner,
+      invoiceId: auditedDraft.invoiceId,
+      totals: { basis: "percent", basisPoints: 1_250n, amountMinor: 0n, taxMinor: 0n },
+    },
+    lineDepsOf(auditedDraft.db, audited),
+  );
+
+  const entries = audited.entries.filter((entry) => entry.action === INVOICE_DISCOUNT_UPDATED_AUDIT_ACTION);
+
+  expectEqual(entries.length, 1, "a totals change writes one entry");
+
+  const payload = at(entries, 0, "the totals entry").payload as Readonly<Record<string, unknown>>;
+
+  expectEqual(payload["basis"], "percent", "naming the basis");
+  expectEqual(payload["basis_points"], "1250", "and the percentage in basis points");
+  expectEqual(payload["discount_minor"], "12500", "twelve and a half percent of 10.00 is 1.25, as the entry records");
+  expect(JSON.stringify(audited.entries).includes("Line 1") === false, "and never any line's text");
+}
+
 /* ---- 11. the line editor's sources ---- */
 
 async function checkLineSources(): Promise<void> {
@@ -2156,8 +2651,21 @@ async function checkLineSources(): Promise<void> {
   expect(editRoute.includes("parseInvoiceLine("), "and so does the edit route");
   expect(!/parseFloat|Number\(/u.test(linesCode), "no amount passes through a float parse");
 
-  // The totals are the database's.
-  expect(!linesCode.includes("subtotal_minor"), "the editor never writes a subtotal");
+  // The totals are the database's. The line editor may **read** the stored subtotal - a percentage discount
+  // is a share of it - but it never writes one: `invoice_items_sync_totals` owns that column, and a service
+  // that sent its own sum would be a second opinion the row does not share.
+  // Every `rest.update`/`insert` this module makes names its columns in an object literal. A subtotal in
+  // one of those is the write this asserts never happens; a subtotal in a `select=` string or an audit
+  // payload is a read or a record of one, which is allowed.
+  const writePayloads = [...linesCode.matchAll(/rest\.(?:update|insert|insertReturning)\(([\s\S]*?)\);/gu)].map(
+    (match) => match[1] ?? "",
+  );
+
+  expect(writePayloads.length > 0, "the line editor writes through the REST client");
+  expect(
+    writePayloads.every((payload) => !/subtotal_minor/u.test(payload)),
+    "and never writes a subtotal: `invoice_items_sync_totals` owns that column",
+  );
 
   // A row the editor sends: the fields of `rowOfLine`. Neither carries a money total, because the
   // generated column and the trigger own both.
@@ -2210,11 +2718,11 @@ async function checkLineSources(): Promise<void> {
 
   // Every mutation carries the token, and each of the four operations has its own endpoint.
   expect(editorCode.includes("csrfHeaders("), "the editor carries the CSRF token on every write");
-  // Three posts - save an edited line, move one, add one - and one delete.
+  // Four posts - save an edited line, move one, add one, and the totals panel - and one delete.
   expectEqual(
     (editorCode.match(/method: "POST"/gu) ?? []).length,
-    3,
-    "it posts to save an edit, to move a line, and to add one",
+    4,
+    "it posts to save an edit, to move a line, to add one, and to save the totals",
   );
   expect(editorCode.includes('method: "DELETE"'), "and deletes to remove one");
   expect(editorCode.includes("/lines/${lineId}/move"), "the move goes to its own path");
@@ -2247,6 +2755,69 @@ async function checkLineSources(): Promise<void> {
 
   expect(form.includes("`/invoices/${saved.id}`"), "a saved draft links to its editor, so the editor is reachable");
   expect(!form.includes("Date.now("), "and the form still reads no clock while rendering");
+
+  // ---- the discount editor's UI and route (STEP 114)
+
+  const discountRoute = await readRepositoryFile("app/api/invoices/[id]/discount/route.ts");
+  const discountRouteCode = codeOf(discountRoute);
+
+  expect(discountRouteCode.includes("requireCsrfToken("), "the discount route checks the token first");
+  expect(
+    discountRouteCode.indexOf("requireCsrfToken(") < discountRouteCode.indexOf("readRequestActor("),
+    "before it reads the session",
+  );
+  expect(discountRouteCode.includes("updateInvoiceTotals("), "and writes through the service");
+  expect(
+    !/subtotal_minor|total_minor/u.test(discountRouteCode),
+    "the route computes no total of its own: the row's derived total is what it answers with",
+  );
+
+  const csrfSource = await readRepositoryFile("lib/security/csrf.ts");
+
+  expect(
+    csrfSource.includes('"/api/invoices/[id]/discount"'),
+    "the discount route is on the CSRF protected list, so the auth gate can see it",
+  );
+
+  const createForm = await readRepositoryFile("app/(dashboard)/invoices/invoice-form.tsx");
+  const createFormCode = codeOf(createForm);
+
+  expect(createFormCode.includes("discount_basis: discountBasis"), "the create form sends the basis with the amount");
+  expect(createFormCode.includes("percentToBasisPoints("), "and reads a percentage with the shared parser");
+  expect(
+    createFormCode.includes("percentDiscountMinor("),
+    "resolving its running total with the same function the server stores",
+  );
+  expect(createFormCode.includes('name="discount-basis"'), "the basis is a radio pair, not a hidden default");
+  expect(!/parseFloat/u.test(createFormCode), "no amount passes through a float in the form");
+
+  const totalsEditor = await readRepositoryFile("app/(dashboard)/invoices/invoice-line-editor.tsx");
+  const totalsEditorCode = codeOf(totalsEditor);
+
+  expect(totalsEditorCode.includes("/discount"), "the editor posts to the discount route");
+  expect(totalsEditorCode.includes("percentDiscountMinor("), "and re-resolves a percentage when its lines change");
+  expect(totalsEditorCode.includes('name="totals-basis"'), "offering both bases in the totals panel");
+  expect(
+    totalsEditorCode.includes("basisPointsToPercent("),
+    "and printing a stored percentage back the way it was typed",
+  );
+  expect(totalsEditorCode.includes("draftLocked"), "with the panel locked once the document is issued");
+
+  // ---- `0113` replaces the trigger function rather than editing `0023`
+  const reresolve = await readRepositoryFile("migrations/0113_invoice_discount_reresolve.sql");
+
+  expect(reresolve.includes("create or replace function public.invoice_items_sync_totals()"), "0113 replaces the trigger function");
+  expect(reresolve.includes("discount_basis = 'percent'"), "resolving a percentage");
+  expect(reresolve.includes("round(lines_total::numeric * discount_percent_bp / 10000)"), "with the same half-away rounding");
+  expect(!/drop\s+table|truncate|delete\s+from/iu.test(reresolve), "and never drops or deletes a row");
+
+  const previous = await readRepositoryFile("migrations/0023_invoice_items.sql");
+
+  expect(
+    previous.includes("update public.invoices set subtotal_minor = lines_total where id = target;"),
+    "while 0023 is left exactly as it was, because migrations are append-only",
+  );
+  expect(!previous.includes("discount_basis"), "and knows nothing of the basis a later STEP added");
 
   // The migration's own facts, restated where the gate can see them.
   const itemsMigration = await readRepositoryFile("migrations/0023_invoice_items.sql");
@@ -2429,6 +3000,8 @@ async function checkSources(): Promise<void> {
     currency: "USD",
     subtotal_minor: "0",
     discount_minor: "0",
+    discount_basis: "amount",
+    discount_percent_bp: 0,
     tax_minor: "0",
     total_minor: "0",
     amount_paid_minor: "0",
@@ -2507,6 +3080,9 @@ async function run(): Promise<void> {
   await checkLineAudit();
   await checkLineOrder();
   await checkLineSources();
+  await checkDiscountEngine();
+  await checkDiscountCreate();
+  await checkDiscountUpdate();
   await checkSources();
 
   if (failures.length > 0) {

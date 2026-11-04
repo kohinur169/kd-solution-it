@@ -7,6 +7,11 @@ import type { MessagePath } from "@/lib/i18n/messages";
 import { csrfHeaders } from "@/lib/security/csrf-client";
 import { INVOICE_MAXIMUM_LINES, INVOICE_UNITS, type InvoiceUnit } from "@/services/invoices/invoice-fields";
 import { grossLineMinor, quantityToThousandths } from "@/services/invoices/invoice-totals";
+import {
+  basisPointsToPercent,
+  percentDiscountMinor,
+  type DiscountBasis,
+} from "@/services/invoices/invoice-discount";
 import type { InvoiceLine } from "@/services/invoices/invoice-lines";
 import type { InvoiceSnapshot } from "@/services/invoices/invoices";
 import { priceFromMinor, priceToMinor } from "@/services/products/price";
@@ -141,6 +146,27 @@ function amountOf(draft: LineDraft): bigint | null {
   return grossLineMinor({ quantityThousandths: quantity, unitPriceMinor: price }) - discount;
 }
 
+/** The four amounts the route answers with, as decimal text. */
+interface StoredTotals {
+  readonly subtotalMinor: bigint;
+  readonly discountMinor: bigint;
+  readonly taxMinor: bigint;
+  readonly totalMinor: bigint;
+  readonly basis: DiscountBasis;
+  readonly basisPoints: number;
+}
+
+/**
+ * A stored amount as the text a box holds.
+ *
+ * `priceFromMinor` prints the column's full scale - `12.5000` - because that is what the database stores.
+ * A box the merchant is about to edit should read `12.5`, so the trailing zeros of the fraction are trimmed
+ * and a whole amount keeps its digits. The parser accepts either, so this is presentation only.
+ */
+function formatMinorAsInput(printed: string): string {
+  return printed.includes(".") ? printed.replace(/0+$/u, "").replace(/[.]$/u, "") : printed;
+}
+
 function moneyText(minor: bigint | null): string {
   return minor === null ? "\u2014" : priceFromMinor(minor);
 }
@@ -175,9 +201,23 @@ export function InvoiceLineEditor({ invoice }: InvoiceLineEditorProps): ReactNod
   const [openId, setOpenId] = useState<string | null>(null);
   const [draft, setDraft] = useState<LineDraft | null>(null);
   const [errors, setErrors] = useState<Readonly<Record<string, string>>>({});
+  const [totalsErrors, setTotalsErrors] = useState<Readonly<Record<string, string>>>({});
   const [busy, setBusy] = useState<boolean>(false);
   const [message, setMessage] = useState<string | null>(null);
   const [failed, setFailed] = useState<boolean>(false);
+  // The discount/tax editor is seeded from the document as it was read, and its box holds whatever the
+  // merchant typed: an amount or a percentage, according to the basis the invoice recorded.
+  const [discountBasis, setDiscountBasis] = useState<DiscountBasis>(invoice.totals.discountBasis);
+  const [discountInput, setDiscountInput] = useState<string>(
+    invoice.totals.discountBasis === "percent"
+      ? invoice.totals.discountPercent
+      : invoice.totals.discountMinor === "0"
+        ? ""
+        : formatMinorAsInput(invoice.totals.discount),
+  );
+  const [taxInput, setTaxInput] = useState<string>(
+    invoice.totals.taxMinor === "0" ? "" : formatMinorAsInput(invoice.totals.tax),
+  );
   const [adding, setAdding] = useState<LineDraft>({
     description: "",
     unit: "item",
@@ -194,13 +234,32 @@ export function InvoiceLineEditor({ invoice }: InvoiceLineEditorProps): ReactNod
 
     const subtotal = next.reduce((total, line) => total + BigInt(line.lineTotalMinor), 0n);
 
-    setTotals((current) => ({
-      ...current,
-      subtotal: priceFromMinor(subtotal),
-      subtotalMinor: subtotal.toString(),
-      total: priceFromMinor(subtotal - BigInt(current.discountMinor) + BigInt(current.taxMinor)),
-      totalMinor: (subtotal - BigInt(current.discountMinor) + BigInt(current.taxMinor)).toString(),
-    }));
+    setTotals((current) => {
+      // A percentage is a share of whatever the lines now add up to, so the panel resolves it again rather
+      // than keeping the money it was worth a moment ago. The engine is the service's own, so what the
+      // screen shows while the server catches up is the value the server will store - the trigger of `0113`
+      // resolves the same product the same way. A flat amount is untouched, because it does not depend on
+      // the lines.
+      const discountMinor =
+        current.discountBasis === "percent"
+          ? percentDiscountMinor({
+              subtotalMinor: subtotal,
+              basisPoints: BigInt(current.discountPercentBasisPoints),
+            })
+          : BigInt(current.discountMinor);
+      const taxMinor = BigInt(current.taxMinor);
+      const totalMinor = subtotal - discountMinor + taxMinor;
+
+      return {
+        ...current,
+        subtotal: priceFromMinor(subtotal),
+        subtotalMinor: subtotal.toString(),
+        discount: priceFromMinor(discountMinor),
+        discountMinor: discountMinor.toString(),
+        total: priceFromMinor(totalMinor),
+        totalMinor: totalMinor.toString(),
+      };
+    });
   }
 
   function open(line: InvoiceLine): void {
@@ -401,6 +460,87 @@ export function InvoiceLineEditor({ invoice }: InvoiceLineEditorProps): ReactNod
     } catch {
       setFailed(true);
       setMessage(getMessage("invoices.editorAddFailed"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  /**
+   * Save the discount and the tax line.
+   *
+   * One request for both, because the merchant reads them as the two lines above the total and a total that
+   * was right between two requests would be a total nobody meant. The basis decides what the discount box
+   * means, and the server resolves a percentage against the subtotal it reads - so the value sent is the
+   * instruction, not a money figure this screen worked out.
+   */
+  async function saveTotals(): Promise<void> {
+    setBusy(true);
+    setTotalsErrors({});
+    setMessage(null);
+    setFailed(false);
+
+    try {
+      const response = await fetch(`/api/invoices/${invoice.id}/discount`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...(await csrfHeaders()) },
+        body: JSON.stringify({
+          discount: discountInput,
+          discount_basis: discountBasis,
+          tax: taxInput,
+        }),
+        credentials: "same-origin",
+        cache: "no-store",
+      });
+      const payload: unknown = await response.json().catch(() => null);
+
+      if (!response.ok) {
+        const next: Record<string, string> = {};
+
+        for (const detail of refusalDetails(payload)) {
+          const field = typeof detail.field === "string" ? detail.field : null;
+
+          if (field !== null && next[field] === undefined) {
+            next[field] = ruleSentence(typeof detail.rule === "string" ? detail.rule : null);
+          }
+        }
+
+        setTotalsErrors(next);
+        setFailed(true);
+        setMessage(failureSentence(payload, "invoices.totalsEditorFailed"));
+
+        return;
+      }
+
+      const stored = (payload as { readonly totals?: StoredTotals }).totals;
+
+      if (stored === undefined) {
+        setFailed(true);
+        setMessage(getMessage("invoices.totalsEditorFailed"));
+
+        return;
+      }
+
+      // The four amounts are the row's, re-read after the write: the total is the database's derived value,
+      // not this screen's arithmetic.
+      setTotals({
+        subtotal: priceFromMinor(stored.subtotalMinor),
+        subtotalMinor: stored.subtotalMinor.toString(),
+        discount: priceFromMinor(stored.discountMinor),
+        discountMinor: stored.discountMinor.toString(),
+        // The row's basis and points come back with the totals, so the panel's next line change resolves
+        // the same instruction rather than an assumption about which one it was.
+        discountBasis: stored.basis,
+        discountPercentBasisPoints: stored.basisPoints,
+        discountPercent: basisPointsToPercent(BigInt(stored.basisPoints)),
+        tax: priceFromMinor(stored.taxMinor),
+        taxMinor: stored.taxMinor.toString(),
+        total: priceFromMinor(stored.totalMinor),
+        totalMinor: stored.totalMinor.toString(),
+      });
+      setMessage(getMessage("invoices.totalsEditorSaved"));
+    } catch {
+      setFailed(true);
+      setMessage(getMessage("invoices.totalsEditorFailed"));
     } finally {
       setBusy(false);
     }
@@ -705,6 +845,109 @@ export function InvoiceLineEditor({ invoice }: InvoiceLineEditorProps): ReactNod
             <dd>{totals.total}</dd>
           </div>
         </dl>
+
+        {draftLocked ? (
+          <p className={hintClasses}>{getMessage("invoices.totalsEditorDiscountFrozen")}</p>
+        ) : (
+          <div className="flex flex-col gap-3 border-t border-border pt-3">
+            <h3 className="text-sm font-semibold">{getMessage("invoices.totalsEditorTitle")}</h3>
+
+            {/*
+              The same two radios as the create form: the basis gives the one box below its meaning, so the
+              merchant switches between "20 dollars off" and "ten percent off" without retyping anything.
+            */}
+            <div className="flex flex-wrap items-center gap-4">
+              <label className="flex items-center gap-2 text-sm" htmlFor="totals-basis-amount">
+                <input
+                  checked={discountBasis === "amount"}
+                  id="totals-basis-amount"
+                  name="totals-basis"
+                  onChange={() => {
+                    setDiscountBasis("amount");
+                    setTotalsErrors({});
+                  }}
+                  type="radio"
+                />
+                {getMessage("invoices.discountBasisAmount")}
+              </label>
+              <label className="flex items-center gap-2 text-sm" htmlFor="totals-basis-percent">
+                <input
+                  checked={discountBasis === "percent"}
+                  id="totals-basis-percent"
+                  name="totals-basis"
+                  onChange={() => {
+                    setDiscountBasis("percent");
+                    setTotalsErrors({});
+                  }}
+                  type="radio"
+                />
+                {getMessage("invoices.discountBasisPercent")}
+              </label>
+            </div>
+
+            {/* One column on a phone, two from `sm` up, like every other money pair in this editor. */}
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <div className="flex flex-col gap-1">
+                <label className={labelClasses} htmlFor="totals-discount">
+                  {getMessage(
+                    discountBasis === "percent" ? "invoices.discountPercentLabel" : "invoices.discountAmountLabel",
+                  )}
+                </label>
+                <input
+                  aria-invalid={totalsErrors["discount"] !== undefined}
+                  className={inputClasses}
+                  id="totals-discount"
+                  inputMode="decimal"
+                  onChange={(event) => {
+                    setDiscountInput(event.target.value);
+                    setTotalsErrors({});
+                  }}
+                  type="text"
+                  value={discountInput}
+                />
+                {totalsErrors["discount"] === undefined ? null : (
+                  <p className={errorClasses} role="alert">
+                    {totalsErrors["discount"]}
+                  </p>
+                )}
+              </div>
+
+              <div className="flex flex-col gap-1">
+                <label className={labelClasses} htmlFor="totals-tax">
+                  {getMessage("invoices.taxLabel")}
+                </label>
+                <input
+                  aria-invalid={totalsErrors["tax"] !== undefined}
+                  className={inputClasses}
+                  id="totals-tax"
+                  inputMode="decimal"
+                  onChange={(event) => {
+                    setTaxInput(event.target.value);
+                    setTotalsErrors({});
+                  }}
+                  type="text"
+                  value={taxInput}
+                />
+                {totalsErrors["tax"] === undefined ? null : (
+                  <p className={errorClasses} role="alert">
+                    {totalsErrors["tax"]}
+                  </p>
+                )}
+              </div>
+            </div>
+
+            <button
+              className="w-fit rounded-md bg-foreground px-4 py-2 text-sm font-medium text-background focus-visible:ring-2 focus-visible:ring-primary disabled:opacity-50"
+              disabled={busy}
+              onClick={() => {
+                void saveTotals();
+              }}
+              type="button"
+            >
+              {getMessage(busy ? "invoices.totalsEditorSaving" : "invoices.totalsEditorSave")}
+            </button>
+          </div>
+        )}
       </section>
 
       {message === null ? null : (

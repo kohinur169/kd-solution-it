@@ -5,13 +5,21 @@ import type { RestClient } from "../../lib/auth/rest.ts";
 import { requireAnyRole, requireCompanyId } from "../../lib/auth/session.ts";
 import type { RequestActor } from "../../lib/auth/types.ts";
 import { AppError, type ErrorDetail } from "../../lib/errors/app-error.ts";
+import { priceColumnSchema } from "../products/price.ts";
 import {
   INVOICE_CREATED_STATUS,
   INVOICE_ITEMS_TABLE,
   INVOICE_MAXIMUM_LINES,
   type InvoiceUnit,
 } from "./invoice-fields.ts";
-import { grossLineMinor, thousandthsToQuantity } from "./invoice-totals.ts";
+import { grossLineMinor, invoiceTotalsOf, thousandthsToQuantity, type InvoiceTotals } from "./invoice-totals.ts";
+import {
+  assertDiscountFits,
+  basisPointsToColumn,
+  discountStateOf,
+  resolveDiscount,
+  type DiscountBasis,
+} from "./invoice-discount.ts";
 
 /**
  * Section 16's line item editor: adding, editing, removing and ordering the lines of a **draft**.
@@ -419,6 +427,19 @@ export async function updateInvoiceLine(
 
   const values = rowOfLine(stored.invoice_id, companyId, stored.position, input.line);
 
+  // An edit can lower a line just as a removal can remove one, so the same guard applies: the subtotal the
+  // edit is about to produce is every other live line plus this line's new total.
+  const others = await readLiveLines(dependencies.rest, companyId, stored.invoice_id);
+  const projectedSubtotal =
+    others.reduce((total, line) => (line.id === stored.id ? total : total + line.line_total_minor), 0n) +
+    parsedLineTotalMinor(input.line);
+
+  await assertStoredDiscountFits(dependencies.rest, {
+    companyId,
+    invoiceId: stored.invoice_id,
+    projectedSubtotalMinor: projectedSubtotal,
+  });
+
   await dependencies.rest.update(
     INVOICE_ITEMS_TABLE,
     `id=eq.${stored.id}&company_id=eq.${companyId}&invoice_id=eq.${stored.invoice_id}&deleted_at=is.null`,
@@ -488,6 +509,19 @@ export async function removeInvoiceLine(
     throw new AppError("VALIDATION_FAILED", { details: [{ field: "lines", rule: "empty" }] });
   }
 
+  // The subtotal this removal is about to produce, summed from the rows already in hand: every live line
+  // except the one being removed. No extra read, and no dependence on what the trigger will write.
+  const projectedSubtotal = lines.reduce(
+    (total, line) => (line.id === stored.id ? total : total + line.line_total_minor),
+    0n,
+  );
+
+  await assertStoredDiscountFits(dependencies.rest, {
+    companyId,
+    invoiceId: parent.id,
+    projectedSubtotalMinor: projectedSubtotal,
+  });
+
   await dependencies.rest.update(
     INVOICE_ITEMS_TABLE,
     `id=eq.${stored.id}&company_id=eq.${companyId}&invoice_id=eq.${stored.invoice_id}&deleted_at=is.null`,
@@ -538,3 +572,247 @@ export function parsedLineTotalMinor(line: ParsedInvoiceLine): bigint {
 
 /** The empty list a refusal about a line's fields is paired with, so a caller has one shape. */
 export type LineDetails = readonly ErrorDetail[];
+
+/**
+ * Refuse a line change that would leave a stored flat discount larger than the new subtotal.
+ *
+ * ## The failure this prevents
+ *
+ * `invoices_discount_check` is `discount_minor <= subtotal_minor`, and `invoice_items_sync_totals` recomputes
+ * the subtotal on every line change. So a draft carrying a flat discount of 500 with lines totalling 600, whose
+ * merchant then removes the 400 line, asks the trigger to write a subtotal of 200 under a discount of 500 - the
+ * parent's own UPDATE violates its check and the whole statement fails. The merchant sees a 500 on "remove
+ * line", and the line does not go away. Nothing about the request was wrong; the stored discount was simply
+ * never re-examined when the thing it is a discount off shrank.
+ *
+ * ## Why the guard is here rather than in the trigger
+ *
+ * `0022` cannot be edited - migrations are append-only - and a "reduce the discount automatically" policy would
+ * be a silent edit to a number the merchant typed. Refusing with a field that names the discount is the honest
+ * answer: the merchant is told which stored value needs attention, and the line removal succeeds on the retry
+ * after they change it. A percentage discount cannot trigger this, because it is resolved against whatever the
+ * subtotal becomes.
+ *
+ * `projectedSubtotalMinor` is the subtotal the write is about to produce, computed by the caller from the lines
+ * it already read. The guard compares the **stored** discount, because that is what the trigger's parent update
+ * will check against.
+ */
+async function assertStoredDiscountFits(
+  rest: RestClient,
+  input: { readonly companyId: string; readonly invoiceId: string; readonly projectedSubtotalMinor: bigint },
+): Promise<void> {
+  const parent = await readParentDiscount(rest, input.companyId, input.invoiceId);
+
+  assertDiscountFits({
+    basis: parent.basis,
+    discountMinor: parent.discountMinor,
+    subtotalMinor: input.projectedSubtotalMinor,
+  });
+}
+
+/** The discount a parent row currently carries, normalised, for the guard above. */
+async function readParentDiscount(
+  rest: RestClient,
+  companyId: string,
+  invoiceId: string,
+): Promise<{ readonly basis: DiscountBasis; readonly discountMinor: bigint }> {
+  const rows = await rest.select(
+    "invoices",
+    `select=id,discount_minor,discount_basis,discount_percent_bp&id=eq.${invoiceId}&company_id=eq.${companyId}&deleted_at=is.null`,
+    parentDiscountSchema,
+  );
+  const row = rows[0];
+
+  if (row === undefined) {
+    throw new AppError("RESOURCE_NOT_FOUND", { cause: { rule: "invoice", reason: "not_found" } });
+  }
+
+  return { basis: discountStateOf(row).basis, discountMinor: row.discount_minor };
+}
+
+const parentDiscountSchema = z.object({
+  id: z.string().uuid(),
+  discount_minor: priceColumnSchema,
+  discount_basis: z.string(),
+  discount_percent_bp: z.number().int(),
+});
+
+/**
+ * Change the invoice-level discount and the tax line of a draft.
+ *
+ * ## Why this exists at all
+ *
+ * The create path sets both, and until now nothing could change them afterwards. That made the totals of
+ * an existing draft frozen: a merchant who agreed ten percent off after writing the document had to
+ * rebuild it. This is the write that unfreezes them, and it is one operation rather than two because the
+ * two amounts are read together by the merchant as "the totals above the total".
+ *
+ * ## Why a percentage is resolved here and not by the caller
+ *
+ * A percentage of the subtotal is not a number the merchant typed, it is a function of how many lines the
+ * invoice currently holds. The subtotal is therefore read back from the parent - the value
+ * `invoice_items_sync_totals` wrote - and the money is resolved against it. A caller that sent the money
+ * it had computed would be a second opinion about the same fact, and the two would drift the first time a
+ * line changed.
+ *
+ * ## The one thing this write must not do
+ *
+ * `invoices_discount_check` is `discount_minor <= subtotal_minor`, and a percentage at most a hundred
+ * percent always satisfies it, so a percentage cannot fail the write. A flat amount can, and the refusal
+ * names `discount` rather than letting the parent's check surface as a 500.
+ */
+export const INVOICE_DISCOUNT_UPDATED_AUDIT_ACTION = "invoice.discount_updated";
+
+export const INVOICE_DISCOUNT_AUDIT_ENTITY = "invoice";
+
+export interface InvoiceTotalsUpdate {
+  readonly basis: DiscountBasis;
+  /** Basis points; zero unless the basis is `percent`. */
+  readonly basisPoints: bigint;
+  /** The flat amount, already parsed. Ignored when the basis is `percent`. */
+  readonly amountMinor: bigint;
+  readonly taxMinor: bigint;
+}
+
+/**
+ * Resolve what the two amounts become on this invoice, and write them.
+ *
+ * The returned `subtotalMinor`, `discountMinor`, `taxMinor` and `totalMinor` are re-read from the row
+ * after the write, not computed and returned: the total is `invoices_derive_total`'s, and answering with
+ * this module's own arithmetic would be a second answer that the gate could not distinguish from the
+ * database's.
+ */
+export async function updateInvoiceTotals(
+  input: {
+    readonly actor: RequestActor;
+    readonly invoiceId: string;
+    readonly totals: InvoiceTotalsUpdate;
+  },
+  dependencies: InvoiceLineDependencies,
+): Promise<InvoiceTotals & { readonly basis: DiscountBasis; readonly basisPoints: number }> {
+  const companyId = requireLineActor(input.actor);
+  const parent = await requireDraftParent(dependencies, { companyId, invoiceId: input.invoiceId });
+
+  const subtotalMinor = await readParentSubtotal(dependencies.rest, companyId, parent.id);
+  const discountMinor = resolveDiscount({
+    basis: input.totals.basis,
+    basisPoints: input.totals.basisPoints,
+    amountMinor: input.totals.amountMinor,
+    subtotalMinor,
+  });
+
+  // A flat amount larger than the lines add up to is refused here with a field the screen can mark,
+  // instead of by the parent's check constraint after an UPDATE that would have already half-happened.
+  assertDiscountFits({ basis: input.totals.basis, discountMinor, subtotalMinor });
+
+  await dependencies.rest.update(
+    "invoices",
+    `id=eq.${parent.id}&company_id=eq.${companyId}&status=eq.${INVOICE_CREATED_STATUS}&deleted_at=is.null`,
+    {
+      discount_minor: discountMinor,
+      discount_basis: input.totals.basis,
+      discount_percent_bp: basisPointsToColumn(input.totals.basisPoints),
+      tax_minor: input.totals.taxMinor,
+    },
+  );
+
+  const stored = await readParentTotals(dependencies.rest, companyId, parent.id);
+  const totals = invoiceTotalsOf({
+    subtotalMinor: stored.subtotal_minor,
+    discountMinor: stored.discount_minor,
+    taxMinor: stored.tax_minor,
+  });
+
+  await appendTolerated(dependencies.audit, {
+    action: INVOICE_DISCOUNT_UPDATED_AUDIT_ACTION,
+    actorUserId: input.actor.userId,
+    entityType: INVOICE_DISCOUNT_AUDIT_ENTITY,
+    entityId: parent.id,
+    companyId,
+    sessionId: input.actor.sessionId ?? null,
+    payload: {
+      basis: input.totals.basis,
+      // The percentage is recorded because it is the instruction; the money is recorded because it is
+      // what the totals became. Neither is free text, so both are safe to keep.
+      basis_points: input.totals.basisPoints.toString(),
+      discount_minor: totals.discountMinor.toString(),
+      tax_minor: totals.taxMinor.toString(),
+      subtotal_minor: totals.subtotalMinor.toString(),
+      total_minor: totals.totalMinor.toString(),
+    },
+  });
+
+  return {
+    ...totals,
+    basis: input.totals.basis,
+    basisPoints: rowPercentBasisPoints(input.totals.basis, input.totals.basisPoints),
+  };
+}
+
+/**
+ * The points a row actually stores.
+ *
+ * A flat amount stores zero, because `invoices_discount_basis_coherent_check` refuses a percentage beside
+ * `amount`. Answering with what was sent rather than what the column holds would let a caller believe a
+ * percentage survived a change to a flat amount.
+ */
+function rowPercentBasisPoints(basis: DiscountBasis, basisPoints: bigint): number {
+  return basis === "percent" ? basisPointsToColumn(basisPoints) : 0;
+}
+
+/** The `subtotal_minor` the trigger last wrote for one invoice. */
+async function readParentSubtotal(rest: RestClient, companyId: string, invoiceId: string): Promise<bigint> {
+  const rows = await rest.select(
+    "invoices",
+    `select=id,subtotal_minor&id=eq.${invoiceId}&company_id=eq.${companyId}&deleted_at=is.null`,
+    parentSubtotalSchema,
+  );
+  const row = rows[0];
+
+  if (row === undefined) {
+    throw new AppError("RESOURCE_NOT_FOUND", { cause: { rule: "invoice", reason: "not_found" } });
+  }
+
+  return row.subtotal_minor;
+}
+
+/** The four amounts a parent row holds after a totals change. */
+async function readParentTotals(
+  rest: RestClient,
+  companyId: string,
+  invoiceId: string,
+): Promise<ParentTotalsRow> {
+  const rows = await rest.select(
+    "invoices",
+    `select=id,subtotal_minor,discount_minor,tax_minor,total_minor&id=eq.${invoiceId}&company_id=eq.${companyId}&deleted_at=is.null`,
+    parentTotalsSchema,
+  );
+  const row = rows[0];
+
+  if (row === undefined) {
+    throw new AppError("RESOURCE_NOT_FOUND", { cause: { rule: "invoice", reason: "not_found" } });
+  }
+
+  return row;
+}
+
+/** The four amounts a parent row holds after a totals change. */
+interface ParentTotalsRow {
+  readonly subtotal_minor: bigint;
+  readonly discount_minor: bigint;
+  readonly tax_minor: bigint;
+  readonly total_minor: bigint;
+}
+
+const parentSubtotalSchema = z.object({
+  id: z.string().uuid(),
+  subtotal_minor: priceColumnSchema,
+});
+
+const parentTotalsSchema = z.object({
+  id: z.string().uuid(),
+  subtotal_minor: priceColumnSchema,
+  discount_minor: priceColumnSchema,
+  tax_minor: priceColumnSchema,
+  total_minor: priceColumnSchema,
+});
