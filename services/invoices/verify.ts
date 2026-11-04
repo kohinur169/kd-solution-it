@@ -31,6 +31,10 @@ import {
   updateInvoiceLine,
   type InvoiceLineDependencies,
 } from "./invoice-lines.ts";
+import {
+  INVOICE_LINE_MOVED_AUDIT_ACTION,
+  moveInvoiceLine,
+} from "./invoice-line-order.ts";
 import { parseInvoiceLine, type ParsedLine } from "./invoices.ts";
 import {
   INVOICE_CREATED_STATUS,
@@ -179,6 +183,8 @@ interface InvoiceDb {
   failItems: boolean;
   inserts: Array<{ readonly table: string; readonly rows: readonly Readonly<Record<string, unknown>>[] }>;
   updates: Array<{ readonly table: string; readonly query: string; readonly values: Record<string, unknown> }>;
+  /** Set while a test wants every intermediate position write checked against the unique index. */
+  strictPositions: boolean;
   queries: string[];
 }
 
@@ -254,6 +260,7 @@ function createDb(): InvoiceDb {
     invoices: [],
     items: [],
     failItems: false,
+    strictPositions: false,
     inserts: [],
     updates: [],
     queries: [],
@@ -644,7 +651,9 @@ function createInvoiceRest(db: InvoiceDb): RestClient {
           return Promise.reject(new AppError("CONFLICT"));
         }
 
-        // The unique index, over the live rows of one invoice.
+        // The unique index, over the live rows of one invoice, checked on **every** statement because
+        // `invoice_items_position_key` is not deferrable. `strictPositions` makes the gate assert that no
+        // intermediate write of a swap ever leaves two live rows holding one position.
         const nextPosition = values["position"];
 
         if (typeof nextPosition === "number") {
@@ -662,6 +671,27 @@ function createInvoiceRest(db: InvoiceDb): RestClient {
 
           if (clash) {
             return Promise.reject(new AppError("CONFLICT"));
+          }
+        }
+
+        if (db.strictPositions) {
+          // The whole table, after the write: a live row's position must be unique within its invoice.
+          const seen = new Map<string, number>();
+
+          for (const candidate of [...db.items.filter((entry) => entry !== row), { ...row, ...wireOf(values) }]) {
+            if (candidate["deleted_at"] !== null) {
+              continue;
+            }
+
+            const key = `${String(candidate["invoice_id"])}:${String(candidate["position"])}`;
+
+            seen.set(key, (seen.get(key) ?? 0) + 1);
+          }
+
+          for (const [key, count] of seen) {
+            if (count > 1) {
+              return Promise.reject(new Error(`invoice_items_position_key would be violated after this write: ${key}`));
+            }
           }
         }
 
@@ -1892,6 +1922,200 @@ async function checkLineAudit(): Promise<void> {
   );
 }
 
+/* ---- 10b. the line editor: ordering (STEP 113 step 2) ---- */
+
+async function checkLineOrder(): Promise<void> {
+  const { db, invoiceId } = await draftWith(3);
+  const positionsOf = async (): Promise<readonly number[]> =>
+    (await readLiveLinesForTest(db, invoiceId)).map((line) => line.position);
+  const descriptionsOf = async (): Promise<readonly string[]> =>
+    (await readLiveLinesForTest(db, invoiceId)).map((line) => line.description);
+
+  expectDeepEqual(await positionsOf(), [1, 2, 3], "a fresh draft is a dense list");
+  expectDeepEqual(await descriptionsOf(), ["Line 1", "Line 2", "Line 3"], "in the order it was written");
+
+  const lines = await readLiveLinesForTest(db, invoiceId);
+  const second = at(lines, 1, "the second line");
+
+  // Move down: the second and third exchange places.
+  const movedDown = await moveInvoiceLine(
+    { actor: owner, invoiceId, lineId: second.id, direction: "down" },
+    lineDepsOf(db),
+  );
+
+  expectDeepEqual(
+    movedDown.lines.map((line) => line.description),
+    ["Line 1", "Line 3", "Line 2"],
+    "moving down puts the line after its neighbour",
+  );
+  expectDeepEqual(await positionsOf(), [1, 2, 3], "and the positions stay dense");
+  expectEqual(movedDown.movedLineId, second.id, "the answer names the line that moved");
+  expectEqual(at(movedDown.lines, 2, "the moved line").position, 3, "which is now last");
+
+  // Move it back up.
+  const movedUp = await moveInvoiceLine(
+    { actor: owner, invoiceId, lineId: second.id, direction: "up" },
+    lineDepsOf(db),
+  );
+
+  expectDeepEqual(
+    movedUp.lines.map((line) => line.description),
+    ["Line 1", "Line 2", "Line 3"],
+    "moving up restores the order",
+  );
+  expectDeepEqual(await positionsOf(), [1, 2, 3], "with the positions still dense");
+
+  // ---- the unique index is satisfied after every write, not just at the end
+  db.updates.length = 0;
+  db.strictPositions = true;
+
+  await moveInvoiceLine(
+    { actor: owner, invoiceId, lineId: second.id, direction: "down" },
+    lineDepsOf(db),
+  );
+
+  const positionWrites = db.updates.filter((entry) => entry.values["position"] !== undefined);
+
+  expectEqual(positionWrites.length, 3, "a swap is exactly three position writes, not two and not a loop");
+  expect(
+    positionWrites.every((entry) => Number(entry.values["position"]) >= 1),
+    "each parked or exchanged position satisfies position >= 1",
+  );
+
+  // The parking position is one past the highest live position, so nothing already holds it.
+  expectEqual(
+    Number(at(positionWrites, 0, "the parking write").values["position"]),
+    4,
+    "the first write parks the line one past the end, a position no live row holds",
+  );
+  expect(db.strictPositions, "and the fixture checked every intermediate write against the index");
+
+  // Moving past either end is a no-op that answers with the list, not a refusal.
+  const first = at(await readLiveLinesForTest(db, invoiceId), 0, "the first line");
+  const atTop = await moveInvoiceLine(
+    { actor: owner, invoiceId, lineId: first.id, direction: "up" },
+    lineDepsOf(db),
+  );
+
+  expectDeepEqual(
+    atTop.lines.map((line) => line.position),
+    [1, 2, 3],
+    "moving the first line up leaves the order as it was",
+  );
+  expectEqual(
+    db.updates.filter((entry) => entry.values["position"] !== undefined).length,
+    3,
+    "and writes nothing, because a move that cannot happen is a no-op",
+  );
+
+  const last = at(await readLiveLinesForTest(db, invoiceId), 2, "the last line");
+  const atBottom = await moveInvoiceLine(
+    { actor: owner, invoiceId, lineId: last.id, direction: "down" },
+    lineDepsOf(db),
+  );
+
+  expectEqual(atBottom.lines.length, 3, "moving the last line down also answers with the list");
+
+  // A removal then a move: the compaction and the swap have to agree about what the list is.
+  db.strictPositions = true;
+  db.updates.length = 0;
+
+  const compacted = await removeInvoiceLine(
+    { actor: owner, invoiceId, lineId: at(await readLiveLinesForTest(db, invoiceId), 0, "the first line").id },
+    lineDepsOf(db),
+  );
+
+  expectDeepEqual(
+    compacted.lines.map((line) => line.position),
+    [1, 2],
+    "a removal leaves a dense list of two",
+  );
+
+  const reordered = await moveInvoiceLine(
+    { actor: owner, invoiceId, lineId: at(compacted.lines, 1, "the remaining last line").id, direction: "up" },
+    lineDepsOf(db),
+  );
+
+  expectDeepEqual(
+    reordered.lines.map((line) => line.position),
+    [1, 2],
+    "and a move on the compacted list is still dense",
+  );
+
+  // An unknown line, another merchant's invoice, and a bad direction all refuse.
+  expectEqual(
+    await lineCodeOf(() =>
+      moveInvoiceLine(
+        { actor: owner, invoiceId, lineId: "018f2b8a-5555-4c2d-9c3e-0000000000ff", direction: "up" },
+        lineDepsOf(db),
+      ),
+    ),
+    "RESOURCE_NOT_FOUND",
+    "moving a line that is not there is a 404",
+  );
+
+  expectEqual(
+    await lineCodeOf(() =>
+      moveInvoiceLine({ actor: otherOwner, invoiceId, lineId: second.id, direction: "up" }, lineDepsOf(db)),
+    ),
+    "RESOURCE_NOT_FOUND",
+    "and another merchant's invoice is not found at all",
+  );
+
+  // The role applies, and the draft lock applies.
+  expectEqual(
+    await lineCodeOf(() =>
+      moveInvoiceLine(
+        { actor: actorOf(["finance_ops"], COMPANY_A, { userId: OFFICE_ID }), invoiceId, lineId: second.id, direction: "up" },
+        lineDepsOf(db),
+      ),
+    ),
+    "PERMISSION_DENIED",
+    "an office role may not reorder a merchant's invoice",
+  );
+
+  const issued = await draftWith(2);
+  const issuedLines = await readLiveLinesForTest(issued.db, issued.invoiceId);
+
+  at(issued.db.invoices, 0, "the issued invoice")["status"] = "sending";
+
+  expectEqual(
+    await lineCodeOf(() =>
+      moveInvoiceLine(
+        { actor: owner, invoiceId: issued.invoiceId, lineId: at(issuedLines, 0, "the first line").id, direction: "down" },
+        lineDepsOf(issued.db),
+      ),
+    ),
+    "CONFLICT",
+    "a document that has left draft cannot be reordered",
+  );
+
+  // The move is audited with the positions, and never with the line's text.
+  const audit = createInMemoryAuditTrail();
+  const audited = await draftWith(2);
+  const auditLines = await readLiveLinesForTest(audited.db, audited.invoiceId);
+
+  await moveInvoiceLine(
+    { actor: owner, invoiceId: audited.invoiceId, lineId: at(auditLines, 0, "the first line").id, direction: "down" },
+    lineDepsOf(audited.db, audit),
+  );
+
+  const moves = audit.entries.filter((entry) => entry.action === INVOICE_LINE_MOVED_AUDIT_ACTION);
+
+  expectEqual(moves.length, 1, "a move writes one entry");
+  expectEqual(
+    (at(moves, 0, "the move entry").payload as Readonly<Record<string, unknown>>)["direction"],
+    "down",
+    "naming the direction",
+  );
+  expectEqual(
+    (at(moves, 0, "the move entry").payload as Readonly<Record<string, unknown>>)["from_position"],
+    1,
+    "and where the line came from",
+  );
+  expect(!JSON.stringify(audit.entries).includes("Line 1"), "and never the line's text");
+}
+
 /* ---- 11. the line editor's sources ---- */
 
 async function checkLineSources(): Promise<void> {
@@ -2225,6 +2449,7 @@ async function run(): Promise<void> {
   await checkSelectors();
   await checkLineEditor();
   await checkLineAudit();
+  await checkLineOrder();
   await checkLineSources();
   await checkSources();
 
