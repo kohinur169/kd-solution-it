@@ -166,8 +166,12 @@ export interface InvoiceSnapshot {
   readonly id: string;
   readonly companyId: string;
   readonly clientId: string;
-  /** Always a draft: this STEP writes no other status. */
+  /** One of the seven statuses of section 16; the workflow behind it is `invoice-status.ts`. */
   readonly status: string;
+  /** Null while draft, the issued number otherwise; a number is assigned once and never reused. */
+  readonly number: string | null;
+  /** Null while draft, the issue instant otherwise; set together with the number. */
+  readonly issuedAt: string | null;
   readonly currency: string;
   readonly client: {
     readonly name: string;
@@ -877,6 +881,8 @@ function snapshotOf(row: InvoiceRow, lines: readonly InvoiceItemRow[]): InvoiceS
     companyId: row.company_id,
     clientId: row.client_id,
     status: row.status,
+    number: row.number,
+    issuedAt: row.issued_at,
     currency: row.currency,
     client: { name: row.client_name, email: row.client_email, address: row.client_address },
     memo: row.memo,

@@ -6,6 +6,7 @@ import { requireAnyRole, requireCompanyId } from "../../lib/auth/session.ts";
 import type { RequestActor } from "../../lib/auth/types.ts";
 import { AppError } from "../../lib/errors/app-error.ts";
 import { INVOICE_CREATED_STATUS, INVOICE_ITEMS_TABLE } from "./invoice-fields.ts";
+import { INVOICE_PAID_LOCKED_RULE, INVOICE_PAID_STATUS } from "./invoice-status.ts";
 import { INVOICE_LINE_COLUMNS, invoiceLineRowSchema, lineOf, type InvoiceLine } from "./invoice-lines.ts";
 
 /**
@@ -108,6 +109,13 @@ export interface DocumentLineOrder<TRow, TLine> {
   readonly lineColumns: string;
   /** The only status whose lines may move; a decided document is frozen by its own trigger. */
   readonly draftStatus: string;
+  /**
+   * Optional: a status that is refused with its own rule rather than the generic "already changed",
+   * because the section gives it a sentence of its own. An invoice is locked once it is paid.
+   */
+  readonly lockedStatus?: string;
+  /** The rule the locked status is refused with. */
+  readonly lockedRule?: string;
   /** The audit action of a move in this family's vocabulary. */
   readonly movedAction: string;
   /** The audit entity a line is: `invoice_line`, `estimate_line`. */
@@ -132,7 +140,13 @@ async function appendTolerated(audit: AuditTrail, entry: Parameters<AuditTrail["
 
 /** The parent's status, or a refusal. Mirrors `requireDraftParent` in `invoice-lines.ts`. */
 async function requireDraftStatus(
-  document: { readonly parentTable: string; readonly draftStatus: string; readonly parentRule: string },
+  document: {
+    readonly parentTable: string;
+    readonly draftStatus: string;
+    readonly parentRule: string;
+    readonly lockedStatus?: string;
+    readonly lockedRule?: string;
+  },
   dependencies: InvoiceLineOrderDependencies,
   input: { readonly companyId: string; readonly parentId: string },
 ): Promise<void> {
@@ -146,6 +160,13 @@ async function requireDraftStatus(
     throw new AppError("RESOURCE_NOT_FOUND", {
       cause: { rule: document.parentRule, reason: "not_found" },
     });
+  }
+
+  // The locked status, when the family names one, is answered with its own sentence: a document that
+  // is refused because the money has settled is not the same answer as one that merely is no longer a
+  // draft. Mirrors `requireDraftParent` in `invoice-lines.ts`.
+  if (document.lockedStatus !== undefined && rows[0].status === document.lockedStatus) {
+    throw new AppError("CONFLICT", { details: [{ field: "status", rule: document.lockedRule ?? "locked" }] });
   }
 
   if (rows[0].status !== document.draftStatus) {
@@ -293,6 +314,8 @@ const INVOICE_LINE_ORDER: DocumentLineOrder<z.infer<typeof invoiceLineRowSchema>
   parentColumn: "invoice_id",
   lineColumns: INVOICE_LINE_COLUMNS,
   draftStatus: INVOICE_CREATED_STATUS,
+  lockedStatus: INVOICE_PAID_STATUS,
+  lockedRule: INVOICE_PAID_LOCKED_RULE,
   movedAction: INVOICE_LINE_MOVED_AUDIT_ACTION,
   lineEntity: "invoice_line",
   parentRule: "invoice",

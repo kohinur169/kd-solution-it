@@ -33,6 +33,8 @@ import { getInvoiceNumberSettings, type InvoiceNumberSettings } from "@/services
 import { NumberingForm } from "./numbering/numbering-form";
 import { BrandingForm } from "./branding/branding-form";
 import { InvoiceLineEditor } from "./invoice-line-editor";
+import { InvoiceStatusActions } from "./invoice-status-actions";
+import { invoiceStatusLabelKey, isInvoiceStatus } from "@/services/invoices/invoice-fields";
 import { z } from "zod";
 import { RecurringSchedulePanel, type RecurringScheduleView, type RecurringTemplateOption } from "./recurring-schedule-panel";
 import {
@@ -260,7 +262,11 @@ export async function InvoiceEditorScreen({
               </div>
               <div className="flex flex-col gap-1">
                 <dt className="text-xs text-muted-foreground">{getMessage("invoices.editorStatus")}</dt>
-                <dd className="font-medium">{state.invoice.status}</dd>
+                <dd className="font-medium">
+                  {isInvoiceStatus(state.invoice.status)
+                    ? getMessage(invoiceStatusLabelKey(state.invoice.status))
+                    : state.invoice.status}
+                </dd>
               </div>
               <div className="flex flex-col gap-1">
                 <dt className="text-xs text-muted-foreground">{getMessage("invoices.editorDueDate")}</dt>
@@ -270,7 +276,21 @@ export async function InvoiceEditorScreen({
                 <dt className="text-xs text-muted-foreground">{getMessage("invoices.total")}</dt>
                 <dd className="font-medium">{state.invoice.totals.total}</dd>
               </div>
+              {state.invoice.number !== null ? (
+                <div className="flex flex-col gap-1">
+                  <dt className="text-xs text-muted-foreground">{getMessage("invoices.numberLabel")}</dt>
+                  <dd className="font-medium">{state.invoice.number}</dd>
+                </div>
+              ) : null}
             </dl>
+
+            <InvoiceStatusActions
+              invoiceId={state.invoice.id}
+              status={state.invoice.status}
+              number={state.invoice.number}
+              issuedAt={state.invoice.issuedAt}
+            />
+
             <InvoiceLineEditor invoice={state.invoice} />
             <InvoicePdfPanel
               invoiceId={state.invoice.id}

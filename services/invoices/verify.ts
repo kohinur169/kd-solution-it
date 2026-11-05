@@ -54,6 +54,16 @@ import {
   type InvoiceLineDependencies,
 } from "./invoice-lines.ts";
 import {
+  INVOICE_PAID_LOCKED_RULE,
+  INVOICE_SENT_AUDIT_ACTION,
+  INVOICE_STATUS_TRANSITIONS,
+  INVOICE_VOID_REASON_LIMITS,
+  INVOICE_VOIDED_AUDIT_ACTION,
+  isLegalInvoiceTransition,
+  sendInvoice,
+  voidInvoice,
+} from "./invoice-status.ts";
+import {
   INVOICE_LINE_MOVED_AUDIT_ACTION,
   moveInvoiceLine,
 } from "./invoice-line-order.ts";
@@ -317,6 +327,8 @@ interface InvoiceDb {
   readonly numberingCounters: Array<Record<string, unknown>>;
   /** `0115`: one live rendered-document row per invoice. */
   readonly documents: Array<Record<string, unknown>>;
+  /** `0024`: the invoice's timeline, append-only; every move the workflow performs is one row here. */
+  readonly invoiceEvents: Array<Record<string, unknown>>;
   /** `0057`: the file rows a render writes, archives and reads back. */
   readonly files: Array<Record<string, unknown>>;
   /** `0116`: the merchant's invoice branding, one row per company, created on the first save. */
@@ -420,6 +432,7 @@ function createDb(): InvoiceDb {
     numberingSettings: [],
     numberingCounters: [],
     documents: [],
+    invoiceEvents: [],
     files: [],
     branding: [],
     profiles: [],
@@ -708,6 +721,7 @@ const MODELLED_TABLES = [
   "services",
   "invoices",
   "invoice_items",
+  "invoice_events",
   "invoice_number_settings",
   "invoice_number_counters",
   "invoice_documents",
@@ -892,6 +906,23 @@ function createInvoiceRest(db: InvoiceDb): RestClient {
           }
 
           db.branding.push(created);
+        }
+
+        return Promise.resolve();
+      }
+
+      // `0024`: the timeline. The real table is append-only; this branch models the append side, and
+      // the update path below refuses the other two, which is the guard the table carries.
+      if (table === "invoice_events") {
+        for (const row of rows) {
+          db.invoiceEvents.push({
+            id: randomUUID(),
+            created_at: new Date(NOW).toISOString(),
+            updated_at: new Date(NOW).toISOString(),
+            deleted_at: null,
+            version: 1,
+            ...row,
+          });
         }
 
         return Promise.resolve();
@@ -1493,6 +1524,12 @@ function createInvoiceRest(db: InvoiceDb): RestClient {
         return Promise.resolve();
       }
 
+      if (table === "invoice_events") {
+        // `invoice_events_guard_append_only`: the timeline is evidence, and evidence that can be edited
+        // is not evidence.
+        return Promise.reject(new AppError("CONFLICT", { cause: { rule: "invoice_events_guard_append_only" } }));
+      }
+
       if (table !== "invoices") {
         return Promise.reject(new Error(`the invoice service updates no other table: ${table}`));
       }
@@ -1514,7 +1551,40 @@ function createInvoiceRest(db: InvoiceDb): RestClient {
         return Promise.resolve();
       }
 
+      // `invoices_guard_paid`, exactly as the trigger states it: a paid row is frozen, the two metadata
+      // columns the row-metadata trigger owns excepted. The service answers this refusal before it ever
+      // reaches the database; the trigger is what the fixture proves the service cannot out-run.
+      if (row["status"] === "paid") {
+        const touched = Object.keys(values).filter((key) => key !== "updated_at" && key !== "version");
+
+        if (touched.length > 0) {
+          return Promise.reject(new AppError("CONFLICT", { cause: { rule: "invoices_guard_paid" } }));
+        }
+      }
+
       const next: Record<string, unknown> = { ...row, ...wireOf(values) };
+
+      // The checks a status write can break: `invoices_issue_check`'s trio (an issued state carries the
+      // number and the issue instant, a draft carries neither), and the two instant checks that tie
+      // `paid_at` and `voided_at` to their states.
+      const issuedStates = ["sent", "viewed", "partially_paid", "paid", "overdue"];
+
+      if (issuedStates.includes(String(next["status"])) && (next["number"] === null || next["issued_at"] === null)) {
+        return Promise.reject(new AppError("CONFLICT", { cause: { rule: "invoices_issue_check" } }));
+      }
+
+      if (next["status"] === "draft" && (next["number"] !== null || next["issued_at"] !== null)) {
+        return Promise.reject(new AppError("CONFLICT", { cause: { rule: "invoices_issue_check" } }));
+      }
+
+      if ((next["status"] === "void") !== (next["voided_at"] !== null)) {
+        return Promise.reject(new AppError("CONFLICT", { cause: { rule: "invoices_voided_instant_check" } }));
+      }
+
+      if ((next["status"] === "paid") !== (next["paid_at"] !== null)) {
+        return Promise.reject(new AppError("CONFLICT", { cause: { rule: "invoices_paid_instant_check" } }));
+      }
+
       const subtotal = BigInt(String(next["subtotal_minor"]));
       const discount = BigInt(String(next["discount_minor"]));
       const tax = BigInt(String(next["tax_minor"]));
@@ -3786,6 +3856,226 @@ async function checkNumberingSettings(): Promise<void> {
 }
 
 /* ---- 11. the line editor's sources ---- */
+
+/** One issued row of the fixture in a named state, with the money that state's checks demand. */
+function statusRowFixture(
+  companyId: string,
+  status: "sent" | "viewed" | "partially_paid" | "paid" | "overdue",
+): Record<string, unknown> {
+  const total = "100000";
+  const paid = status === "paid" ? total : status === "partially_paid" ? "40000" : "0";
+
+  return {
+    id: randomUUID(),
+    company_id: companyId,
+    client_id: CLIENT_A,
+    number: "INV-00001",
+    status,
+    currency: "USD",
+    subtotal_minor: total,
+    discount_minor: "0",
+    discount_basis: "amount",
+    discount_percent_bp: 0,
+    tax_minor: "0",
+    total_minor: total,
+    amount_paid_minor: paid,
+    client_name: "Acme Ltd",
+    client_email: "billing@acme.example",
+    client_address: null,
+    memo: null,
+    issued_at: new Date(NOW).toISOString(),
+    due_at: new Date(NOW + 20 * 86_400_000).toISOString(),
+    first_viewed_at:
+      status === "viewed" || status === "paid" || status === "overdue" ? new Date(NOW).toISOString() : null,
+    paid_at: status === "paid" ? new Date(NOW).toISOString() : null,
+    voided_at: null,
+    created_at: new Date(NOW).toISOString(),
+    updated_at: new Date(NOW).toISOString(),
+    deleted_at: null,
+    version: 1,
+  };
+}
+
+async function checkStatusWorkflow(): Promise<void> {
+  // ---- the graph: the one table the screen, the service and this gate all read
+  expectEqual(INVOICE_STATUS_TRANSITIONS.draft.length, 2, "a draft has exactly two exits");
+  expect(isLegalInvoiceTransition("draft", "sent"), "a draft can be sent");
+  expect(isLegalInvoiceTransition("draft", "void"), "and a draft can be voided");
+  expect(!isLegalInvoiceTransition("draft", "paid"), "a draft is not paid, because no money has been offered");
+  expect(!isLegalInvoiceTransition("sent", "draft"), "a sent document is not a draft again");
+  expect(!isLegalInvoiceTransition("paid", "void"), "a paid invoice never leaves its state");
+  expect(!isLegalInvoiceTransition("paid", "sent"), "and it is not sent again, either");
+  expect(!isLegalInvoiceTransition("void", "sent"), "a voided document is not one that comes back");
+  expect(isLegalInvoiceTransition("overdue", "paid"), "an overdue document can still be paid");
+  expect(!isLegalInvoiceTransition("overdue", "sent"), "and it does not go back to sent");
+
+  // ---- send: the draft becomes the first issued document of the series
+  const { db, invoiceId } = await draftWith(1);
+  const sentAudit = createInMemoryAuditTrail();
+  const sent = await sendInvoice({ actor: owner, invoiceId }, depsOf(db, sentAudit));
+
+  expectEqual(sent.from, "draft", "the move starts from the draft it read");
+  expectEqual(sent.to, "sent", "and ends in the state it was asked for");
+  expectEqual(sent.number, "INV-00001", "the first issue takes the first number of the series");
+  const sentRow = at(db.invoices, 0, "the invoice");
+
+  expectEqual(sentRow["status"], "sent", "the row is sent");
+  expectEqual(sentRow["number"], "INV-00001", "with the number the counter gave");
+  expect(sentRow["issued_at"] !== null, "and the issue instant written in the same statement");
+  expectEqual(db.takenNumbers.length, 1, "and the number was spent from the merchant's counter");
+
+  expectEqual(db.invoiceEvents.length, 1, "one timeline row for the move");
+  const sentEvent = at(db.invoiceEvents, 0, "the sent event");
+
+  expectEqual(sentEvent["type"], "sent", "in the word 0024 gives it");
+  expectEqual(sentEvent["actor"], "merchant", "acted by the merchant");
+  expectEqual(sentEvent["actor_user_id"], OWNER_ID, "and named for the person who acted");
+  expectEqual(sentAudit.entries.length, 1, "one audit entry for the move");
+  const sentEntry = at(sentAudit.entries, 0, "the sent audit entry");
+
+  expectEqual(sentEntry.action, INVOICE_SENT_AUDIT_ACTION, "under the send's action");
+  expectEqual(sentEntry.entityId, invoiceId, "on the document it moved");
+  expectEqual((sentEntry.payload as { readonly number?: unknown })["number"], "INV-00001", "carrying the number");
+  expect(!("client_name" in sentEntry.payload), "and no client data in the trail");
+
+  // A second send is a conflict, and the refusal spends no second number.
+  expectEqual(
+    await lineCodeOf(() => sendInvoice({ actor: owner, invoiceId }, depsOf(db, sentAudit))),
+    "CONFLICT",
+    "a second send is refused",
+  );
+  expectEqual(db.takenNumbers.length, 1, "and the counter was not spent twice");
+
+  // ---- the paid lock: the sentence, and the trigger behind it
+  const paidDb = createDb();
+  const paidRow = statusRowFixture(COMPANY_A, "paid");
+  paidDb.invoices.push(paidRow);
+  const paidId = String(paidRow["id"]);
+  const paidAudit = createInMemoryAuditTrail();
+
+  expectEqual(
+    await lineCodeOf(() => sendInvoice({ actor: owner, invoiceId: paidId }, depsOf(paidDb))),
+    "CONFLICT",
+    "a paid invoice cannot be sent",
+  );
+
+  const paidVoidRefusal = await refusalOfAsync(() =>
+    voidInvoice({ actor: owner, invoiceId: paidId }, depsOf(paidDb, paidAudit)),
+  );
+
+  expectEqual(paidVoidRefusal.length, 1, "voiding a paid invoice is refused");
+  expectEqual(
+    paidVoidRefusal.filter((detail) => detail.rule === INVOICE_PAID_LOCKED_RULE).length,
+    1,
+    "with the paid lock's own rule",
+  );
+  expectEqual(paidDb.invoiceEvents.length, 0, "and a refused move writes no timeline row");
+  expectEqual(paidAudit.entries.length, 0, "nor an audit entry");
+
+  // The editor's own paths refuse a paid parent with the same rule.
+  const paidLineRefusal = await refusalOfAsync(() =>
+    addInvoiceLine({ actor: owner, invoiceId: paidId, line: parsedLine() }, lineDepsOf(paidDb)),
+  );
+
+  expectEqual(
+    paidLineRefusal.filter((detail) => detail.rule === INVOICE_PAID_LOCKED_RULE).length,
+    1,
+    "a line is not added to a paid invoice, under the paid lock's rule",
+  );
+
+  // ---- void: with and without a reason, from the states an open document can be in
+  const { db: voidDb, invoiceId: voidId } = await draftWith(1);
+  const voidAudit = createInMemoryAuditTrail();
+  const voided = await voidInvoice(
+    { actor: owner, invoiceId: voidId, reason: "sent to the wrong client" },
+    depsOf(voidDb, voidAudit),
+  );
+
+  expectEqual(voided.from, "draft", "the void starts from the state it read");
+  expectEqual(voided.to, "void", "and ends in the state it was asked for");
+  const voidedRow = at(voidDb.invoices, 0, "the voided invoice");
+
+  expectEqual(voidedRow["status"], "void", "the row is void");
+  expect(voidedRow["voided_at"] !== null, "with the void instant in the same statement");
+  expectEqual(voidDb.invoiceEvents.length, 1, "one timeline row for the void");
+  const voidedEvent = at(voidDb.invoiceEvents, 0, "the voided event");
+
+  expectEqual(voidedEvent["type"], "voided", "in the word 0024 gives it");
+  expectEqual(voidedEvent["detail"], "sent to the wrong client", "keeping the reason for the timeline");
+  expectEqual(voidAudit.entries.length, 1, "one audit entry for the void");
+  const voidedEntry = at(voidAudit.entries, 0, "the voided audit entry");
+
+  expectEqual(voidedEntry.action, INVOICE_VOIDED_AUDIT_ACTION, "under the void's action");
+  expectEqual((voidedEntry.payload as { readonly reason_present?: unknown })["reason_present"], true, "and it says the reason was given");
+
+  expectEqual(
+    await lineCodeOf(() => voidInvoice({ actor: owner, invoiceId: voidId }, depsOf(voidDb, voidAudit))),
+    "CONFLICT",
+    "a second void is refused",
+  );
+
+  const { db: plainVoidDb, invoiceId: plainVoidId } = await draftWith(1);
+  await voidInvoice({ actor: owner, invoiceId: plainVoidId }, depsOf(plainVoidDb));
+
+  expectEqual(at(plainVoidDb.invoiceEvents, 0, "the plain voided event")["detail"], null, "a void without a reason keeps no detail");
+
+  const { db: sentVoidDb, invoiceId: sentVoidId } = await draftWith(1);
+  await sendInvoice({ actor: owner, invoiceId: sentVoidId }, depsOf(sentVoidDb));
+  const sentVoid = await voidInvoice({ actor: owner, invoiceId: sentVoidId }, depsOf(sentVoidDb));
+
+  expectEqual(sentVoid.from, "sent", "an issued document is voided from the state it is in");
+
+  const ppDb = createDb();
+  const ppRow = statusRowFixture(COMPANY_A, "partially_paid");
+  ppDb.invoices.push(ppRow);
+  const ppVoid = await voidInvoice({ actor: owner, invoiceId: String(ppRow["id"]) }, depsOf(ppDb));
+
+  expectEqual(ppVoid.from, "partially_paid", "a partially paid document is voided from its own state");
+
+  // ---- the reason's bounds
+  const { db: reasonDb, invoiceId: reasonId } = await draftWith(1);
+
+  expectEqual(
+    await lineCodeOf(() => voidInvoice({ actor: owner, invoiceId: reasonId, reason: "   " }, depsOf(reasonDb))),
+    "VALIDATION_FAILED",
+    "whitespace is not a reason",
+  );
+  expectEqual(
+    await lineCodeOf(() =>
+      voidInvoice(
+        { actor: owner, invoiceId: reasonId, reason: "x".repeat(INVOICE_VOID_REASON_LIMITS.max + 1) },
+        depsOf(reasonDb),
+      ),
+    ),
+    "VALIDATION_FAILED",
+    "and a reason past its bound is refused",
+  );
+  expectEqual(
+    await lineCodeOf(() => voidInvoice({ actor: owner, invoiceId: reasonId, reason: 7 }, depsOf(reasonDb))),
+    "VALIDATION_FAILED",
+    "and a reason that is not a sentence is refused",
+  );
+
+  // ---- tenancy and role
+  expectEqual(
+    await lineCodeOf(() => sendInvoice({ actor: desk, invoiceId }, depsOf(createDb()))),
+    "PERMISSION_DENIED",
+    "an office role may not send a merchant's draft",
+  );
+
+  const { db: tenancyDb, invoiceId: tenancyId } = await draftWith(1);
+
+  expectEqual(
+    await lineCodeOf(() => sendInvoice({ actor: otherOwner, invoiceId: tenancyId }, depsOf(tenancyDb))),
+    "RESOURCE_NOT_FOUND",
+    "and a merchant may not reach another merchant's document",
+  );
+  expectEqual(
+    await lineCodeOf(() => sendInvoice({ actor: owner, invoiceId: "not-a-uuid" }, depsOf(tenancyDb))),
+    "VALIDATION_FAILED",
+    "an id that is not a uuid is a validation failure",
+  );
+}
 
 async function checkLineSources(): Promise<void> {
   const codeOf = (source: string): string =>
@@ -7806,6 +8096,7 @@ async function run(): Promise<void> {
   await checkNumberingPrinting();
   await checkNumberingTake();
   await checkNumberingSettings();
+  await checkStatusWorkflow();
   await checkDiscountEngine();
   await checkDiscountCreate();
   await checkDiscountUpdate();
@@ -7833,7 +8124,7 @@ async function run(): Promise<void> {
   process.stdout.write(
     `invoice gate passed: ${String(checks)} checks, 0022/0023/0115/0116, draft, ` +
       `${String(INVOICE_MAXIMUM_LINES)} lines, half-away-from-zero rounding, PDF as a background job, ` +
-      `a merchant's own logo and branding on it\n`,
+      `a merchant's own logo and branding on it, the status workflow and the paid lock\n`,
   );
 }
 
