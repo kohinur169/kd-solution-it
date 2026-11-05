@@ -6,7 +6,9 @@ import { SessionKeeper } from "@/components/auth/session-keeper";
 import { getAuthRuntime } from "@/lib/auth/runtime";
 import { AppError } from "@/lib/errors/app-error";
 import { getMessage } from "@/lib/i18n/messages";
+import type { RequestActor } from "@/lib/auth/types";
 import { ESTIMATE_EXPIRY_MAXIMUM_DAYS } from "@/services/estimates/estimate-fields";
+import { readEstimateSignature } from "@/services/estimates/estimate-signature";
 import { getEstimate, type EstimateSnapshot } from "@/services/estimates/estimates";
 import {
   listInvoiceClientOptions,
@@ -15,6 +17,7 @@ import {
 import { readOwnerActor } from "../onboarding/owner-actor";
 import { EstimateForm } from "./estimate-form";
 import { EstimateLineEditor } from "./estimate-line-editor";
+import { EstimateSignaturePanel, type SignaturePanelState } from "./estimate-signature-panel";
 
 /**
  * Section 16's estimate screens: the create form and the editor of one draft.
@@ -41,6 +44,16 @@ import { EstimateLineEditor } from "./estimate-line-editor";
  * are computed on the server so the page renders deterministically - a browser that computed them would
  * disagree with the server's own clock, and a hydration mismatch on a date is a form that opens on one day
  * and saves another. A phone whose clock is wrong is still offered the day the server believes.
+ *
+ * ## Why the evidence is read here too, and tolerated
+ *
+ * The panel beside the quote is section 16's evidence, and it is read on the server for the reason the
+ * client book is: the company that scopes it comes from the session, so the page cannot be tricked into
+ * showing one merchant another's signature. But it is read *tolerantly*, and that is the one place this
+ * screen swallows an error deliberately. The quote is the page's subject, so its failure is the page's
+ * refusal; the evidence is one panel of it, and a store that is down must not take the quote off the
+ * screen. Nor may it read as an absence - "no signature recorded" during an outage is a sentence a
+ * merchant could repeat in a dispute - so the panel has a third state for a read that failed.
  *
  * ## The width
  *
@@ -97,6 +110,30 @@ function defaultExpiryDate(): string {
  */
 function maximumExpiryDate(): string {
   return dayFromNow(ESTIMATE_EXPIRY_MAXIMUM_DAYS);
+}
+
+/**
+ * The evidence beside the quote, read tolerantly.
+ *
+ * Three answers, because three things are true of a read: nobody has decided, somebody has, and the read
+ * itself failed. The last one is not a variant of the first - collapsing them is how an outage becomes a
+ * merchant believing a client's decision was lost.
+ */
+async function signatureStateOf(
+  actor: RequestActor,
+  estimateId: string,
+  runtime: ReturnType<typeof getAuthRuntime>,
+): Promise<SignaturePanelState> {
+  try {
+    const signature = await readEstimateSignature(
+      { actor, estimateId },
+      { rest: runtime.rest, audit: runtime.audit },
+    );
+
+    return signature === null ? { kind: "none" } : { kind: "recorded", signature };
+  } catch {
+    return { kind: "unreadable" };
+  }
 }
 
 async function readScreenState(): Promise<ScreenState> {
@@ -162,9 +199,13 @@ export async function EstimateEditorScreen({
   readonly estimateId: string;
 }): Promise<ReactNode> {
   const actorState = await readOwnerActor();
-  let state: { readonly kind: "ready"; readonly estimate: EstimateSnapshot } | ScreenState = {
-    kind: "unavailable",
-  };
+  let state:
+    | {
+        readonly kind: "ready";
+        readonly estimate: EstimateSnapshot;
+        readonly signatureState: SignaturePanelState;
+      }
+    | ScreenState = { kind: "unavailable" };
 
   if (actorState.kind === "anonymous") {
     state = { kind: "signed-out" };
@@ -177,7 +218,9 @@ export async function EstimateEditorScreen({
         { rest: runtime.rest, audit: runtime.audit },
       );
 
-      state = { kind: "ready", estimate };
+      const signatureState = await signatureStateOf(actorState.actor, estimateId, runtime);
+
+      state = { kind: "ready", estimate, signatureState };
     } catch (error) {
       state =
         error instanceof AppError && error.code === "AUTHENTICATION_REQUIRED"
@@ -221,6 +264,7 @@ export async function EstimateEditorScreen({
               </div>
             </dl>
             <EstimateLineEditor estimate={state.estimate} />
+            <EstimateSignaturePanel state={state.signatureState} />
           </>
         ) : (
           <p className="text-sm text-destructive" role="alert">

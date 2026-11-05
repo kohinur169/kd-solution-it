@@ -3113,7 +3113,19 @@ const MUTATING_ROUTES = [
   "app/api/estimates/[id]/discount/route.ts",
 ] as const;
 
-const READING_ROUTES = ["app/api/estimates/clients/route.ts", "app/api/estimates/catalogue/route.ts"] as const;
+/**
+ * The routes that only read, each beside the one definition of the fact it reads.
+ *
+ * A read goes through the service that owns the fact rather than querying a table itself: a route that
+ * queried would be a second cap, a second column list and a second company scope, and the three drift
+ * apart from the picker or the evidence they duplicate. Naming the reader per route is what lets the third
+ * one read something other than a picker without the claim going vague.
+ */
+const READING_ROUTES = [
+  ["app/api/estimates/clients/route.ts", "listInvoiceClientOptions("],
+  ["app/api/estimates/catalogue/route.ts", "listInvoiceCatalogueOptions("],
+  ["app/api/estimates/[id]/signature/route.ts", "readEstimateSignature("],
+] as const;
 
 /**
  * The routes this part adds, read as text.
@@ -3135,7 +3147,11 @@ async function checkRoutes(): Promise<void> {
       })
       .join("\n");
 
-  for (const path of [...MUTATING_ROUTES, ...READING_ROUTES, "services/estimates/estimate-lines.ts"]) {
+  for (const path of [
+    ...MUTATING_ROUTES,
+    ...READING_ROUTES.map(([route]) => route),
+    "services/estimates/estimate-lines.ts",
+  ]) {
     const source = await readRepositoryFile(path);
 
     expect(source.length > 0, `${path} exists`);
@@ -3258,17 +3274,14 @@ async function checkRoutes(): Promise<void> {
   );
 
   // The two reads change nothing, so they carry no token - and they are the only two estimate routes that do not.
-  for (const path of READING_ROUTES) {
+  for (const [path, reader] of READING_ROUTES) {
     const source = codeOf(await readRepositoryFile(path));
 
     expect(source.includes("export const GET"), `${path} answers a GET`);
     expect(!source.includes("requireCsrfToken("), `${path} checks no token, because it changes nothing`);
     expect(!source.includes("export const POST"), `${path} exports no mutation`);
     expect(source.includes('"cache-control": "no-store"'), `${path} still lets no cache keep the answer`);
-    expect(
-      source.includes("listInvoiceClientOptions(") || source.includes("listInvoiceCatalogueOptions("),
-      `${path} reads through the picker's one definition rather than a second cap and column list`,
-    );
+    expect(source.includes(reader), `${path} reads through ${reader.slice(0, -1)}, the one definition of the fact it answers`);
   }
 
   // The protected list is what makes the five mutations safe, and the auth gate counts it against the
@@ -3281,7 +3294,7 @@ async function checkRoutes(): Promise<void> {
     expect(csrf.includes(`"${apiPath}"`), `${apiPath} is on the CSRF protected list`);
   }
 
-  for (const path of READING_ROUTES) {
+  for (const [path] of READING_ROUTES) {
     const apiPath = `/${path.slice("app/".length).replace(/\/route[.]ts$/u, "")}`;
 
     expect(!csrf.includes(`"${apiPath}"`), `${apiPath} is not on it, because a read has nothing to forge`);
@@ -3476,6 +3489,7 @@ async function checkUi(): Promise<void> {
   const listPath = "app/(dashboard)/estimates/page.tsx";
   const newPath = "app/(dashboard)/estimates/new/page.tsx";
   const onePath = "app/(dashboard)/estimates/[id]/page.tsx";
+  const panelPath = "app/(dashboard)/estimates/estimate-signature-panel.tsx";
 
   const form = await readRepositoryFile(formPath);
   const editor = await readRepositoryFile(editorPath);
@@ -3483,7 +3497,8 @@ async function checkUi(): Promise<void> {
   const listPage = await readRepositoryFile(listPath);
   const newPage = await readRepositoryFile(newPath);
   const onePage = await readRepositoryFile(onePath);
-  const ui = [form, editor, screens, listPage, newPage, onePage];
+  const panel = await readRepositoryFile(panelPath);
+  const ui = [form, editor, screens, listPage, newPage, onePage, panel];
 
   for (const [name, source] of [
     [formPath, form],
@@ -3492,6 +3507,7 @@ async function checkUi(): Promise<void> {
     [listPath, listPage],
     [newPath, newPage],
     [onePath, onePage],
+    [panelPath, panel],
   ] as const) {
     expect(source.startsWith(`// path: ${name}\n`), `${name} starts with its path`);
     expect(/^[\x20-\x7e\n\r\t]*$/u.test(source), `${name} is ASCII`);
@@ -3614,6 +3630,8 @@ async function checkUi(): Promise<void> {
   expect(countOf(editor, "flex-wrap") >= 3, "a row's controls wrap rather than overflow");
   expect(form.includes("flex-wrap"), "and so do the form's");
   expect(editor.includes("min-w-0") && editor.includes("truncate"), "the editor's closed row truncates a long description instead of pushing its amount off the screen");
+  expect(countOf(panel, "grid-cols-1") === countOf(panel, "sm:grid-cols-2"), "and the evidence list is one column on a phone, two from sm up");
+  expect(countOf(panel, "grid-cols-1") === 1, "because it is one list");
 
   // Every sentence the screens name exists in the catalogue, and the catalogue is not padded: this build
   // uses what it declares. A key renamed here would leave a screen with no copy, and a type error is the
@@ -4764,6 +4782,100 @@ async function checkCapture(): Promise<void> {
   );
 }
 
+/* ---- the read side: one route and one panel ---- */
+
+/**
+ * STEP 120's read side, and the claim that it is read only.
+ *
+ * The capture has no route and this group proves it stays that way: nothing here exports a mutation, and
+ * the panel offers no control, because `0027` refuses an update and a delete and a button that can only
+ * fail is worse than no button. What the group proves hardest is the third state - a read that failed is
+ * not an absence - because collapsing the two is how an outage becomes a merchant believing a client's
+ * decision was lost, and believing it in a dispute.
+ */
+async function checkEvidence(): Promise<void> {
+  const routePath = "app/api/estimates/[id]/signature/route.ts";
+  const panelPath = "app/(dashboard)/estimates/estimate-signature-panel.tsx";
+  const routeSource = await readRepositoryFile(routePath);
+  const panelSource = await readRepositoryFile(panelPath);
+  const route = sourceCodeOf(routeSource);
+  const panel = sourceCodeOf(panelSource);
+  const screens = sourceCodeOf(await readRepositoryFile("app/(dashboard)/estimates/estimate-screens.tsx"));
+
+  /* -- the route reads, and nothing in this build writes -- */
+
+  expect(route.includes("export const GET"), "the evidence route answers a GET");
+
+  for (const verb of ["POST", "PATCH", "PUT", "DELETE"]) {
+    expect(!route.includes(`export const ${verb}`), `and it exports no ${verb}: nothing in this build can record or remove a decision`);
+  }
+
+  expect(!route.includes("captureEstimateSignature"), "the route does not reach the capture, so no merchant session can write evidence");
+  expect(route.includes("readEstimateSignature("), "it reads through the service that owns the evidence");
+  expect(route.includes("readRequestActor("), "and the session decides who is asking");
+  expect(
+    !/searchParams[.]get\(["']company|body[.]company|params[.]company|headers[.]get\(["']x-company/u.test(route),
+    "the company comes from the session and never from the request",
+  );
+  expect(route.includes("decodeURIComponent("), "the id is decoded, so two spellings of one id read one document");
+  expect(route.includes("status: 200"), "an undecided quote answers 200 with a null rather than a 404");
+  expect(!route.includes("parseFloat") && !route.includes("Number("), "the route does no arithmetic of its own");
+  expect(!route.includes("logger."), "and a read earns no log line: rule 9 is about writes");
+
+  /* -- the panel holds no control -- */
+
+  expect(!panelSource.includes('"use client"'), "the panel is not a client component, because it holds no box and no click");
+
+  for (const control of ["<button", "<form", "<input", "<select", "<textarea", "useState", "onClick", "fetch("]) {
+    expect(!panel.includes(control), `the panel offers no ${control === "fetch(" ? "request of its own" : control}: an append-only record has nothing to submit`);
+  }
+
+  /* -- three states, and the third is not the first -- */
+
+  for (const kind of ["none", "recorded", "unreadable"]) {
+    expect(countOf(panel, `state.kind === "${kind}"`) === 1, `the panel words "${kind}" once, as its own state`);
+  }
+
+  expect(
+    panel.indexOf('state.kind === "unreadable"') < panel.indexOf('role="alert"'),
+    "and a read that failed is an alert rather than a quiet empty box",
+  );
+  expect(panel.includes("signatureUnreadable"), "worded as a failure to read, never as an absence");
+  expect(panel.includes("signatureNone"), "with a separate sentence for a quote nobody has decided");
+
+  /* -- the eight elements of section 16, printed -- */
+
+  for (const element of [
+    "signerName",
+    "signerEmail",
+    "consentText",
+    "signedAt",
+    "ip",
+    "geoLocation",
+    "deviceFingerprint",
+    "documentHash",
+  ]) {
+    expect(panel.includes(`state.signature.${element}`), `the panel prints the record's ${element}`);
+  }
+
+  expect(panel.includes("state.signature.decision"), "and the decision itself");
+  expect(countOf(panel, "state.signature.signaturePath") === 1, "while a storage key is compared and never printed");
+  expect(!/documentHash[.]slice|documentHash[.]substring/u.test(panel), "the digest is never truncated to fit a column");
+  expect(panel.includes("break-all font-mono"), "it is wrapped in a monospace face instead, so a merchant can check it against a stored row");
+  expect(panel.includes("valueOrAbsent("), "and an element that was not captured is named as absent rather than left blank");
+
+  /* -- the screen reads the evidence on the server, tolerantly -- */
+
+  expect(screens.includes("signatureStateOf("), "the screen reads the evidence beside the quote, on the server");
+  expect(countOf(screens, "readEstimateSignature(") === 1, "through the service, once");
+  expect(screens.includes('kind: "unreadable"'), "and it can answer that the read failed");
+  expect(!screens.includes("/signature"), "so the page never fetches the route: the session's scope stays on the server");
+  expect(
+    screens.indexOf("<EstimateLineEditor") < screens.indexOf("<EstimateSignaturePanel"),
+    "the evidence sits under the lines, which are what the merchant came to work on",
+  );
+}
+
 /* ---- the run ---- */
 
 async function run(): Promise<void> {
@@ -4781,6 +4893,7 @@ async function run(): Promise<void> {
   await checkSignature();
   await checkCapture();
   await checkUi();
+  await checkEvidence();
   await checkMigration();
 
   if (failures.length > 0) {
@@ -4798,8 +4911,9 @@ async function run(): Promise<void> {
   process.stdout.write(
     `estimate gate passed: ${String(checks)} checks, 0025/0026/0027/0117, draft only, ` +
       `${String(INVOICE_MAXIMUM_LINES)} lines, both discount bases, add/edit/remove/move, ` +
-      "7 routes, one parser and one swap for one document family, the two screens that use them, " +
-      "the signature evidence vocabulary with its document hash, and the append-only capture that writes it\n",
+      "8 routes, one parser and one swap for one document family, the two screens that use them, " +
+      "the signature evidence vocabulary with its document hash, the append-only capture that writes it, " +
+      "and the read-only panel that shows it\n",
   );
 }
 
