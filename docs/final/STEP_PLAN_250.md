@@ -2,16 +2,24 @@
 # KD SOLUTION IT - 250 STEP Chat Plan
 
 ## How this plan is used
-- This plan, docs/final/FEATURE_LIST.md and docs/final/MASTER_PROMPT.md stay inside the
-  GitHub repository. The owner opens each new coding chat with this repository selected,
-  so the agent can read and verify the full plan and the complete project scope by itself.
-- The owner writes only one line in each new chat: Implement STEP NNN.
-  Example: Implement STEP 001.
-- The agent then reads FEATURE_LIST.md and MASTER_PROMPT.md in full, finds STEP NNN below,
-  reads the previous handoff file, implements only that STEP, runs typecheck and lint,
-  commits with the message "STEP NNN: title", pushes, and creates
-  docs/handoffs/STEP_NNN_COMPLETED.md before the chat ends.
-- One chat finishes exactly one STEP. STEP N+1 never starts before the handoff of STEP N exists.
+- Keep all six `docs/final/` files and the complete historical `docs/planning/` bundle in the
+  selected fresh implementation repository. The final files are active authority; planning files
+  are historical background only and cannot override them.
+- The owner sends exactly one STEP number in each message, such as `Implement STEP 001`, then
+  `Implement STEP 002`. The same chat session may contain many such sequential requests, including
+  STEP 001 through STEP 040. Do not ask the owner to send a range and never start an unrequested STEP.
+- Verify the start point on the selected branch: STEP 001 if no completed handoff exists, otherwise
+  the next uncompleted STEP. Never skip, repeat or act beyond the one STEP in the latest message.
+- Each STEP independently follows its eight same-session sub-steps, passes required checks,
+  commits as `STEP NNN: title`, pushes, and creates its own
+  `docs/handoffs/STEP_NNN_COMPLETED.md`. The owner must request the next STEP after receiving the
+  completed handoff. Never combine multiple STEPs into one commit or handoff.
+- After every five completed low/medium-risk STEPs, give a concise progress checkpoint. Database
+  migration, authentication/security, money/ledger, KYC, provider, payout and production-release
+  STEPs receive a verification checkpoint before the owner requests the next STEP. If a STEP fails,
+  an ownership/scope conflict appears, a required provider/secret is unavailable, or session capacity
+  is inadequate, stop and report the exact last completed STEP and next pending STEP. Never claim
+  pending work is complete or skip it.
 
 ## Production Gate for Every STEP
 Every STEP follows the Production Readiness Rules in docs/final/MASTER_PROMPT.md:
@@ -19,17 +27,69 @@ typecheck, lint and build must pass; migrations must prove rollback; money flows
 prove balanced ledger entries; provider work must prove a sandbox cycle; new environment
 variables must be added to .env.example. The handoff file of each STEP records these proofs.
 
+## Cross-STEP Contract: Invoice Issuance, Recurrence and Email Delivery
+- `draft` is not an issued invoice. The canonical `draft -> sent` transition is owned by STEP 116.
+  It must assign the invoice number using STEP 115's existing `takeInvoiceNumber` service, set
+  `issued_at`, transition the status, and write the existing invoice-event/audit records in one
+  database transaction. Repeating the issue request for an already-sent invoice must return the
+  existing result without allocating another number or duplicating its event. Use row locking or
+  an equivalent concurrency-safe guard. Never edit STEP 115 or any committed migration to do this.
+- For this product, `sent` means the invoice has been issued by the platform and its stable email
+  job has been durably enqueued; it does not claim the recipient's email was delivered. Email
+  delivery, provider message IDs and delivery retries belong to STEPs 221-227. Do not call
+  `lib/email` from an invoice/recurrence STEP or claim delivery in UI, logs, tests or handoffs.
+- STEP 123 creates exactly one recurring invoice for each schedule occurrence, then uses STEP 116's
+  canonical issue transition in the same transaction. The occurrence key is the schedule ID plus
+  the scheduled local calendar date supplied by STEP 122, not the worker's current date/time.
+  A delayed or repeated scheduler run must resolve to that same occurrence and must not allocate a
+  second invoice number, invoice, issue event, email job or reminder occurrence.
+- `invoice_events` is an append-only domain timeline, never an email queue or mutable delivery-status
+  table. Domain-event deduplication uses immutable rows and a unique dedupe key. The durable job queue
+  from STEP 011/012 carries email work and has its own unique idempotency key. Delivery/attempt state
+  is recorded by STEPs 226-227; never update or delete an invoice event to mark it sent/failed.
+- A reminder occurrence count means reminder events/jobs durably enqueued, not emails successfully
+  delivered. Use a stable reminder occurrence/dedupe key and the configured interval/limit. A retry
+  of email delivery retries the same job key and does not consume another reminder occurrence.
+  Do not add a mutable per-invoice sent counter unless a separately approved feature change requires it.
+- STEP 123 may add a schema migration only under its explicit narrow ownership below. Before coding,
+  inspect the actual migration inventory and append exactly the next unused migration. If the current
+  highest migration is 0118, the next is 0119; never assume that number without checking. Never edit,
+  renumber or replay-patch a committed migration.
+- STEP 225 registers the email-job handler and consumes stable email jobs emitted by earlier feature
+  STEPs, including invoice issue/reminders, estimate issue, account/KYC alerts, dispute deadline
+  warnings, subscription warnings/service changes and support replies. STEP 226 records delivery
+  attempts/provider message IDs; STEP 227 retries the same job idempotently. If the job queue lacks
+  durable idempotency/claim semantics, stop and resolve its STEP 011/012 contract before producers
+  are implemented; do not disguise a timeline row as an email job.
+
+## Dependency Preflight and Cross-STEP Integration Register
+Before coding any STEP, list its required earlier handoffs, schema objects, callable service/job contracts, and any later consumer in the working notes. Use only interfaces actually present on the selected branch. A later STEP is not an available dependency. If the current STEP's acceptance cannot work without a missing prerequisite, stop before coding and request an owner-approved plan amendment; do not use mocks, direct table writes, fabricated statuses, or duplicate implementations to claim completion. Mocks are permitted for unit tests only. Every later integration must have a named owner STEP and an explicit stable contract below.
+
+- STEP 011/012: the job API must support stable idempotency keys and concurrent enqueue/claim safety. STEP 012's queue schema stores a nullable idempotency key with a unique partial index. All later scheduled work uses this queue and STEP 011's registration seam; later STEPs may add only their handler/registration entry, never refactor the queue/worker foundation. STEP 249 verifies registrations and schedules.
+- STEP 032 and STEPs 046, 052, 085-086, 094, 123, 139, 196, 218-220 and 229: email-producing features before STEP 225 enqueue a typed, minimal-data email job with a stable key on the STEP 011/012 queue; they never call a not-yet-built sender. STEP 225 owns dispatch, STEP 226 delivery logging, and STEP 227 retry. The queue key prevents a duplicate job; delivery retries reuse that same key.
+- STEP 061 and STEPs 085-086: validate uploads with the STEP 061 validator. KYC upload services use a typed, injectable storage port and test adapter; STEP 100-103 provide the shared storage contract/adapters/encryption/record service, and STEP 104 binds KYC document categories to that adapter. No local-disk fallback, direct unencrypted upload, or claim of production persistence before the adapter binding is verified. STEP 104 has only the narrow KYC storage-binding exception listed under File Ownership Rules.
+- STEP 094-096 and STEP 128/153/160/163/167/169: approval creates a durable, idempotent provider-provisioning intent and pending status; it does not claim a provider account exists. STEP 128 defines the capability registry; only the provider's adapter STEP can execute provisioning/bank-link operations and update that provider's authoritative status. STEP 096 handles the no-master-account queue/alert. Never bypass a missing adapter or treat platform approval as provider verification.
+- STEP 114 and STEP 127: STEP 114 must use an approved decimal library for invoice calculations (request package changes through the integrator; never edit `package.json`). STEP 127 adds the shared currency guard/payment-facing money contract using that same decimal implementation; it must not reimplement floating-point arithmetic or retroactively edit completed invoice code.
+- STEP 119-121/182: estimates begin as drafts. STEP 120 owns estimate-specific issuance prerequisites and signature evidence; estimate numbering is separate from invoice numbering. STEP 121 is an idempotent accepted-estimate-to-invoice service using STEP 115's invoice numbering and STEP 065's token service. STEP 182 consumes STEP 120's issued token/signature contract for the client page, decline and expiry. No STEP edits committed invoice-number migration 0114 or genericizes invoice numbering.
+- STEP 124/130/132/150-169/183/189: STEP 124 validates/records a partial-payment intent only; it does not mark money paid or post ledger entries. STEP 130 creates the idempotent payment operation, STEP 132 posts only confirmed money as balanced ledger entries, provider STEPs execute provider operations, STEP 183 supplies the hosted-fields page, and STEP 189 connects the invoice link to the same partial-payment service. A failed/pending attempt never reduces the invoice balance.
+- STEP 125-126/131-144: statement exports read the canonical settlement/ledger tables from STEP 026/025; STEP 136/137/144 populate/release the corresponding balances. Test exports with isolated fixtures before that data exists, but do not create a duplicate statement ledger or claim live settlement coverage until those producers are verified.
+- STEP 139/156/169: bank linking before provider execution creates a pending idempotent link request only. Payoneer STEP 156 or Airwallex STEP 169 completes it and records provider-confirmed status; do not claim automatic bank linking before the adapter response.
+- STEP 149-152/183-190: NMI STEPs 149-152 implement and verify the token/API adapter contract; STEP 183 embeds hosted fields, and STEPs 181/189/190 provide client invoice/estimate/payment-link surfaces. Provider adapters must not create duplicate page implementations, and page STEPs must not handle raw card data.
+
+A STEP that emits an event or intent has completed only that named durable handoff—not the downstream email, provider, ledger or storage action. Its handoff must identify the consumer STEP and the evidence still required before the whole feature can be called end-to-end or production-ready. No STEP may bypass a missing dependency by writing another STEP's tables directly.
+
 ## Coverage Map (feature list section to STEP range)
 - Platform Foundations: STEP 001-011. Application Security Core: STEP 056-067.
-- Database Schema and RLS: STEP 012-036.
+- Database Schema and RLS foundation: STEP 012-036. Later feature-specific schema additions use only their explicitly assigned, append-only migrations.
+- Merchant risk-policy scope (FEATURE_LIST section 34): forward-only schema parts in STEP 081, 084, 092 and 181, plus workflows in STEP 090-095, 136-144, 170-175, 249 and final review in STEP 250. Earlier STEP scopes remain unchanged.
 - Roles, Permissions, Office Dashboards and Announcements: STEP 068-078.
 - Authentication, 2FA, Login Lock and LR-022 Sessions: STEP 037-055.
-- Merchant Onboarding, Underwriting, KYC and Sub-Merchant Provisioning: STEP 079-099.
+- Merchant Onboarding, Processor KYB, optional IDV, Underwriting, Risk Tiers, Sanctions, Re-KYC and Sub-Merchant Provisioning: STEP 079-099.
 - File Storage Layer: STEP 100-105.
 - Clients, Products, Import, Invoices, Estimates, Recurring and Statements: STEP 106-126.
-- Payment Core, Double-Entry Ledger, Settlement, Reserve, Payout and Reconciliation: STEP 127-146.
+- Payment Core, Double-Entry Ledger, Risk Limits, Fulfilment-Gated Settlement, Reserve, Payout and Reconciliation: STEP 127-146.
 - Five Payment Provider Adapters (NMI, Payoneer, Rainforest, Stripe Connect, Airwallex): STEP 147-169.
-- Automatic KYC Adapters (Jumio, Didit, Sumsub): STEP 170-175.
+- Optional supplementary identity verification adapters (Jumio, Didit, Sumsub): STEP 170-175.
 - Sales Tax Collection with TaxCloud: STEP 176-180.
 - Client Portal, Payment Pages and Payment Links: STEP 181-190.
 - Refunds, Disputes and Evidence Packs: STEP 191-199.
@@ -40,20 +100,22 @@ variables must be added to .env.example. The handoff file of each STEP records t
 - Company Accounting and Operations Metrics: STEP 239-243.
 - Performance, Deployment and Launch Verification: STEP 244-250.
 - Background Jobs: the queue, worker and scheduler foundation is STEP 011. Every feature
-  STEP that needs a job registers it on that foundation. STEP 249 verifies all schedules.
+  STEP that needs a job registers it on that foundation. STEP 249 verifies all schedules,
+  including daily screening, re-KYC, volume-spike, tier-limit and fulfilment-gated payout jobs.
 
-## File Ownership Rules (applies to all 250 STEPs, no exceptions)
+## File Ownership Rules (applies to all 250 STEPs; only the explicit narrow overrides below are allowed)
 - Foundation STEPs 001-011 own root configuration, config/ and lib/ foundation files.
-- Database STEPs 012-036 own only their numbered migration files in migrations/.
+- Database STEPs 012-036 own their numbered migration files in migrations/. A later feature STEP may add schema only when its own block explicitly grants a narrow, append-only migration exception and names the schema purpose; inspect the actual migration inventory and use only the next unused number. The specific STEP 123 exception is defined below. Risk-policy migrations remain limited to the explicitly named, still-uncompleted STEPs 081, 084, 092 and 181. No completed migration is edited.
 - Auth STEPs 037-055 own app/(auth)/, app/api/auth/ and lib/auth/.
 - Security STEPs 056-067 own lib/security/.
 - Office STEPs 068-078 own app/(admin)/ and office components.
 - Onboarding and KYC STEPs 079-099 own app/(dashboard)/onboarding/, services/kyc/ and services/submerchant/.
+- STEP 081 has a narrow, pre-authorized cross-path exception, because its approved scope includes MCC in onboarding and merchant profile settings: the existing merchant profile-settings UI component; `lib/i18n/strings/en.ts` for MCC-only labels/messages; the existing client/server Zod schema and API handler for the MCC field only; and the STEP 081-owned additive migration described below. The agent must inspect the repository and list exact paths before editing. Reuse existing authentication, authorization, RLS and security middleware; do not modify those shared guards, refactor unrelated code, change `package.json`, or touch any other completed STEP's behavior. If the required profile/API path cannot be identified without exceeding this exception, stop and ask before editing.
 - Storage STEPs 100-105 own lib/storage/.
-- Business STEPs 106-126 own services/clients/, services/products/, services/invoices/ and invoice components.
+- Business STEPs 106-126 own services/clients/, services/products/, services/invoices/ and invoice components. STEP 123 has a narrow additional exception to edit only the existing recurring-job handler/registration entry under lib/jobs/ if required by STEP 122's seam; it does not own or refactor the STEP 011 queue, worker, scheduler, registry foundation or unrelated jobs.
 - Payment Core STEPs 127-146 own lib/payments/ core files (types, registry, routing, ledger, settlement), never adapter files.
 - Adapter STEPs 147-169 own exactly one file each under lib/payments/adapters/ plus their provider components.
-- KYC Adapter STEPs 170-175 own lib/kyc/adapters/ and KYC provider settings.
+- Supplementary IDV Adapter STEPs 170-175 own lib/kyc/adapters/ and supplementary identity-provider settings.
 - TaxCloud STEPs 176-180 own lib/tax/ and tax settings.
 - Portal STEPs 181-190 own app/(client-portal)/ and payment components.
 - Refund and Dispute STEPs 191-199 own services/refunds/ and services/disputes/.
@@ -1039,13 +1101,15 @@ Sub-steps (same chat session, in order):
    7. Verify security for this STEP: validation, RLS, audit log entries and permission checks.
    8. Run typecheck, lint and build for the touched area, exercise the behaviours named in the title, then finish with one commit, push and the completed handoff file.
 
-### STEP 081: Merchant Category Code field in onboarding and profile settings
-Chat line: Implement STEP 081 only: Merchant Category Code field in onboarding and profile settings. Follow docs/final/FEATURE_LIST.md and docs/final/MASTER_PROMPT.md. Work only on files owned by this STEP. At the end run typecheck and lint, commit with message "STEP 081: Merchant Category Code field in onboarding and profile settings", push, and create docs/handoffs/STEP_081_COMPLETED.md.
+### STEP 081: Merchant Category Code and additive versioned risk-policy/tier-history schema
+Database ownership: when STEP 081 is reached in numeric order, inspect the completed handoffs and actual migration inventory. Add a new forward migration and rollback for versioned risk-policy proposals/approvals, merchant risk profile and tier history only if those structures are missing. Never alter or rerun a committed migration; record the new migration number and rollback proof in the handoff.
+STEP 081 ownership exception: onboarding and profile MCC UI, MCC-only English catalog entries, the existing MCC-specific client/server validation and API integration, plus only the listed additive schema. Before edits, print the exact file paths and confirm each is covered by this exception. Do not change general authentication/security guards or unrelated shared files.
+Chat line: Implement STEP 081 only: Merchant Category Code and additive versioned risk-policy/tier-history schema. Follow docs/final/FEATURE_LIST.md and docs/final/MASTER_PROMPT.md. Work only on files owned by this STEP. At the end run typecheck and lint, commit with message "STEP 081: Merchant Category Code and additive versioned risk-policy/tier-history schema", push, and create docs/handoffs/STEP_081_COMPLETED.md.
 Sub-steps (same chat session, in order):
    1. Read the matching FEATURE_LIST section, MASTER_PROMPT rules and the previous handoff file.
    2. Confirm the owned paths for this STEP from the File Ownership Rules and list them in the working notes.
    3. Implement the database part of this STEP if any (migration plus rollback proof).
-   4. Implement the core service and logic for: Merchant Category Code field in onboarding and profile settings.
+   4. Implement the core service and logic for: Merchant Category Code and additive versioned risk-policy/tier-history schema.
    5. Connect the API routes or background jobs for this STEP.
    6. Build or update the UI for this STEP where applicable and check desktop and mobile widths.
    7. Verify security for this STEP: validation, RLS, audit log entries and permission checks.
@@ -1075,13 +1139,14 @@ Sub-steps (same chat session, in order):
    7. Verify security for this STEP: validation, RLS, audit log entries and permission checks.
    8. Run typecheck, lint and build for the touched area, exercise the behaviours named in the title, then finish with one commit, push and the completed handoff file.
 
-### STEP 084: KYC document upload with UBO capture and sanctions and PEP screening execution and result record
-Chat line: Implement STEP 084 only: KYC document upload with UBO capture and sanctions and PEP screening execution and result record. Follow docs/final/FEATURE_LIST.md and docs/final/MASTER_PROMPT.md. Work only on files owned by this STEP. At the end run typecheck and lint, commit with message "STEP 084: KYC document upload with UBO capture and sanctions and PEP screening execution and result record", push, and create docs/handoffs/STEP_084_COMPLETED.md.
+### STEP 084: Processor KYB document/status capture, UBO/director identity records and sanctions, PEP and adverse-media screening
+Database ownership: append a separate migration/rollback only for missing screening-run/list-version, match-resolution or re-KYC case records; reuse existing UBO/KYC/sanctions tables when they already meet the feature requirements.
+Chat line: Implement STEP 084 only: Processor KYB document/status capture, UBO/director identity records and sanctions, PEP and adverse-media screening. Follow docs/final/FEATURE_LIST.md and docs/final/MASTER_PROMPT.md. Work only on files owned by this STEP. At the end run typecheck and lint, commit with message "STEP 084: Processor KYB document/status capture, UBO/director identity records and sanctions, PEP and adverse-media screening", push, and create docs/handoffs/STEP_084_COMPLETED.md.
 Sub-steps (same chat session, in order):
    1. Read the matching FEATURE_LIST section, MASTER_PROMPT rules and the previous handoff file.
    2. Confirm the owned paths for this STEP from the File Ownership Rules and list them in the working notes.
    3. Implement the database part of this STEP if any (migration plus rollback proof).
-   4. Implement the core service and logic for: KYC document upload with UBO capture and sanctions and PEP screening execution and result record.
+   4. Implement the core service and logic for: Processor KYB document/status capture, UBO/director identity records and sanctions, PEP and adverse-media screening.
    5. Connect the API routes or background jobs for this STEP.
    6. Build or update the UI for this STEP where applicable and check desktop and mobile widths.
    7. Verify security for this STEP: validation, RLS, audit log entries and permission checks.
@@ -1135,61 +1200,63 @@ Sub-steps (same chat session, in order):
    7. Verify security for this STEP: validation, RLS, audit log entries and permission checks.
    8. Run typecheck, lint and build for the touched area, exercise the behaviours named in the title, then finish with one commit, push and the completed handoff file.
 
-### STEP 089: Four-eye review flow for large and high-risk merchants
-Chat line: Implement STEP 089 only: Four-eye review flow for large and high-risk merchants. Follow docs/final/FEATURE_LIST.md and docs/final/MASTER_PROMPT.md. Work only on files owned by this STEP. At the end run typecheck and lint, commit with message "STEP 089: Four-eye review flow for large and high-risk merchants", push, and create docs/handoffs/STEP_089_COMPLETED.md.
+### STEP 089: Four-eye review flow for high-risk merchants, screening matches and tier decisions
+Chat line: Implement STEP 089 only: Four-eye review flow for high-risk merchants, screening matches and tier decisions. Follow docs/final/FEATURE_LIST.md and docs/final/MASTER_PROMPT.md. Work only on files owned by this STEP. At the end run typecheck and lint, commit with message "STEP 089: Four-eye review flow for high-risk merchants, screening matches and tier decisions", push, and create docs/handoffs/STEP_089_COMPLETED.md.
 Sub-steps (same chat session, in order):
    1. Read the matching FEATURE_LIST section, MASTER_PROMPT rules and the previous handoff file.
    2. Confirm the owned paths for this STEP from the File Ownership Rules and list them in the working notes.
    3. Implement the database part of this STEP if any (migration plus rollback proof).
-   4. Implement the core service and logic for: Four-eye review flow for large and high-risk merchants.
+   4. Implement the core service and logic for: Four-eye review flow for high-risk merchants, screening matches and tier decisions.
    5. Connect the API routes or background jobs for this STEP.
    6. Build or update the UI for this STEP where applicable and check desktop and mobile widths.
    7. Verify security for this STEP: validation, RLS, audit log entries and permission checks.
    8. Run typecheck, lint and build for the touched area, exercise the behaviours named in the title, then finish with one commit, push and the completed handoff file.
 
-### STEP 090: Underwriting criteria settings managed by compliance team
-Chat line: Implement STEP 090 only: Underwriting criteria settings managed by compliance team. Follow docs/final/FEATURE_LIST.md and docs/final/MASTER_PROMPT.md. Work only on files owned by this STEP. At the end run typecheck and lint, commit with message "STEP 090: Underwriting criteria settings managed by compliance team", push, and create docs/handoffs/STEP_090_COMPLETED.md.
+### STEP 090: CEO/super_admin versioned risk-policy settings, underwriting criteria, screening cadence and re-KYC rules
+Policy change control: CEO and super_admin may propose permitted values. Activate only after approval by a distinct authorized actor under the requester → CEO → super_admin chain; super_admin retains full authority. Store each version with proposer, approver, effective date, reason and audit link; apply prospectively, never rewrite a policy snapshot already attached to a transaction.
+Chat line: Implement STEP 090 only: CEO/super_admin versioned risk-policy settings, underwriting criteria, screening cadence and re-KYC rules. Follow docs/final/FEATURE_LIST.md and docs/final/MASTER_PROMPT.md. Work only on files owned by this STEP. At the end run typecheck and lint, commit with message "STEP 090: CEO/super_admin versioned risk-policy settings, underwriting criteria, screening cadence and re-KYC rules", push, and create docs/handoffs/STEP_090_COMPLETED.md.
 Sub-steps (same chat session, in order):
    1. Read the matching FEATURE_LIST section, MASTER_PROMPT rules and the previous handoff file.
    2. Confirm the owned paths for this STEP from the File Ownership Rules and list them in the working notes.
    3. Implement the database part of this STEP if any (migration plus rollback proof).
-   4. Implement the core service and logic for: Underwriting criteria settings managed by compliance team.
+   4. Implement the core service and logic for: CEO/super_admin versioned risk-policy settings, underwriting criteria, screening cadence and re-KYC rules.
    5. Connect the API routes or background jobs for this STEP.
    6. Build or update the UI for this STEP where applicable and check desktop and mobile widths.
    7. Verify security for this STEP: validation, RLS, audit log entries and permission checks.
    8. Run typecheck, lint and build for the touched area, exercise the behaviours named in the title, then finish with one commit, push and the completed handoff file.
 
-### STEP 091: Starting transaction limit enforcement for new merchants
-Chat line: Implement STEP 091 only: Starting transaction limit enforcement for new merchants. Follow docs/final/FEATURE_LIST.md and docs/final/MASTER_PROMPT.md. Work only on files owned by this STEP. At the end run typecheck and lint, commit with message "STEP 091: Starting transaction limit enforcement for new merchants", push, and create docs/handoffs/STEP_091_COMPLETED.md.
+### STEP 091: Tier 1-3 eligibility, merchant risk-tier history and per-transaction/monthly limits with manual upgrade review
+Chat line: Implement STEP 091 only: Tier 1-3 eligibility, merchant risk-tier history and per-transaction/monthly limits with manual upgrade review. Follow docs/final/FEATURE_LIST.md and docs/final/MASTER_PROMPT.md. Work only on files owned by this STEP. At the end run typecheck and lint, commit with message "STEP 091: Tier 1-3 eligibility, merchant risk-tier history and per-transaction/monthly limits with manual upgrade review", push, and create docs/handoffs/STEP_091_COMPLETED.md.
 Sub-steps (same chat session, in order):
    1. Read the matching FEATURE_LIST section, MASTER_PROMPT rules and the previous handoff file.
    2. Confirm the owned paths for this STEP from the File Ownership Rules and list them in the working notes.
    3. Implement the database part of this STEP if any (migration plus rollback proof).
-   4. Implement the core service and logic for: Starting transaction limit enforcement for new merchants.
+   4. Implement the core service and logic for: Tier 1-3 eligibility, merchant risk-tier history and per-transaction/monthly limits with manual upgrade review.
    5. Connect the API routes or background jobs for this STEP.
    6. Build or update the UI for this STEP where applicable and check desktop and mobile widths.
    7. Verify security for this STEP: validation, RLS, audit log entries and permission checks.
    8. Run typecheck, lint and build for the touched area, exercise the behaviours named in the title, then finish with one commit, push and the completed handoff file.
 
-### STEP 092: Unusual large transaction hold and review trigger
-Chat line: Implement STEP 092 only: Unusual large transaction hold and review trigger. Follow docs/final/FEATURE_LIST.md and docs/final/MASTER_PROMPT.md. Work only on files owned by this STEP. At the end run typecheck and lint, commit with message "STEP 092: Unusual large transaction hold and review trigger", push, and create docs/handoffs/STEP_092_COMPLETED.md.
+### STEP 092: Pre-capture manual review for every transaction above USD 5,000 and risk-triggered transaction holds
+Database ownership: append a separate migration/rollback for missing transaction-review cases, decision evidence and policy-version linkage only; no earlier migration may be edited. A provider that cannot separate authorization/capture must be reviewed before charge submission or the attempt must be rejected.
+Chat line: Implement STEP 092 only: Pre-capture manual review for every transaction above USD 5,000 and risk-triggered transaction holds. Follow docs/final/FEATURE_LIST.md and docs/final/MASTER_PROMPT.md. Work only on files owned by this STEP. At the end run typecheck and lint, commit with message "STEP 092: Pre-capture manual review for every transaction above USD 5,000 and risk-triggered transaction holds", push, and create docs/handoffs/STEP_092_COMPLETED.md.
 Sub-steps (same chat session, in order):
    1. Read the matching FEATURE_LIST section, MASTER_PROMPT rules and the previous handoff file.
    2. Confirm the owned paths for this STEP from the File Ownership Rules and list them in the working notes.
    3. Implement the database part of this STEP if any (migration plus rollback proof).
-   4. Implement the core service and logic for: Unusual large transaction hold and review trigger.
+   4. Implement the core service and logic for: Pre-capture manual review for every transaction above USD 5,000 and risk-triggered transaction holds.
    5. Connect the API routes or background jobs for this STEP.
    6. Build or update the UI for this STEP where applicable and check desktop and mobile widths.
    7. Verify security for this STEP: validation, RLS, audit log entries and permission checks.
    8. Run typecheck, lint and build for the touched area, exercise the behaviours named in the title, then finish with one commit, push and the completed handoff file.
 
-### STEP 093: KYC approval and rejection decision flow with reasons
-Chat line: Implement STEP 093 only: KYC approval and rejection decision flow with reasons. Follow docs/final/FEATURE_LIST.md and docs/final/MASTER_PROMPT.md. Work only on files owned by this STEP. At the end run typecheck and lint, commit with message "STEP 093: KYC approval and rejection decision flow with reasons", push, and create docs/handoffs/STEP_093_COMPLETED.md.
+### STEP 093: Separate processor KYB status from platform risk decision, with approval, restriction and reasoned review flow
+Chat line: Implement STEP 093 only: Separate processor KYB status from platform risk decision, with approval, restriction and reasoned review flow. Follow docs/final/FEATURE_LIST.md and docs/final/MASTER_PROMPT.md. Work only on files owned by this STEP. At the end run typecheck and lint, commit with message "STEP 093: Separate processor KYB status from platform risk decision, with approval, restriction and reasoned review flow", push, and create docs/handoffs/STEP_093_COMPLETED.md.
 Sub-steps (same chat session, in order):
    1. Read the matching FEATURE_LIST section, MASTER_PROMPT rules and the previous handoff file.
    2. Confirm the owned paths for this STEP from the File Ownership Rules and list them in the working notes.
    3. Implement the database part of this STEP if any (migration plus rollback proof).
-   4. Implement the core service and logic for: KYC approval and rejection decision flow with reasons.
+   4. Implement the core service and logic for: Separate processor KYB status from platform risk decision, with approval, restriction and reasoned review flow.
    5. Connect the API routes or background jobs for this STEP.
    6. Build or update the UI for this STEP where applicable and check desktop and mobile widths.
    7. Verify security for this STEP: validation, RLS, audit log entries and permission checks.
@@ -1207,13 +1274,13 @@ Sub-steps (same chat session, in order):
    7. Verify security for this STEP: validation, RLS, audit log entries and permission checks.
    8. Run typecheck, lint and build for the touched area, exercise the behaviours named in the title, then finish with one commit, push and the completed handoff file.
 
-### STEP 095: Provider sub-merchant status sync through verified webhooks
-Chat line: Implement STEP 095 only: Provider sub-merchant status sync through verified webhooks. Follow docs/final/FEATURE_LIST.md and docs/final/MASTER_PROMPT.md. Work only on files owned by this STEP. At the end run typecheck and lint, commit with message "STEP 095: Provider sub-merchant status sync through verified webhooks", push, and create docs/handoffs/STEP_095_COMPLETED.md.
+### STEP 095: Per-processor KYB/capability status sync through signature-verified idempotent webhooks
+Chat line: Implement STEP 095 only: Per-processor KYB/capability status sync through signature-verified idempotent webhooks. Follow docs/final/FEATURE_LIST.md and docs/final/MASTER_PROMPT.md. Work only on files owned by this STEP. At the end run typecheck and lint, commit with message "STEP 095: Per-processor KYB/capability status sync through signature-verified idempotent webhooks", push, and create docs/handoffs/STEP_095_COMPLETED.md.
 Sub-steps (same chat session, in order):
    1. Read the matching FEATURE_LIST section, MASTER_PROMPT rules and the previous handoff file.
    2. Confirm the owned paths for this STEP from the File Ownership Rules and list them in the working notes.
    3. Implement the database part of this STEP if any (migration plus rollback proof).
-   4. Implement the core service and logic for: Provider sub-merchant status sync through verified webhooks.
+   4. Implement the core service and logic for: Per-processor KYB/capability status sync through signature-verified idempotent webhooks.
    5. Connect the API routes or background jobs for this STEP.
    6. Build or update the UI for this STEP where applicable and check desktop and mobile widths.
    7. Verify security for this STEP: validation, RLS, audit log entries and permission checks.
@@ -1468,12 +1535,14 @@ Chat line: Implement STEP 116 only: Invoice status workflow transitions with pai
 Sub-steps (same chat session, in order):
    1. Read the matching FEATURE_LIST section, MASTER_PROMPT rules and the previous handoff file.
    2. Confirm the owned paths for this STEP from the File Ownership Rules and list them in the working notes.
-   3. Implement the database part of this STEP if any (migration plus rollback proof).
-   4. Implement the core service and logic for: Invoice status workflow transitions with paid invoice edit lock and audit entries.
-   5. Connect the API routes or background jobs for this STEP.
-   6. Build or update the UI for this STEP where applicable and check desktop and mobile widths.
-   7. Verify security for this STEP: validation, RLS, audit log entries and permission checks.
+   3. Inspect STEP 115's committed invoice-numbering API and the actual invoice/event schema. Do not edit STEP 115 files or committed migrations.
+   4. Implement the canonical `draft -> sent` invoice issue transition in the STEP 116-owned invoice service. Expose an internal transaction-aware function that STEP 123 can call with its existing database transaction (do not make STEP 123 call an HTTP endpoint and split the transaction). In one transaction, allocate the number once through STEP 115's `takeInvoiceNumber`, set `issued_at`, change status, and write the applicable immutable invoice event and audit record. Make concurrent/repeated issue requests idempotent; do not issue an already-sent invoice again.
+   5. Implement the remaining status transitions and enforce the paid-invoice edit lock. A paid transition must be based on a valid successful payment/ledger state, never a direct status-only update. Do not implement provider capture in this STEP.
+   6. Connect the authorized API routes/background jobs and UI for this STEP. The issue transition records a durable dispatch event; it does not send email or claim email delivery. Email delivery remains owned by STEPs 221-227.
+   7. Verify tenant isolation, authorization, RLS, audit/event consistency and rollback/failure atomicity. Test draft-to-sent number/timestamp assignment, repeated and concurrent issue requests, invalid transitions, paid edit rejection and any payment-backed paid transition.
    8. Run typecheck, lint and build for the touched area, exercise the behaviours named in the title, then finish with one commit, push and the completed handoff file.
+
+Acceptance and dependency rule: STEP 123 must call this canonical issue transition; it must not implement a second numbering or status-transition path. Before beginning STEP 123, verify the STEP 116 handoff and code provide this behavior. If STEP 116 is already marked complete but this behavior is absent, do not rewrite its commit or bypass the missing transition; stop and request an owner-approved corrective plan.
 
 ### STEP 117: Invoice PDF generation as a background job
 Chat line: Implement STEP 117 only: Invoice PDF generation as a background job. Follow docs/final/FEATURE_LIST.md and docs/final/MASTER_PROMPT.md. Work only on files owned by this STEP. At the end run typecheck and lint, commit with message "STEP 117: Invoice PDF generation as a background job", push, and create docs/handoffs/STEP_117_COMPLETED.md.
@@ -1550,14 +1619,14 @@ Sub-steps (same chat session, in order):
 ### STEP 123: Recurring generation job with due and overdue handling and client reminders
 Chat line: Implement STEP 123 only: Recurring generation job with due and overdue handling and client reminders. Follow docs/final/FEATURE_LIST.md and docs/final/MASTER_PROMPT.md. Work only on files owned by this STEP. At the end run typecheck and lint, commit with message "STEP 123: Recurring generation job with due and overdue handling and client reminders", push, and create docs/handoffs/STEP_123_COMPLETED.md.
 Sub-steps (same chat session, in order):
-   1. Read the matching FEATURE_LIST section, MASTER_PROMPT rules and the previous handoff file.
-   2. Confirm the owned paths for this STEP from the File Ownership Rules and list them in the working notes.
-   3. Implement the database part of this STEP if any (migration plus rollback proof).
-   4. Implement the core service and logic for: Recurring generation job with due and overdue handling and client reminders.
-   5. Connect the API routes or background jobs for this STEP.
-   6. Build or update the UI for this STEP where applicable and check desktop and mobile widths.
-   7. Verify security for this STEP: validation, RLS, audit log entries and permission checks.
-   8. Run typecheck, lint and build for the touched area, exercise the behaviours named in the title, then finish with one commit, push and the completed handoff file.
+   1. Read the recurring-invoice feature requirements, this plan's Cross-STEP Invoice Issuance Contract, MASTER_PROMPT and the STEP 122 handoff. Verify contiguous completed handoffs, especially STEP 116 and STEP 122, before coding.
+   2. Own only the existing recurring-invoice handler/service under `services/invoices/`, its explicitly registered STEP 123 job-handler entry, and one new append-only migration in `migrations/` for the schema listed below. Do not edit the STEP 011 scheduler/worker foundation, completed STEP 116/122 files, invoice-numbering code from STEP 115, `package.json`, `lib/email/`, or other email-owned files. If an additional path is needed, stop and ask for exact-path approval.
+   3. Inspect all migrations and the actual table definitions first. Add exactly the next unused migration (for example, 0119 only if 0118 is confirmed as the highest). Add nullable `invoices.recurring_schedule_id` referencing the existing schedule, nullable `invoices.recurring_run_on` (the canonical scheduled occurrence date), and a tenant-scoped unique partial index over `(company_id, recurring_schedule_id, recurring_run_on)` for recurring rows. Add nullable `invoice_events.dedupe_key` and a tenant-scoped unique partial index over `(company_id, dedupe_key)` for non-null keys. Preserve all old rows, RLS and append-only triggers. Include and prove a safe rollback on a disposable database; never edit a committed migration.
+   4. Use the scheduled occurrence date and timezone supplied by STEP 122, never the worker's current wall-clock date, as `recurring_run_on`. Generate at most one invoice for each `(company_id, schedule_id, occurrence date)`. Handle conflict/concurrent runs by returning or recognizing the already-created occurrence; never allocate another invoice number or duplicate events.
+   5. Create each recurring invoice and issue it by calling STEP 116's canonical issue transition within the same database transaction. The resulting invoice must have its one invoice number, `issued_at`, and `sent` status; the transition must also write the durable issue event/audit record. If any part fails, roll back the entire occurrence. Do not set `sent` directly, bypass STEP 116, charge a payment, or implement a provider-capture flow. `sent` means issued/dispatch-requested under the Cross-STEP contract, not proof of email delivery.
+   6. Sweep only invoices that are actually issued and eligible by status/date. Use the existing per-schedule/per-invoice reminder interval and limit configuration; do not hard-code intervals or add a mutable `sentCount` column. Derive the next reminder occurrence from persisted `overdue_reminder` events and use a stable dedupe key scoped to company, invoice and reminder occurrence. The count means events enqueued, not emails delivered. Unique-index conflicts are the concurrency-safe idempotency result, not an error that creates a duplicate.
+   7. Treat `invoice_events` as append-only event/outbox records, not as a table whose rows are updated to `queued/sent/failed`. Enqueue invoice-issue and overdue-reminder events only; do not send email here. STEP 225 consumes these events, STEP 226 records delivery attempts/provider IDs, and STEP 227 retries delivery without duplicating the event or reminder occurrence. If the current event schema lacks an allowed event type/payload contract, stop and request a plan amendment rather than editing `lib/email/` or inventing a mutable queue state.
+   8. Test due/not-due and timezone/DST cases, delayed and repeated scheduler runs, concurrent duplicate occurrences, one-time invoice numbering, atomic issue/event/audit rollback, reminder interval/limit behavior, reminder dedupe, and exclusion of draft/paid/void or otherwise ineligible invoices. Verify generated invoice status and number satisfy the existing issue constraint. Run typecheck, lint, build, migration replay and rollback on a disposable database; record that email delivery remains a later STEP dependency. Then create the STEP 123 handoff and its separate commit/push. Do not start STEP 124.
 
 ### STEP 124: Partial payment recording with 20 USD minimum
 Chat line: Implement STEP 124 only: Partial payment recording with 20 USD minimum. Follow docs/final/FEATURE_LIST.md and docs/final/MASTER_PROMPT.md. Work only on files owned by this STEP. At the end run typecheck and lint, commit with message "STEP 124: Partial payment recording with 20 USD minimum", push, and create docs/handoffs/STEP_124_COMPLETED.md.
@@ -1705,25 +1774,25 @@ Sub-steps (same chat session, in order):
    7. Verify security for this STEP: validation, RLS, audit log entries and permission checks.
    8. Run typecheck, lint and build for the touched area, exercise the behaviours named in the title, then finish with one commit, push and the completed handoff file.
 
-### STEP 136: Settlement hold calculation and scheduled release job
-Chat line: Implement STEP 136 only: Settlement hold calculation and scheduled release job. Follow docs/final/FEATURE_LIST.md and docs/final/MASTER_PROMPT.md. Work only on files owned by this STEP. At the end run typecheck and lint, commit with message "STEP 136: Settlement hold calculation and scheduled release job", push, and create docs/handoffs/STEP_136_COMPLETED.md.
+### STEP 136: Settlement hold and tier-specific post-fulfilment payout eligibility with scheduled release job
+Chat line: Implement STEP 136 only: Settlement hold and tier-specific post-fulfilment payout eligibility with scheduled release job. Follow docs/final/FEATURE_LIST.md and docs/final/MASTER_PROMPT.md. Work only on files owned by this STEP. At the end run typecheck and lint, commit with message "STEP 136: Settlement hold and tier-specific post-fulfilment payout eligibility with scheduled release job", push, and create docs/handoffs/STEP_136_COMPLETED.md.
 Sub-steps (same chat session, in order):
    1. Read the matching FEATURE_LIST section, MASTER_PROMPT rules and the previous handoff file.
    2. Confirm the owned paths for this STEP from the File Ownership Rules and list them in the working notes.
    3. Implement the database part of this STEP if any (migration plus rollback proof).
-   4. Implement the core service and logic for: Settlement hold calculation and scheduled release job.
+   4. Implement the core service and logic for: Settlement hold and tier-specific post-fulfilment payout eligibility with scheduled release job.
    5. Connect the API routes or background jobs for this STEP.
    6. Build or update the UI for this STEP where applicable and check desktop and mobile widths.
    7. Verify security for this STEP: validation, RLS, audit log entries and permission checks.
    8. Run typecheck, lint and build for the touched area, exercise the behaviours named in the title, then finish with one commit, push and the completed handoff file.
 
-### STEP 137: Rolling reserve posting, tracking and release
-Chat line: Implement STEP 137 only: Rolling reserve posting, tracking and release. Follow docs/final/FEATURE_LIST.md and docs/final/MASTER_PROMPT.md. Work only on files owned by this STEP. At the end run typecheck and lint, commit with message "STEP 137: Rolling reserve posting, tracking and release", push, and create docs/handoffs/STEP_137_COMPLETED.md.
+### STEP 137: Versioned tier-based rolling reserve posting, tracking and authorized release
+Chat line: Implement STEP 137 only: Versioned tier-based rolling reserve posting, tracking and authorized release. Follow docs/final/FEATURE_LIST.md and docs/final/MASTER_PROMPT.md. Work only on files owned by this STEP. At the end run typecheck and lint, commit with message "STEP 137: Versioned tier-based rolling reserve posting, tracking and authorized release", push, and create docs/handoffs/STEP_137_COMPLETED.md.
 Sub-steps (same chat session, in order):
    1. Read the matching FEATURE_LIST section, MASTER_PROMPT rules and the previous handoff file.
    2. Confirm the owned paths for this STEP from the File Ownership Rules and list them in the working notes.
    3. Implement the database part of this STEP if any (migration plus rollback proof).
-   4. Implement the core service and logic for: Rolling reserve posting, tracking and release.
+   4. Implement the core service and logic for: Versioned tier-based rolling reserve posting, tracking and authorized release.
    5. Connect the API routes or background jobs for this STEP.
    6. Build or update the UI for this STEP where applicable and check desktop and mobile widths.
    7. Verify security for this STEP: validation, RLS, audit log entries and permission checks.
@@ -1789,25 +1858,25 @@ Sub-steps (same chat session, in order):
    7. Verify security for this STEP: validation, RLS, audit log entries and permission checks.
    8. Run typecheck, lint and build for the touched area, exercise the behaviours named in the title, then finish with one commit, push and the completed handoff file.
 
-### STEP 143: Payout execution and failure email notification
-Chat line: Implement STEP 143 only: Payout execution and failure email notification. Follow docs/final/FEATURE_LIST.md and docs/final/MASTER_PROMPT.md. Work only on files owned by this STEP. At the end run typecheck and lint, commit with message "STEP 143: Payout execution and failure email notification", push, and create docs/handoffs/STEP_143_COMPLETED.md.
+### STEP 143: Payout execution only after fulfilment, provider, tier, bank, hold and risk gates pass
+Chat line: Implement STEP 143 only: Payout execution only after fulfilment, provider, tier, bank, hold and risk gates pass. Follow docs/final/FEATURE_LIST.md and docs/final/MASTER_PROMPT.md. Work only on files owned by this STEP. At the end run typecheck and lint, commit with message "STEP 143: Payout execution only after fulfilment, provider, tier, bank, hold and risk gates pass", push, and create docs/handoffs/STEP_143_COMPLETED.md.
 Sub-steps (same chat session, in order):
    1. Read the matching FEATURE_LIST section, MASTER_PROMPT rules and the previous handoff file.
    2. Confirm the owned paths for this STEP from the File Ownership Rules and list them in the working notes.
    3. Implement the database part of this STEP if any (migration plus rollback proof).
-   4. Implement the core service and logic for: Payout execution and failure email notification.
+   4. Implement the core service and logic for: Payout execution only after fulfilment, provider, tier, bank, hold and risk gates pass.
    5. Connect the API routes or background jobs for this STEP.
    6. Build or update the UI for this STEP where applicable and check desktop and mobile widths.
    7. Verify security for this STEP: validation, RLS, audit log entries and permission checks.
    8. Run typecheck, lint and build for the touched area, exercise the behaviours named in the title, then finish with one commit, push and the completed handoff file.
 
-### STEP 144: Settlement release background job after hold period
-Chat line: Implement STEP 144 only: Settlement release background job after hold period. Follow docs/final/FEATURE_LIST.md and docs/final/MASTER_PROMPT.md. Work only on files owned by this STEP. At the end run typecheck and lint, commit with message "STEP 144: Settlement release background job after hold period", push, and create docs/handoffs/STEP_144_COMPLETED.md.
+### STEP 144: Idempotent settlement release job enforcing fulfilment evidence, tier delay and all risk gates
+Chat line: Implement STEP 144 only: Idempotent settlement release job enforcing fulfilment evidence, tier delay and all risk gates. Follow docs/final/FEATURE_LIST.md and docs/final/MASTER_PROMPT.md. Work only on files owned by this STEP. At the end run typecheck and lint, commit with message "STEP 144: Idempotent settlement release job enforcing fulfilment evidence, tier delay and all risk gates", push, and create docs/handoffs/STEP_144_COMPLETED.md.
 Sub-steps (same chat session, in order):
    1. Read the matching FEATURE_LIST section, MASTER_PROMPT rules and the previous handoff file.
    2. Confirm the owned paths for this STEP from the File Ownership Rules and list them in the working notes.
    3. Implement the database part of this STEP if any (migration plus rollback proof).
-   4. Implement the core service and logic for: Settlement release background job after hold period.
+   4. Implement the core service and logic for: Idempotent settlement release job enforcing fulfilment evidence, tier delay and all risk gates.
    5. Connect the API routes or background jobs for this STEP.
    6. Build or update the UI for this STEP where applicable and check desktop and mobile widths.
    7. Verify security for this STEP: validation, RLS, audit log entries and permission checks.
@@ -2115,75 +2184,75 @@ Sub-steps (same chat session, in order):
    7. Verify security for this STEP: validation, RLS, audit log entries and permission checks.
    8. Run typecheck, lint and build for the touched area, exercise the behaviours named in the title, then finish with one commit, push and the completed handoff file.
 
-## Automatic KYC Provider Adapters
+## Optional Supplementary Identity Verification Adapters
 
-### STEP 170: KYC provider adapter interface with unified status mapping
-Chat line: Implement STEP 170 only: KYC provider adapter interface with unified status mapping. Follow docs/final/FEATURE_LIST.md and docs/final/MASTER_PROMPT.md. Work only on files owned by this STEP. At the end run typecheck and lint, commit with message "STEP 170: KYC provider adapter interface with unified status mapping", push, and create docs/handoffs/STEP_170_COMPLETED.md.
+### STEP 170: Optional supplementary identity-verification adapter interface kept separate from processor KYB status
+Chat line: Implement STEP 170 only: Optional supplementary identity-verification adapter interface kept separate from processor KYB status. Follow docs/final/FEATURE_LIST.md and docs/final/MASTER_PROMPT.md. Work only on files owned by this STEP. At the end run typecheck and lint, commit with message "STEP 170: Optional supplementary identity-verification adapter interface kept separate from processor KYB status", push, and create docs/handoffs/STEP_170_COMPLETED.md.
 Sub-steps (same chat session, in order):
    1. Read the matching FEATURE_LIST section, MASTER_PROMPT rules and the previous handoff file.
    2. Confirm the owned paths for this STEP from the File Ownership Rules and list them in the working notes.
    3. Implement the database part of this STEP if any (migration plus rollback proof).
-   4. Implement the core service and logic for: KYC provider adapter interface with unified status mapping.
+   4. Implement the core service and logic for: Optional supplementary identity-verification adapter interface kept separate from processor KYB status.
    5. Connect the API routes or background jobs for this STEP.
    6. Build or update the UI for this STEP where applicable and check desktop and mobile widths.
    7. Verify security for this STEP: validation, RLS, audit log entries and permission checks.
    8. Run typecheck, lint and build for the touched area, exercise the behaviours named in the title, then finish with one commit, push and the completed handoff file.
 
-### STEP 171: Jumio adapter with key configuration and verification session
-Chat line: Implement STEP 171 only: Jumio adapter with key configuration and verification session. Follow docs/final/FEATURE_LIST.md and docs/final/MASTER_PROMPT.md. Work only on files owned by this STEP. At the end run typecheck and lint, commit with message "STEP 171: Jumio adapter with key configuration and verification session", push, and create docs/handoffs/STEP_171_COMPLETED.md.
+### STEP 171: Jumio supplementary identity/liveness adapter with encrypted configuration and verification session
+Chat line: Implement STEP 171 only: Jumio supplementary identity/liveness adapter with encrypted configuration and verification session. Follow docs/final/FEATURE_LIST.md and docs/final/MASTER_PROMPT.md. Work only on files owned by this STEP. At the end run typecheck and lint, commit with message "STEP 171: Jumio supplementary identity/liveness adapter with encrypted configuration and verification session", push, and create docs/handoffs/STEP_171_COMPLETED.md.
 Sub-steps (same chat session, in order):
    1. Read the matching FEATURE_LIST section, MASTER_PROMPT rules and the previous handoff file.
    2. Confirm the owned paths for this STEP from the File Ownership Rules and list them in the working notes.
    3. Implement the database part of this STEP if any (migration plus rollback proof).
-   4. Implement the core service and logic for: Jumio adapter with key configuration and verification session.
+   4. Implement the core service and logic for: Jumio supplementary identity/liveness adapter with encrypted configuration and verification session.
    5. Connect the API routes or background jobs for this STEP.
    6. Build or update the UI for this STEP where applicable and check desktop and mobile widths.
    7. Verify security for this STEP: validation, RLS, audit log entries and permission checks.
    8. Run typecheck, lint and build for the touched area, exercise the behaviours named in the title, then finish with one commit, push and the completed handoff file.
 
-### STEP 172: Didit adapter with key configuration and verification session
-Chat line: Implement STEP 172 only: Didit adapter with key configuration and verification session. Follow docs/final/FEATURE_LIST.md and docs/final/MASTER_PROMPT.md. Work only on files owned by this STEP. At the end run typecheck and lint, commit with message "STEP 172: Didit adapter with key configuration and verification session", push, and create docs/handoffs/STEP_172_COMPLETED.md.
+### STEP 172: Didit supplementary identity/liveness adapter with encrypted configuration and verification session
+Chat line: Implement STEP 172 only: Didit supplementary identity/liveness adapter with encrypted configuration and verification session. Follow docs/final/FEATURE_LIST.md and docs/final/MASTER_PROMPT.md. Work only on files owned by this STEP. At the end run typecheck and lint, commit with message "STEP 172: Didit supplementary identity/liveness adapter with encrypted configuration and verification session", push, and create docs/handoffs/STEP_172_COMPLETED.md.
 Sub-steps (same chat session, in order):
    1. Read the matching FEATURE_LIST section, MASTER_PROMPT rules and the previous handoff file.
    2. Confirm the owned paths for this STEP from the File Ownership Rules and list them in the working notes.
    3. Implement the database part of this STEP if any (migration plus rollback proof).
-   4. Implement the core service and logic for: Didit adapter with key configuration and verification session.
+   4. Implement the core service and logic for: Didit supplementary identity/liveness adapter with encrypted configuration and verification session.
    5. Connect the API routes or background jobs for this STEP.
    6. Build or update the UI for this STEP where applicable and check desktop and mobile widths.
    7. Verify security for this STEP: validation, RLS, audit log entries and permission checks.
    8. Run typecheck, lint and build for the touched area, exercise the behaviours named in the title, then finish with one commit, push and the completed handoff file.
 
-### STEP 173: Sumsub adapter with key configuration and verification session
-Chat line: Implement STEP 173 only: Sumsub adapter with key configuration and verification session. Follow docs/final/FEATURE_LIST.md and docs/final/MASTER_PROMPT.md. Work only on files owned by this STEP. At the end run typecheck and lint, commit with message "STEP 173: Sumsub adapter with key configuration and verification session", push, and create docs/handoffs/STEP_173_COMPLETED.md.
+### STEP 173: Sumsub supplementary identity/liveness adapter with encrypted configuration and verification session
+Chat line: Implement STEP 173 only: Sumsub supplementary identity/liveness adapter with encrypted configuration and verification session. Follow docs/final/FEATURE_LIST.md and docs/final/MASTER_PROMPT.md. Work only on files owned by this STEP. At the end run typecheck and lint, commit with message "STEP 173: Sumsub supplementary identity/liveness adapter with encrypted configuration and verification session", push, and create docs/handoffs/STEP_173_COMPLETED.md.
 Sub-steps (same chat session, in order):
    1. Read the matching FEATURE_LIST section, MASTER_PROMPT rules and the previous handoff file.
    2. Confirm the owned paths for this STEP from the File Ownership Rules and list them in the working notes.
    3. Implement the database part of this STEP if any (migration plus rollback proof).
-   4. Implement the core service and logic for: Sumsub adapter with key configuration and verification session.
+   4. Implement the core service and logic for: Sumsub supplementary identity/liveness adapter with encrypted configuration and verification session.
    5. Connect the API routes or background jobs for this STEP.
    6. Build or update the UI for this STEP where applicable and check desktop and mobile widths.
    7. Verify security for this STEP: validation, RLS, audit log entries and permission checks.
    8. Run typecheck, lint and build for the touched area, exercise the behaviours named in the title, then finish with one commit, push and the completed handoff file.
 
-### STEP 174: KYC provider webhook verification and result handling
-Chat line: Implement STEP 174 only: KYC provider webhook verification and result handling. Follow docs/final/FEATURE_LIST.md and docs/final/MASTER_PROMPT.md. Work only on files owned by this STEP. At the end run typecheck and lint, commit with message "STEP 174: KYC provider webhook verification and result handling", push, and create docs/handoffs/STEP_174_COMPLETED.md.
+### STEP 174: Supplementary IDV webhook verification and result handling without overriding processor KYB
+Chat line: Implement STEP 174 only: Supplementary IDV webhook verification and result handling without overriding processor KYB. Follow docs/final/FEATURE_LIST.md and docs/final/MASTER_PROMPT.md. Work only on files owned by this STEP. At the end run typecheck and lint, commit with message "STEP 174: Supplementary IDV webhook verification and result handling without overriding processor KYB", push, and create docs/handoffs/STEP_174_COMPLETED.md.
 Sub-steps (same chat session, in order):
    1. Read the matching FEATURE_LIST section, MASTER_PROMPT rules and the previous handoff file.
    2. Confirm the owned paths for this STEP from the File Ownership Rules and list them in the working notes.
    3. Implement the database part of this STEP if any (migration plus rollback proof).
-   4. Implement the core service and logic for: KYC provider webhook verification and result handling.
+   4. Implement the core service and logic for: Supplementary IDV webhook verification and result handling without overriding processor KYB.
    5. Connect the API routes or background jobs for this STEP.
    6. Build or update the UI for this STEP where applicable and check desktop and mobile widths.
    7. Verify security for this STEP: validation, RLS, audit log entries and permission checks.
    8. Run typecheck, lint and build for the touched area, exercise the behaviours named in the title, then finish with one commit, push and the completed handoff file.
 
-### STEP 175: Active KYC provider selection in super admin settings with manual fallback
-Chat line: Implement STEP 175 only: Active KYC provider selection in super admin settings with manual fallback. Follow docs/final/FEATURE_LIST.md and docs/final/MASTER_PROMPT.md. Work only on files owned by this STEP. At the end run typecheck and lint, commit with message "STEP 175: Active KYC provider selection in super admin settings with manual fallback", push, and create docs/handoffs/STEP_175_COMPLETED.md.
+### STEP 175: super_admin selects at most one active supplementary IDV vendor with manual fallback and processor-KYB gate
+Chat line: Implement STEP 175 only: super_admin selects at most one active supplementary IDV vendor with manual fallback and processor-KYB gate. Follow docs/final/FEATURE_LIST.md and docs/final/MASTER_PROMPT.md. Work only on files owned by this STEP. At the end run typecheck and lint, commit with message "STEP 175: super_admin selects at most one active supplementary IDV vendor with manual fallback and processor-KYB gate", push, and create docs/handoffs/STEP_175_COMPLETED.md.
 Sub-steps (same chat session, in order):
    1. Read the matching FEATURE_LIST section, MASTER_PROMPT rules and the previous handoff file.
    2. Confirm the owned paths for this STEP from the File Ownership Rules and list them in the working notes.
    3. Implement the database part of this STEP if any (migration plus rollback proof).
-   4. Implement the core service and logic for: Active KYC provider selection in super admin settings with manual fallback.
+   4. Implement the core service and logic for: super_admin selects at most one active supplementary IDV vendor with manual fallback and processor-KYB gate.
    5. Connect the API routes or background jobs for this STEP.
    6. Build or update the UI for this STEP where applicable and check desktop and mobile widths.
    7. Verify security for this STEP: validation, RLS, audit log entries and permission checks.
@@ -2253,13 +2322,14 @@ Sub-steps (same chat session, in order):
 
 ## Client Portal and Payment Pages
 
-### STEP 181: Tokenized invoice page with paid state and receipt view
-Chat line: Implement STEP 181 only: Tokenized invoice page with paid state and receipt view. Follow docs/final/FEATURE_LIST.md and docs/final/MASTER_PROMPT.md. Work only on files owned by this STEP. At the end run typecheck and lint, commit with message "STEP 181: Tokenized invoice page with paid state and receipt view", push, and create docs/handoffs/STEP_181_COMPLETED.md.
+### STEP 181: Tokenized invoice page with paid state, receipt and buyer delivery/service-acceptance confirmation
+Database ownership: append a separate migration/rollback for missing fulfilment evidence and buyer-acceptance records only; preserve existing invoice/payment rows and link them by immutable IDs. Payout remains blocked until valid evidence is recorded.
+Chat line: Implement STEP 181 only: Tokenized invoice page with paid state, receipt and buyer delivery/service-acceptance confirmation. Follow docs/final/FEATURE_LIST.md and docs/final/MASTER_PROMPT.md. Work only on files owned by this STEP. At the end run typecheck and lint, commit with message "STEP 181: Tokenized invoice page with paid state, receipt and buyer delivery/service-acceptance confirmation", push, and create docs/handoffs/STEP_181_COMPLETED.md.
 Sub-steps (same chat session, in order):
    1. Read the matching FEATURE_LIST section, MASTER_PROMPT rules and the previous handoff file.
    2. Confirm the owned paths for this STEP from the File Ownership Rules and list them in the working notes.
    3. Implement the database part of this STEP if any (migration plus rollback proof).
-   4. Implement the core service and logic for: Tokenized invoice page with paid state and receipt view.
+   4. Implement the core service and logic for: Tokenized invoice page with paid state, receipt and buyer delivery/service-acceptance confirmation.
    5. Connect the API routes or background jobs for this STEP.
    6. Build or update the UI for this STEP where applicable and check desktop and mobile widths.
    7. Verify security for this STEP: validation, RLS, audit log entries and permission checks.
@@ -2792,14 +2862,13 @@ Sub-steps (same chat session, in order):
 ### STEP 225: Activity email events wiring for account, KYC, invoice and payment events
 Chat line: Implement STEP 225 only: Activity email events wiring for account, KYC, invoice and payment events. Follow docs/final/FEATURE_LIST.md and docs/final/MASTER_PROMPT.md. Work only on files owned by this STEP. At the end run typecheck and lint, commit with message "STEP 225: Activity email events wiring for account, KYC, invoice and payment events", push, and create docs/handoffs/STEP_225_COMPLETED.md.
 Sub-steps (same chat session, in order):
-   1. Read the matching FEATURE_LIST section, MASTER_PROMPT rules and the previous handoff file.
+   1. Read the matching FEATURE_LIST section, this plan's Cross-STEP Invoice Issuance Contract, MASTER_PROMPT rules and the previous handoff file.
    2. Confirm the owned paths for this STEP from the File Ownership Rules and list them in the working notes.
-   3. Implement the database part of this STEP if any (migration plus rollback proof).
-   4. Implement the core service and logic for: Activity email events wiring for account, KYC, invoice and payment events.
-   5. Connect the API routes or background jobs for this STEP.
-   6. Build or update the UI for this STEP where applicable and check desktop and mobile widths.
-   7. Verify security for this STEP: validation, RLS, audit log entries and permission checks.
-   8. Run typecheck, lint and build for the touched area, exercise the behaviours named in the title, then finish with one commit, push and the completed handoff file.
+   3. Consume the durable invoice-issue and `overdue_reminder` events produced by STEP 116/123 and map them to the approved invoice/reminder templates. Do not mutate/delete append-only `invoice_events` rows; use send logs for consumer/delivery state.
+   4. Implement the core email event dispatch using the active SMTP/API method and validate the intended recipient and tenant context. Keep provider credentials encrypted and server-side.
+   5. Connect the authorized background job/API path; verify duplicate event delivery is idempotent and each email uses its stable source-event key.
+   6. Verify security, tenant isolation and audit logging; do not claim a message was delivered until the provider reports success and STEP 226 records its message ID.
+   7. Run typecheck, lint and build, exercise successful and failed invoice/reminder delivery, and prove the same failed event can be retried by STEP 227 without creating a second invoice or reminder occurrence. Finish with one commit, push and the completed handoff file.
 
 ### STEP 226: Email send logging with provider message id
 Chat line: Implement STEP 226 only: Email send logging with provider message id. Follow docs/final/FEATURE_LIST.md and docs/final/MASTER_PROMPT.md. Work only on files owned by this STEP. At the end run typecheck and lint, commit with message "STEP 226: Email send logging with provider message id", push, and create docs/handoffs/STEP_226_COMPLETED.md.
@@ -3083,25 +3152,25 @@ Sub-steps (same chat session, in order):
    7. Verify security for this STEP: validation, RLS, audit log entries and permission checks.
    8. Run typecheck, lint and build for the touched area, exercise the behaviours named in the title, then finish with one commit, push and the completed handoff file.
 
-### STEP 249: Background job schedules registration and verification
-Chat line: Implement STEP 249 only: Background job schedules registration and verification. Follow docs/final/FEATURE_LIST.md and docs/final/MASTER_PROMPT.md. Work only on files owned by this STEP. At the end run typecheck and lint, commit with message "STEP 249: Background job schedules registration and verification", push, and create docs/handoffs/STEP_249_COMPLETED.md.
+### STEP 249: Register and verify daily screening, re-KYC, volume-spike, tier-limit and fulfilment-gated payout schedules
+Chat line: Implement STEP 249 only: Register and verify daily screening, re-KYC, volume-spike, tier-limit and fulfilment-gated payout schedules. Follow docs/final/FEATURE_LIST.md and docs/final/MASTER_PROMPT.md. Work only on files owned by this STEP. At the end run typecheck and lint, commit with message "STEP 249: Register and verify daily screening, re-KYC, volume-spike, tier-limit and fulfilment-gated payout schedules", push, and create docs/handoffs/STEP_249_COMPLETED.md.
 Sub-steps (same chat session, in order):
    1. Read the matching FEATURE_LIST section, MASTER_PROMPT rules and the previous handoff file.
    2. Confirm the owned paths for this STEP from the File Ownership Rules and list them in the working notes.
    3. Implement the database part of this STEP if any (migration plus rollback proof).
-   4. Implement the core service and logic for: Background job schedules registration and verification.
+   4. Implement the core service and logic for: Register and verify daily screening, re-KYC, volume-spike, tier-limit and fulfilment-gated payout schedules.
    5. Connect the API routes or background jobs for this STEP.
    6. Build or update the UI for this STEP where applicable and check desktop and mobile widths.
    7. Verify security for this STEP: validation, RLS, audit log entries and permission checks.
    8. Run typecheck, lint and build for the touched area, exercise the behaviours named in the title, then finish with one commit, push and the completed handoff file.
 
-### STEP 250: Final staging verification, production go-live gate checklist and launch record document
-Chat line: Implement STEP 250 only: Final staging verification, production go-live gate checklist and launch record document. Follow docs/final/FEATURE_LIST.md and docs/final/MASTER_PROMPT.md. Work only on files owned by this STEP. At the end run typecheck and lint, commit with message "STEP 250: Final staging verification, production go-live gate checklist and launch record document", push, and create docs/handoffs/STEP_250_COMPLETED.md.
+### STEP 250: Final staging verification, independent security/compliance review evidence, production go-live gates and launch record
+Chat line: Implement STEP 250 only: Final staging verification, independent security/compliance review evidence, production go-live gates and launch record. Follow docs/final/FEATURE_LIST.md and docs/final/MASTER_PROMPT.md. Work only on files owned by this STEP. At the end run typecheck and lint, commit with message "STEP 250: Final staging verification, independent security/compliance review evidence, production go-live gates and launch record", push, and create docs/handoffs/STEP_250_COMPLETED.md.
 Sub-steps (same chat session, in order):
    1. Read the matching FEATURE_LIST section, MASTER_PROMPT rules and the previous handoff file.
    2. Confirm the owned paths for this STEP from the File Ownership Rules and list them in the working notes.
    3. Implement the database part of this STEP if any (migration plus rollback proof).
-   4. Implement the core service and logic for: Final staging verification, production go-live gate checklist and launch record document.
+   4. Implement the core service and logic for: Final staging verification, independent security/compliance review evidence, production go-live gates and launch record.
    5. Connect the API routes or background jobs for this STEP.
    6. Build or update the UI for this STEP where applicable and check desktop and mobile widths.
    7. Verify security for this STEP: validation, RLS, audit log entries and permission checks.
