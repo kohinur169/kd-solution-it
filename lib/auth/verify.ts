@@ -12749,11 +12749,18 @@ async function checkCsrfProtection(): Promise<void> {
   // changes its state - a pause, a resume or an end - from one screen. They are two calls and not four because
   // the three state changes share one route and one verb, which is the difference between a verb and a fact.
   // So the files arrive at forty five and the call sites at fifty nine.
-  expectEqual(browserMutations.length, 45, "forty five browser files send a mutation");
+  //
+  // STEP 096 adds one more file and one more call: the provisioning console, which acknowledges a queued
+  // provision from the office alert.
+  //
+  // STEP 116 adds one more file and two more calls: the invoice status actions, which send a draft and void
+  // a document - the two moves the status workflow gives a merchant, each its own route and its own token.
+  // So the files arrive at forty seven and the call sites at sixty two.
+  expectEqual(browserMutations.length, 47, "forty seven browser files send a mutation");
   expectEqual(
     browserMutations.reduce((total, path) => total + mutationCalls(appSourceOf(appSources, path)), 0),
-    59,
-    "across fifty nine call sites",
+    62,
+    "across sixty two call sites",
   );
   const postCalls = mutationCalls;
   const tokenSpreads = (source: string): number =>

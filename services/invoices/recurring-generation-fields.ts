@@ -34,19 +34,27 @@ export const RECURRING_REMINDER_EVENT_TYPE = "overdue_reminder";
 export const RECURRING_EVENT_ACTOR = "system";
 
 /**
- * The invoice statuses a reminder may act on, and it is the list `invoices_due_idx` was built for.
+ * The invoice statuses a reminder may act on, and it is the list `invoices_due_reminder_idx` was built for.
  *
  * `0022` writes "the overdue sweep of section 27 reads the open invoices that are due" above an index whose
- * predicate is `status in ('sent', 'viewed', 'partially_paid') and deleted_at is null`. This constant is that
- * predicate written once, so the query below and the index cannot drift: if the list here were wider than the
- * index, PostgreSQL would still answer correctly and stop using the index, and nobody would notice until a
- * merchant had enough invoices to feel it.
+ * predicate is `status in ('sent', 'viewed', 'partially_paid') and deleted_at is null`. That index serves the
+ * sweep that *finds* due documents, so its predicate stops at `partially_paid`: an `overdue` document is not
+ * found, it simply is. `0120` adds the index this constant is written for, whose predicate is the same four
+ * statuses - because a document that has become overdue is exactly the one whose reminders must go on, and a
+ * reminder sweep that stopped at the moment an invoice became overdue would stop where the work matters most.
+ *
+ * As with its predecessor, the constant is the predicate written once, so the query below and the index cannot
+ * drift: if the list here were wider than the index, PostgreSQL would still answer correctly and stop using
+ * the index, and nobody would notice until a merchant had enough invoices to feel it.
  *
  * `draft` is absent on purpose: an unissued document is not late, because it was never sent to anyone.
- * `overdue` is absent because `0022`'s own index leaves it out - it is a status nothing writes today, and
- * including it here would silently change the index predicate this query depends on.
  */
-export const RECURRING_REMINDER_STATUSES = Object.freeze(["sent", "viewed", "partially_paid"] as const);
+export const RECURRING_REMINDER_STATUSES = Object.freeze([
+  "sent",
+  "viewed",
+  "partially_paid",
+  "overdue",
+] as const);
 
 export type RecurringReminderStatus = (typeof RECURRING_REMINDER_STATUSES)[number];
 

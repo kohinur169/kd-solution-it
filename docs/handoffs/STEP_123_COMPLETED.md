@@ -248,3 +248,55 @@ tsc 0 · eslint 0 · build 0 (154 routes).
 ## Next
 
 **STEP 124** — Partial payment recording with 20 USD minimum. Not started, per instruction.
+
+## Addendum - the overdue-state half, completed after the second audit pass
+
+*(Written after the second audit pass over STEPs 001-123 - `docs/AUDIT_120.md`, Addendum 3 - named the gap
+this handoff left behind: the sweep recorded `overdue_reminder` rows, but nothing moved the status to
+`overdue`. It was then completed on instruction, as the rest of this STEP's declared scope: "due and
+overdue handling".)*
+
+What the addendum adds:
+
+- **`migrations/0120_invoice_overdue_event.sql`** adds the `overdue` word to `0024`'s timeline vocabulary
+  (nine words become ten) and creates `invoices_due_reminder_idx`, the four-open-statuses predicate the
+  reminder sweep now reads, with `overdue` among them. The rollback drops the index and restores the
+  nine-word check, re-validating it against the data, and is refused if an `overdue` row exists - by
+  design, because a vocabulary the timeline already uses cannot be stripped.
+- **`sweepOverdueInvoices`** (`services/invoices/invoice-status.ts`) moves a company's open invoices
+  past their due date to `overdue` through STEP 116's own engine: graph check, guarded `status = eq.<from>`
+  write, re-read, one timeline row (actor `system`, no user - `0024`'s
+  `invoice_events_actor_user_check` exists exactly for this), one audit entry (`invoice.overdue`, null
+  actor). The due date is checked twice, because the query is a fast path and the row is the authority. A
+  row that moves under the sweep's feet - a payment that arrives between the list read and the move - is
+  counted as skipped, not failed. `applyTransition` was generalized so the actor facts come from the
+  caller; the merchant's send and void pass theirs unchanged.
+- **`services/invoices/overdue-sweep-job.ts`** is the job: name `invoice.overdue_sweep`, a `.strict()`
+  payload that carries the company and nothing else - the sweep's date is its own clock, so a date does
+  not travel in the payload the way a run date does in the recurring job. The attempt ceiling is the
+  registry's default, because the guarded write is the dedupe and a retry resumes its remaining work. No
+  import-time registration; wiring it to a scheduler is the same deployment work as the recurring job's.
+- **Reminders keep running once a document is overdue.** `overdue` joined `RECURRING_REMINDER_STATUSES`,
+  and `0120`'s index is the four-status predicate that constant is written for. A reminder sweep that
+  stopped at the moment an invoice became overdue would stop where the work matters most - that is the
+  other half of section 178: the invoice shows as overdue, and the reminders go on.
+
+What this closes, against the unfinished list above:
+
+- Item 1 is resolved for the state half: STEP 116 exists, and its engine now performs the `overdue` move
+  as well as send and void.
+- Item 2 stands for both jobs: the recurring generator and the overdue sweep are both registered by
+  deployment, on the same startup hook that does not exist yet in this sandbox.
+
+The auth gate's bookkeeping was updated with the addendum: the two browser files STEP 096 and STEP 116
+added (`provisioning-console.tsx`, `invoice-status-actions.tsx`) and the three POST routes they and that
+same pair of STEPs registered (`/api/office/provisioning/acknowledge`, `/api/invoices/[id]/send`,
+`/api/invoices/[id]/void`) were missing from the CSRF protected list and from the gate's own counts. The
+routes enforced the token inline all along; the list and the counts now say what is true.
+
+## Gate inventory after the addendum
+
+recurring 126 · recurring-service 107 · recurring-job 83 · recurring-generation 129 · invoices 1553 ·
+estimates 1583 · conversion 147 · **auth 2805** · security 2378 · jobs 110 · kyc 4142 · office 545 ·
+**migrations 3495 / 120 / 89** · structure 458 · i18n 2315 · shell 774 · lint-rules 77 · config 10 · env 16 ·
+tsc 0 · eslint 0 · build 0 (154 routes).

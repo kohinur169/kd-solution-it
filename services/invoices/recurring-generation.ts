@@ -532,10 +532,10 @@ export async function recordRecurringReminder(
 /**
  * Record every reminder the schedules promised for one merchant today.
  *
- * The invoice query is written to the shape `0022`'s `invoices_due_idx` was built for: the same three statuses in
- * the same order, `deleted_at is null`, and a range on `due_at` rather than a function of it. The index is never
- * called - it is chosen by the planner when the predicate matches - and the constants above are that predicate
- * written once so the query and the index cannot drift apart without a gate noticing.
+ * The invoice query is written to the shape `0120`'s `invoices_due_reminder_idx` was built for: the four open
+ * statuses in the same order, `deleted_at is null`, and a range on `due_at` rather than a function of it. The
+ * index is never called - it is chosen by the planner when the predicate matches - and the constants above are
+ * that predicate written once so the query and the index cannot drift apart without a gate noticing.
  *
  * Only generated invoices are swept, because only a generated invoice knows which schedule's reminder policy
  * applies to it. A hand-written invoice has no `recurring_schedule_id`, and section 16's reminder cadence is a

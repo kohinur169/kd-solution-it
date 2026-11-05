@@ -29,6 +29,7 @@ import {
 } from "../../lib/storage/types.ts";
 import {
   INVOICE_ABANDONED_AUDIT_ACTION,
+  INVOICE_AUDIT_ENTITY,
   INVOICE_CLIENT_OPTION_LIMIT,
   INVOICE_CREATED_AUDIT_ACTION,
   INVOICE_MANAGE_ROLES,
@@ -54,6 +55,7 @@ import {
   type InvoiceLineDependencies,
 } from "./invoice-lines.ts";
 import {
+  INVOICE_OVERDUE_AUDIT_ACTION,
   INVOICE_PAID_LOCKED_RULE,
   INVOICE_SENT_AUDIT_ACTION,
   INVOICE_STATUS_TRANSITIONS,
@@ -61,8 +63,16 @@ import {
   INVOICE_VOIDED_AUDIT_ACTION,
   isLegalInvoiceTransition,
   sendInvoice,
+  sweepOverdueInvoices,
   voidInvoice,
 } from "./invoice-status.ts";
+import {
+  OVERDUE_SWEEP_JOB_NAME,
+  createDefaultOverdueSweepJob,
+  createOverdueSweepJob,
+  overdueSweepJobPayloadSchema,
+  registerOverdueSweepJob,
+} from "./overdue-sweep-job.ts";
 import {
   INVOICE_LINE_MOVED_AUDIT_ACTION,
   moveInvoiceLine,
@@ -281,6 +291,23 @@ const COMPANY_A = "018f2b8a-4444-4c2d-9c3e-000000000001";
 const COMPANY_B = "018f2b8a-4444-4c2d-9c3e-000000000002";
 
 const CLIENT_A = "018f2b8a-5555-4c2d-9c3e-000000000001";
+
+/** `0024`'s timeline vocabulary with `0120`'s `overdue` word, written from the migrations. */
+const INVOICE_EVENT_TYPES = [
+  "created",
+  "sent",
+  "viewed",
+  "payment_received",
+  "paid",
+  "overdue",
+  "overdue_reminder",
+  "voided",
+  "duplicated",
+  "note",
+] as const;
+
+/** `0024`'s actor words. */
+const INVOICE_EVENT_ACTORS = ["merchant", "client", "office", "system"] as const;
 const CLIENT_B = "018f2b8a-5555-4c2d-9c3e-000000000002";
 
 const PRODUCT_A = "018f2b8a-6666-4c2d-9c3e-000000000001";
@@ -346,6 +373,12 @@ interface InvoiceDb {
    * write the service sends matches nothing and the service has to read the winner's state back.
    */
   raceDocumentVersion: boolean;
+  /**
+   * Set to make one invoice status write lose a race: the fixture moves the row to these values first,
+   * so the guarded write the service sends matches nothing and the service has to read the winner's
+   * state back.
+   */
+  raceInvoiceRow: Readonly<Record<string, unknown>> | null;
   /**
    * Set to make one branding save lose a race: the fixture moves the row first, so the version-scoped write
    * the service sends matches nothing and the service has to answer `CONFLICT` rather than overwrite.
@@ -440,6 +473,7 @@ function createDb(): InvoiceDb {
     takenNumbers: [],
     failItems: false,
     raceDocumentVersion: false,
+    raceInvoiceRow: null,
     raceBrandingVersion: false,
     strictPositions: false,
     inserts: [],
@@ -915,6 +949,36 @@ function createInvoiceRest(db: InvoiceDb): RestClient {
       // the update path below refuses the other two, which is the guard the table carries.
       if (table === "invoice_events") {
         for (const row of rows) {
+          // `0024`'s checks, with `0120`'s word in the vocabulary: the timeline writes only words and
+          // actors the migrations know, a system move names no person, and a detail is bounded and
+          // already trimmed.
+          if (!(INVOICE_EVENT_TYPES as readonly string[]).includes(String(row["type"]))) {
+            return Promise.reject(new AppError("VALIDATION_FAILED", { cause: { rule: "invoice_events_type_check" } }));
+          }
+
+          if (!(INVOICE_EVENT_ACTORS as readonly string[]).includes(String(row["actor"]))) {
+            return Promise.reject(new AppError("VALIDATION_FAILED", { cause: { rule: "invoice_events_actor_check" } }));
+          }
+
+          if (row["actor"] === "system" && row["actor_user_id"] !== null && row["actor_user_id"] !== undefined) {
+            return Promise.reject(
+              new AppError("VALIDATION_FAILED", { cause: { rule: "invoice_events_actor_user_check" } }),
+            );
+          }
+
+          const detail = row["detail"];
+
+          if (
+            detail !== null &&
+            detail !== undefined &&
+            (typeof detail !== "string" ||
+              detail.trim().length < 1 ||
+              detail.trim().length > 500 ||
+              detail !== detail.trim())
+          ) {
+            return Promise.reject(new AppError("VALIDATION_FAILED", { cause: { rule: "invoice_events_detail_check" } }));
+          }
+
           db.invoiceEvents.push({
             id: randomUUID(),
             created_at: new Date(NOW).toISOString(),
@@ -1546,6 +1610,13 @@ function createInvoiceRest(db: InvoiceDb): RestClient {
       const row = db.invoices.find(
         (candidate) => candidate["id"] === id.slice(3) && candidate["company_id"] === company.slice(3),
       );
+
+      // The race the guard exists for: another worker moves the row first, once, so the write this
+      // service is about to send matches nothing and the service has to read the winner's state back.
+      if (db.raceInvoiceRow !== null && row !== undefined) {
+        Object.assign(row, db.raceInvoiceRow, { version: Number(row["version"]) + 1 });
+        db.raceInvoiceRow = null;
+      }
 
       if (row === undefined || (status !== undefined && row["status"] !== status.slice(3))) {
         return Promise.resolve();
@@ -4074,6 +4145,195 @@ async function checkStatusWorkflow(): Promise<void> {
     await lineCodeOf(() => sendInvoice({ actor: owner, invoiceId: "not-a-uuid" }, depsOf(tenancyDb))),
     "VALIDATION_FAILED",
     "an id that is not a uuid is a validation failure",
+  );
+}
+
+/**
+ * STEP 123's other half: the sweep that moves a company's past-due documents to `overdue`, and the
+ * job that runs it.
+ */
+async function checkOverdueSweep(): Promise<void> {
+  // ---- the sweep: one merchant, one document of each kind the sweep must distinguish
+  const db = createDb();
+  const dueAgo = (days: number) => new Date(NOW - days * 86_400_000).toISOString();
+
+  const sentDue: Record<string, unknown> = { ...statusRowFixture(COMPANY_A, "sent"), due_at: dueAgo(1) };
+  const partialDue: Record<string, unknown> = { ...statusRowFixture(COMPANY_A, "partially_paid"), due_at: dueAgo(2) };
+  const sentNotDue: Record<string, unknown> = { ...statusRowFixture(COMPANY_A, "sent"), due_at: new Date(NOW + 86_400_000).toISOString() };
+  const draftRow: Record<string, unknown> = {
+    ...statusRowFixture(COMPANY_A, "sent"),
+    status: "draft",
+    number: null,
+    issued_at: null,
+    first_viewed_at: null,
+    due_at: dueAgo(1),
+  };
+  const paidRow: Record<string, unknown> = { ...statusRowFixture(COMPANY_A, "paid"), due_at: dueAgo(3) };
+  const alreadyOverdue: Record<string, unknown> = { ...statusRowFixture(COMPANY_A, "overdue"), due_at: dueAgo(4) };
+
+  db.invoices.push(sentDue, partialDue, sentNotDue, draftRow, paidRow, alreadyOverdue);
+  const audit = createInMemoryAuditTrail();
+
+  const first = await sweepOverdueInvoices({ companyId: COMPANY_A }, depsOf(db, audit));
+
+  expectEqual(first.marked.length, 2, "the two open documents past their due date, and nothing else");
+  expect(first.marked.includes(String(sentDue["id"])), "the sent document is among them");
+  expect(first.marked.includes(String(partialDue["id"])), "and the partially paid one");
+  expectEqual(first.skipped, 0, "with no row that moved under the sweep's feet");
+
+  expectEqual(sentDue["status"], "overdue", "the sent document is overdue");
+  expectEqual(partialDue["status"], "overdue", "and the partially paid one, too");
+  expectEqual(sentNotDue["status"], "sent", "the not-yet-due document stays sent");
+  expectEqual(draftRow["status"], "draft", "the draft stays a draft");
+  expectEqual(paidRow["status"], "paid", "the paid document stays paid");
+  expectEqual(alreadyOverdue["status"], "overdue", "and the already overdue one is left where it is");
+
+  expectEqual(db.invoiceEvents.length, 2, "one timeline row per moved document");
+
+  for (const event of db.invoiceEvents) {
+    expectEqual(event["type"], "overdue", "in the word 0120 added to the vocabulary");
+    expectEqual(event["actor"], "system", "acted by the sweep");
+    expectEqual(event["actor_user_id"], null, "and named for no person");
+    expectEqual(event["detail"], null, "and carrying nothing the invoice itself does not carry");
+  }
+
+  const eventInvoices = db.invoiceEvents.map((event) => String(event["invoice_id"])).sort();
+
+  expectEqual(
+    eventInvoices.join(","),
+    [String(sentDue["id"]), String(partialDue["id"])].sort().join(","),
+    "on the two documents the sweep moved",
+  );
+
+  expectEqual(audit.entries.length, 2, "one audit entry per moved document");
+
+  for (const entry of audit.entries) {
+    expectEqual(entry.action, INVOICE_OVERDUE_AUDIT_ACTION, "under the sweep's action");
+    expectEqual(entry.actorUserId, null, "and for no person");
+    expectEqual(entry.entityType, INVOICE_AUDIT_ENTITY, "on the document's own entity");
+    expect(
+      entry.payload["due_at"] === sentDue["due_at"] || entry.payload["due_at"] === partialDue["due_at"],
+      "carrying the due date that made the document overdue",
+    );
+  }
+
+  // ---- the second run: the status is the dedupe, so a repeated run is a no-op
+  const second = await sweepOverdueInvoices({ companyId: COMPANY_A }, depsOf(db, audit));
+
+  expectEqual(second.marked.length, 0, "a second run marks nothing");
+  expectEqual(second.skipped, 0, "and counts nothing as missed");
+  expectEqual(db.invoiceEvents.length, 2, "and writes no second timeline row");
+  expectEqual(audit.entries.length, 2, "nor a second audit entry");
+
+  // ---- the race: a payment that arrives between the list read and the move
+  const raceRow: Record<string, unknown> = { ...statusRowFixture(COMPANY_A, "sent"), due_at: dueAgo(1) };
+  db.invoices.push(raceRow);
+  db.raceInvoiceRow = { status: "paid", paid_at: new Date(NOW + 5_000).toISOString() };
+  const eventsBeforeRace = db.invoiceEvents.length;
+  const entriesBeforeRace = audit.entries.length;
+
+  const raced = await sweepOverdueInvoices({ companyId: COMPANY_A }, depsOf(db, audit));
+
+  expectEqual(raced.marked.length, 0, "the document that paid its way out is not marked");
+  expectEqual(raced.skipped, 1, "but counted as a miss the sweep saw, not a failure");
+  expectEqual(raceRow["status"], "paid", "the payment won the race");
+  expectEqual(db.invoiceEvents.length, eventsBeforeRace, "and it left no timeline row");
+  expectEqual(audit.entries.length, entriesBeforeRace, "nor an audit entry");
+
+  // ---- the timeline the fixture now enforces: `0024`'s checks, with `0120`'s word in them
+  const rest = depsOf(db, audit).rest;
+  const eventOf = (patch: Record<string, unknown>) => ({
+    company_id: COMPANY_A,
+    invoice_id: sentDue["id"],
+    type: "overdue",
+    actor: "system",
+    actor_user_id: null,
+    detail: null,
+    occurred_at: new Date(NOW).toISOString(),
+    ...patch,
+  });
+
+  expectEqual(
+    await lineCodeOf(() => rest.insert("invoice_events", [eventOf({ type: "delinquent" })])),
+    "VALIDATION_FAILED",
+    "a word the migrations do not give is refused",
+  );
+  expectEqual(
+    await lineCodeOf(() => rest.insert("invoice_events", [eventOf({ actor: "bank" })])),
+    "VALIDATION_FAILED",
+    "and an actor the migrations do not give is refused",
+  );
+  expectEqual(
+    await lineCodeOf(() => rest.insert("invoice_events", [eventOf({ actor_user_id: OWNER_ID })])),
+    "VALIDATION_FAILED",
+    "and a system move that names a person is refused",
+  );
+  expectEqual(
+    await lineCodeOf(() => rest.insert("invoice_events", [eventOf({ actor: "merchant", detail: " " })])),
+    "VALIDATION_FAILED",
+    "and a detail that is only whitespace is refused",
+  );
+  expectEqual(
+    await lineCodeOf(() =>
+      rest.insert("invoice_events", [eventOf({ actor: "merchant", detail: "x".repeat(501) })]),
+    ),
+    "VALIDATION_FAILED",
+    "nor a detail past the bound",
+  );
+  expectEqual(db.invoiceEvents.length, 2, "and a refused row is not written");
+
+  await rest.insert("invoice_events", [
+    eventOf({ actor: "merchant", actor_user_id: OWNER_ID, detail: "the word in a person's own hand" }),
+  ]);
+  expectEqual(db.invoiceEvents.length, 3, "and the overdue word itself is written, in any actor's hand");
+
+  // ---- the job: the name, the payload, the registration
+  expect(overdueSweepJobPayloadSchema.safeParse({ company_id: COMPANY_A }).success, "the payload carries the company");
+  expect(
+    !overdueSweepJobPayloadSchema.safeParse({ company_id: COMPANY_A, at: new Date(NOW).toISOString() }).success,
+    "and nothing the handler would ignore, because the sweep's date is its own clock",
+  );
+  expect(
+    !overdueSweepJobPayloadSchema.safeParse({ company_id: "a merchant's name" }).success,
+    "nor a company that is not a uuid",
+  );
+  expectEqual(createDefaultOverdueSweepJob().name, OVERDUE_SWEEP_JOB_NAME, "the default instance carries the name");
+
+  const registry = new JobRegistry();
+  expectEqual(registry.names().length, 0, "importing the module registers nothing");
+  registerOverdueSweepJob(registry, () => depsOf(db, audit));
+  expect(registry.has(OVERDUE_SWEEP_JOB_NAME), "the registration takes the name");
+  expectEqual(registry.names().length, 1, "and it is the only registration the module makes");
+  registerOverdueSweepJob(registry, () => depsOf(db, audit));
+  expect(registry.has(OVERDUE_SWEEP_JOB_NAME), "a second registration is a no-op rather than an error");
+
+  // The handler end to end, through the definition a scheduler would register.
+  const jobDb = createDb();
+  const jobAudit = createInMemoryAuditTrail();
+  const jobRow: Record<string, unknown> = { ...statusRowFixture(COMPANY_A, "sent"), due_at: dueAgo(1) };
+  jobDb.invoices.push(jobRow);
+  const definition = createOverdueSweepJob(() => depsOf(jobDb, jobAudit));
+
+  expectEqual(definition.name, OVERDUE_SWEEP_JOB_NAME, "the definition carries the name");
+  await definition.handler({
+    jobId: "job-1",
+    name: OVERDUE_SWEEP_JOB_NAME,
+    attempt: 1,
+    maxAttempts: 3,
+    traceId: "trace-1",
+    payload: overdueSweepJobPayloadSchema.parse({ company_id: COMPANY_A }),
+    signal: new AbortController().signal,
+  });
+
+  expectEqual(jobRow["status"], "overdue", "the registered handler moves the due document");
+  expectEqual(jobAudit.entries.length, 1, "and leaves the trail");
+
+  // The module's one registration is the guarded one, so an import-time registration cannot hide here.
+  const jobSource = await readRepositoryFile("services/invoices/overdue-sweep-job.ts");
+  expectEqual(
+    jobSource.split("registry.register(").length - 1,
+    1,
+    "the module registers exactly once, inside its own registration function",
   );
 }
 
@@ -8097,6 +8357,7 @@ async function run(): Promise<void> {
   await checkNumberingTake();
   await checkNumberingSettings();
   await checkStatusWorkflow();
+  await checkOverdueSweep();
   await checkDiscountEngine();
   await checkDiscountCreate();
   await checkDiscountUpdate();

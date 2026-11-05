@@ -1009,7 +1009,6 @@ async function checkFailureAndRollback(): Promise<void> {
 async function checkDueQuery(): Promise<void> {
   const service = await readRepositoryFile("services/invoices/recurring-generation.ts");
   const migration = await readRepositoryFile("migrations/0022_invoices.sql");
-  const fields = await readRepositoryFile("services/invoices/recurring-generation-fields.ts");
 
   // The index's predicate, read from the SQL that declares it.
   expect(
@@ -1018,13 +1017,25 @@ async function checkDueQuery(): Promise<void> {
     "0022 declares invoices_due_idx over the three open statuses and live rows",
   );
 
-  // The constant is that predicate, written once.
+  const migrationOverdue = await readRepositoryFile("migrations/0120_invoice_overdue_event.sql");
+
   expect(
-    fields.includes('Object.freeze(["sent", "viewed", "partially_paid"] as const)'),
-    "the reminder statuses are exactly the index's three, in its order",
+    migrationOverdue.includes("create index invoices_due_reminder_idx") &&
+      migrationOverdue.includes(
+        "where status in ('sent', 'viewed', 'partially_paid', 'overdue') and deleted_at is null",
+      ),
+    "0120 declares invoices_due_reminder_idx over the four open statuses, overdue among them",
   );
-  expect(!fields.includes('"draft"') || !RECURRING_REMINDER_STATUSES.includes("draft" as never), "and draft is not among them");
-  expectEqual(RECURRING_REMINDER_STATUSES.length, 3, "with three statuses and no fourth");
+
+  // The constant is that predicate, written once: a document that has become overdue is exactly the one
+  // whose reminders must go on, so the reminder sweep reads four statuses rather than three.
+  expectEqual(
+    RECURRING_REMINDER_STATUSES.join(","),
+    "sent,viewed,partially_paid,overdue",
+    "the reminder statuses are exactly the index's four, in its order",
+  );
+  expect(!RECURRING_REMINDER_STATUSES.includes("draft" as never), "and draft is not among them");
+  expectEqual(RECURRING_REMINDER_STATUSES.length, 4, "with four statuses and no fifth");
 
   // The query: an equality on the status set, `deleted_at is null`, and a range on `due_at` rather than a
   // function of it - a `date(due_at)` wrapper is the classic way to defeat a btree index without noticing.

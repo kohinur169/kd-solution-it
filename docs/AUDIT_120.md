@@ -37,7 +37,8 @@ time.
 
 **Addendum 3 (second pass, post-audit).** A code pass over the two steps completed after this audit
 (096 and 116), and over the paths they touch, found and fixed two code defects and one stale comment,
-and named two gaps that are plan-level rather than code-level.
+and named two gaps that are plan-level rather than code-level. The overdue gap was closed after this
+pass, on instruction; the timeline gap remains, by design.
 
 *Fixed in this pass:*
 
@@ -64,6 +65,11 @@ and named two gaps that are plan-level rather than code-level.
   for the status move itself (only `overdue_reminder`, which the STEP 123 sweep records). A production
   invoice therefore cannot reach the sixth of the seven states; the reminder half of section 16 works,
   the state half does not.
+
+  *(Now closed. On instruction, the overdue-state half of STEP 123 was completed after this pass:
+  `0120` adds the `overdue` word to the vocabulary, `sweepOverdueInvoices` performs the move through
+  the STEP 116 engine, `invoice.overdue_sweep` is the job that runs it, and reminders continue while a
+  document is overdue. See the addendum to `docs/handoffs/STEP_123_COMPLETED.md`.)*
 - **The timeline is written incrementally.** `invoice_events` carries `sent`, `voided` (this audit's
   steps) and `overdue_reminder` (STEP 123) today; `created`, `viewed`, `payment_received` and `paid`
   are written by the steps that own those moments as they land. The table's contract is "every step is

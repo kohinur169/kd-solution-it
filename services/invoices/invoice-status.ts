@@ -5,7 +5,7 @@ import type { RestClient } from "../../lib/auth/rest.ts";
 import { isConflictError } from "../../lib/auth/rest.ts";
 import { requireAnyRole, requireCompanyId } from "../../lib/auth/session.ts";
 import type { RequestActor } from "../../lib/auth/types.ts";
-import { AppError } from "../../lib/errors/app-error.ts";
+import { AppError, isAppError } from "../../lib/errors/app-error.ts";
 import { deepFreeze } from "../../lib/utils/freeze.ts";
 import { INVOICE_AUDIT_ENTITY, INVOICE_MANAGE_ROLES } from "./invoices.ts";
 import { INVOICE_STATUSES, type InvoiceStatus } from "./invoice-fields.ts";
@@ -56,8 +56,8 @@ export const INVOICE_VOIDED_AUDIT_ACTION = "invoice.voided";
 const INVOICE_EVENT_SENT = "sent";
 const INVOICE_EVENT_VOIDED = "voided";
 
-/** The actor word of `0024` this module acts under: the move is made by the merchant who owns it. */
-const INVOICE_EVENT_ACTOR = "merchant";
+/** The actor words of `0024`: a move is named for the one who made it, or for the system that did. */
+export type InvoiceEventActor = "merchant" | "client" | "office" | "system";
 
 /** The status the lock belongs to, named once rather than spelled in every refusal. */
 export const INVOICE_PAID_STATUS: InvoiceStatus = "paid";
@@ -167,7 +167,6 @@ type StatusRow = z.infer<typeof statusRowSchema>;
 async function applyTransition(
   dependencies: InvoiceStatusDependencies,
   input: {
-    readonly actor: RequestActor;
     readonly row: StatusRow;
     readonly to: InvoiceStatus;
     /** The columns the move writes beside the status, in the same statement. */
@@ -175,6 +174,12 @@ async function applyTransition(
     readonly event: {
       readonly type: string;
       readonly detail: string | null;
+      /** The word `0024` names the move under: who made it, or the system that did. */
+      readonly actor: InvoiceEventActor;
+      /** The person who acted; null for a system move, which `0024`'s own check requires. */
+      readonly actorUserId: string | null;
+      /** The session the move was made from; null for a system move, which has none. */
+      readonly sessionId: string | null;
     };
     readonly audit: {
       readonly action: string;
@@ -250,8 +255,8 @@ async function applyTransition(
         company_id: input.row.company_id,
         invoice_id: input.row.id,
         type: input.event.type,
-        actor: INVOICE_EVENT_ACTOR,
-        actor_user_id: input.actor.userId,
+        actor: input.event.actor,
+        actor_user_id: input.event.actorUserId,
         detail: input.event.detail,
         occurred_at: at,
       },
@@ -260,11 +265,11 @@ async function applyTransition(
 
   await dependencies.audit.append({
     action: input.audit.action,
-    actorUserId: input.actor.userId,
+    actorUserId: input.event.actorUserId,
     entityType: INVOICE_AUDIT_ENTITY,
     entityId: input.row.id,
     companyId: input.row.company_id,
-    sessionId: input.actor.sessionId ?? null,
+    sessionId: input.event.sessionId,
     payload: { from: input.row.status, to: input.to, ...input.audit.payload },
   });
 
@@ -353,11 +358,16 @@ export async function sendInvoice(
   );
 
   return applyTransition(dependencies, {
-    actor: input.actor,
     row,
     to: "sent",
     extra: { number: taken.number, issued_at: at },
-    event: { type: INVOICE_EVENT_SENT, detail: null },
+    event: {
+      type: INVOICE_EVENT_SENT,
+      detail: null,
+      actor: "merchant",
+      actorUserId: input.actor.userId,
+      sessionId: input.actor.sessionId ?? null,
+    },
     audit: {
       action: INVOICE_SENT_AUDIT_ACTION,
       payload: { number: taken.number, total_minor: row.total_minor, currency: row.currency },
@@ -408,11 +418,16 @@ export async function voidInvoice(
   const at = new Date(dependencies.now?.() ?? Date.now()).toISOString();
 
   return applyTransition(dependencies, {
-    actor: input.actor,
     row,
     to: "void",
     extra: { voided_at: at },
-    event: { type: INVOICE_EVENT_VOIDED, detail: reason },
+    event: {
+      type: INVOICE_EVENT_VOIDED,
+      detail: reason,
+      actor: "merchant",
+      actorUserId: input.actor.userId,
+      sessionId: input.actor.sessionId ?? null,
+    },
     audit: {
       action: INVOICE_VOIDED_AUDIT_ACTION,
       payload: {
@@ -447,4 +462,153 @@ function parseVoidReason(value: unknown): string | null {
   }
 
   return trimmed;
+}
+
+/**
+ * The overdue sweep of STEP 123's other half: the move from `0022`'s graph that no person makes.
+ *
+ * ## Why the sweep is per company
+ *
+ * Every other read in this family is scoped to one company from the session; a platform-wide read would
+ * be the first query here that answers "which merchants have a past-due document" instead of "what does
+ * this merchant's document say". The sweep therefore runs as one job per company, named in the job's
+ * payload, and the scheduler that decides which companies to sweep - when, and how often - is the same
+ * deployment work that wires the recurring job to a clock.
+ *
+ * ## Why the due date is checked twice
+ *
+ * The query asks `invoices_due_idx` for the company's open documents past their due date; the code then
+ * checks each row's due date again, against the sweep's own instant. The query is a fast path and the
+ * row is the authority, for the same reason the guarded update is followed by a re-read: a sweep that
+ * trusted the query alone would mark a document whose due date changed under it, and the sweep's only
+ * promise is that it marks a document whose due date has actually passed.
+ *
+ * ## Why a raced row is a skip, not a failure
+ *
+ * Between the list read and the move a row can pay, void or be sent its way out of the sweep's reach.
+ * The move is guarded on the status the sweep read, so the race is a miss, and a missed row is counted
+ * as skipped rather than raised: a sweep that failed on a race would be a sweep nobody left running,
+ * and the next run will find whatever is still due.
+ *
+ * ## The entries
+ *
+ * Each move writes the timeline row with the actor `system` and no user, because `0024`'s
+ * `invoice_events_actor_user_check` exists exactly for this: a scheduled sweep has no person behind it,
+ * and naming one would blame a person for the platform's timetable. The audit entry carries the same
+ * actor facts, `0013` allowing a null actor for the same reason. The detail is deliberately null: the
+ * document's number and due date are on the invoice itself, and a row that copies them would copy them
+ * wrong the first time the document changes.
+ */
+
+/** The statuses an overdue sweep may move: the open states `0022`'s `invoices_due_idx` is built for. */
+const OVERDUE_SWEEP_SOURCE_STATUSES: readonly InvoiceStatus[] = deepFreeze([
+  "sent",
+  "viewed",
+  "partially_paid",
+]);
+
+/** How many of one company's due documents one sweep run marks. The rest wait for the next run. */
+export const OVERDUE_SWEEP_INVOICE_LIMIT = 200;
+
+/** The audit action of the sweep, one entry per document it moves. */
+export const INVOICE_OVERDUE_AUDIT_ACTION = "invoice.overdue";
+
+/** The word the sweep writes to the timeline; `0120` added it to `0024`'s vocabulary. */
+const INVOICE_OVERDUE_EVENT = "overdue";
+
+export interface OverdueSweepResult {
+  readonly companyId: string;
+  /** The ids of the documents the sweep moved to `overdue`, in the order it moved them. */
+  readonly marked: readonly string[];
+  /** The rows that moved out of the sweep's reach while it was running. */
+  readonly skipped: number;
+}
+
+/** One company's overdue sweep, at the sweep's own instant. */
+export async function sweepOverdueInvoices(
+  input: { readonly companyId: unknown },
+  dependencies: InvoiceStatusDependencies,
+): Promise<OverdueSweepResult> {
+  if (typeof input.companyId !== "string" || !z.string().uuid().safeParse(input.companyId).success) {
+    throw new AppError("VALIDATION_FAILED", {
+      details: [{ field: "company_id", rule: "invalid_format" }],
+    });
+  }
+
+  const companyId = input.companyId;
+  const nowMs = dependencies.now?.() ?? Date.now();
+  const at = new Date(nowMs).toISOString();
+
+  const candidates = await dependencies.rest.select(
+    "invoices",
+    "select=id,company_id,status,due_at" +
+      `&company_id=eq.${companyId}` +
+      `&status=in.(${OVERDUE_SWEEP_SOURCE_STATUSES.join(",")})` +
+      `&deleted_at=is.null` +
+      `&due_at=lt.${encodeURIComponent(at)}` +
+      `&order=due_at.asc&limit=${String(OVERDUE_SWEEP_INVOICE_LIMIT)}`,
+    z.object({
+      id: z.string().uuid(),
+      company_id: z.string().uuid(),
+      status: z.enum(INVOICE_STATUSES),
+      due_at: z.string(),
+    }),
+  );
+
+  const marked: string[] = [];
+  let skipped = 0;
+
+  for (const candidate of candidates) {
+    // The code's checks, because the query is a fast path: a row that is not one the sweep reads, or that
+    // is not yet due as of the sweep's own instant, is not this sweep's row, and is left alone rather
+    // than counted as a miss.
+    if (!OVERDUE_SWEEP_SOURCE_STATUSES.includes(candidate.status)) {
+      continue;
+    }
+
+    const dueMs = Date.parse(candidate.due_at);
+
+    if (!Number.isFinite(dueMs) || dueMs >= nowMs) {
+      continue;
+    }
+
+    const row = await readStatusRow(dependencies, { companyId, invoiceId: candidate.id });
+
+    if (row.status !== candidate.status) {
+      skipped += 1;
+      continue;
+    }
+
+    try {
+      const result = await applyTransition(dependencies, {
+        row,
+        to: "overdue",
+        extra: {},
+        event: {
+          type: INVOICE_OVERDUE_EVENT,
+          detail: null,
+          actor: "system",
+          actorUserId: null,
+          sessionId: null,
+        },
+        audit: {
+          action: INVOICE_OVERDUE_AUDIT_ACTION,
+          payload: { due_at: row.due_at },
+        },
+      });
+
+      marked.push(result.invoiceId);
+    } catch (error) {
+      if (isAppError(error) && error.code === "CONFLICT") {
+        // The row moved between the list read and the move: a payment arrived, a void was recorded. The
+        // next run finds whatever is still due, and nothing this run can safely do.
+        skipped += 1;
+        continue;
+      }
+
+      throw error;
+    }
+  }
+
+  return { companyId, marked, skipped };
 }
