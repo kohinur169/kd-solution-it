@@ -67,6 +67,16 @@ export interface SettlementStatementResult {
   readonly filename: string;
 }
 
+/** The raw statement: the movements, the period, and the count, before any renderer turns them into a file. */
+export interface SettlementStatementLines {
+  /** One line per movement, newest first, each signed and labelled. */
+  readonly lines: StatementLine[];
+  /** The period the statement covers. */
+  readonly period: StatementPeriod;
+  /** The movements the statement carries, the header not counted. */
+  readonly rowCount: number;
+}
+
 /** The columns the ledger read takes, one by one (rule 17, never a `*`). */
 const ENTRY_COLUMNS =
   "select=id,company_id,account_id,occurred_at,entry_side,amount_minor,currency,source_type,description";
@@ -115,16 +125,21 @@ function dayOf(value: unknown, field: "from" | "to"): string {
 }
 
 /**
- * Build the statement for the actor's company.
+ * Read the statement for the actor's company: the movements, the period, and the count, in the raw
+ * form both renderers turn into a file.
  *
  * The order of the work is the order of the refusals: the role, the period, the account, the entries.
  * Each refusal costs nothing the step after it would have spent, and the period is judged before any
  * read at all, because a period that names no window is not a request for a statement.
+ *
+ * STEP 125 renders this as CSV; STEP 126 renders the same lines as PDF. The gather is the one place
+ * the statement's rules live, so a rule changed here is a rule changed for every file the merchant
+ * downloads, not for the one a particular renderer happens to produce.
  */
-export async function buildSettlementStatement(
+export async function gatherSettlementLines(
   input: SettlementStatementInput,
   dependencies: SettlementStatementDependencies,
-): Promise<SettlementStatementResult> {
+): Promise<SettlementStatementLines> {
   requireAnyRole(input.actor, SETTLEMENT_STATEMENT_ROLES);
   const companyId = requireCompanyId(input.actor);
 
@@ -150,54 +165,64 @@ export async function buildSettlementStatement(
     accountRowSchema,
   );
 
-  if (accounts.length === 0) {
-    return {
-      csv: statementCsvOf([]),
-      rowCount: 0,
-      period,
-      filename: statementFilenameOf(period),
-    };
+  const lines: StatementLine[] = [];
+
+  if (accounts.length > 0) {
+    // Both payables a merchant has ever been given: a wrong account is closed and a corrected one
+    // opened beside it, `0040`'s way, and the entries on the closed one are still the balance's history.
+    const entries = await dependencies.rest.select(
+      "ledger_entries",
+      `${ENTRY_COLUMNS}&company_id=eq.${companyId}` +
+        `&account_id=in.(${accounts.map((account) => account.id).join(",")})` +
+        `&source_type=in.(${STATEMENT_SOURCE_TYPES.join(",")})` +
+        `&occurred_at=gte.${new Date(fromMs).toISOString()}` +
+        `&occurred_at=lt.${new Date(toMs).toISOString()}` +
+        "&order=occurred_at.desc,id.desc" +
+        `&limit=${MAXIMUM_STATEMENT_ROWS + 1}`,
+      entryRowSchema,
+    );
+
+    if (entries.length > MAXIMUM_STATEMENT_ROWS) {
+      // One more than the ceiling is the signal the period is wider than a statement, and the answer
+      // is the period named, not the file: a document a person cannot finish reading is not a document.
+      throw new AppError("VALIDATION_FAILED", {
+        details: [{ field: "period", rule: SETTLEMENT_STATEMENT_RULES.statement_too_long }],
+      });
+    }
+
+    for (const entry of entries) {
+      // A credit to the payable is money the balance gains; a debit is money it loses. The sign is the
+      // side, because `0040` pairs the account's kind with its normal side and the entry with a side.
+      const amount = priceFromMinor(BigInt(String(entry.amount_minor)));
+
+      lines.push({
+        date: entry.occurred_at,
+        label: STATEMENT_TYPE_LABELS[entry.source_type] ?? entry.source_type,
+        amount: entry.entry_side === "credit" ? amount : `-${amount}`,
+        currency: entry.currency,
+        description: entry.description ?? "",
+      });
+    }
   }
 
-  // Both payables a merchant has ever been given: a wrong account is closed and a corrected one
-  // opened beside it, `0040`'s way, and the entries on the closed one are still the balance's history.
-  const entries = await dependencies.rest.select(
-    "ledger_entries",
-    `${ENTRY_COLUMNS}&company_id=eq.${companyId}` +
-      `&account_id=in.(${accounts.map((account) => account.id).join(",")})` +
-      `&source_type=in.(${STATEMENT_SOURCE_TYPES.join(",")})` +
-      `&occurred_at=gte.${new Date(fromMs).toISOString()}` +
-      `&occurred_at=lt.${new Date(toMs).toISOString()}` +
-      "&order=occurred_at.desc,id.desc" +
-      `&limit=${MAXIMUM_STATEMENT_ROWS + 1}`,
-    entryRowSchema,
-  );
+  return { lines, period, rowCount: lines.length };
+}
 
-  if (entries.length > MAXIMUM_STATEMENT_ROWS) {
-    // One more than the ceiling is the signal the period is wider than a statement, and the answer
-    // is the period named, not the file: a document a person cannot finish reading is not a document.
-    throw new AppError("VALIDATION_FAILED", {
-      details: [{ field: "period", rule: SETTLEMENT_STATEMENT_RULES.statement_too_long }],
-    });
-  }
-
-  const lines: StatementLine[] = entries.map((entry): StatementLine => {
-    // A credit to the payable is money the balance gains; a debit is money it loses. The sign is the
-    // side, because `0040` pairs the account's kind with its normal side and the entry with a side.
-    const amount = priceFromMinor(BigInt(String(entry.amount_minor)));
-
-    return {
-      date: entry.occurred_at,
-      label: STATEMENT_TYPE_LABELS[entry.source_type] ?? entry.source_type,
-      amount: entry.entry_side === "credit" ? amount : `-${amount}`,
-      currency: entry.currency,
-      description: entry.description ?? "",
-    };
-  });
+/**
+ * Build the statement as CSV for the actor's company.
+ *
+ * The gather does every rule; this function renders. The file is the header and the records, nothing
+ * else: a totals row is a document's job (STEP 126's PDF), not a file a spreadsheet opens.
+ */
+export async function buildSettlementStatement(
+  input: SettlementStatementInput,
+  dependencies: SettlementStatementDependencies,
+): Promise<SettlementStatementResult> {
+  const { lines, period, rowCount } = await gatherSettlementLines(input, dependencies);
 
   return {
     csv: statementCsvOf(lines),
-    rowCount: lines.length,
+    rowCount,
     period,
     filename: statementFilenameOf(period),
   };

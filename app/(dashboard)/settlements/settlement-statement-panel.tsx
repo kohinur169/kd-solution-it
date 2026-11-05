@@ -1,7 +1,7 @@
 // path: app/(dashboard)/settlements/settlement-statement-panel.tsx
 "use client";
 
-import { useState, type FormEvent, type ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import { getMessage } from "@/lib/i18n/messages";
 
 const labelClasses = "text-xs font-medium text-muted-foreground";
@@ -11,6 +11,8 @@ const hintClasses = "mt-1 text-xs text-muted-foreground";
 const errorClasses = "mt-1 text-xs font-medium text-danger";
 const primaryClasses =
   "rounded-md bg-primary px-4 py-2 text-xs font-medium text-primary-foreground transition-colors hover:opacity-90 focus-visible:ring-2 focus-visible:ring-primary disabled:opacity-40";
+const secondaryClasses =
+  "rounded-md border border-border bg-background px-4 py-2 text-xs font-medium text-foreground transition-colors hover:bg-muted focus-visible:ring-2 focus-visible:ring-primary disabled:opacity-40";
 const panelClasses = "space-y-4 rounded-lg border border-border bg-card p-4";
 
 /** The day a statement takes, `YYYY-MM-DD`, the two inputs and the query all read the same way. */
@@ -31,16 +33,25 @@ function defaultPeriod(): { readonly from: string; readonly to: string } {
   return { from: `${year}-${month}-01`, to: `${year}-${month}-${day}` };
 }
 
+/** The two forms the statement downloads in, and the extension each saves under. */
+const FORMATS = {
+  csv: { label: "settlements.download", extension: "csv" },
+  pdf: { label: "settlements.downloadPdf", extension: "pdf" },
+} as const;
+
+type Format = keyof typeof FORMATS;
+
 /**
  * Section 17's statement download: pick a first day and a last day, and the merchant's settlement
- * balance comes back as a CSV file, one line per movement, newest first.
+ * balance comes back as a file, one line per movement, newest first - CSV to open in a spreadsheet,
+ * PDF to read on a page with its totals.
  *
  * ## Why the download is a link the page answers, not a form
  *
- * A statement is a file, and a file the browser saves is a file the merchant opens in a spreadsheet.
- * The page asks the read endpoint for the days it picked and follows the attachment it is handed. The
- * read answers the file with an attachment name the browser keeps, so the saved file says the period
- * it covers without the merchant having to remember it.
+ * A statement is a file, and a file the browser saves is a file the merchant opens. The page asks
+ * the read endpoint for the days it picked and follows the attachment it is handed. The read
+ * answers the file with an attachment name the browser keeps, so the saved file says the period it
+ * covers without the merchant having to remember it.
  *
  * ## Why the days are judged before the request goes
  *
@@ -51,7 +62,8 @@ function defaultPeriod(): { readonly from: string; readonly to: string } {
  * ## The widths
  *
  * One column on a phone and two from `sm` up, the days sharing a row because they are one period.
- * The button and the message sit below, full width, so the message is never a truncated line at 360px.
+ * The buttons and the message sit below, full width, so the message is never a truncated line at
+ * 360px.
  */
 export function SettlementStatementPanel(): ReactNode {
   const defaults = defaultPeriod();
@@ -62,7 +74,7 @@ export function SettlementStatementPanel(): ReactNode {
 
   const reversed = dayOf(from) && dayOf(to) && from > to;
 
-  async function download(): Promise<void> {
+  async function download(format: Format): Promise<void> {
     if (!dayOf(from) || !dayOf(to) || reversed) {
       setError(getMessage(reversed ? "settlements.periodReversed" : "settlements.periodInvalid"));
 
@@ -73,8 +85,9 @@ export function SettlementStatementPanel(): ReactNode {
     setError(null);
 
     try {
+      const query = format === "pdf" ? "&format=pdf" : "";
       const response = await fetch(
-        `/api/settlements/statements?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`,
+        `/api/settlements/statements?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}${query}`,
       );
 
       if (response.ok) {
@@ -83,7 +96,7 @@ export function SettlementStatementPanel(): ReactNode {
         const anchor = document.createElement("a");
 
         anchor.href = url;
-        anchor.download = `settlement-statement_${from}_${to}.csv`;
+        anchor.download = `settlement-statement_${from}_${to}.${FORMATS[format].extension}`;
         document.body.append(anchor);
         anchor.click();
         anchor.remove();
@@ -145,11 +158,6 @@ export function SettlementStatementPanel(): ReactNode {
     return getMessage("settlements.failed");
   }
 
-  function onSubmit(event: FormEvent<HTMLFormElement>): void {
-    event.preventDefault();
-    void download();
-  }
-
   return (
     <div className={panelClasses}>
       <div className="space-y-1">
@@ -157,52 +165,63 @@ export function SettlementStatementPanel(): ReactNode {
         <p className="text-xs text-muted-foreground">{getMessage("settlements.lead")}</p>
       </div>
 
-      <form onSubmit={onSubmit} className="space-y-3">
-        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-          <div>
-            <label className={labelClasses} htmlFor="statement-from">
-              {getMessage("settlements.fromLabel")}
-            </label>
-            <input
-              id="statement-from"
-              type="date"
-              value={from}
-              onChange={(event) => setFrom(event.target.value)}
-              className={inputClasses}
-              aria-invalid={reversed || !dayOf(from)}
-              required
-            />
-            <p className={hintClasses}>{getMessage("settlements.fromHint")}</p>
-          </div>
-          <div>
-            <label className={labelClasses} htmlFor="statement-to">
-              {getMessage("settlements.toLabel")}
-            </label>
-            <input
-              id="statement-to"
-              type="date"
-              value={to}
-              onChange={(event) => setTo(event.target.value)}
-              className={inputClasses}
-              aria-invalid={reversed || !dayOf(to)}
-              required
-            />
-            <p className={hintClasses}>{getMessage("settlements.toHint")}</p>
-          </div>
-        </div>
-
-        {error !== null ? (
-          <p role="alert" className={errorClasses}>
-            {error}
-          </p>
-        ) : null}
-
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
         <div>
-          <button type="submit" disabled={saving} className={primaryClasses}>
-            {saving ? getMessage("settlements.preparing") : getMessage("settlements.download")}
-          </button>
+          <label className={labelClasses} htmlFor="statement-from">
+            {getMessage("settlements.fromLabel")}
+          </label>
+          <input
+            id="statement-from"
+            type="date"
+            value={from}
+            onChange={(event) => setFrom(event.target.value)}
+            className={inputClasses}
+            aria-invalid={reversed || !dayOf(from)}
+            required
+          />
+          <p className={hintClasses}>{getMessage("settlements.fromHint")}</p>
         </div>
-      </form>
+        <div>
+          <label className={labelClasses} htmlFor="statement-to">
+            {getMessage("settlements.toLabel")}
+          </label>
+          <input
+            id="statement-to"
+            type="date"
+            value={to}
+            onChange={(event) => setTo(event.target.value)}
+            className={inputClasses}
+            aria-invalid={reversed || !dayOf(to)}
+            required
+          />
+          <p className={hintClasses}>{getMessage("settlements.toHint")}</p>
+        </div>
+      </div>
+
+      {error !== null ? (
+        <p role="alert" className={errorClasses}>
+          {error}
+        </p>
+      ) : null}
+
+      <div className="flex flex-col gap-2 sm:flex-row">
+        <button
+          type="button"
+          onClick={() => void download("csv")}
+          disabled={saving}
+          className={primaryClasses}
+        >
+          {saving ? getMessage("settlements.preparing") : getMessage("settlements.download")}
+        </button>
+        <button
+          type="button"
+          onClick={() => void download("pdf")}
+          disabled={saving}
+          className={secondaryClasses}
+        >
+          {getMessage("settlements.downloadPdf")}
+        </button>
+      </div>
     </div>
   );
 }

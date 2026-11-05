@@ -3,12 +3,14 @@ import { NextResponse } from "next/server";
 import { readRequestActor } from "@/lib/auth/request-actor";
 import { getAuthRuntime } from "@/lib/auth/runtime";
 import { withErrorResponse } from "@/lib/errors/respond";
+import { buildSettlementStatementPdf } from "@/services/invoices/settlement-statement-pdf";
 import { buildSettlementStatement } from "@/services/invoices/settlement-statement";
 
 export const dynamic = "force-dynamic";
 
 /**
- * Section 17's settlement statement, as the CSV file the merchant downloads.
+ * Section 17's settlement statement, as the file the merchant downloads: CSV by default, PDF when
+ * the caller asks for it with `format=pdf`.
  *
  * ## Why the read is a `GET` with no token and no body
  *
@@ -21,10 +23,19 @@ export const dynamic = "force-dynamic";
  * ## Why the file is answered, not a JSON body
  *
  * The screen's one job is to hand the merchant a file, and a file the browser saves is a file the
- * merchant opens in a spreadsheet. A JSON body would make the screen reassemble the document it just
- * asked for, and a document reassembled in a browser is a document a slow script can change. The
- * response is the file: `text/csv`, an attachment named with the period it covers, `no-store`
- * because the rows are one merchant's money.
+ * merchant opens - in a spreadsheet, or in a viewer. A JSON body would make the screen reassemble
+ * the document it just asked for, and a document reassembled in a browser is a document a slow script
+ * can change. The response is the file: `text/csv` or `application/pdf`, an attachment named with
+ * the period it covers, `no-store` because the rows are one merchant's money.
+ *
+ * ## The one endpoint, the two forms
+ *
+ * The same statement, the same rules, the same auth - only the renderer differs. The `format`
+ * parameter picks the file the merchant asked for, and nothing else: the period, the role, the
+ * account and the entries are judged the same way whichever file comes back, because they are the
+ * same statement. A caller that asked for a form the statement has no renderer for gets the CSV,
+ * the statement's default, not a refusal - the forms are additions to the statement, not a
+ * vocabulary the caller has to name exactly.
  *
  * ## The order of the work
  *
@@ -44,14 +55,28 @@ export const GET = withErrorResponse(
       audit: runtime.audit,
     });
 
-    const statement = await buildSettlementStatement(
-      {
-        actor,
-        from: parameters.get("from"),
-        to: parameters.get("to"),
-      },
-      { rest: runtime.rest },
-    );
+    const period = {
+      from: parameters.get("from"),
+      to: parameters.get("to"),
+    };
+
+    if (parameters.get("format") === "pdf") {
+      const statement = await buildSettlementStatementPdf({ actor, ...period }, { rest: runtime.rest });
+
+      // A response body must be backed by its own `ArrayBuffer`: the bytes the writer assembled are
+      // handed to the platform as a copy, so no later read of a pooled allocation can reach into a
+      // statement on its way to a merchant.
+      return new NextResponse(statement.pdf.slice(), {
+        status: 200,
+        headers: {
+          "content-type": "application/pdf",
+          "content-disposition": `attachment; filename="${statement.filename}"`,
+          "cache-control": "no-store",
+        },
+      });
+    }
+
+    const statement = await buildSettlementStatement({ actor, ...period }, { rest: runtime.rest });
 
     return new NextResponse(statement.csv, {
       status: 200,

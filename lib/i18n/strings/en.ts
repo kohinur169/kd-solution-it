@@ -2692,6 +2692,7 @@ const catalog = {
     fromHint: "The statement starts at the beginning of this day.",
     toHint: "The statement ends at the end of this day.",
     download: "Download CSV",
+    downloadPdf: "Download PDF",
     preparing: "Preparing",
     periodReversed: "The first day must be on or before the last day.",
     periodInvalid: "That is not a day in the form this statement takes.",
