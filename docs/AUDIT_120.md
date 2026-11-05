@@ -8,24 +8,32 @@ This document answers three questions asked in one breath: which STEPs are done,
 
 ---
 
-## 1. Inventory: 121 of 123 STEPs have a handoff
+## 1. Inventory: 123 of 123 STEPs have a handoff
 
 | Measure | Result |
 |---|---|
 | STEP entries declared in `docs/final/STEP_PLAN_250.md` up to 123 | **123** |
-| Handoffs in `docs/handoffs/` | **122** (121 at audit time) |
-| Missing | **STEP 116** (STEP 096 completed in `df49387`, after this audit) |
+| Handoffs in `docs/handoffs/` | **123** (121 at audit time) |
+| Missing | **none** (STEP 096 closed in `df49387`, STEP 116 in `9c00ea7`, both after this audit) |
 
 The gaps were recorded as `knownGaps` in the gate. That means they cannot be quietly forgotten **and**
 they cannot be used to excuse a third: any *other* missing handoff fails the build with its number. The
-list now names only `116`.
+list is now empty, and it stays a trap rather than a certificate: a missing handoff that is not listed
+fails the build with its number.
 
 **Addendum (post-audit).** STEP 096 was completed in `df49387` ("STEP 096: Provisioning queue and
 office alert…"), which added the queue read and acknowledgement under `services/submerchant/`, the
 `/provisioning-alerts` office screen and its route, and `docs/handoffs/STEP_096_COMPLETED.md`. The gate's
-`knownGaps` dropped from `["096","116"]` to `["116"]` and `npm run verify` is green. STEP 116 remains the
-single outstanding gap below. The STEP 096 subsection that follows is preserved as it was written at
-audit time.
+`knownGaps` dropped from `["096","116"]` to `["116"]` and `npm run verify` is green. The STEP 096
+subsection below is preserved as it was written at audit time.
+
+**Addendum 2 (post-audit).** STEP 116 was completed in `9c00ea7` ("STEP 116: Invoice status workflow
+transitions with paid invoice edit lock and audit entries"), which added the transition graph and the
+send/void moves under `services/invoices/invoice-status.ts`, the `/api/invoices/[id]/send` and
+`/api/invoices/[id]/void` routes, the action bar on the invoice screen, the `paid_locked` rule on the
+line-edit paths, and `docs/handoffs/STEP_116_COMPLETED.md`. The gate's `knownGaps` is now empty and
+`npm run verify` is green. The STEP 116 subsection below is preserved as it was written at audit
+time.
 
 ### STEP 096 — Provisioning queue and office alert when no master account is connected
 
@@ -46,7 +54,8 @@ indefinitely with no signal. This is a **real operational gap**, not a cosmetic 
 
 ### STEP 116 — Invoice status workflow with paid-invoice edit lock and audit entries
 
-**Not built at all.** No handoff, no service function, no route, no UI. Confirmed by search: there is
+**At audit time: not built at all.** *(Now closed; see Addendum 2 above.)* No handoff, no service
+function, no route, no UI. Confirmed by search: there is
 no `updateInvoiceStatus`, no `transitionInvoice`, and `services/invoices/invoices.ts` exports only
 `createInvoice`, `getInvoice` and two option lists.
 
@@ -104,7 +113,7 @@ the gate was required to notice:
 | Remove `invoice_events_default_deny` from `0024` | fail | `every one carries a default-deny policy (missing: invoice_events)` |
 | `requireCsrfToken(x)` → `void (x)` | fail | named the route as unexplained |
 | Delete the `requireCsrfToken(...)` call outright | fail | named the route as unexplained |
-| Move one handoff away | fail | `missing: 096, 100, 116` (at audit time; the same mutation now reports `missing: 100, 116`) |
+| Move one handoff away | fail | `missing: 096, 100, 116` (at audit time; the same mutation now reports `missing: 100`) |
 
 The third of those exposed a **real defect in the first version of the audit gate**: it matched the
 *name* `requireCsrfToken` anywhere in the file, so wrapping the call in `void (` disabled the guard
@@ -178,11 +187,12 @@ runtime tree is clean, and the gate enforces that it stays clean.
 
 ## 5. What to do next, in order
 
-1. **STEP 116** — the invoice status workflow. It unblocks FEATURE_LIST lines 170, 178 and 181, makes
-   STEP 123's reminders reachable, and is a prerequisite for STEP 124. It is the only missing STEP.
-2. **A scratch database** — apply `0001…0119` forward, run the rollback proofs, and `EXPLAIN` the
+1. **A scratch database** — apply `0001…0119` forward, run the rollback proofs, and `EXPLAIN` the
    overdue sweep against `invoices_due_idx`. This is the one verification this sandbox cannot give.
-3. **A startup hook** — `registerRecurringGenerationJob` and the due-schedule enqueue have no caller at
+   No missing STEP remains in 1–123.
+2. **A startup hook** — `registerRecurringGenerationJob` and the due-schedule enqueue have no caller at
    boot (`/api/jobs/health` reports `scheduler.registered: 0`). Deployment work.
+3. **STEP 124** — partial payment recording with the 20 USD minimum, the next STEP in the plan after
+   the now-complete 123. It moves an invoice to `partially_paid`/`paid` through the STEP 116 engine.
 
-STEP 124 was **not** started.
+STEP 124 was **not** started as of this audit; it is now the next thing in the plan.
