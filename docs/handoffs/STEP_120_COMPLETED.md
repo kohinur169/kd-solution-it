@@ -121,6 +121,28 @@ line's list, and one further assertion reads the **query the service actually se
 — the string the fixture records is the string the real client would send, so it is the honest place to look.
 Dropping the prefix now fails the gate in ten places, two of them those.
 
+### The audit entry is proved against the chain production runs
+
+The same blind spot has a second shape. `createInMemoryAuditTrail` pushes whatever it is handed and validates
+nothing, while production runs `requireAuditEntry` against `0013`'s constraints and `buildAuditEntry` at the
+door that redacts and freezes. And `appendTolerated` **swallows** a refusal from the sink — deliberately, so an
+outage never fails the write it records. The combination is the one failure nobody would ever see: an entry the
+chain refuses means the evidence is stored with **no link beside it**, and the gap surfaces only in a dispute,
+months later, when the pack is short a row.
+
+So the gate hands the entry the capture actually produced to the platform's own validator and then through its
+own door: `auditEntryProblem(entry)` is null, and `buildAuditEntry(entry)` leaves the payload **byte-identical**
+after redaction — which is also the proof that `document_hash` is not a secret-shaped key, since redaction works
+on key names and `documenthash` contains none of the fifteen fragments. The address, the agent, the action, the
+null actor, the entity id and the company all survive the door unchanged, and the payload sits far inside
+`AUDIT_MAXIMUM_PAYLOAD_BYTES`.
+
+Failure-probing this found a defect in the gate itself: `buildAuditEntry` **throws** rather than returning a
+refusal, so an invalid entry crashed the gate and took every failure recorded before it down with it — the
+crash skips `run()`'s printing path, so the one output was a stack trace. The door is now called inside a try
+and an entry it refuses arrives as one more legible failure. Probed again: an agent of 600 characters now fails
+three assertions, one of them naming `user_agent_invalid`, instead of crashing.
+
 ## Environment
 
 No new variable. `ENCRYPTION_MASTER_KEY` and the rest are untouched; the evidence table needs no secret of its
@@ -220,7 +242,7 @@ excluding the document's lifecycle and excluding any second spelling of a fact a
 
 ### Gate
 
-`npx --yes tsx services/estimates/verify.ts` — **1 572 checks in 16 groups**, run twice for stability:
+`npx --yes tsx services/estimates/verify.ts` — **1 581 checks in 16 groups**, run twice for stability:
 `checkVocabulary, checkCreate, checkDiscount, checkValidation, checkConflict, checkTenancy, checkBoundaries,
 checkLines, checkRoutes, checkCompensation, checkSources, checkSignature, checkCapture, checkUi,
 checkEvidence, checkMigration`.
@@ -247,7 +269,7 @@ absent elements, and that a stored image is named without its key.
 
 | Gate | Result |
 | --- | --- |
-| `services/estimates` | 1 572 checks, 16 groups |
+| `services/estimates` | 1 581 checks, 16 groups |
 | `services/invoices` | 1 442 checks |
 | `lib/auth` | 2 774 checks |
 | `migrations` | 3 433 checks, 117 migrations, 89 tables |

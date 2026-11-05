@@ -7,7 +7,13 @@ import { createInMemoryAuditTrail, type AuditTrail, type InMemoryAuditTrail } fr
 import type { RestClient } from "../../lib/auth/rest.ts";
 import type { PlatformRole, RequestActor } from "../../lib/auth/types.ts";
 import { AppError, isAppError } from "../../lib/errors/app-error.ts";
-import { AUDIT_MAXIMUM_USER_AGENT_LENGTH } from "../../lib/security/audit.ts";
+import {
+  AUDIT_MAXIMUM_PAYLOAD_BYTES,
+  AUDIT_MAXIMUM_USER_AGENT_LENGTH,
+  auditEntryProblem,
+  auditPayloadBytes,
+  buildAuditEntry,
+} from "../../lib/security/audit.ts";
 import { isIpLiteral } from "../../lib/security/host.ts";
 import { INVOICE_MAXIMUM_LINES, INVOICE_UNITS } from "../invoices/invoice-fields.ts";
 import {
@@ -4631,6 +4637,39 @@ async function checkCapture(): Promise<void> {
   for (const personal of ["Rina Akter", "rina@buyer.example", "Dhaka, BD", "fp-9f2c41ab7d05"]) {
     expect(!payloadText.includes(personal), `the chain holds no "${personal}": personal data lives in the one table section 16 built for it`);
   }
+
+  // The in-memory trail pushes whatever it is handed, so it cannot refuse an entry the real chain would -
+  // and `appendTolerated` swallows a refusal, which makes an invalid entry the one failure nobody sees: the
+  // evidence would be stored with no link beside it, and the gap would only ever show up in a dispute. So
+  // the entry is handed to the platform's own validator and then through the door that redacts and freezes
+  // it, which is exactly what production runs.
+  expectEqual(auditEntryProblem(entry), null, "the entry the capture produced is one the platform's own validator writes");
+
+  // `buildAuditEntry` throws rather than returning a refusal, so it is called inside a try: an entry the
+  // chain would refuse has to arrive as one more legible failure, not as a crash that swallows every
+  // failure recorded before it.
+  let chained: ReturnType<typeof buildAuditEntry> | null = null;
+
+  try {
+    chained = buildAuditEntry(entry);
+  } catch {
+    chained = null;
+  }
+
+  if (chained === null) {
+    expect(false, "and the chain's own door accepts it, which is where the payload is redacted and frozen");
+
+    return;
+  }
+
+  expectDeepEqual(chained.payload, entry.payload, "and the chain's redaction leaves every fact intact, the digest among them");
+  expectEqual(chained.ipAddress, entry.ipAddress ?? null, "the address survives the chain's own canonicalisation unchanged, because it was already the canonical spelling");
+  expectEqual(chained.userAgent, entry.userAgent ?? null, "as does the agent, which the service had already cut to the chain's ceiling");
+  expectEqual(chained.action, entry.action, "and the action");
+  expectEqual(chained.actorUserId, null, "while an entry with no actor stays an entry with no actor");
+  expectEqual(chained.entityId, entry.entityId, "still pointing at the evidence row");
+  expectEqual(chained.companyId, COMPANY_A, "and still in the merchant's chain");
+  expect(auditPayloadBytes(entry.payload) < AUDIT_MAXIMUM_PAYLOAD_BYTES, "with a payload far inside the ceiling `audit_logs_payload_check` measures");
 
   /* -- what a capture refuses -- */
 
