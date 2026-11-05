@@ -13,15 +13,24 @@ This document answers three questions asked in one breath: which STEPs are done,
 | Measure | Result |
 |---|---|
 | STEP entries declared in `docs/final/STEP_PLAN_250.md` up to 123 | **123** |
-| Handoffs in `docs/handoffs/` | **121** |
-| Missing | **STEP 096**, **STEP 116** |
+| Handoffs in `docs/handoffs/` | **122** (121 at audit time) |
+| Missing | **STEP 116** (STEP 096 completed in `df49387`, after this audit) |
 
-Both are recorded as `knownGaps` in the gate. That means they cannot be quietly forgotten **and** they
-cannot be used to excuse a third: any *other* missing handoff fails the build with its number.
+The gaps were recorded as `knownGaps` in the gate. That means they cannot be quietly forgotten **and**
+they cannot be used to excuse a third: any *other* missing handoff fails the build with its number. The
+list now names only `116`.
+
+**Addendum (post-audit).** STEP 096 was completed in `df49387` ("STEP 096: Provisioning queue and
+office alert…"), which added the queue read and acknowledgement under `services/submerchant/`, the
+`/provisioning-alerts` office screen and its route, and `docs/handoffs/STEP_096_COMPLETED.md`. The gate's
+`knownGaps` dropped from `["096","116"]` to `["116"]` and `npm run verify` is green. STEP 116 remains the
+single outstanding gap below. The STEP 096 subsection that follows is preserved as it was written at
+audit time.
 
 ### STEP 096 — Provisioning queue and office alert when no master account is connected
 
-**Partly built, and the missing part is the whole point of the STEP.**
+**At audit time: partly built, and the missing part was the whole point of the STEP.** *(Now closed; see
+the addendum above.)*
 
 Present: `0054_submerchant_provisions.sql` carries `master_account_ref` (null while queued), the
 "queue the office alert reads" index, and `services/submerchant/provision.ts` writes and reads the
@@ -95,7 +104,7 @@ the gate was required to notice:
 | Remove `invoice_events_default_deny` from `0024` | fail | `every one carries a default-deny policy (missing: invoice_events)` |
 | `requireCsrfToken(x)` → `void (x)` | fail | named the route as unexplained |
 | Delete the `requireCsrfToken(...)` call outright | fail | named the route as unexplained |
-| Move one handoff away | fail | `missing: 096, 100, 116` |
+| Move one handoff away | fail | `missing: 096, 100, 116` (at audit time; the same mutation now reports `missing: 100, 116`) |
 
 The third of those exposed a **real defect in the first version of the audit gate**: it matched the
 *name* `requireCsrfToken` anywhere in the file, so wrapping the call in `void (` disabled the guard
@@ -170,11 +179,10 @@ runtime tree is clean, and the gate enforces that it stays clean.
 ## 5. What to do next, in order
 
 1. **STEP 116** — the invoice status workflow. It unblocks FEATURE_LIST lines 170, 178 and 181, makes
-   STEP 123's reminders reachable, and is a prerequisite for STEP 124.
-2. **STEP 096** — the office alert for queued provisions, so a blocked sub-merchant is visible.
-3. **A scratch database** — apply `0001…0119` forward, run the rollback proofs, and `EXPLAIN` the
+   STEP 123's reminders reachable, and is a prerequisite for STEP 124. It is the only missing STEP.
+2. **A scratch database** — apply `0001…0119` forward, run the rollback proofs, and `EXPLAIN` the
    overdue sweep against `invoices_due_idx`. This is the one verification this sandbox cannot give.
-4. **A startup hook** — `registerRecurringGenerationJob` and the due-schedule enqueue have no caller at
+3. **A startup hook** — `registerRecurringGenerationJob` and the due-schedule enqueue have no caller at
    boot (`/api/jobs/health` reports `scheduler.registered: 0`). Deployment work.
 
 STEP 124 was **not** started.
