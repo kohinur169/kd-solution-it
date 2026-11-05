@@ -111,6 +111,16 @@ Both claims were **failure-probed** rather than trusted: renaming `signer_name` 
 list fails the gate with *"the read asks for "signed_by", a column `0027` actually has"*, and adding an
 invented `signer_ip` to the insert payload fails it twice, once for the payload and once for the stored row.
 
+Looking for that blind spot found a real one. `ESTIMATE_SIGNATURE_COLUMNS` was written as a bare
+`id,company_id,...` list, while every other column list in this family is built as `` `select=${[...]}` `` —
+and `RestClient.select` puts its second argument straight after the `?`, so the evidence reads would have
+asked PostgREST for **no column list at all** and received the whole row instead of the seventeen named
+columns. Nothing in the gate could see it: the fixture answers from its own rows and only ever parses the
+filters. It is fixed, the evidence list now joins the shared invariant that already covered the quote's and a
+line's list, and one further assertion reads the **query the service actually sent** rather than the constant
+— the string the fixture records is the string the real client would send, so it is the honest place to look.
+Dropping the prefix now fails the gate in ten places, two of them those.
+
 ## Environment
 
 No new variable. `ENCRYPTION_MASTER_KEY` and the rest are untouched; the evidence table needs no secret of its
@@ -210,7 +220,7 @@ excluding the document's lifecycle and excluding any second spelling of a fact a
 
 ### Gate
 
-`npx --yes tsx services/estimates/verify.ts` — **1 536 checks in 16 groups**, run twice for stability:
+`npx --yes tsx services/estimates/verify.ts` — **1 572 checks in 16 groups**, run twice for stability:
 `checkVocabulary, checkCreate, checkDiscount, checkValidation, checkConflict, checkTenancy, checkBoundaries,
 checkLines, checkRoutes, checkCompensation, checkSources, checkSignature, checkCapture, checkUi,
 checkEvidence, checkMigration`.
@@ -237,7 +247,7 @@ absent elements, and that a stored image is named without its key.
 
 | Gate | Result |
 | --- | --- |
-| `services/estimates` | 1 536 checks, 16 groups |
+| `services/estimates` | 1 572 checks, 16 groups |
 | `services/invoices` | 1 442 checks |
 | `lib/auth` | 2 774 checks |
 | `migrations` | 3 433 checks, 117 migrations, 89 tables |

@@ -259,9 +259,30 @@ export function hashEstimateDocument(estimate: EstimateSnapshot): string {
 
 /* ---- the evidence row ---- */
 
-/** The columns of `0027` a read of the evidence asks for: all of them, because all of them are the record. */
-export const ESTIMATE_SIGNATURE_COLUMNS =
-  "id,company_id,estimate_id,decision,signer_name,signer_email,consent_text,consent_accepted,signed_at,ip,geo_location,device_fingerprint,document_hash,signature_path,created_at,updated_at,version";
+/**
+ * The columns a read of the evidence asks for, in the family's own shape: a `select=` list, never every
+ * column. All of `0027`'s are asked for but one, because all of them are the record; `deleted_at` is the
+ * exception, and it is filtered to null by every read rather than read.
+ */
+export const ESTIMATE_SIGNATURE_COLUMNS = `select=${[
+  "id",
+  "company_id",
+  "estimate_id",
+  "decision",
+  "signer_name",
+  "signer_email",
+  "consent_text",
+  "consent_accepted",
+  "signed_at",
+  "ip",
+  "geo_location",
+  "device_fingerprint",
+  "document_hash",
+  "signature_path",
+  "created_at",
+  "updated_at",
+  "version",
+].join(",")}`;
 
 /** The row shape of `0027`, validated on every read the way the quote's own row is. */
 export const estimateSignatureRowSchema = z.object({

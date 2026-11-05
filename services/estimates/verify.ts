@@ -1519,6 +1519,7 @@ async function checkVocabulary(): Promise<void> {
   for (const [name, list, schema] of [
     ["a quote", ESTIMATE_COLUMNS, estimateRowSchema],
     ["a line", ESTIMATE_ITEM_COLUMNS, estimateItemRowSchema],
+    ["the evidence", ESTIMATE_SIGNATURE_COLUMNS, estimateSignatureRowSchema],
   ] as const) {
     expect(list.startsWith("select="), `${name} is read through a named column list, never through every column`);
 
@@ -4034,7 +4035,7 @@ async function checkSignature(): Promise<void> {
   // have is a query refused in production while the fixture, which builds its own rows, answers it happily.
   // `deleted_at` is the one column the read filters on rather than reads, so the two lists differ by it.
   const tableColumns = await estimateSignatureTableColumns();
-  const askedColumns = ESTIMATE_SIGNATURE_COLUMNS.split(",");
+  const askedColumns = ESTIMATE_SIGNATURE_COLUMNS.slice("select=".length).split(",");
 
   expectEqual(tableColumns.length, 18, "`0027` creates eighteen columns, counted out of the file rather than remembered");
 
@@ -4799,6 +4800,15 @@ async function checkCapture(): Promise<void> {
     reading.db.queries.filter((query) => query.startsWith(ESTIMATE_SIGNATURES_TABLE)).every((query) => (query.split("?")[1] ?? "").includes("company_id=eq.")),
     "and every read of the evidence is scoped to one merchant",
   );
+  // The string the fixture records is the string the real client puts after its `?`, so this is the shape
+  // PostgREST would actually receive: a read with no `select=` is not a named column list but every column,
+  // and the difference is invisible to a fixture that answers from its own rows.
+  expect(
+    reading.db.queries
+      .filter((query) => query.startsWith(ESTIMATE_SIGNATURES_TABLE))
+      .every((query) => (query.split("?")[1] ?? "").startsWith("select=")),
+    "and every read of the evidence asks PostgREST for a named column list, never for every column",
+  );
 
   expectEqual(
     await codeOf(() => readEstimateSignature({ actor: owner, estimateId: randomUUID() }, depsOf(reading.db))),
@@ -4819,7 +4829,7 @@ async function checkCapture(): Promise<void> {
   /* -- the row shape and the reader that validates it -- */
 
   expectDeepEqual(
-    ESTIMATE_SIGNATURE_COLUMNS.split(","),
+    ESTIMATE_SIGNATURE_COLUMNS.slice("select=".length).split(","),
     Object.keys(estimateSignatureRowSchema.shape),
     "the columns a read asks for are exactly the columns the reader validates, so neither can drift alone",
   );
