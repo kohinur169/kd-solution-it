@@ -4033,6 +4033,10 @@ async function checkSignature(): Promise<void> {
 
   expect(migration.includes("\n  signature_path "), "and a drawn signature's storage key, which is a key and never an image");
   expect(migration.includes("ip inet not null"), "the address is an inet, so its shape is the type's and there is no length to restate");
+  // The fixture mints its ids with `randomUUID()`, which is version 4, while `0027` mints its own with a
+  // version-7 function. The two are the same shape to a format check and not to a version check, so the
+  // version the column really produces is stated here and the reader is held to it in `checkCapture`.
+  expect(migration.includes("id uuid not null default public.uuid_generate_v7()"), "and `0027` mints its own ids as version-7 uuids");
   expect(migration.includes("signed_at timestamptz not null"), "and the time is a zoned timestamp in server time, not a string a client sent");
   expectEqual(ESTIMATE_SIGNATURES_TABLE, "estimate_signatures", "the table has one name in this family");
   expect(migration.includes(`create table public.${ESTIMATE_SIGNATURES_TABLE} (`), "which is the table `0027` creates");
@@ -4877,6 +4881,15 @@ async function checkCapture(): Promise<void> {
   const storedRow = reading.db.signatures[0] as Readonly<Record<string, unknown>>;
 
   expect(estimateSignatureRowSchema.safeParse(storedRow).success, "a stored row passes the reader's own schema");
+  // A reader that accepted only version 4 would pass every check in this gate - the fixture mints v4 - and
+  // refuse every row in production, where `0027`'s default mints v7. So the shape the column produces is
+  // fed to the reader rather than assumed to be the shape the fixture happens to make.
+  const versionSeven = "0192f3a4-b5c6-7d8e-9f0a-1b2c3d4e5f67";
+
+  expect(
+    estimateSignatureRowSchema.safeParse({ ...storedRow, id: versionSeven, estimate_id: versionSeven, company_id: versionSeven }).success,
+    "and it accepts a version-7 id in all three of its uuid columns, which is what the table actually stores",
+  );
   expect(!estimateSignatureRowSchema.safeParse({ ...storedRow, document_hash: "nope" }).success, "and a row with a malformed digest does not");
   expect(!estimateSignatureRowSchema.safeParse({ ...storedRow, ip: "" }).success, "nor one with no address");
 

@@ -143,6 +143,22 @@ crash skips `run()`'s printing path, so the one output was a stack trace. The do
 and an entry it refuses arrives as one more legible failure. Probed again: an agent of 600 characters now fails
 three assertions, one of them naming `user_agent_invalid`, instead of crashing.
 
+### And a third shape: the ids are not the version the table mints
+
+The same class of gap appears once more, in the values rather than the names. The fixture mints its ids with
+`randomUUID()`, which is **version 4**, while `0027` mints its own with `public.uuid_generate_v7()`. To a format
+check the two are identical; to a *version* check they are not. A reader holding `.uuid({ version: "v4" })`
+would pass every assertion in this gate and refuse **every row in production** — and nothing in the service, the
+route or the panel would change to suggest it.
+
+So the version the column really produces is now stated in `checkSignature` (`0027`'s own default is asserted
+from the migration text) and the reader is held to it in `checkCapture`: the stored row is re-fed to
+`estimateSignatureRowSchema` with version-7 ids in all three of its uuid columns. Probed by tightening the schema
+to v4-only, which fails that one assertion and nothing else.
+
+Today zod's plain `.uuid()` accepts both versions, so this is a regression guard rather than a repair — but it is
+the cheapest possible one, and it is the reason a future tightening cannot ship unnoticed.
+
 ## Environment
 
 No new variable. `ENCRYPTION_MASTER_KEY` and the rest are untouched; the evidence table needs no secret of its
@@ -242,7 +258,7 @@ excluding the document's lifecycle and excluding any second spelling of a fact a
 
 ### Gate
 
-`npx --yes tsx services/estimates/verify.ts` — **1 581 checks in 16 groups**, run twice for stability:
+`npx --yes tsx services/estimates/verify.ts` — **1 583 checks in 16 groups**, run twice for stability:
 `checkVocabulary, checkCreate, checkDiscount, checkValidation, checkConflict, checkTenancy, checkBoundaries,
 checkLines, checkRoutes, checkCompensation, checkSources, checkSignature, checkCapture, checkUi,
 checkEvidence, checkMigration`.
@@ -269,7 +285,7 @@ absent elements, and that a stored image is named without its key.
 
 | Gate | Result |
 | --- | --- |
-| `services/estimates` | 1 581 checks, 16 groups |
+| `services/estimates` | 1 583 checks, 16 groups |
 | `services/invoices` | 1 442 checks |
 | `lib/auth` | 2 774 checks |
 | `migrations` | 3 433 checks, 117 migrations, 89 tables |
