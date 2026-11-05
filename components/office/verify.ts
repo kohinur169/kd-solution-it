@@ -65,6 +65,11 @@ const repositoryRoot = new URL("../../", import.meta.url);
 const failures: string[] = [];
 let checks = 0;
 
+/** Source with its comments removed, so a claim about code is not answered by prose about code. */
+function codeOf(source: string): string {
+  return source.replaceAll(/\/\*[\s\S]*?\*\/\s*/gu, "").replaceAll(/\/\/.*/gu, "");
+}
+
 function expect(condition: boolean, description: string): void {
   checks += 1;
 
@@ -688,7 +693,10 @@ async function checkShellSource(): Promise<void> {
 
       const source = await readFile(new URL(file, repositoryRoot), "utf8");
 
-      if (source.includes("super_admin")) {
+      // A doc comment may explain who is allowed to call a route, and explaining is not naming: the claim
+      // is about the one file that maps the roles to messages, so the comments go before the search. Three
+      // onboarding routes describe their callers in prose, and prose is not a second vocabulary.
+      if (codeOf(source).includes("super_admin")) {
         roleNamers.push(file);
       }
     }
