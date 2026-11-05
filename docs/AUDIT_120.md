@@ -35,6 +35,40 @@ line-edit paths, and `docs/handoffs/STEP_116_COMPLETED.md`. The gate's `knownGap
 `npm run verify` is green. The STEP 116 subsection below is preserved as it was written at audit
 time.
 
+**Addendum 3 (second pass, post-audit).** A code pass over the two steps completed after this audit
+(096 and 116), and over the paths they touch, found and fixed two code defects and one stale comment,
+and named two gaps that are plan-level rather than code-level.
+
+*Fixed in this pass:*
+
+1. **The provisioning acknowledgement read could lose a mark.** The read of the acknowledgement
+   trail used a limit equal to the number of rows on the page, newest first. A duplicate
+   acknowledgement on one row - which the service explicitly allows, because two officers may both
+   look - would push an older provision's single acknowledgement out of the window, and the screen
+   would show "not yet" for a row that had been seen. The limit is now a stated bound (500, against
+   a page of at most 100 rows whose acknowledgements each cost a second factor and a fresh
+   reauthentication), not the page's own arithmetic.
+2. **The invoice transition answer reported a column the move had not written.** For any move other
+   than send and void, the result's instant would have been the document's issue instant, read from a
+   column the move never touched. The answer now reports the issue instant only for a send, the void
+   instant only for a void, and the move's own instant for everything else - the behaviour its
+   comment always promised.
+3. **A stale comment in the recurring generator** claimed the issue action did not exist and that the
+   number function was called only from the workflow step; both are false now, and the comment says
+   what is true.
+
+*Named, not fixed, because fixing them would invent work the plan does not allocate:*
+
+- **No writer moves an invoice to `overdue`.** The graph allows the move and `invoices_due_idx`
+  exists for a sweep, but no STEP in 001-123 owns the sweep, and `0024`'s event vocabulary has no word
+  for the status move itself (only `overdue_reminder`, which the STEP 123 sweep records). A production
+  invoice therefore cannot reach the sixth of the seven states; the reminder half of section 16 works,
+  the state half does not.
+- **The timeline is written incrementally.** `invoice_events` carries `sent`, `voided` (this audit's
+  steps) and `overdue_reminder` (STEP 123) today; `created`, `viewed`, `payment_received` and `paid`
+  are written by the steps that own those moments as they land. The table's contract is "every step is
+  a row", and the rows arrive with their steps.
+
 ### STEP 096 — Provisioning queue and office alert when no master account is connected
 
 **At audit time: partly built, and the missing part was the whole point of the STEP.** *(Now closed; see

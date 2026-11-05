@@ -48,11 +48,11 @@ import {
  * ## Why a generated invoice is a draft, and why that is not a shortcut
  *
  * `RECURRING_GENERATED_STATUS` is `draft`. Nothing in this STEP issues or sends a document: `0022`'s status
- * vocabulary has no `issued`, `takeInvoiceNumber` is only ever called from a workflow STEP 116 owns, and writing
- * `sent` here would mean inventing a number and an `issued_at` for a bill no merchant approved. A draft says
- * exactly what is true. The consequences are stated rather than hidden: until the issue action exists, generated
- * invoices are not visible as bills, and the reminder sweep below skips them because a document nobody received
- * cannot be late.
+ * vocabulary has no `issued`, and writing `sent` here would mean inventing a number and an `issued_at` for a
+ * bill no merchant approved. A draft says exactly what is true. The consequences are stated rather than
+ * hidden: a generated invoice is not a bill until its merchant sends it through the workflow's own issue
+ * action, where the number and the issue instant come from, and the reminder sweep below skips drafts,
+ * because a document nobody received cannot be late.
  *
  * ## Reminders are recorded, and delivery is somebody else's STEP
  *

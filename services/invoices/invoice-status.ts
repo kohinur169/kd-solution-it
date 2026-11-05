@@ -268,13 +268,23 @@ async function applyTransition(
     payload: { from: input.row.status, to: input.to, ...input.audit.payload },
   });
 
+  // The instant the answer reports is the move's own: the issue instant a send writes, the void instant a
+  // void writes, and for every other move the instant the engine performed it. A column the move did not
+  // write (the issue instant on a document that was issued long ago) is not what the move happened at.
+  const atAnswer =
+    input.to === "sent"
+      ? (after.issued_at ?? at)
+      : input.to === "void"
+        ? (after.voided_at ?? at)
+        : at;
+
   return {
     invoiceId: input.row.id,
     companyId: input.row.company_id,
     from: input.row.status,
     to: input.to,
     number: after.number,
-    at: after.issued_at ?? after.voided_at ?? at,
+    at: atAnswer,
   };
 }
 

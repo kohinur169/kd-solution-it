@@ -13,6 +13,7 @@ import {
   PROVISIONING_BLOCKED_AFTER_MS,
   PROVISIONING_COMPANIES_TABLE,
   PROVISIONING_COMPANY_LIMIT,
+  PROVISIONING_ACKNOWLEDGEMENT_READ_LIMIT,
   PROVISIONING_QUEUE_LIMIT,
   PROVISIONING_QUEUE_STATUS,
   PROVISIONING_QUEUE_TABLE,
@@ -297,9 +298,11 @@ export async function acknowledgeProvisioningAlert(
 /**
  * The acknowledgements already recorded for these rows, newest first per row.
  *
- * One query for the whole page rather than one per row, bounded by the queue's own limit. `audit_logs` is
- * append-only and this read takes only the two columns the screen needs, so a note an officer wrote is
- * never carried into a list view.
+ * One query for the whole page rather than one per row. The cap is the read limit, not the page size: a
+ * limit of the page size would let one provision's newer duplicate acknowledgements push an older provision's
+ * single one out of the window, and the screen would show "not yet" for a row that was seen. Newest first,
+ * first per row, under a cap generous against human duplication. `audit_logs` is append-only and this read
+ * takes only the two columns the screen needs, so a note an officer wrote is never carried into a list view.
  */
 async function readAcknowledgements(
   provisionIds: readonly string[],
@@ -314,7 +317,7 @@ async function readAcknowledgements(
     `select=entity_id,occurred_at&action=eq.${PROVISIONING_ALERT_ACKNOWLEDGED_AUDIT_ACTION}` +
       `&entity_type=eq.${PROVISIONING_ALERT_AUDIT_ENTITY}` +
       `&entity_id=in.(${provisionIds.map((id) => encodeURIComponent(id)).join(",")})` +
-      `&order=occurred_at.desc&limit=${String(provisionIds.length)}`,
+      `&order=occurred_at.desc&limit=${String(PROVISIONING_ACKNOWLEDGEMENT_READ_LIMIT)}`,
     z.object({ entity_id: z.string(), occurred_at: z.string() }),
   );
 

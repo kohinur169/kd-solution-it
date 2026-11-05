@@ -130,10 +130,13 @@ Checked by the family gate (`services/invoices/verify.ts`, 1496 checks) plus the
   `applyTransition`'s shape - the graph already allows both moves - and write `paid_at` in the same
   statement as `status = 'paid'`, because `invoices_paid_instant_check` ties the two. The 20 USD
   floor is `0022`'s `invoices_partial_minimum_check`, already enforced by the database.
-- **STEP 123 (the sweep)** moves an open invoice to `overdue` when `due_at` passes, reading
-  `invoices_due_idx`; the graph allows it from `sent`, `viewed` and `partially_paid`. Its event word
-  is `overdue_reminder`'s cousin - `0024`'s vocabulary has `overdue_reminder` for the reminder, and
-  the sweep's own word must come from there.
+- **The move to `overdue` has no writer yet, and no STEP in 001-123 owns one.** STEP 123's sweep
+  records `overdue_reminder` rows for issued invoices past their due date; it does not move the status.
+  The graph allows the move from `sent`, `viewed` and `partially_paid`, and `invoices_due_idx` exists
+  for a sweep to read - but `0024`'s event vocabulary has no word for the status move itself (only
+  `overdue_reminder`), so a sweep would need both the transition and a new event word. This is the one
+  state of the seven that a production invoice cannot reach today, and it is recorded as a gap rather
+  than closed by inventing a STEP the plan did not allocate.
 - A number is consumed even when the send fails after the take; do not return it to the counter.
 - The screen's action bar reads `INVOICE_STATUS_TRANSITIONS`; a new move the service learns must
   appear in the table or the bar will not offer it.

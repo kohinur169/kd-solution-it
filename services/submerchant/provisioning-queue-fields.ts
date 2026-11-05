@@ -145,3 +145,12 @@ export const PROVISIONING_ALERT_AUDIT_ENTITY = "submerchant_provision";
 
 /** A note on an acknowledgement, bounded so a queue row cannot become a mailbox. */
 export const PROVISIONING_ACKNOWLEDGEMENT_NOTE_LIMITS = Object.freeze({ min: 1, max: 280 });
+
+/**
+ * The ceiling on the acknowledgement read: one row per officer who looked at a provision, so a page of at
+ * most 100 provisions with a handful of duplicate clicks each sits under it with a wide margin. A duplicate
+ * is a second officer, or a second click, behind a second-factor proof, not a loop. Stated as a bound, like
+ * every other bound in this module, rather than left to a limit that a page's own arithmetic can make too
+ * small.
+ */
+export const PROVISIONING_ACKNOWLEDGEMENT_READ_LIMIT = 500;
