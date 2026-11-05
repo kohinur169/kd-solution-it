@@ -263,14 +263,16 @@ What the addendum adds:
   reminder sweep now reads, with `overdue` among them. The rollback drops the index and restores the
   nine-word check, re-validating it against the data, and is refused if an `overdue` row exists - by
   design, because a vocabulary the timeline already uses cannot be stripped.
-- **`sweepOverdueInvoices`** (`services/invoices/invoice-status.ts`) moves a company's open invoices
-  past their due date to `overdue` through STEP 116's own engine: graph check, guarded `status = eq.<from>`
-  write, re-read, one timeline row (actor `system`, no user - `0024`'s
+- **`sweepOverdueInvoices`** (`services/invoices/invoice-status.ts`) moves a company's money-less open
+  documents - `sent` and `viewed` - past their due date to `overdue` through STEP 116's own engine: graph
+  check, guarded `status = eq.<from>` write, re-read, one timeline row (actor `system`, no user - `0024`'s
   `invoice_events_actor_user_check` exists exactly for this), one audit entry (`invoice.overdue`, null
   actor). The due date is checked twice, because the query is a fast path and the row is the authority. A
   row that moves under the sweep's feet - a payment that arrives between the list read and the move - is
   counted as skipped, not failed. `applyTransition` was generalized so the actor facts come from the
-  caller; the merchant's send and void pass theirs unchanged.
+  caller; the merchant's send and void pass theirs unchanged. (STEP 124 later narrowed the sweep's sources
+  to the two money-less states, because `0022`'s money check forbids an overdue document from holding the
+  money a partially paid one holds - see `docs/handoffs/STEP_124_COMPLETED.md`.)
 - **`services/invoices/overdue-sweep-job.ts`** is the job: name `invoice.overdue_sweep`, a `.strict()`
   payload that carries the company and nothing else - the sweep's date is its own clock, so a date does
   not travel in the payload the way a run date does in the recurring job. The attempt ceiling is the

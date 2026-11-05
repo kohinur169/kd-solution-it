@@ -12756,11 +12756,15 @@ async function checkCsrfProtection(): Promise<void> {
   // STEP 116 adds one more file and two more calls: the invoice status actions, which send a draft and void
   // a document - the two moves the status workflow gives a merchant, each its own route and its own token.
   // So the files arrive at forty seven and the call sites at sixty two.
+  //
+  // STEP 124 adds one more call to that same file: the payment form, which records one amount on the
+  // document it sits under, on its own route with its own token.
+  // So the files stay at forty seven and the call sites arrive at sixty three.
   expectEqual(browserMutations.length, 47, "forty seven browser files send a mutation");
   expectEqual(
     browserMutations.reduce((total, path) => total + mutationCalls(appSourceOf(appSources, path)), 0),
-    62,
-    "across sixty two call sites",
+    63,
+    "across sixty three call sites",
   );
   const postCalls = mutationCalls;
   const tokenSpreads = (source: string): number =>

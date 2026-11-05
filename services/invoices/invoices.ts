@@ -172,6 +172,9 @@ export interface InvoiceSnapshot {
   readonly number: string | null;
   /** Null while draft, the issue instant otherwise; set together with the number. */
   readonly issuedAt: string | null;
+  /** The money the document has taken in, beside its printed form: zero while open, the total when paid. */
+  readonly paid: string;
+  readonly paidMinor: string;
   readonly currency: string;
   readonly client: {
     readonly name: string;
@@ -883,6 +886,8 @@ function snapshotOf(row: InvoiceRow, lines: readonly InvoiceItemRow[]): InvoiceS
     status: row.status,
     number: row.number,
     issuedAt: row.issued_at,
+    paid: priceFromMinor(row.amount_paid_minor),
+    paidMinor: row.amount_paid_minor.toString(),
     currency: row.currency,
     client: { name: row.client_name, email: row.client_email, address: row.client_address },
     memo: row.memo,

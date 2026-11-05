@@ -56,12 +56,18 @@ import {
 } from "./invoice-lines.ts";
 import {
   INVOICE_OVERDUE_AUDIT_ACTION,
+  INVOICE_PAID_AUDIT_ACTION,
   INVOICE_PAID_LOCKED_RULE,
+  INVOICE_PAYMENT_BELOW_MINIMUM_RULE,
+  INVOICE_PAYMENT_EXCEEDS_REMAINING_RULE,
+  INVOICE_PAYMENT_INVALID_RULE,
+  INVOICE_PAYMENT_RECEIVED_AUDIT_ACTION,
   INVOICE_SENT_AUDIT_ACTION,
   INVOICE_STATUS_TRANSITIONS,
   INVOICE_VOID_REASON_LIMITS,
   INVOICE_VOIDED_AUDIT_ACTION,
   isLegalInvoiceTransition,
+  recordInvoicePayment,
   sendInvoice,
   sweepOverdueInvoices,
   voidInvoice,
@@ -1276,6 +1282,37 @@ function createInvoiceRest(db: InvoiceDb): RestClient {
           return Promise.reject(new AppError("VALIDATION_FAILED"));
         }
 
+        // `invoices_paid_amount_check`, `invoices_status_money_check` and `invoices_partial_minimum_check`,
+        // on the row being inserted: a document arrives in the money state its status owes.
+        const storedTotal = BigInt(String(stored["total_minor"] ?? "0"));
+        const storedPaid = BigInt(String(stored["amount_paid_minor"] ?? "0"));
+
+        if (storedPaid < 0n || storedPaid > storedTotal) {
+          return Promise.reject(new AppError("VALIDATION_FAILED"));
+        }
+
+        const storedStatus = String(stored["status"]);
+        const storedCurrency = String(stored["currency"] ?? "USD");
+
+        const storedMoneyAgrees =
+          (storedStatus === "paid" && storedPaid === storedTotal) ||
+          (storedStatus === "partially_paid" && storedPaid > 0n && storedPaid < storedTotal) ||
+          ((storedStatus === "draft" || storedStatus === "sent" || storedStatus === "viewed" ||
+            storedStatus === "overdue") &&
+            storedPaid === 0n) ||
+          storedStatus === "void";
+
+        if (!storedMoneyAgrees) {
+          return Promise.reject(new AppError("VALIDATION_FAILED"));
+        }
+
+        if (
+          storedStatus === "partially_paid" &&
+          !((storedCurrency === "USD" && storedPaid >= 2000n) || (storedCurrency !== "USD" && storedPaid > 0n))
+        ) {
+          return Promise.reject(new AppError("VALIDATION_FAILED"));
+        }
+
         db.invoices.push(stored);
 
         return Promise.resolve([schema.parse(stored)]);
@@ -1622,6 +1659,15 @@ function createInvoiceRest(db: InvoiceDb): RestClient {
         return Promise.resolve();
       }
 
+      // The guard the payment's write carries besides the status: the accumulated amount it read, which a
+      // payment that won the same instant may already have moved. A miss on it is a zero-row update, the
+      // same success PostgREST reports for every miss, and the re-read is what makes it a refusal.
+      const paidGuard = parts.get("amount_paid_minor");
+
+      if (paidGuard !== undefined && String(row["amount_paid_minor"]) !== paidGuard.slice(3)) {
+        return Promise.resolve();
+      }
+
       // `invoices_guard_paid`, exactly as the trigger states it: a paid row is frozen, the two metadata
       // columns the row-metadata trigger owns excepted. The service answers this refusal before it ever
       // reaches the database; the trigger is what the fixture proves the service cannot out-run.
@@ -1654,6 +1700,37 @@ function createInvoiceRest(db: InvoiceDb): RestClient {
 
       if ((next["status"] === "paid") !== (next["paid_at"] !== null)) {
         return Promise.reject(new AppError("CONFLICT", { cause: { rule: "invoices_paid_instant_check" } }));
+      }
+
+      // `0022`'s three money checks, on the values the row will hold: the open states hold nothing, a
+      // partially paid one holds some, a paid one holds all, and a partially paid USD document has taken
+      // in at least the floor the state itself carries.
+      const nextTotal = BigInt(String(next["total_minor"] ?? "0"));
+      const nextPaid = BigInt(String(next["amount_paid_minor"] ?? "0"));
+
+      if (nextPaid < 0n || nextPaid > nextTotal) {
+        return Promise.reject(new AppError("CONFLICT", { cause: { rule: "invoices_paid_amount_check" } }));
+      }
+
+      const nextStatus = String(next["status"]);
+      const nextCurrency = String(next["currency"] ?? "USD");
+
+      const moneyStateAgrees =
+        (nextStatus === "paid" && nextPaid === nextTotal) ||
+        (nextStatus === "partially_paid" && nextPaid > 0n && nextPaid < nextTotal) ||
+        ((nextStatus === "draft" || nextStatus === "sent" || nextStatus === "viewed" || nextStatus === "overdue") &&
+          nextPaid === 0n) ||
+        nextStatus === "void";
+
+      if (!moneyStateAgrees) {
+        return Promise.reject(new AppError("CONFLICT", { cause: { rule: "invoices_status_money_check" } }));
+      }
+
+      if (
+        nextStatus === "partially_paid" &&
+        !((nextCurrency === "USD" && nextPaid >= 2000n) || (nextCurrency !== "USD" && nextPaid > 0n))
+      ) {
+        return Promise.reject(new AppError("CONFLICT", { cause: { rule: "invoices_partial_minimum_check" } }));
       }
 
       const subtotal = BigInt(String(next["subtotal_minor"]));
@@ -4176,19 +4253,22 @@ async function checkOverdueSweep(): Promise<void> {
 
   const first = await sweepOverdueInvoices({ companyId: COMPANY_A }, depsOf(db, audit));
 
-  expectEqual(first.marked.length, 2, "the two open documents past their due date, and nothing else");
-  expect(first.marked.includes(String(sentDue["id"])), "the sent document is among them");
-  expect(first.marked.includes(String(partialDue["id"])), "and the partially paid one");
+  expectEqual(first.marked.length, 1, "the one money-less open document past its due date, and nothing else");
+  expect(first.marked.includes(String(sentDue["id"])), "the sent document is it");
   expectEqual(first.skipped, 0, "with no row that moved under the sweep's feet");
 
   expectEqual(sentDue["status"], "overdue", "the sent document is overdue");
-  expectEqual(partialDue["status"], "overdue", "and the partially paid one, too");
+  expectEqual(
+    partialDue["status"],
+    "partially_paid",
+    "and the partially paid one stays, because 0022's money check forbids an overdue document from holding money",
+  );
   expectEqual(sentNotDue["status"], "sent", "the not-yet-due document stays sent");
   expectEqual(draftRow["status"], "draft", "the draft stays a draft");
   expectEqual(paidRow["status"], "paid", "the paid document stays paid");
   expectEqual(alreadyOverdue["status"], "overdue", "and the already overdue one is left where it is");
 
-  expectEqual(db.invoiceEvents.length, 2, "one timeline row per moved document");
+  expectEqual(db.invoiceEvents.length, 1, "one timeline row for the moved document");
 
   for (const event of db.invoiceEvents) {
     expectEqual(event["type"], "overdue", "in the word 0120 added to the vocabulary");
@@ -4197,24 +4277,19 @@ async function checkOverdueSweep(): Promise<void> {
     expectEqual(event["detail"], null, "and carrying nothing the invoice itself does not carry");
   }
 
-  const eventInvoices = db.invoiceEvents.map((event) => String(event["invoice_id"])).sort();
-
   expectEqual(
-    eventInvoices.join(","),
-    [String(sentDue["id"]), String(partialDue["id"])].sort().join(","),
-    "on the two documents the sweep moved",
+    String(at(db.invoiceEvents, 0, "the overdue event")["invoice_id"]),
+    String(sentDue["id"]),
+    "on the document the sweep moved",
   );
 
-  expectEqual(audit.entries.length, 2, "one audit entry per moved document");
+  expectEqual(audit.entries.length, 1, "one audit entry for the moved document");
 
   for (const entry of audit.entries) {
     expectEqual(entry.action, INVOICE_OVERDUE_AUDIT_ACTION, "under the sweep's action");
     expectEqual(entry.actorUserId, null, "and for no person");
     expectEqual(entry.entityType, INVOICE_AUDIT_ENTITY, "on the document's own entity");
-    expect(
-      entry.payload["due_at"] === sentDue["due_at"] || entry.payload["due_at"] === partialDue["due_at"],
-      "carrying the due date that made the document overdue",
-    );
+    expect(entry.payload["due_at"] === sentDue["due_at"], "carrying the due date that made the document overdue");
   }
 
   // ---- the second run: the status is the dedupe, so a repeated run is a no-op
@@ -4222,8 +4297,8 @@ async function checkOverdueSweep(): Promise<void> {
 
   expectEqual(second.marked.length, 0, "a second run marks nothing");
   expectEqual(second.skipped, 0, "and counts nothing as missed");
-  expectEqual(db.invoiceEvents.length, 2, "and writes no second timeline row");
-  expectEqual(audit.entries.length, 2, "nor a second audit entry");
+  expectEqual(db.invoiceEvents.length, 1, "and writes no second timeline row");
+  expectEqual(audit.entries.length, 1, "nor a second audit entry");
 
   // ---- the race: a payment that arrives between the list read and the move
   const raceRow: Record<string, unknown> = { ...statusRowFixture(COMPANY_A, "sent"), due_at: dueAgo(1) };
@@ -4280,12 +4355,12 @@ async function checkOverdueSweep(): Promise<void> {
     "VALIDATION_FAILED",
     "nor a detail past the bound",
   );
-  expectEqual(db.invoiceEvents.length, 2, "and a refused row is not written");
+  expectEqual(db.invoiceEvents.length, 1, "and a refused row is not written");
 
   await rest.insert("invoice_events", [
     eventOf({ actor: "merchant", actor_user_id: OWNER_ID, detail: "the word in a person's own hand" }),
   ]);
-  expectEqual(db.invoiceEvents.length, 3, "and the overdue word itself is written, in any actor's hand");
+  expectEqual(db.invoiceEvents.length, 2, "and the overdue word itself is written, in any actor's hand");
 
   // ---- the job: the name, the payload, the registration
   expect(overdueSweepJobPayloadSchema.safeParse({ company_id: COMPANY_A }).success, "the payload carries the company");
@@ -4335,6 +4410,215 @@ async function checkOverdueSweep(): Promise<void> {
     1,
     "the module registers exactly once, inside its own registration function",
   );
+}
+
+/**
+ * STEP 124: recording a payment on an issued invoice, and the 20 USD minimum a partial carries.
+ */
+async function checkPayments(): Promise<void> {
+  // The document every case bills: three hundred major units, which a four-decimal platform stores as
+  // 3,000,000 minor - enough above the 20.0000 minimum that a partial can be offered below it.
+  const payFixture = (status: "sent" | "viewed" | "partially_paid" | "paid" | "overdue" | "draft" | "void", paidMinor: string) => {
+    const row: Record<string, unknown> = {
+      ...statusRowFixture(COMPANY_A, status === "draft" || status === "void" ? "sent" : status),
+      subtotal_minor: "3000000",
+      total_minor: "3000000",
+      amount_paid_minor: paidMinor,
+    };
+
+    if (status === "draft") {
+      row["status"] = "draft";
+      row["number"] = null;
+      row["issued_at"] = null;
+    }
+
+    if (status === "void") {
+      row["status"] = "void";
+      row["voided_at"] = new Date(NOW).toISOString();
+    }
+
+    return row;
+  };
+
+  const record = (db: InvoiceDb, audit: ReturnType<typeof createInMemoryAuditTrail>, invoiceId: string, amount: unknown) =>
+    recordInvoicePayment({ actor: owner, invoiceId, amount }, depsOf(db, audit));
+
+  // ---- the first payment: money and state are one move
+  const db = createDb();
+  const audit = createInMemoryAuditTrail();
+  const first = payFixture("sent", "0");
+  db.invoices.push(first);
+
+  const one = await record(db, audit, String(first["id"]), "200.00");
+
+  expectEqual(one.from, "sent", "the payment starts from the state the row held");
+  expectEqual(one.to, "partially_paid", "and a partial leaves the document open with money");
+  expectEqual(one.paidMinor, 2_000_000n, "the money read in is what the row now holds");
+  expectEqual(one.remainingMinor, 1_000_000n, "and the rest is what it still owes");
+  expectEqual(first["status"], "partially_paid", "the row is partially paid");
+  expectEqual(String(first["amount_paid_minor"]), "2000000", "with the payment written beside the state");
+  expectEqual(String(first["number"]), "INV-00001", "and the number the document already carried is kept");
+
+  expectEqual(db.invoiceEvents.length, 1, "one timeline row for the payment");
+  const paidEvent = at(db.invoiceEvents, 0, "the payment event");
+
+  expectEqual(paidEvent["type"], "payment_received", "in the word 0024 gives a payment that leaves the door open");
+  expectEqual(paidEvent["actor"], "merchant", "acted by the merchant");
+  expectEqual(paidEvent["actor_user_id"], OWNER_ID, "and named for the person who recorded it");
+  expectEqual(paidEvent["detail"], "200.0000 USD", "carrying the amount in the one form the platform prints");
+
+  expectEqual(audit.entries.length, 1, "one audit entry for the payment");
+  const paidEntry = at(audit.entries, 0, "the payment audit entry");
+
+  expectEqual(paidEntry.action, INVOICE_PAYMENT_RECEIVED_AUDIT_ACTION, "under the payment's action");
+  expectEqual(paidEntry.entityId, String(first["id"]), "on the document it moved");
+  expectEqual((paidEntry.payload as { readonly amount_minor?: unknown })["amount_minor"], "2000000", "with the amount in minor units");
+  expectEqual((paidEntry.payload as { readonly paid_minor?: unknown })["paid_minor"], "2000000", "the money now held");
+  expectEqual((paidEntry.payload as { readonly remaining_minor?: unknown })["remaining_minor"], "1000000", "and the rest still owed");
+
+  // ---- the second payment: the self-loop, a partial on a document already partially paid
+  const two = await record(db, audit, String(first["id"]), "90.00");
+
+  expectEqual(two.from, "partially_paid", "the second payment starts from the first payment's state");
+  expectEqual(two.to, "partially_paid", "and leaves it there, because the money, not the state, changed");
+  expectEqual(two.paidMinor, 2_900_000n, "the accumulated amount grew");
+  expectEqual(two.remainingMinor, 100_000n, "and a remainder below the minimum is what the last payment will be");
+  expectEqual(String(first["amount_paid_minor"]), "2900000", "and the row says so");
+  expectEqual(db.invoiceEvents.length, 2, "one more timeline row for the second payment");
+
+  // ---- the payment that settles: below the minimum, because it is not a partial
+  const three = await record(db, audit, String(first["id"]), "10.00");
+
+  expectEqual(three.to, "paid", "the last remainder settles the document");
+  expectEqual(three.remainingMinor, 0n, "and nothing remains");
+  expectEqual(first["status"], "paid", "the row is paid");
+  expectEqual(String(first["amount_paid_minor"]), "3000000", "holding the whole");
+  expect(first["paid_at"] !== null, "with the paid instant written in the same statement");
+  const settledEvent = at(db.invoiceEvents, 2, "the settling event");
+
+  expectEqual(settledEvent["type"], "paid", "in the word 0024 gives a document that has taken it all");
+  expectEqual(audit.entries[2]?.action, INVOICE_PAID_AUDIT_ACTION, "and the audit names the settling payment");
+
+  // A paid document takes no more money, for the same reason it takes no more edits. Its remaining is
+  // zero, so the first line of refusal is the ceiling; the paid lock of the engine stands behind it as
+  // the second, for a caller the validation never met.
+  const locked = await refusalOfAsync(() => record(db, audit, String(first["id"]), "1.00"));
+
+  expectEqual(locked[0]?.rule, INVOICE_PAYMENT_EXCEEDS_REMAINING_RULE, "a payment on a paid document is refused at the ceiling");
+  expectEqual(audit.entries.length, 3, "and it left the trail it found");
+  expectEqual(db.invoiceEvents.length, 3, "and wrote nothing");
+
+  // ---- the minimum: on the partial, and only on the partial
+  const belowDb = createDb();
+  const belowAudit = createInMemoryAuditTrail();
+  const below = payFixture("sent", "0");
+  belowDb.invoices.push(below);
+
+  const belowRefusal = await refusalOfAsync(() => record(belowDb, belowAudit, String(below["id"]), "19.9999"));
+
+  expectEqual(belowRefusal[0]?.field, "amount", "the refusal names the field");
+  expectEqual(belowRefusal[0]?.rule, INVOICE_PAYMENT_BELOW_MINIMUM_RULE, "and the rule is the minimum");
+  expectEqual(below["status"], "sent", "the document is still sent");
+  expectEqual(String(below["amount_paid_minor"]), "0", "and it still holds nothing");
+  expectEqual(belowDb.invoiceEvents.length, 0, "and nothing was written");
+
+  const boundary = await record(belowDb, belowAudit, String(below["id"]), "20.00");
+
+  expectEqual(boundary.to, "partially_paid", "twenty is a partial the minimum accepts, not a refusal");
+  expectEqual(boundary.paidMinor, 200_000n, "and the row holds exactly the floor");
+
+  // ---- the remaining is the ceiling
+  const overDb = createDb();
+  const overAudit = createInMemoryAuditTrail();
+  const over = payFixture("sent", "0");
+  overDb.invoices.push(over);
+
+  const overRefusal = await refusalOfAsync(() => record(overDb, overAudit, String(over["id"]), "300.0001"));
+
+  expectEqual(overRefusal[0]?.rule, INVOICE_PAYMENT_EXCEEDS_REMAINING_RULE, "a cent above the remainder is refused");
+  expectEqual(over["status"], "sent", "and the document is untouched");
+
+  const partialOver = payFixture("partially_paid", "2000000");
+  overDb.invoices.push(partialOver);
+
+  const partialOverRefusal = await refusalOfAsync(() => record(overDb, overAudit, String(partialOver["id"]), "100.0001"));
+
+  expectEqual(partialOverRefusal[0]?.rule, INVOICE_PAYMENT_EXCEEDS_REMAINING_RULE, "and the ceiling is the rest, once some has been taken in");
+
+  // ---- the amount, or its absence, is a validation problem at the field
+  const zero = await refusalOfAsync(() => record(overDb, overAudit, String(over["id"]), "0"));
+
+  expectEqual(zero[0]?.rule, "zero_amount", "an amount that pays nothing is refused by name");
+
+  for (const notAnAmount of ["12.50505", "12,50", "abc", 1500]) {
+    const invalid = await refusalOfAsync(() => record(overDb, overAudit, String(over["id"]), notAnAmount));
+
+    expectEqual(invalid[0]?.rule, INVOICE_PAYMENT_INVALID_RULE, `a payment of ${JSON.stringify(notAnAmount)} is not an amount`);
+  }
+
+  const absent = await refusalOfAsync(() => record(overDb, overAudit, String(over["id"]), undefined));
+
+  expectEqual(absent[0]?.rule, INVOICE_PAYMENT_INVALID_RULE, "and a body without an amount is refused at the same field");
+
+  // ---- the states that take no money
+  const draftDb = createDb();
+  const draftAudit = createInMemoryAuditTrail();
+  const draft = payFixture("draft", "0");
+  draftDb.invoices.push(draft);
+
+  const draftRefusal = await refusalOfAsync(() => record(draftDb, draftAudit, String(draft["id"]), "20.00"));
+
+  expectEqual(draftRefusal[0]?.rule, "illegal_transition", "a draft is not paid, because it has not been issued");
+  expectEqual(draft["status"], "draft", "and it is still a draft");
+
+  const voidDb = createDb();
+  const voidAudit = createInMemoryAuditTrail();
+  const voided = payFixture("void", "0");
+  voidDb.invoices.push(voided);
+
+  const voidRefusal = await refusalOfAsync(() => record(voidDb, voidAudit, String(voided["id"]), "20.00"));
+
+  expectEqual(voidRefusal[0]?.rule, "illegal_transition", "a voided document is closed to money, for the same reason it is closed to everything");
+
+  // ---- the race: a payment that won the same instant
+  const raceDb = createDb();
+  const raceAudit = createInMemoryAuditTrail();
+  const raced = payFixture("partially_paid", "2000000");
+  raceDb.invoices.push(raced);
+
+  // The other payment, read the same row and recorded first: it left the document holding 2,100,000,
+  // not the 2,000,000 this one's write still expects.
+  raceDb.raceInvoiceRow = { status: "partially_paid", amount_paid_minor: "2100000" };
+
+  const raceRefusal = await refusalOfAsync(() => record(raceDb, raceAudit, String(raced["id"]), "20.00"));
+
+  expectEqual(raceRefusal[0]?.rule, "already_changed", "the loser of the race is refused, not recorded");
+  expectEqual(String(raced["amount_paid_minor"]), "2100000", "and the winner's money stands");
+  expectEqual(raceDb.invoiceEvents.length, 0, "with no timeline row for the payment that did not land");
+
+  // ---- the graph the bar reads: the self-loop is legal, and only there
+  expect(isLegalInvoiceTransition("partially_paid", "partially_paid"), "a partially paid document accepts another partial");
+  expect(!isLegalInvoiceTransition("sent", "sent"), "and no other state accepts itself");
+  expect(isLegalInvoiceTransition("overdue", "partially_paid"), "an overdue document takes a partial, because the money ends it");
+
+  // ---- the snapshot the screen prints: the money beside its printed form
+  const snapshotDb = createDb();
+  const paidRow = payFixture("paid", "3000000");
+  snapshotDb.invoices.push(paidRow);
+  const snapshot = await getInvoice({ actor: owner, invoiceId: String(paidRow["id"]) }, depsOf(snapshotDb));
+
+  expectEqual(snapshot.paid, "300.0000", "the printed form of the money held");
+  expectEqual(snapshot.paidMinor, "3000000", "and the minor units beside it");
+
+  // ---- the boundary the service is reached through: the route and its protection
+  const paymentRoute = await readRepositoryFile("app/api/invoices/[id]/payments/route.ts");
+  const paymentBar = await readRepositoryFile("app/(dashboard)/invoices/invoice-status-actions.tsx");
+  const csrfSource = await readRepositoryFile("lib/security/csrf.ts");
+
+  expect(paymentRoute.includes("requireCsrfToken("), "the route checks the token before anything else");
+  expect(paymentRoute.includes("recordInvoicePayment("), "and its only work is the one service call");
+  expect(csrfSource.includes('"/api/invoices/[id]/payments"'), "the route is on the protected list");
+  expect(paymentBar.includes("/api/invoices/${invoiceId}/payments"), "and the bar that offers the payment reaches it");
 }
 
 async function checkLineSources(): Promise<void> {
@@ -8358,6 +8642,7 @@ async function run(): Promise<void> {
   await checkNumberingSettings();
   await checkStatusWorkflow();
   await checkOverdueSweep();
+  await checkPayments();
   await checkDiscountEngine();
   await checkDiscountCreate();
   await checkDiscountUpdate();

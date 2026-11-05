@@ -276,6 +276,12 @@ export async function InvoiceEditorScreen({
                 <dt className="text-xs text-muted-foreground">{getMessage("invoices.total")}</dt>
                 <dd className="font-medium">{state.invoice.totals.total}</dd>
               </div>
+              {state.invoice.paidMinor !== "0" ? (
+                <div className="flex flex-col gap-1">
+                  <dt className="text-xs text-muted-foreground">{getMessage("invoices.paidAmountLabel")}</dt>
+                  <dd className="font-medium">{state.invoice.paid}</dd>
+                </div>
+              ) : null}
               {state.invoice.number !== null ? (
                 <div className="flex flex-col gap-1">
                   <dt className="text-xs text-muted-foreground">{getMessage("invoices.numberLabel")}</dt>
@@ -289,6 +295,8 @@ export async function InvoiceEditorScreen({
               status={state.invoice.status}
               number={state.invoice.number}
               issuedAt={state.invoice.issuedAt}
+              paidMinor={state.invoice.paidMinor}
+              totalMinor={state.invoice.totals.totalMinor}
             />
 
             <InvoiceLineEditor invoice={state.invoice} />

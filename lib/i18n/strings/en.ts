@@ -2422,6 +2422,21 @@ const catalog = {
     voidReasonPlaceholder: "What this void means",
     voidNote:
       "Records the void on the timeline. It does not refund anything and does not change a payment.",
+    paidAmountLabel: "Paid",
+    paymentAction: "Record a payment",
+    paymentPending: "Recording the payment...",
+    paymentPanelTitle: "Record a payment",
+    paymentAmountLabel: "Amount (USD)",
+    paymentAmountPlaceholder: "0.00",
+    paymentMinimumHint:
+      "A payment that leaves the invoice open must be at least 20.00. The payment that settles it may be any amount the invoice still owes.",
+    paymentRemaining: "The invoice still owes {amount}.",
+    paymentRecorded: "Payment recorded. The invoice still owes {remaining}.",
+    paymentSettled: "Payment recorded. The invoice is now paid.",
+    paymentFailed: "The payment was not recorded. Try again in a moment.",
+    paymentBelowMinimum:
+      "That is a partial payment below the 20.00 minimum. The amount that settles the invoice may be smaller.",
+    paymentExceedsRemaining: "That is more than the {remaining} the invoice still owes.",
     paidLocked:
       "This invoice is paid, so it is locked and cannot be edited or voided.",
     voidClosed: "This invoice is void, so it is closed. A voided document cannot be changed.",

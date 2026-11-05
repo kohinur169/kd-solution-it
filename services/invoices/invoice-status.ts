@@ -6,7 +6,9 @@ import { isConflictError } from "../../lib/auth/rest.ts";
 import { requireAnyRole, requireCompanyId } from "../../lib/auth/session.ts";
 import type { RequestActor } from "../../lib/auth/types.ts";
 import { AppError, isAppError } from "../../lib/errors/app-error.ts";
+import { appConfig } from "../../config/app.ts";
 import { deepFreeze } from "../../lib/utils/freeze.ts";
+import { priceFromMinor, priceToMinor } from "../products/price.ts";
 import { INVOICE_AUDIT_ENTITY, INVOICE_MANAGE_ROLES } from "./invoices.ts";
 import { INVOICE_STATUSES, type InvoiceStatus } from "./invoice-fields.ts";
 import { takeInvoiceNumber } from "./invoice-numbering.ts";
@@ -84,6 +86,9 @@ export const INVOICE_VOID_REASON_LIMITS = deepFreeze({ min: 1, max: 200 });
  *     exception: `sent` goes to `viewed` because first viewing opens the document, and `overdue` goes
  *     to `viewed` because a client can open a past-due document; `viewed` does not leave, because
  *     `first_viewed_at` keeps the view fact and only the money or the clock moves the state after it.
+ *   - `partially_paid` accepts itself: a second partial payment records money on a document that is
+ *     already partially paid, and `invoices_status_money_check` describes the state after the write,
+ *     not the move - the accumulated amount grows, the state stays the one the first payment made.
  *   - `overdue` does not go back to `sent`: an unpaid document past its due date stays overdue until
  *     the money or a void ends it.
  *   - `paid` and `void` are terminal. The first is frozen by `invoices_guard_paid` in the database;
@@ -94,7 +99,7 @@ export const INVOICE_STATUS_TRANSITIONS: Readonly<Record<InvoiceStatus, readonly
     draft: ["sent", "void"],
     sent: ["viewed", "partially_paid", "paid", "overdue", "void"],
     viewed: ["partially_paid", "paid", "overdue", "void"],
-    partially_paid: ["paid", "overdue", "void"],
+    partially_paid: ["partially_paid", "paid", "overdue", "void"],
     overdue: ["viewed", "partially_paid", "paid", "void"],
     paid: [],
     void: [],
@@ -140,8 +145,8 @@ const statusRowSchema = z.object({
   number: z.string().nullable(),
   status: z.enum(INVOICE_STATUSES),
   currency: z.string().length(3),
-  total_minor: z.string(),
-  amount_paid_minor: z.string(),
+  total_minor: z.union([z.string(), z.number()]),
+  amount_paid_minor: z.union([z.string(), z.number()]),
   issued_at: z.string().nullable(),
   due_at: z.string(),
   first_viewed_at: z.string().nullable(),
@@ -171,6 +176,12 @@ async function applyTransition(
     readonly to: InvoiceStatus;
     /** The columns the move writes beside the status, in the same statement. */
     readonly extra: Readonly<Record<string, unknown>>;
+    /**
+     * The predicates the guarded write carries beside `status = eq.<from>`, a move's own
+     * invariants: the accumulated amount a payment read, which the write must still find or
+     * the payment it carries is not the payment of this row.
+     */
+    readonly guard?: Readonly<Record<string, unknown>>;
     readonly event: {
       readonly type: string;
       readonly detail: string | null;
@@ -206,10 +217,15 @@ async function applyTransition(
 
   const at = new Date(dependencies.now?.() ?? Date.now()).toISOString();
 
+  const guardParts = Object.entries(input.guard ?? {})
+    .map(([column, value]) => `${column}=eq.${encodeURIComponent(String(value))}`)
+    .join("&");
+
   try {
     await dependencies.rest.update(
       "invoices",
-      `id=eq.${input.row.id}&company_id=eq.${input.row.company_id}&status=eq.${input.row.status}`,
+      `id=eq.${input.row.id}&company_id=eq.${input.row.company_id}&status=eq.${input.row.status}` +
+        (guardParts.length > 0 ? `&${guardParts}` : ""),
       { status: input.to, ...input.extra },
     );
   } catch (error) {
@@ -226,10 +242,12 @@ async function applyTransition(
   }
 
   // The zero-row problem: an update that matches nothing is a success to PostgREST. Read the row back
-  // and take the status the row says, not the one the engine hoped for.
+  // and take what the row says, not what the engine hoped for. The read carries every column a move
+  // writes beside the status, one by one (rule 17): the number and instants a send and a void write,
+  // the money a payment writes, the paid instant a full payment writes.
   const rows = await dependencies.rest.select(
     "invoices",
-    `select=id,status,number,issued_at,voided_at` +
+    `select=id,status,number,issued_at,voided_at,amount_paid_minor,paid_at` +
       `&id=eq.${input.row.id}&company_id=eq.${input.row.company_id}&limit=1`,
     z.object({
       id: z.string().uuid(),
@@ -237,6 +255,8 @@ async function applyTransition(
       number: z.string().nullable(),
       issued_at: z.string().nullable(),
       voided_at: z.string().nullable(),
+      amount_paid_minor: z.union([z.string(), z.number()]).nullable(),
+      paid_at: z.string().nullable(),
     }),
   );
   const after = rows[0];
@@ -246,6 +266,18 @@ async function applyTransition(
       details: [{ field: "status", rule: "already_changed" }],
       cause: { rule: "invoice_status", reason: "moved_while_in_flight" },
     });
+  }
+
+  // The written columns, checked back against the row: a zero-row update is only distinguishable from
+  // a success by what the move was meant to leave behind. When the move is the state itself (a payment
+  // on a document already partially paid), the state alone proves nothing, and the money does.
+  for (const [column, written] of Object.entries(input.extra)) {
+    if (String((after as Record<string, unknown>)[column] ?? null) !== String(written)) {
+      throw new AppError("CONFLICT", {
+        details: [{ field: "status", rule: "already_changed" }],
+        cause: { rule: "invoice_status", reason: "moved_while_in_flight" },
+      });
+    }
   }
 
   await dependencies.rest.insert(
@@ -475,6 +507,14 @@ function parseVoidReason(value: unknown): string | null {
  * payload, and the scheduler that decides which companies to sweep - when, and how often - is the same
  * deployment work that wires the recurring job to a clock.
  *
+ * ## Why it reads two states, not the three the index carries
+ *
+ * `invoices_due_idx` is built for the three open states, because it serves the read. The sweep moves
+ * only the two that hold no money: `0022`'s `invoices_status_money_check` puts `amount_paid_minor = 0`
+ * on an overdue document, and a partially paid one holds some by definition, so the database would
+ * refuse the move it offers. A sweep that offered it anyway would spend a guarded write and a re-read
+ * on a refusal the constraint makes certain, every run, for every such document.
+ *
  * ## Why the due date is checked twice
  *
  * The query asks `invoices_due_idx` for the company's open documents past their due date; the code then
@@ -500,12 +540,15 @@ function parseVoidReason(value: unknown): string | null {
  * wrong the first time the document changes.
  */
 
-/** The statuses an overdue sweep may move: the open states `0022`'s `invoices_due_idx` is built for. */
-const OVERDUE_SWEEP_SOURCE_STATUSES: readonly InvoiceStatus[] = deepFreeze([
-  "sent",
-  "viewed",
-  "partially_paid",
-]);
+/**
+ * The statuses an overdue sweep may move: the open states that hold no money.
+ *
+ * `sent` and `viewed`, and not `partially_paid`, because `0022`'s `invoices_status_money_check`
+ * forbids an overdue document from holding money - and a partially paid one always holds some. The
+ * index the due read rides on still carries the three open states, because it serves the read; the
+ * sweep moves only the states the database would let it move.
+ */
+const OVERDUE_SWEEP_SOURCE_STATUSES: readonly InvoiceStatus[] = deepFreeze(["sent", "viewed"]);
 
 /** How many of one company's due documents one sweep run marks. The rest wait for the next run. */
 export const OVERDUE_SWEEP_INVOICE_LIMIT = 200;
@@ -611,4 +654,170 @@ export async function sweepOverdueInvoices(
   }
 
   return { companyId, marked, skipped };
+}
+
+/**
+ * Recording a payment on an issued document: the move where money is what changes the state.
+ *
+ * ## Why the money and the state are one statement
+ *
+ * `0022`'s `invoices_status_money_check` leaves no state in which a sent or viewed document holds
+ * money: the open states hold zero, a partially paid one holds some, a paid one holds all. A
+ * payment that lands is therefore a move, not an annotation: the engine performs it with the
+ * guarded write, the re-read and the entries the other moves get, and the payment's own invariant
+ * joins the guard - the accumulated amount it read must still be there, or the payment it carries
+ * is not the payment of the row it read.
+ *
+ * ## Why the minimum is on the payment, and only while it leaves the document open
+ *
+ * Section 16 accepts partial payments with a minimum of 20 USD, and the platform's config carries
+ * the number (`money.minimumPartialPayment`). The rule sits on the payment, because the payment is
+ * the thing the merchant offers: a five-dollar partial is refused whatever the document already
+ * holds. It stops applying the moment the payment settles the document, because a payment that pays
+ * the last remainder is not a partial payment, and a remainder may sit below the minimum without
+ * the document ever becoming unpayable.
+ *
+ * The database's own floor (`invoices_partial_minimum_check`) sits beneath the rule rather than at
+ * it: at the platform's four-decimal scale its two thousand minor is a backstop, and the service is
+ * the authority on the twenty the feature names.
+ *
+ * ## The entries
+ *
+ * A partial payment writes `payment_received`, the payment that settles writes `paid` - the two
+ * words `0024` gives the moments - each carrying the amount it records in the one form the
+ * platform prints, and the audit entry carrying the money in minor units, where money belongs.
+ */
+
+/** The audit action of a recorded payment that leaves the document open. */
+export const INVOICE_PAYMENT_RECEIVED_AUDIT_ACTION = "invoice.payment_received";
+
+/** The audit action of the payment that settles a document. */
+export const INVOICE_PAID_AUDIT_ACTION = "invoice.paid";
+
+/** The words this move writes to the `0024` timeline, one per kind of payment. */
+const INVOICE_EVENT_PAYMENT_RECEIVED = "payment_received";
+const INVOICE_EVENT_PAID = "paid";
+
+/** The rule a payment answers with when it is a partial below the minimum the feature names. */
+export const INVOICE_PAYMENT_BELOW_MINIMUM_RULE = "below_minimum";
+
+/** The rule a payment answers with when it is more than the document still owes. */
+export const INVOICE_PAYMENT_EXCEEDS_REMAINING_RULE = "exceeds_remaining";
+
+/** The rule a payment answers with when the text is not an amount at all. */
+export const INVOICE_PAYMENT_INVALID_RULE = "invalid_format";
+
+/** The answer a recorded payment gives: the document, the move and the money it now holds. */
+export interface InvoicePaymentResult {
+  readonly invoiceId: string;
+  readonly companyId: string;
+  readonly from: InvoiceStatus;
+  /** The two states a payment can end in: open with money, or settled. */
+  readonly to: "partially_paid" | "paid";
+  readonly number: string | null;
+  /** The accumulated amount after the payment, in minor units. */
+  readonly paidMinor: bigint;
+  /** What the document still owes after the payment, in minor units. */
+  readonly remainingMinor: bigint;
+  readonly at: string;
+}
+
+export async function recordInvoicePayment(
+  input: { readonly actor: RequestActor; readonly invoiceId: unknown; readonly amount: unknown },
+  dependencies: InvoiceStatusDependencies,
+): Promise<InvoicePaymentResult> {
+  requireAnyRole(input.actor, INVOICE_MANAGE_ROLES);
+  const companyId = requireCompanyId(input.actor);
+
+  if (typeof input.invoiceId !== "string") {
+    throw new AppError("VALIDATION_FAILED", { details: [{ field: "id", rule: "invalid_format" }] });
+  }
+
+  // The amount in the one form the merchant types it, through the one parser the platform's money
+  // has: decimal string arithmetic into minor units, and no float beside it.
+  if (typeof input.amount !== "string") {
+    throw new AppError("VALIDATION_FAILED", { details: [{ field: "amount", rule: INVOICE_PAYMENT_INVALID_RULE }] });
+  }
+
+  const amountMinor = priceToMinor(input.amount);
+
+  if (amountMinor === null) {
+    throw new AppError("VALIDATION_FAILED", { details: [{ field: "amount", rule: INVOICE_PAYMENT_INVALID_RULE }] });
+  }
+
+  if (amountMinor <= 0n) {
+    throw new AppError("VALIDATION_FAILED", { details: [{ field: "amount", rule: "zero_amount" }] });
+  }
+
+  const row = await readStatusRow(dependencies, { companyId, invoiceId: input.invoiceId });
+
+  const totalMinor = BigInt(row.total_minor);
+  const paidMinor = BigInt(row.amount_paid_minor);
+  const remainingMinor = totalMinor - paidMinor;
+
+  // The document's remaining amount is the payment's ceiling: an overpayment is not a payment this
+  // service records, because a link that has been paid in full no longer accepts money, and a
+  // document does not owe more than it says on itself.
+  if (amountMinor > remainingMinor) {
+    throw new AppError("VALIDATION_FAILED", {
+      details: [{ field: "amount", rule: INVOICE_PAYMENT_EXCEEDS_REMAINING_RULE }],
+      cause: { rule: "invoice_payment", reason: `remaining:${remainingMinor}` },
+    });
+  }
+
+  const newPaidMinor = paidMinor + amountMinor;
+  const to = newPaidMinor === totalMinor ? ("paid" as const) : ("partially_paid" as const);
+
+  // The minimum the feature names, on the payments that leave the document open, and on the
+  // platform's currency: a partial below it is refused, the settling payment is never a partial,
+  // and a currency the platform does not price at all carries no floor, which `0022`'s own check
+  // agrees with.
+  if (to === "partially_paid" && row.currency === appConfig.money.currencyCode) {
+    const minimumMinor = priceToMinor(appConfig.money.minimumPartialPayment);
+
+    if (minimumMinor !== null && amountMinor < minimumMinor) {
+      throw new AppError("VALIDATION_FAILED", {
+        details: [{ field: "amount", rule: INVOICE_PAYMENT_BELOW_MINIMUM_RULE }],
+        cause: { rule: "invoice_payment", reason: `minimum:${minimumMinor}` },
+      });
+    }
+  }
+
+  const at = new Date(dependencies.now?.() ?? Date.now()).toISOString();
+
+  const result = await applyTransition(dependencies, {
+    row,
+    to,
+    extra:
+      to === "paid"
+        ? { amount_paid_minor: newPaidMinor.toString(), paid_at: at }
+        : { amount_paid_minor: newPaidMinor.toString() },
+    guard: { amount_paid_minor: paidMinor.toString() },
+    event: {
+      type: to === "paid" ? INVOICE_EVENT_PAID : INVOICE_EVENT_PAYMENT_RECEIVED,
+      detail: `${priceFromMinor(amountMinor)} ${row.currency}`,
+      actor: "merchant",
+      actorUserId: input.actor.userId,
+      sessionId: input.actor.sessionId ?? null,
+    },
+    audit: {
+      action: to === "paid" ? INVOICE_PAID_AUDIT_ACTION : INVOICE_PAYMENT_RECEIVED_AUDIT_ACTION,
+      payload: {
+        amount_minor: amountMinor.toString(),
+        paid_minor: newPaidMinor.toString(),
+        remaining_minor: (totalMinor - newPaidMinor).toString(),
+      },
+    },
+  });
+
+  return {
+    invoiceId: result.invoiceId,
+    companyId: result.companyId,
+    from: result.from,
+    to,
+    number: result.number,
+    paidMinor: newPaidMinor,
+    remainingMinor: totalMinor - newPaidMinor,
+    at: result.at,
+  };
 }
