@@ -7,6 +7,8 @@ import { createInMemoryAuditTrail, type AuditTrail, type InMemoryAuditTrail } fr
 import type { RestClient } from "../../lib/auth/rest.ts";
 import type { PlatformRole, RequestActor } from "../../lib/auth/types.ts";
 import { AppError, isAppError } from "../../lib/errors/app-error.ts";
+import { AUDIT_MAXIMUM_USER_AGENT_LENGTH } from "../../lib/security/audit.ts";
+import { isIpLiteral } from "../../lib/security/host.ts";
 import { INVOICE_MAXIMUM_LINES, INVOICE_UNITS } from "../invoices/invoice-fields.ts";
 import {
   createEstimate,
@@ -23,6 +25,32 @@ import {
   type EstimateSnapshot,
 } from "./estimates.ts";
 import { percentToBasisPoints } from "../invoices/invoice-discount.ts";
+import {
+  canonicalEstimateDocumentEncoding,
+  captureEstimateSignature,
+  ESTIMATE_DOCUMENT_HASH_ENCODING,
+  ESTIMATE_SIGNATURE_COLUMNS,
+  estimateSignatureCaptureSchema,
+  estimateSignatureRowSchema,
+  estimateSignatureSnapshotOf,
+  hashEstimateDocument,
+  parseEstimateSignatureCapture,
+  readEstimateSignature,
+  type EstimateSignatureSnapshot,
+} from "./estimate-signature.ts";
+import {
+  ESTIMATE_DOCUMENT_HASH_LENGTH,
+  ESTIMATE_DOCUMENT_HASH_PATTERN,
+  ESTIMATE_SIGNATURES_TABLE,
+  ESTIMATE_SIGNATURE_AUDIT_ENTITY,
+  ESTIMATE_SIGNATURE_DECISIONS,
+  ESTIMATE_SIGNATURE_EMAIL_PATTERN,
+  ESTIMATE_SIGNATURE_FINGERPRINT_PATTERN,
+  ESTIMATE_SIGNATURE_LIMITS,
+  ESTIMATE_SIGNATURE_OPEN_STATUSES,
+  ESTIMATE_SIGNATURE_RECORDED_AUDIT_ACTION,
+  ESTIMATE_SIGNATURE_RULES,
+} from "./estimate-signature-fields.ts";
 import { priceToMinor } from "../products/price.ts";
 import {
   addEstimateLine,
@@ -186,7 +214,7 @@ const owner = actorOf(["owner"], COMPANY_A);
 const otherOwner = actorOf(["owner"], COMPANY_B, { userId: OTHER_OWNER_ID });
 const desk = actorOf(["support"], null, { userId: OFFICE_ID });
 
-/* ---- an in-memory estimates, estimate_items and clients shaped like 0025, 0026, 0117 and 0019 ---- */
+/* ---- an in-memory estimates, estimate_items, estimate_signatures and clients shaped like 0025, 0026, 0027, 0117 and 0019 ---- */
 
 /** A `0019` client row, because the printed snapshot of a quote is read from the book and never from a body. */
 function clientRow(input: {
@@ -228,6 +256,8 @@ interface EstimateDb {
   readonly services: Array<Record<string, unknown>>;
   readonly estimates: Array<Record<string, unknown>>;
   readonly items: Array<Record<string, unknown>>;
+  /** The evidence rows `0027` holds: one per decided quote, and never more. */
+  readonly signatures: Array<Record<string, unknown>>;
   /** Every read, in order, so a loop of queries is visible as a count and not as a guess. */
   readonly queries: string[];
   /** Every insert, in order, so one insert of N lines is distinguishable from N inserts of one. */
@@ -240,6 +270,8 @@ interface EstimateDb {
   failUpdates: boolean;
   /** Set to make the quote insert hit a uniqueness or foreign key violation, as a racing delete would. */
   conflictInsert: boolean;
+  /** Set to make the evidence insert hit its unique index, as two signers deciding one quote at once would. */
+  signatureConflict: boolean;
 }
 
 function catalogueRow(input: {
@@ -308,17 +340,26 @@ function createDb(): EstimateDb {
     ],
     estimates: [],
     items: [],
+    signatures: [],
     queries: [],
     inserts: [],
     updates: [],
     failItems: false,
     failUpdates: false,
     conflictInsert: false,
+    signatureConflict: false,
   };
 }
 
-/** The tables this gate models, so a service that touched a fourth would be caught rather than guessed. */
-const MODELLED_TABLES = ["clients", "products", "services", "estimates", "estimate_items"] as const;
+/** The tables this gate models, so a service that touched another would be caught rather than guessed. */
+const MODELLED_TABLES = [
+  "clients",
+  "products",
+  "services",
+  "estimates",
+  "estimate_items",
+  "estimate_signatures",
+] as const;
 
 function rowsOf(db: EstimateDb, table: string): Array<Record<string, unknown>> {
   switch (table) {
@@ -332,6 +373,8 @@ function rowsOf(db: EstimateDb, table: string): Array<Record<string, unknown>> {
       return db.estimates;
     case "estimate_items":
       return db.items;
+    case "estimate_signatures":
+      return db.signatures;
     default:
       throw new Error(`an unmodelled table was touched: ${table}`);
   }
@@ -670,6 +713,181 @@ function estimateItemProblem(
 }
 
 /**
+ * `0027`'s column checks on the values an evidence row will hold.
+ *
+ * Transcribed from the migration's `check` constraints rather than from the service under test, and through
+ * the limits the vocabulary module states, because `checkSignature` proves those limits against the
+ * migration's own text: one number, one spelling, proved once. Returns the constraint's own name as the
+ * message, because a fixture that says "invalid" tells nobody which rule it is standing in for.
+ */
+function estimateSignatureProblem(
+  row: Readonly<Record<string, unknown>>,
+  db: EstimateDb,
+): string | null {
+  const text = (column: string): string | null => {
+    const value = row[column];
+
+    return typeof value === "string" ? value : null;
+  };
+
+  // `estimate_signatures_estimate_fkey` is composite, so a row naming a quote and a merchant that do not
+  // belong together has no parent to point at - which is what tenant isolation looks like from here.
+  const parent = rowsOf(db, ESTIMATE_TABLE).find(
+    (quote) =>
+      quote["id"] === row["estimate_id"] &&
+      quote["company_id"] === row["company_id"] &&
+      quote["deleted_at"] === null,
+  );
+
+  if (parent === undefined) {
+    return "estimate_signatures_estimate_fkey";
+  }
+
+  const decision = text("decision");
+
+  if (decision === null || !(ESTIMATE_SIGNATURE_DECISIONS as readonly string[]).includes(decision)) {
+    return "estimate_signatures_decision_check";
+  }
+
+  const signerName = text("signer_name");
+
+  if (
+    signerName === null ||
+    signerName.length < ESTIMATE_SIGNATURE_LIMITS.signerName.min ||
+    signerName.length > ESTIMATE_SIGNATURE_LIMITS.signerName.max ||
+    signerName !== signerName.trim()
+  ) {
+    return "estimate_signatures_signer_name_check";
+  }
+
+  const signerEmail = text("signer_email");
+
+  if (
+    signerEmail === null ||
+    signerEmail.length < ESTIMATE_SIGNATURE_LIMITS.signerEmail.min ||
+    signerEmail.length > ESTIMATE_SIGNATURE_LIMITS.signerEmail.max ||
+    !ESTIMATE_SIGNATURE_EMAIL_PATTERN.test(signerEmail)
+  ) {
+    return "estimate_signatures_signer_email_check";
+  }
+
+  const consentText = text("consent_text");
+
+  if (
+    consentText === null ||
+    consentText.length < ESTIMATE_SIGNATURE_LIMITS.consentText.min ||
+    consentText.length > ESTIMATE_SIGNATURE_LIMITS.consentText.max ||
+    consentText !== consentText.trim()
+  ) {
+    return "estimate_signatures_consent_text_check";
+  }
+
+  if (row["consent_accepted"] !== true) {
+    return "estimate_signatures_consent_check";
+  }
+
+  const signedAt = text("signed_at");
+
+  if (signedAt === null || Number.isNaN(Date.parse(signedAt))) {
+    // `signed_at timestamptz not null` carries no constraint name of its own, so the refusal is named
+    // after the column: the element of section 16 it stands in for is the time of the decision.
+    return "estimate_signatures_signed_at_not_null";
+  }
+
+  const ip = text("ip");
+
+  if (ip === null || !isIpLiteral(ip)) {
+    // `ip inet not null`, again a column rather than a named constraint, tested with the platform's own
+    // predicate rather than with a pattern of this gate's.
+    return "estimate_signatures_ip_not_null";
+  }
+
+  const geoLocation = text("geo_location");
+
+  if (
+    geoLocation !== null &&
+    (geoLocation.length < ESTIMATE_SIGNATURE_LIMITS.geoLocation.min ||
+      geoLocation.length > ESTIMATE_SIGNATURE_LIMITS.geoLocation.max ||
+      geoLocation !== geoLocation.trim())
+  ) {
+    return "estimate_signatures_geo_check";
+  }
+
+  const fingerprint = text("device_fingerprint");
+
+  if (
+    fingerprint !== null &&
+    (fingerprint.length < ESTIMATE_SIGNATURE_LIMITS.deviceFingerprint.min ||
+      fingerprint.length > ESTIMATE_SIGNATURE_LIMITS.deviceFingerprint.max ||
+      !ESTIMATE_SIGNATURE_FINGERPRINT_PATTERN.test(fingerprint))
+  ) {
+    return "estimate_signatures_fingerprint_check";
+  }
+
+  const documentHash = text("document_hash");
+
+  if (documentHash === null || !ESTIMATE_DOCUMENT_HASH_PATTERN.test(documentHash)) {
+    return "estimate_signatures_hash_check";
+  }
+
+  const signaturePath = text("signature_path");
+
+  if (
+    signaturePath !== null &&
+    (signaturePath.length < ESTIMATE_SIGNATURE_LIMITS.signaturePath.min ||
+      signaturePath.length > ESTIMATE_SIGNATURE_LIMITS.signaturePath.max ||
+      signaturePath !== signaturePath.trim())
+  ) {
+    return "estimate_signatures_path_check";
+  }
+
+  if (Number(row["version"] ?? 0) <= 0) {
+    return "estimate_signatures_version_positive_check";
+  }
+
+  return null;
+}
+
+/**
+ * The body of one decision, as a signing page would send it.
+ *
+ * Every value inside its column's limits and every one of them a value a signer could have given: an
+ * address out of the documentation range, a fingerprint of the printable shape the column admits, and a
+ * consent sentence that says what it is consenting to.
+ */
+function signatureBodyOf(
+  estimateId: string,
+  overrides: Readonly<Record<string, unknown>> = {},
+): Record<string, unknown> {
+  return {
+    estimate_id: estimateId,
+    company_id: COMPANY_A,
+    decision: "accepted",
+    signer_name: "Rina Akter",
+    signer_email: "rina@buyer.example",
+    consent_text: "I have read this quote and I accept its terms.",
+    consent_accepted: true,
+    ip_address: "203.0.113.44",
+    geo_location: "Dhaka, BD",
+    device_fingerprint: "fp-9f2c41ab7d05",
+    signature_path: null,
+    user_agent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
+    ...overrides,
+  };
+}
+
+/** An issued quote with three lines, which is the only state that accepts a signature. */
+async function openQuoteWith(
+  overrides: Readonly<Record<string, unknown>> = {},
+): Promise<{ readonly db: EstimateDb; readonly snapshot: EstimateSnapshot }> {
+  const quote = await draftWith({ lines: threeLines(), ...overrides });
+
+  issue(quote.db, quote.snapshot.id);
+
+  return quote;
+}
+
+/**
  * Write line rows the way `0026` does, for both insert shapes.
  *
  * The order is the database's: the guards on the row first, then the generated column, then the row becomes
@@ -839,8 +1057,64 @@ function createEstimateRest(db: EstimateDb): RestClient {
         }
       }
 
+      if (table === ESTIMATE_SIGNATURES_TABLE) {
+        if (db.signatureConflict) {
+          // `23505` on `estimate_signatures_estimate_id_key`. PostgREST answers a unique violation with a
+          // conflict, which is the one failure of this insert the REST layer reports as one.
+          return Promise.reject(
+            new AppError("CONFLICT", { cause: { rule: "estimate_signature", reason: "unique_violation" } }),
+          );
+        }
+
+        const evidence: TRow[] = [];
+
+        for (const row of rows) {
+          const candidate: Record<string, unknown> = {
+            id: randomUUID(),
+            signed_at: new Date(NOW).toISOString(),
+            geo_location: null,
+            device_fingerprint: null,
+            signature_path: null,
+            created_at: new Date(NOW).toISOString(),
+            updated_at: new Date(NOW).toISOString(),
+            deleted_at: null,
+            version: 1,
+            ...wireOf(row),
+          };
+
+          // `estimate_signatures_guard_decision` is a BEFORE INSERT trigger, and it reads the quote rather
+          // than the row, so the fixture has to read it too. A trigger's `raise exception` reaches the REST
+          // layer as `check_violation`, which is class 23 and therefore a validation failure, not a conflict.
+          const quote = rowsOf(db, ESTIMATE_TABLE).find(
+            (row_) => row_["id"] === candidate["estimate_id"] && row_["company_id"] === candidate["company_id"],
+          );
+          const state = quote === undefined ? "" : String(quote["status"] ?? "");
+
+          if (!(ESTIMATE_SIGNATURE_OPEN_STATUSES as readonly string[]).includes(state)) {
+            return Promise.reject(
+              new AppError("VALIDATION_FAILED", {
+                cause: { rule: "estimate_signature", reason: "estimate_signatures_guard_decision" },
+              }),
+            );
+          }
+
+          const problem = estimateSignatureProblem(candidate, db);
+
+          if (problem !== null) {
+            return Promise.reject(
+              new AppError("VALIDATION_FAILED", { cause: { rule: "estimate_signature", reason: problem } }),
+            );
+          }
+
+          rowsOf(db, ESTIMATE_SIGNATURES_TABLE).push(candidate);
+          evidence.push(schema.parse(wireOf(candidate)));
+        }
+
+        return Promise.resolve(evidence);
+      }
+
       if (table !== ESTIMATE_TABLE) {
-        return Promise.reject(new Error(`this service returns rows of two tables and nothing else: ${table}`));
+        return Promise.reject(new Error(`this service returns rows of three tables and nothing else: ${table}`));
       }
 
       if (db.conflictInsert) {
@@ -1742,7 +2016,7 @@ async function checkValidation(): Promise<void> {
 
 /**
  * The one failure this part cannot prevent: a client deleted between the read of the book and the write of
- * the quote, or a number taken by a concurrent issue in STEP 120. Both reach the service as a conflict from
+ * the quote, or a number taken by a concurrent write against the same unique index. Both reach the service as a conflict from
  * the database, and both have to answer as a conflict rather than as a broken platform.
  */
 async function checkConflict(): Promise<void> {
@@ -3404,6 +3678,1092 @@ function camelOf(kind: string): string {
   return kind;
 }
 
+/** A module's code with its comments stripped, so an assertion reads the behaviour and not the prose. */
+function sourceCodeOf(source: string): string {
+  return source.replaceAll(/\/\*[\s\S]*?\*\/\s*/gu, "").replaceAll(/\/\/.*/gu, "");
+}
+
+/**
+ * One function's own text, from its signature to the closing brace of its body.
+ *
+ * The alternative is asserting over a whole module, which stops being true the moment the module grows a
+ * second export - and "the hash is pure" is a claim about a function, not about a file. Braces are counted
+ * over comment-stripped source, so a doc comment cannot hold the body open.
+ */
+function functionBodyOf(code: string, name: string): string {
+  const start = code.indexOf(`function ${name}(`);
+
+  if (start === -1) {
+    throw new Error(`gate fixture: no function ${name}`);
+  }
+
+  let depth = 0;
+
+  for (let index = start; index < code.length; index += 1) {
+    const character = code[index];
+
+    if (character === "{") {
+      depth += 1;
+    } else if (character === "}") {
+      depth -= 1;
+
+      if (depth === 0) {
+        return code.slice(start, index + 1);
+      }
+    }
+  }
+
+  throw new Error(`gate fixture: ${name} has no closing brace`);
+}
+
+/** The two captured words of a migration's own list, read out of the file rather than out of a comment. */
+function matchOf(source: string, pattern: RegExp, what: string): readonly [string, string] {
+  const found = pattern.exec(source);
+
+  if (found === null) {
+    throw new Error(`gate fixture: ${what} is missing from the migration`);
+  }
+
+  return [found[1] ?? "", found[2] ?? ""];
+}
+
+/** The floor and ceiling a column's `char_length` check states. */
+function boundsOf(source: string, column: string): { readonly min: number; readonly max: number } {
+  const found = new RegExp(`char_length\\(${column}\\) between (\\d+) and (\\d+)`, "u").exec(source);
+
+  if (found === null) {
+    throw new Error(`gate fixture: ${column} has no length check in 0027`);
+  }
+
+  return { min: Number(found[1]), max: Number(found[2]) };
+}
+
+/** The pattern a column's `~` check states, exactly as the migration spells it. */
+function patternOf(source: string, column: string): string {
+  const found = new RegExp(`${column} ~ '([^']+)'`, "u").exec(source);
+
+  if (found === null) {
+    throw new Error(`gate fixture: ${column} has no pattern check`);
+  }
+
+  return found[1] ?? "";
+}
+
+/** The same value with every object's keys inserted the other way round, deeply. */
+function reverseKeys(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map((entry) => reverseKeys(entry));
+  }
+
+  if (typeof value !== "object" || value === null) {
+    return value;
+  }
+
+  const record = value as Readonly<Record<string, unknown>>;
+  const out: Record<string, unknown> = {};
+
+  for (const key of Object.keys(record).reverse()) {
+    out[key] = reverseKeys(record[key]);
+  }
+
+  return out;
+}
+
+interface DecodedField {
+  readonly name: string;
+  readonly tag: string;
+  readonly value: string;
+}
+
+/**
+ * The canonical encoding read back field by field.
+ *
+ * This is the proof that the encoding is self-delimiting: a decoder that can recover every name, tag and
+ * value from the concatenated string, without knowing anything but the lengths written in it, is a decoder
+ * that cannot be misled by a value containing a colon, a pipe or a field header of its own.
+ */
+function decodeEncoding(encoding: string): readonly DecodedField[] {
+  const bytes = new TextEncoder().encode(encoding);
+  const text = new TextDecoder();
+  const fields: DecodedField[] = [];
+  let cursor = 0;
+
+  while (cursor < bytes.length) {
+    let nameEnd = cursor;
+
+    while (nameEnd < bytes.length && bytes[nameEnd] !== 0x3a) {
+      nameEnd += 1;
+    }
+
+    // The layout is `name:tag:length:value`, so the colon after a one-character tag sits at `nameEnd + 2`
+    // and the digits begin at the byte after it. Scanning for the next colon from the colon itself would
+    // find it immediately and read a length of zero digits.
+    const tagEnd = nameEnd + 2;
+    let lengthEnd = tagEnd + 1;
+
+    while (lengthEnd < bytes.length && bytes[lengthEnd] !== 0x3a) {
+      lengthEnd += 1;
+    }
+
+    const length = Number.parseInt(text.decode(bytes.subarray(tagEnd + 1, lengthEnd)), 10);
+
+    if (!Number.isFinite(length) || length < 0 || lengthEnd + 1 + length > bytes.length) {
+      throw new Error(`gate fixture: the encoding is not decodable at byte ${String(cursor)}`);
+    }
+
+    fields.push({
+      name: text.decode(bytes.subarray(cursor, nameEnd)),
+      tag: text.decode(bytes.subarray(nameEnd + 1, tagEnd)),
+      value: text.decode(bytes.subarray(lengthEnd + 1, lengthEnd + 1 + length)),
+    });
+    cursor = lengthEnd + 1 + length;
+  }
+
+  return fields;
+}
+
+/**
+ * The quote the golden digest is taken over.
+ *
+ * A literal rather than `draftWith()`'s answer, because the fixture database mints a fresh id for every
+ * row it inserts and a digest over those would move on every run. Pinning the encoding needs a document
+ * that does not move.
+ *
+ * Two of its values are awkward on purpose. The address holds a character that is two bytes in UTF-8, so a
+ * length counted in UTF-16 units would put the next field's boundary in the wrong place and the decoder
+ * would read a truncated value. The memo holds a colon and a pipe, so an encoding joined by a separator
+ * would read the memo's own text as a field header. Both are recovered verbatim below, which is the proof
+ * that the encoding counts bytes and delimits itself.
+ *
+ * The amounts are the standard fixture's arithmetic: 2.5 of 125.00 is 312.50, 1 of 99.00 less 5.00 is
+ * 94.00, 4 of 75.00 is 300.00, so the subtotal is 706.50 and with 35.57 of tax the total is 742.07.
+ */
+/**
+ * A character that is two bytes in UTF-8, built from its code point.
+ *
+ * Built rather than typed, because this repository's source has to be English and ASCII - rule 1, and the
+ * `local/english-only-source` lint rule enforces it. A merchant's client may still be called anything at
+ * all, so the gate synthesises the value a real address could hold instead of spelling it in the file. The
+ * string it produces is byte for byte the one a typed character would have been, so the digest below is a
+ * digest over real data and not over an escape.
+ */
+const TWO_BYTE_CHARACTER = String.fromCodePoint(0x00fc);
+
+function signatureFixtureQuote(): EstimateSnapshot {
+  return {
+    id: "0e1a2b3c-4d5e-7f60-8192-a3b4c5d6e7f8",
+    companyId: "1f2e3d4c-5b6a-7980-9182-736455463728",
+    clientId: "2a3b4c5d-6e7f-7081-92a3-b4c5d6e7f809",
+    number: null,
+    status: "draft",
+    voidReason: null,
+    currency: "USD",
+    client: {
+      name: "Acme Ltd",
+      email: "accounts@acme.example",
+      address: `12 Main Road, Z${TWO_BYTE_CHARACTER}rich`,
+    },
+    memo: "Terms: half up front | balance on delivery",
+    expiresAt: "2026-11-19T00:00:00.000Z",
+    issuedAt: null,
+    acceptedAt: null,
+    voidedAt: null,
+    convertedInvoiceId: null,
+    lines: [
+      {
+        id: "3b4c5d6e-7f80-7192-a3b4-c5d6e7f80911",
+        estimateId: "0e1a2b3c-4d5e-7f60-8192-a3b4c5d6e7f8",
+        position: 1,
+        description: "Consulting",
+        unit: "hour",
+        quantity: "2.5",
+        unitPrice: "125.0000",
+        unitPriceMinor: "1250000",
+        discount: "0.0000",
+        discountMinor: "0",
+        lineTotalMinor: "3125000",
+        productId: null,
+        serviceId: null,
+        version: 1,
+        createdAtEpochMs: 1762300800000,
+        updatedAtEpochMs: 1762300800000,
+      },
+      {
+        id: "4c5d6e7f-8091-72a3-b4c5-d6e7f8091122",
+        estimateId: "0e1a2b3c-4d5e-7f60-8192-a3b4c5d6e7f8",
+        position: 2,
+        description: "Hosting",
+        unit: "month",
+        quantity: "1",
+        unitPrice: "99.0000",
+        unitPriceMinor: "990000",
+        discount: "5.0000",
+        discountMinor: "50000",
+        lineTotalMinor: "940000",
+        productId: null,
+        serviceId: null,
+        version: 1,
+        createdAtEpochMs: 1762300800000,
+        updatedAtEpochMs: 1762300800000,
+      },
+      {
+        id: "5d6e7f80-9112-73b4-c5d6-e7f809112233",
+        estimateId: "0e1a2b3c-4d5e-7f60-8192-a3b4c5d6e7f8",
+        position: 3,
+        description: "Training",
+        unit: "hour",
+        quantity: "4",
+        unitPrice: "75.0000",
+        unitPriceMinor: "750000",
+        discount: "0.0000",
+        discountMinor: "0",
+        lineTotalMinor: "3000000",
+        productId: null,
+        serviceId: null,
+        version: 1,
+        createdAtEpochMs: 1762300800000,
+        updatedAtEpochMs: 1762300800000,
+      },
+    ],
+    totals: {
+      subtotal: "706.5000",
+      subtotalMinor: "7065000",
+      discount: "0.0000",
+      discountMinor: "0",
+      discountBasis: "amount",
+      discountPercentBasisPoints: 0,
+      discountPercent: "0",
+      tax: "35.5700",
+      taxMinor: "355700",
+      total: "742.0700",
+      totalMinor: "7420700",
+    },
+    version: 1,
+    createdAtEpochMs: 1762300800000,
+    updatedAtEpochMs: 1762300800000,
+  };
+}
+
+async function checkSignature(): Promise<void> {
+  /* -- the vocabulary is `0027`'s, read out of the file rather than trusted -- */
+
+  const migration = await readRepositoryFile("migrations/0027_estimate_signatures.sql");
+  const auditMigration = await readRepositoryFile("migrations/0013_audit_logs.sql");
+  const fieldsSource = await readRepositoryFile("services/estimates/estimate-signature-fields.ts");
+  const hasherSource = await readRepositoryFile("services/estimates/estimate-signature.ts");
+  const fieldsCode = sourceCodeOf(fieldsSource);
+  const hasherCode = sourceCodeOf(hasherSource);
+
+  expect(migration.startsWith("-- path: migrations/0027_estimate_signatures.sql\n"), "`0027` starts with its path");
+  expect(fieldsSource.startsWith("// path: services/estimates/estimate-signature-fields.ts\n"), "the vocabulary starts with its path");
+  expect(hasherSource.startsWith("// path: services/estimates/estimate-signature.ts\n"), "and so does the hash");
+
+  for (const [name, source] of [
+    ["estimate-signature-fields.ts", fieldsSource],
+    ["estimate-signature.ts", hasherSource],
+  ] as const) {
+    expect(/^[\x20-\x7e\n\r\t]*$/u.test(source), `${name} is ASCII`);
+  }
+
+  // Section 16's eight elements are eight columns, because evidence kept in one JSON blob can be neither
+  // constrained nor indexed nor read by the chargeback pack of section 19.
+  for (const column of [
+    "signer_name",
+    "signer_email",
+    "consent_text",
+    "consent_accepted",
+    "signed_at",
+    "ip",
+    "geo_location",
+    "device_fingerprint",
+    "document_hash",
+  ]) {
+    expect(migration.includes(`\n  ${column} `), `0027 stores ${column} as its own column`);
+  }
+
+  expect(migration.includes("\n  signature_path "), "and a drawn signature's storage key, which is a key and never an image");
+  expect(migration.includes("ip inet not null"), "the address is an inet, so its shape is the type's and there is no length to restate");
+  expect(migration.includes("signed_at timestamptz not null"), "and the time is a zoned timestamp in server time, not a string a client sent");
+  expectEqual(ESTIMATE_SIGNATURES_TABLE, "estimate_signatures", "the table has one name in this family");
+  expect(migration.includes(`create table public.${ESTIMATE_SIGNATURES_TABLE} (`), "which is the table `0027` creates");
+
+  // The two decisions and the two open statuses, read out of the CHECK and out of the trigger.
+  expectDeepEqual(
+    [...ESTIMATE_SIGNATURE_DECISIONS],
+    [...matchOf(migration, /decision in \('([a-z]+)', '([a-z]+)'\)/u, "the decision check")],
+    "the vocabulary's two decisions are the column's two",
+  );
+  expectDeepEqual(
+    [...ESTIMATE_SIGNATURE_OPEN_STATUSES],
+    [...matchOf(migration, /state is distinct from '([a-z]+)' and state is distinct from '([a-z]+)'/u, "the decision guard")],
+    "and a signature is writable in exactly the two statuses the trigger names",
+  );
+
+  // Every length is the column's, extracted and compared as numbers rather than spotted in prose.
+  for (const [key, column] of [
+    ["signerName", "signer_name"],
+    ["signerEmail", "signer_email"],
+    ["consentText", "consent_text"],
+    ["geoLocation", "geo_location"],
+    ["signaturePath", "signature_path"],
+  ] as const) {
+    const bounds = boundsOf(migration, column);
+
+    expectEqual(ESTIMATE_SIGNATURE_LIMITS[key].min, bounds.min, `${column}'s floor is the column's own`);
+    expectEqual(ESTIMATE_SIGNATURE_LIMITS[key].max, bounds.max, `and so is ${column}'s ceiling`);
+    expect(migration.includes(`${column} = btrim(${column})`), `${column} has to arrive trimmed, so a capture path trims before it measures`);
+  }
+
+  // The three patterns are the column's, character for character.
+  expectEqual(patternOf(migration, "signer_email"), ESTIMATE_SIGNATURE_EMAIL_PATTERN.source, "the address shape is the column's");
+  expectEqual(patternOf(migration, "device_fingerprint"), ESTIMATE_SIGNATURE_FINGERPRINT_PATTERN.source, "as is the fingerprint's");
+  expectEqual(patternOf(migration, "document_hash"), ESTIMATE_DOCUMENT_HASH_PATTERN.source, "and the hash's");
+  expectEqual(ESTIMATE_DOCUMENT_HASH_LENGTH, 64, "a stored hash is 64 characters long");
+  expect(/[{]64[}]/u.test(patternOf(migration, "document_hash")), "which is the length `0027`'s own pattern states");
+
+  // The fingerprint's numbers and its pattern have to agree with each other, or one of the two is wrong.
+  const fingerprintBounds = /[{](\d+),(\d+)[}]/u.exec(ESTIMATE_SIGNATURE_FINGERPRINT_PATTERN.source);
+
+  expectEqual(Number(fingerprintBounds?.[1]), ESTIMATE_SIGNATURE_LIMITS.deviceFingerprint.min, "the fingerprint's floor is in the limits and in the pattern alike");
+  expectEqual(Number(fingerprintBounds?.[2]), ESTIMATE_SIGNATURE_LIMITS.deviceFingerprint.max, "and so is its ceiling");
+
+  // Consent is not a boolean that may be false, so an unticked box is a missing required field.
+  expect(migration.includes("constraint estimate_signatures_consent_check check (consent_accepted)"), "an unticked box cannot be stored at all");
+  expect(migration.includes("consent_text = btrim(consent_text)"), "and the wording shown is stored as it was shown");
+
+  // Append-only, one decision per quote, tenant isolated.
+  expect(migration.includes("before update or delete on public.estimate_signatures"), "every update and every removal is refused by a trigger");
+  expect(migration.includes("raise exception 'estimate signatures are append only'"), "with a sentence that says why");
+  expect(migration.includes("create unique index estimate_signatures_estimate_key"), "one quote carries one decision");
+  expect(migration.includes(`on public.${ESTIMATE_SIGNATURES_TABLE} (estimate_id)`), "which is what the unique index says");
+  expect(migration.includes("foreign key (estimate_id, company_id)"), "the evidence belongs to a quote through the tenant key");
+  expect(migration.includes("references public.estimates (id, company_id)"), "so it cannot be attached to another merchant's quote");
+  expect(migration.includes(`alter table public.${ESTIMATE_SIGNATURES_TABLE} enable row level security`), "row level security is on");
+  expect(migration.includes("using (false)") && migration.includes("with check (false)"), "and default-deny, the house pattern for this family");
+
+  // The audit entry this family earns has to be one the audit table stores.
+  expect(new RegExp(patternOf(auditMigration, "action"), "u").test(ESTIMATE_SIGNATURE_RECORDED_AUDIT_ACTION), "the audit action is a shape `0013` accepts");
+  expect(new RegExp(patternOf(auditMigration, "entity_type"), "u").test(ESTIMATE_SIGNATURE_AUDIT_ENTITY), "and so is the entity it names");
+  expectEqual(ESTIMATE_SIGNATURE_RECORDED_AUDIT_ACTION, "estimate.signature_recorded", "in the house entity.verb shape");
+  expectEqual(ESTIMATE_SIGNATURE_AUDIT_ENTITY, "estimate_signature", "naming the evidence row rather than the quote it belongs to");
+
+  // No new rule names, so no screen needs a second map to word a signature refusal.
+  for (const rule of ESTIMATE_SIGNATURE_RULES) {
+    expect((ESTIMATE_RULES as readonly string[]).includes(rule), `"${rule}" is already a rule of this family`);
+  }
+
+  expectEqual(ESTIMATE_SIGNATURE_RULES.length, 7, "and seven of them cover every refusal an evidence row can earn");
+
+  // The vocabulary is numbers, so a browser file may import it: nothing to import, nothing to call.
+  expect(!/^import /mu.test(fieldsSource), "the vocabulary imports nothing, so a browser file may use it");
+
+  // A guard over its own list is what `estimate-fields.ts` and `invoice-fields.ts` export too, so the claim
+  // is not "no function at all" but "nothing that does anything": no guard may throw, await or reach a client.
+  const guardNames = [...fieldsCode.matchAll(/^export function (\w+)/gmu)].map((match) => match[1] ?? "");
+
+  expect(guardNames.every((name) => name.startsWith("is")), "every function the vocabulary exports is a guard over one of its own lists");
+  expect(guardNames.includes("isEstimateSignatureDecision"), "and one of them tells a reader whether a stored decision is one of the two");
+  expect(!fieldsCode.includes("throw"), "the vocabulary throws nothing");
+  expect(!fieldsCode.includes("async"), "awaits nothing");
+  expect(!fieldsCode.includes("RestClient"), "and holds no database client, so a browser file may import it");
+  expect(!/CONSENT_TEXT\s*=/u.test(fieldsCode), "no consent wording is a service constant, because what is stored is what was shown");
+
+  const hashBody = functionBodyOf(hasherCode, "hashEstimateDocument");
+
+  expect(!hashBody.includes("consent"), "and the hashing function does not choose a consent wording either");
+
+  // The vocabulary writes nothing at all. The module around it now holds the capture, so its purity is
+  // claimed of the hashing function itself rather than of the file: a claim about a file goes stale the
+  // moment the file grows a second export, and "the digest is computed from a snapshot" is a claim about
+  // one function and its arguments.
+  expect(!fieldsCode.includes("insertReturning"), "the vocabulary writes no row");
+  expect(!fieldsCode.includes("RestClient"), "and holds no database client");
+  expect(!fieldsCode.includes("take_invoice_number"), "and reaches for no number");
+  expect(!fieldsCode.includes("status:"), "and invents no status");
+
+  expect(!hashBody.includes("RestClient"), "the hashing function holds no database client");
+  expect(!hashBody.includes("rest."), "and reads nothing: a digest of a snapshot needs no query");
+  expect(!hashBody.includes("insertReturning"), "and writes no row");
+  expect(!hashBody.includes("status:"), "and invents no status");
+  expect(!hashBody.includes("take_invoice_number"), "and reaches for no number");
+  expect(!hasherCode.includes("invoice_number_settings"), "nothing in the module generalises \`0114\`");
+
+  /* -- the document hash -- */
+
+  const draft = await draftWith();
+  const quote = draft.snapshot;
+  const digest = hashEstimateDocument(quote);
+
+  expect(ESTIMATE_DOCUMENT_HASH_PATTERN.test(digest), "the hash is 64 lower case hex characters, which is what the column admits");
+  expectEqual(digest.length, ESTIMATE_DOCUMENT_HASH_LENGTH, "and exactly as long as the column says");
+  expectEqual(hashEstimateDocument(quote), digest, "one quote hashes to one digest, every time");
+  /* -- the golden pin, over a document that does not move -- */
+
+  const pinned = signatureFixtureQuote();
+  const pinnedEncoding = canonicalEstimateDocumentEncoding(pinned);
+  const pinnedFields = decodeEncoding(pinnedEncoding);
+
+  expectEqual(
+    hashEstimateDocument(pinned),
+    "559832bb2f137d1d9eb44f0bd5e25dea30f6b5bd4cee70dde57a208c6d7965ba",
+    "the pinned quote's digest is the one this encoding has always produced",
+  );
+  expectEqual(hashEstimateDocument(reverseKeys(pinned) as EstimateSnapshot), hashEstimateDocument(pinned), "and it does not depend on how the snapshot was built");
+
+  const address = at(pinnedFields.filter((field) => field.name === "client_address"), 0, "the address");
+  const memo = at(pinnedFields.filter((field) => field.name === "memo"), 0, "the memo");
+
+  expectEqual(address.value, pinned.client.address, "a two-byte character is recovered verbatim, so lengths are counted in bytes");
+  expect(
+    new TextEncoder().encode(address.value).length > address.value.length,
+    "and the address really does hold a character that is wider than one byte, which is what makes that a test",
+  );
+  expectEqual(memo.value, pinned.memo, "a memo holding a colon and a pipe is recovered verbatim, so the encoding delimits itself");
+  expect(memo.value.includes(":") && memo.value.includes("|"), "and the memo really does hold both");
+
+  // A function of the document, not of how the snapshot happened to be built.
+  expectEqual(hashEstimateDocument(reverseKeys(quote) as EstimateSnapshot), digest, "the snapshot's key order does not reach the digest");
+  expectEqual(hashEstimateDocument({ ...quote, lines: [...quote.lines].reverse() }), digest, "nor the order the lines arrived in, because they are sorted before they are hashed");
+
+  // Every fact about the offer is in: changing one changes the digest.
+  const sensitive: readonly (readonly [string, EstimateSnapshot])[] = [
+    ["which document it is", { ...quote, id: randomUUID() }],
+    ["the merchant whose offer it is", { ...quote, companyId: randomUUID() }],
+    ["the client it is addressed to", { ...quote, clientId: randomUUID() }],
+    ["the client's name", { ...quote, client: { ...quote.client, name: "Another client" } }],
+    ["the client's address", { ...quote, client: { ...quote.client, address: "Another road" } }],
+    ["the address the link was sent to", { ...quote, client: { ...quote.client, email: "another@example.com" } }],
+    ["how long the offer stands", { ...quote, expiresAt: "2027-01-01T00:00:00.000Z" }],
+    ["what else the merchant wrote on it", { ...quote, memo: "Deposit half up front." }],
+    ["a line's description", { ...quote, lines: quote.lines.map((line, index) => (index === 0 ? { ...line, description: "Another thing" } : line)) }],
+    ["a line's unit", { ...quote, lines: quote.lines.map((line, index) => (index === 0 ? { ...line, unit: "day" as const } : line)) }],
+    ["a line's quantity", { ...quote, lines: quote.lines.map((line, index) => (index === 0 ? { ...line, quantity: "3" } : line)) }],
+    ["a line's price", { ...quote, lines: quote.lines.map((line, index) => (index === 0 ? { ...line, unitPriceMinor: "1260000" } : line)) }],
+    ["a line's discount", { ...quote, lines: quote.lines.map((line, index) => (index === 0 ? { ...line, discountMinor: "10000" } : line)) }],
+    ["a line's amount", { ...quote, lines: quote.lines.map((line, index) => (index === 0 ? { ...line, lineTotalMinor: "3025000" } : line)) }],
+    ["the product a line quoted", { ...quote, lines: quote.lines.map((line, index) => (index === 0 ? { ...line, productId: randomUUID() } : line)) }],
+    ["the service a line quoted", { ...quote, lines: quote.lines.map((line, index) => (index === 0 ? { ...line, serviceId: randomUUID() } : line)) }],
+    ["the order the lines are read in", { ...quote, lines: quote.lines.map((line, index) => ({ ...line, position: quote.lines.length - index })) }],
+    ["the subtotal", { ...quote, totals: { ...quote.totals, subtotalMinor: "7065001" } }],
+    ["how the discount was expressed", { ...quote, totals: { ...quote.totals, discountBasis: "percent" as const, discountPercentBasisPoints: 1250, discountMinor: "883125" } }],
+    ["the percentage itself", { ...quote, totals: { ...quote.totals, discountBasis: "percent" as const, discountPercentBasisPoints: 1251 } }],
+    ["the discount", { ...quote, totals: { ...quote.totals, discountMinor: "100" } }],
+    ["the tax", { ...quote, totals: { ...quote.totals, taxMinor: "3557001" } }],
+    ["the total", { ...quote, totals: { ...quote.totals, totalMinor: "7420701" } }],
+    ["how many lines it has", { ...quote, lines: quote.lines.slice(0, 2) }],
+  ];
+
+  for (const [what, changed] of sensitive) {
+    expect(hashEstimateDocument(changed) !== digest, `changing ${what} changes the digest`);
+  }
+
+  // The document's lifecycle is out, so the digest survives every move that does not change the offer.
+  const lifecycle: readonly (readonly [string, EstimateSnapshot])[] = [
+    ["the number it was issued with", { ...quote, number: "Q-2026-0001" }],
+    ["its status", { ...quote, status: "sent" as const }],
+    ["why it ended", { ...quote, status: "void" as const, voidReason: "withdrawn" as const, voidedAt: "2026-11-05T00:00:00.000Z" }],
+    ["when it was issued", { ...quote, issuedAt: "2026-11-05T00:00:00.000Z" }],
+    ["when it was accepted", { ...quote, status: "accepted" as const, acceptedAt: "2026-11-06T00:00:00.000Z" }],
+    ["the invoice it became", { ...quote, status: "accepted" as const, convertedInvoiceId: randomUUID() }],
+    ["its version", { ...quote, version: quote.version + 1 }],
+    ["when it was written", { ...quote, createdAtEpochMs: quote.createdAtEpochMs + 1000, updatedAtEpochMs: quote.updatedAtEpochMs + 1000 }],
+    ["a line's own identity", { ...quote, lines: quote.lines.map((line) => ({ ...line, id: randomUUID() })) }],
+    ["a line's version and timestamps", { ...quote, lines: quote.lines.map((line) => ({ ...line, version: line.version + 1, createdAtEpochMs: 0, updatedAtEpochMs: 0 })) }],
+  ];
+
+  for (const [what, changed] of lifecycle) {
+    expectEqual(hashEstimateDocument(changed), digest, `${what} does not reach the digest`);
+  }
+
+  // A print rule is not evidence: the same stored value spelled another way is the same document.
+  expectEqual(
+    hashEstimateDocument({
+      ...quote,
+      lines: quote.lines.map((line, index) => (index === 0 ? { ...line, quantity: "2.500" } : line)),
+    }),
+    digest,
+    "a quantity spelled 2.500 rather than 2.5 is the same quantity",
+  );
+  expectEqual(
+    hashEstimateDocument({
+      ...quote,
+      lines: quote.lines.map((line) => ({ ...line, unitPrice: "0.0000", discount: "0.0000" })),
+      totals: { ...quote.totals, subtotal: "0.0000", discount: "0.0000", discountPercent: "0", tax: "0.0000", total: "0.0000" },
+    }),
+    digest,
+    "and no printed amount is hashed at all, only the minor units it prints",
+  );
+
+  // The property that makes the digest usable as evidence: issuing the quote does not change the offer.
+  issue(draft.db, quote.id);
+
+  const issued = await getEstimate({ actor: owner, estimateId: quote.id }, depsOf(draft.db));
+
+  expectEqual(issued.status, "sent", "the fixture quote is now sent");
+  expect(issued.number !== null && issued.issuedAt !== null, "with the number and the issued instant `0025` requires of a sent quote");
+  expectEqual(hashEstimateDocument(issued), digest, "and issuing it changed the document's life but not its offer, so the digest stands");
+
+  // The encoding is self-delimiting, which is the only reason a digest over concatenated text is safe.
+  const joined = (name: string, memo: string): string => [name, memo].join("|");
+  const left: EstimateSnapshot = { ...quote, client: { ...quote.client, name: "Acme Ltd" }, memo: "Net 14|Deposit 500" };
+  const right: EstimateSnapshot = { ...quote, client: { ...quote.client, name: "Acme Ltd|Net 14" }, memo: "Deposit 500" };
+
+  expectEqual(joined(left.client.name, left.memo ?? ""), joined(right.client.name, right.memo ?? ""), "a separator join of these two quotes is one string, which is the trap");
+  expect(hashEstimateDocument(left) !== hashEstimateDocument(right), "and the length-prefixed encoding keeps them two documents");
+
+  const forged: EstimateSnapshot = { ...quote, memo: "total_minor:I:1:0" };
+  const forgedFields = decodeEncoding(canonicalEstimateDocumentEncoding(forged));
+
+  expectEqual(forgedFields.filter((field) => field.name === "total_minor").length, 1, "a memo that spells a field header still leaves one total in the encoding");
+  expectEqual(
+    at(forgedFields.filter((field) => field.name === "memo"), 0, "the memo").value,
+    "total_minor:I:1:0",
+    "and the memo comes back verbatim",
+  );
+
+  // What the encoding carries, field by field: this is the field selection, pinned.
+  const lineFieldNames = [
+    "line_position",
+    "line_description",
+    "line_unit",
+    "line_quantity_thousandths",
+    "line_unit_price_minor",
+    "line_discount_minor",
+    "line_total_minor",
+    "line_product_id",
+    "line_service_id",
+  ];
+  const decoded = decodeEncoding(canonicalEstimateDocumentEncoding(quote));
+
+  expectDeepEqual(
+    decoded.map((field) => field.name),
+    [
+      "encoding",
+      "estimate_id",
+      "company_id",
+      "client_id",
+      "currency",
+      "client_name",
+      "client_email",
+      "client_address",
+      "expires_at",
+      "memo",
+      "line_count",
+      ...quote.lines.flatMap(() => lineFieldNames),
+      "subtotal_minor",
+      "discount_basis",
+      "discount_percent_bp",
+      "discount_minor",
+      "tax_minor",
+      "total_minor",
+    ],
+    "the encoding carries exactly the offer's fields, in one fixed order",
+  );
+  expectEqual(at(decoded, 0, "the first field").value, ESTIMATE_DOCUMENT_HASH_ENCODING, "and its first field is the encoding's own version");
+  expectEqual(at(decoded, 0, "the first field").tag, "S", "tagged as text");
+
+  const nullable = ["client_email", "client_address", "memo", "line_product_id", "line_service_id"];
+
+  for (const field of decoded) {
+    expect(["N", "S", "I"].includes(field.tag), `every field carries a type tag, and ${field.name} does`);
+
+    if (field.tag === "N") {
+      expect(nullable.includes(field.name), `${field.name} is null, and only a field that may be null is`);
+      expectEqual(field.value, "", "with an empty value, so a null and an empty string never meet");
+    }
+
+    if (field.tag === "I") {
+      expect(/^\d+$/u.test(field.value), `${field.name} is an integer in decimal digits, with no sign and no point`);
+    }
+  }
+
+  // The quantities are hashed in the unit the column stores, not in the spelling a screen prints.
+  const quantities = decoded.filter((field) => field.name === "line_quantity_thousandths");
+
+  expectEqual(quantities.length, quote.lines.length, "one hashed quantity per line");
+
+  for (const field of quantities) {
+    expectEqual(Number(field.value) % 1, 0, "each hashed quantity is a whole number of thousandths");
+  }
+
+  /* -- the hash module's own discipline -- */
+
+  expect(!hasherCode.includes("parseFloat"), "the hash never parses a float");
+  expect(!hasherCode.includes("JSON.stringify"), "and never leans on JSON, whose key order and number spelling are not this module's to fix");
+  expect(!hasherCode.includes("toFixed("), "nor rounds with a float method");
+  expect(!hasherCode.includes("Number("), "nor converts through Number");
+  expect(hasherCode.includes('createHash("sha256")'), "the digest is SHA-256, which is what 64 hex characters mean");
+  expect(hasherCode.includes('.digest("hex")'), "and it is printed as hex, because the column refuses anything else");
+  expect(hasherCode.includes("TextEncoder"), "lengths are counted in bytes rather than in UTF-16 units, so a non-ASCII description cannot move a boundary");
+  expect(hasherCode.includes("quantityToThousandths"), "a quantity is put back into thousandths before it is hashed");
+  expect(!/^import /mu.test(fieldsSource) === true, "the vocabulary stays import-free");
+
+  const hasherImports = [...hasherSource.matchAll(/^import [^"]*from "([^"]+)";$/gmu)].map((match) => match[1] ?? "");
+
+  expectDeepEqual(
+    hasherImports,
+    [
+      "node:crypto",
+      "zod",
+      "../../lib/auth/audit.ts",
+      "../../lib/auth/rest.ts",
+      "../../lib/auth/session.ts",
+      "../../lib/auth/types.ts",
+      "../../lib/errors/app-error.ts",
+      "../../lib/security/audit.ts",
+      "../../lib/security/rate-limit.ts",
+      "../../lib/security/text.ts",
+      "../invoices/invoice-totals.ts",
+      "../invoices/invoices.ts",
+      "./estimate-fields.ts",
+      "./estimate-signature-fields.ts",
+      "./estimates.ts",
+    ],
+    "the evidence module imports these fifteen and nothing else, in the family's own relative style",
+  );
+}
+
+/* ---- the capture: one decision, written once ---- */
+
+/**
+ * What a signature capture does, and the four things it must never do.
+ *
+ * The capture is the whole of STEP 120: the eight elements of section 16 arrive in one row, that row is
+ * written once and never edited, and the digest in it is computed here rather than believed from a caller.
+ * What this group proves hardest is the absences - that a capture writes no status, mints no number, issues
+ * nothing and voids nothing - because those are the boundaries this STEP was given, and a boundary is only
+ * real if a test would fail when it is crossed.
+ */
+async function checkCapture(): Promise<void> {
+  const signatureSource = await readRepositoryFile("services/estimates/estimate-signature.ts");
+  const signatureCode = sourceCodeOf(signatureSource);
+
+  /* -- what the module never does -- */
+
+  expect(!signatureCode.includes("rest.update"), "the capture updates no row, because `0027` is append only");
+  expect(!signatureCode.includes("rest.delete"), "and removes none, for the same reason");
+  expect(!signatureCode.includes("rest.insert("), "every write reads the row back, so there is no fire-and-forget insert");
+  expect(!signatureCode.includes("take_invoice_number"), "it reaches for no number");
+  expect(!signatureCode.includes("invoice_number_settings"), "and does not generalise `0114`");
+  expect(!signatureCode.includes("issued_at"), "it never writes the instant a quote was issued");
+  expect(!signatureCode.includes("status:"), "and it never writes a status");
+  expect(signatureCode.includes("ESTIMATE_SIGNATURE_OPEN_STATUSES"), "it requires an open quote instead of making one");
+
+  /* -- the parser, element by element -- */
+
+  const issued = await openQuoteWith();
+  const parsed = parseEstimateSignatureCapture(signatureBodyOf(issued.snapshot.id));
+
+  expectEqual(parsed.signerName, "Rina Akter", "a signer's name is stored as it was given");
+  expectEqual(parsed.signerEmail, "rina@buyer.example", "and so is the address the receipt would go to");
+  expectEqual(parsed.decision, "accepted", "with the decision the signer made");
+  expectEqual(parsed.consentText, "I have read this quote and I accept its terms.", "and the wording they consented to");
+  expectEqual(parsed.ip, "203.0.113.44", "and the address the decision arrived from");
+  expectEqual(parsed.geoLocation, "Dhaka, BD", "and where that address is");
+  expectEqual(parsed.deviceFingerprint, "fp-9f2c41ab7d05", "and the device it arrived on");
+
+  const trimmed = parseEstimateSignatureCapture(
+    signatureBodyOf(issued.snapshot.id, { signer_name: "  Rina Akter  ", geo_location: "  Dhaka, BD  " }),
+  );
+
+  expectEqual(trimmed.signerName, "Rina Akter", "surrounding space is trimmed rather than refused");
+  expectEqual(trimmed.geoLocation, "Dhaka, BD", "in a place as well as in a name");
+
+  const v6 = parseEstimateSignatureCapture(signatureBodyOf(issued.snapshot.id, { ip_address: "2001:0DB8:0000::0001" }));
+
+  expectEqual(v6.ip, "2001:db8::1", "an IPv6 address is stored in one compressed spelling, so one machine is one address");
+  expectEqual(
+    parseEstimateSignatureCapture(signatureBodyOf(issued.snapshot.id, { user_agent: "   " })).userAgent,
+    null,
+    "an agent that was only ever space becomes null, which the column and the chain both accept",
+  );
+  expectEqual(
+    parseEstimateSignatureCapture(signatureBodyOf(issued.snapshot.id, { user_agent: "x".repeat(600) })).userAgent?.length,
+    AUDIT_MAXIMUM_USER_AGENT_LENGTH,
+    "and a long one is cut to the audit chain's own ceiling, so the entry is never one the chain would refuse",
+  );
+
+  // Refused rather than repaired: an element outside its column is a sentence, never a quiet edit.
+  const elements: readonly [string, Record<string, unknown>, string, string][] = [
+    ["signer_name", { signer_name: "" }, "too_short", "a name of nothing"],
+    ["signer_name", { signer_name: "n".repeat(161) }, "too_long", "a name longer than the column"],
+    ["signer_name", { signer_name: "Rina\nAkter" }, "invalid_format", "a name holding a line break"],
+    ["signer_email", { signer_email: "a@" }, "too_short", "an address shorter than the column"],
+    ["signer_email", { signer_email: `${"a".repeat(250)}@b.example` }, "too_long", "an address longer than the column"],
+    ["signer_email", { signer_email: "rina at buyer.example" }, "invalid_format", "an address that is not one"],
+    ["consent_text", { consent_text: "   " }, "required", "a consent of nothing"],
+    ["consent_text", { consent_text: `${"I accept. ".repeat(210)}` }, "too_long", "a consent longer than the column"],
+    ["consent_text", { consent_text: "I accept. " }, "invalid_format", "a consent the column would store trimmed"],
+    ["ip_address", { ip_address: "not-an-address" }, "invalid_format", "an address that is not one"],
+    ["ip_address", { ip_address: "203.0.113.44:8080" }, "invalid_format", "an address carrying a port"],
+    ["ip_address", { ip_address: "" }, "invalid_format", "an address of nothing"],
+    ["geo_location", { geo_location: "g".repeat(201) }, "too_long", "a place longer than the column"],
+    ["device_fingerprint", { device_fingerprint: "fp-9f2c" }, "too_short", "a fingerprint shorter than the column"],
+    ["device_fingerprint", { device_fingerprint: "f".repeat(129) }, "too_long", "a fingerprint longer than the column"],
+    ["device_fingerprint", { device_fingerprint: "fp 9f2c41ab" }, "invalid_format", "a fingerprint holding a space"],
+    ["signature_path", { signature_path: "s".repeat(301) }, "too_long", "a storage key longer than the column"],
+  ];
+
+  for (const [field, overrides, rule, what] of elements) {
+    const details = await refusalOf(() =>
+      Promise.resolve(parseEstimateSignatureCapture(signatureBodyOf(issued.snapshot.id, overrides))),
+    );
+
+    expectDeepEqual(details, [{ field, rule }], `${what} is refused as ${rule} on ${field}`);
+  }
+
+  expectDeepEqual(
+    await refusalOf(() => Promise.resolve(parseEstimateSignatureCapture(signatureBodyOf(issued.snapshot.id, { consent_accepted: false })))),
+    [{ field: "consent_accepted", rule: "required" }],
+    "an unticked box is not consent, and `0027` would not store one either",
+  );
+
+  // The digest is computed, never accepted: this is the refusal that makes the column mean anything.
+  expectDeepEqual(
+    await refusalOf(() =>
+      Promise.resolve(parseEstimateSignatureCapture(signatureBodyOf(issued.snapshot.id, { document_hash: "a".repeat(64) }))),
+    ),
+    [{ field: "document_hash", rule: "unknown_field" }],
+    "a caller offering a digest of its own is refused with the key it offered",
+  );
+  expectDeepEqual(
+    await refusalOf(() =>
+      Promise.resolve(
+        parseEstimateSignatureCapture(signatureBodyOf(issued.snapshot.id, { status: "accepted", signed_at: "2020-01-01T00:00:00.000Z" })),
+      ),
+    ),
+    [
+      { field: "status", rule: "unknown_field" },
+      { field: "signed_at", rule: "unknown_field" },
+    ],
+    "and neither a status nor an instant of the caller's choosing is a key it may send",
+  );
+  expectDeepEqual(
+    await refusalOf(() => Promise.resolve(parseEstimateSignatureCapture(signatureBodyOf(issued.snapshot.id, {})))),
+    [],
+    "so the instant a signature carries is the platform's clock and never a body's",
+  );
+  expectDeepEqual(
+    await refusalOf(() => Promise.resolve(parseEstimateSignatureCapture(null))),
+    [{ field: "estimate_signature", rule: "invalid_format" }],
+    "a body that is not an object at all is named as the document, because there is no field to name",
+  );
+  expect(!estimateSignatureCaptureSchema.safeParse(signatureBodyOf(issued.snapshot.id, { consent_text: undefined })).success, "a missing element is a refusal");
+
+  // Two wrong elements are both named, in the order a signer meets the boxes.
+  expectDeepEqual(
+    await refusalOf(() =>
+      Promise.resolve(
+        parseEstimateSignatureCapture(
+          signatureBodyOf(issued.snapshot.id, { consent_accepted: false, signer_email: "not an address", device_fingerprint: "x" }),
+        ),
+      ),
+    ),
+    [
+      { field: "signer_email", rule: "invalid_format" },
+      { field: "consent_accepted", rule: "required" },
+      { field: "device_fingerprint", rule: "too_short" },
+    ],
+    "several refusals arrive together, ordered as the boxes are on the page",
+  );
+
+  /* -- one decision, written once -- */
+
+  const audit = createInMemoryAuditTrail();
+  const insertsBefore = issued.db.inserts.length;
+  const queriesBefore = issued.db.queries.length;
+  const stored = await captureEstimateSignature(signatureBodyOf(issued.snapshot.id), depsOf(issued.db, audit));
+
+  expectEqual(issued.db.signatures.length, 1, "the capture wrote exactly one evidence row");
+  expectEqual(issued.db.inserts.length - insertsBefore, 1, "in exactly one insert of its own");
+  expectEqual(issued.db.inserts.at(-1)?.table, ESTIMATE_SIGNATURES_TABLE, "and that insert was of `0027`'s table");
+  expectEqual(issued.db.updates.length, 0, "with no update anywhere: the quote is untouched and the evidence is append only");
+
+  expectDeepEqual(
+    issued.db.queries.slice(queriesBefore).map((query) => query.split("?")[0] ?? ""),
+    ["estimates", "estimate_signatures", "estimate_items"],
+    "three reads of its own, in the order they are needed: is this quote open, has it been decided, what does it offer",
+  );
+
+  const row = issued.db.signatures[0] as Readonly<Record<string, unknown>>;
+
+  expectEqual(row["signer_name"], "Rina Akter", "the row holds the signer's name");
+  expectEqual(row["signer_email"], "rina@buyer.example", "their address");
+  expectEqual(row["consent_text"], "I have read this quote and I accept its terms.", "the wording they were shown");
+  expectEqual(row["consent_accepted"], true, "the ticked box itself");
+  expectEqual(row["signed_at"], new Date(NOW).toISOString(), "the instant, from the platform's clock");
+  expectEqual(row["ip"], "203.0.113.44", "the address it arrived from");
+  expectEqual(row["geo_location"], "Dhaka, BD", "where that address is");
+  expectEqual(row["device_fingerprint"], "fp-9f2c41ab7d05", "the device it arrived on");
+  expectEqual(row["document_hash"], hashEstimateDocument(issued.snapshot), "and the digest of the offer, which is the same digest the draft had");
+  expectEqual(row["version"], 1, "at version one, which is the only version an append-only row ever has");
+  expectEqual(row["company_id"], COMPANY_A, "scoped to the merchant it belongs to");
+  expectEqual(row["estimate_id"], issued.snapshot.id, "and to the quote's own stable id");
+
+  expectEqual(stored.decision, "accepted", "the caller gets the decision back");
+  expectEqual(stored.documentHash, String(row["document_hash"] ?? ""), "with the digest it stored");
+  expectEqual(stored.signedAtEpochMs, NOW, "and the instant as an epoch, the way every other snapshot in this family carries one");
+  expect(!("version" in stored), "but no version, because an append-only row offers no lock and printing one invites an edit the trigger refuses");
+
+  // The quote the signature was written against is exactly the quote that was there before.
+  const quoteRow = rowOf(issued.db, issued.snapshot.id);
+
+  expectEqual(quoteRow["status"], "sent", "the capture wrote no status");
+  expectEqual(quoteRow["number"], "Q-2026-0001", "minted no number");
+  expectEqual(quoteRow["issued_at"], new Date(NOW).toISOString(), "and moved no instant of the quote's own lifecycle");
+  expectEqual(quoteRow["accepted_at"], null, "an accepted signature does not accept the quote: that is STEP 121's");
+  expectEqual(quoteRow["converted_invoice_id"], null, "and it creates no invoice");
+  expectEqual(quoteRow["version"], Number(issued.snapshot.version), "with the quote's version exactly where it was");
+
+  expectEqual(audit.entries.length, 1, "one audit entry, because one fact happened");
+  const entry = audit.entries[0];
+
+  if (entry === undefined) {
+    throw new Error("gate fixture: the capture earned no audit entry");
+  }
+
+  expectEqual(entry.action, ESTIMATE_SIGNATURE_RECORDED_AUDIT_ACTION, "naming the action `0013` admits");
+  expectEqual(entry.entityType, ESTIMATE_SIGNATURE_AUDIT_ENTITY, "and the entity it names");
+  expectEqual(entry.entityId, stored.id, "pointing at the evidence row rather than at the quote");
+  expectEqual(entry.actorUserId, null, "with no actor, because a client holds no account here");
+  expectEqual(entry.companyId, COMPANY_A, "in the merchant's own chain");
+  expectEqual(entry.ipAddress, stored.ip, "carrying the same address the evidence row carries, in the same spelling");
+  expectEqual(entry.userAgent, "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36", "and the agent the decision arrived with");
+  expectDeepEqual(
+    entry.payload,
+    {
+      decision: "accepted",
+      document_hash: stored.documentHash,
+      consent_accepted: true,
+      has_geo_location: true,
+      has_device_fingerprint: true,
+      has_signature_path: false,
+    },
+    "a payload of field facts and the digest",
+  );
+
+  const payloadText = JSON.stringify(entry.payload);
+
+  for (const personal of ["Rina Akter", "rina@buyer.example", "Dhaka, BD", "fp-9f2c41ab7d05"]) {
+    expect(!payloadText.includes(personal), `the chain holds no "${personal}": personal data lives in the one table section 16 built for it`);
+  }
+
+  /* -- what a capture refuses -- */
+
+  for (const [status, extra, what] of [
+    ["draft", {}, "a draft"],
+    ["accepted", { accepted_at: new Date(NOW).toISOString() }, "an accepted quote"],
+    ["void", { void_reason: "declined", voided_at: new Date(NOW).toISOString() }, "a void one"],
+  ] as const) {
+    const closed = await draftWith({ lines: threeLines() });
+
+    if (status !== "draft") {
+      issue(closed.db, closed.snapshot.id);
+    }
+
+    const target = rowOf(closed.db, closed.snapshot.id);
+
+    target["status"] = status;
+
+    for (const [column, value] of Object.entries(extra)) {
+      target[column] = value;
+    }
+
+    const trail = createInMemoryAuditTrail();
+    const attempted = closed.db.inserts.length;
+
+    expectDeepEqual(
+      await refusalOf(() => captureEstimateSignature(signatureBodyOf(closed.snapshot.id), depsOf(closed.db, trail))),
+      [{ field: "status", rule: "already_changed" }],
+      `${what} accepts no signature, and says so with the field a screen can mark`,
+    );
+    expectEqual(closed.db.signatures.length, 0, `${what} was left with no evidence row`);
+    expectEqual(closed.db.inserts.length - attempted, 0, "and no insert was even attempted: the service checks before it writes");
+    expectEqual(trail.entries.length, 0, "and earned no entry in the chain");
+  }
+
+  const viewed = await draftWith({ lines: threeLines() });
+
+  issue(viewed.db, viewed.snapshot.id);
+  rowOf(viewed.db, viewed.snapshot.id)["status"] = "viewed";
+
+  expectEqual(
+    (await captureEstimateSignature(signatureBodyOf(viewed.snapshot.id), depsOf(viewed.db))).decision,
+    "accepted",
+    "a quote the client has opened accepts a signature exactly as a sent one does",
+  );
+
+  const declined = await draftWith({ lines: threeLines() });
+
+  issue(declined.db, declined.snapshot.id);
+  await captureEstimateSignature(signatureBodyOf(declined.snapshot.id, { decision: "declined" }), depsOf(declined.db));
+
+  expectEqual(declined.db.signatures[0]?.["decision"], "declined", "a refusal is recorded as the decision it is");
+  expectEqual(rowOf(declined.db, declined.snapshot.id)["status"], "sent", "and voids nothing: turning a declined quote void is STEP 182's");
+  expectEqual(rowOf(declined.db, declined.snapshot.id)["void_reason"], null, "so no reason is written either");
+
+  const missing = await openQuoteWith();
+
+  expectEqual(
+    await codeOf(() => captureEstimateSignature(signatureBodyOf(randomUUID()), depsOf(missing.db))),
+    "RESOURCE_NOT_FOUND",
+    "a quote that is not there is a missing quote",
+  );
+  expectEqual(
+    await refusalReason(() => captureEstimateSignature(signatureBodyOf(randomUUID()), depsOf(missing.db))),
+    "not_found",
+    "named as one rather than as a validation failure",
+  );
+  expectEqual(
+    await codeOf(() => captureEstimateSignature(signatureBodyOf(missing.snapshot.id, { company_id: COMPANY_B }), depsOf(missing.db))),
+    "RESOURCE_NOT_FOUND",
+    "and a quote at another merchant is missing too, never somebody else's document",
+  );
+  expectEqual(missing.db.signatures.length, 0, "with nothing written by any of those refusals");
+
+  const decided = await openQuoteWith();
+  const first = await captureEstimateSignature(signatureBodyOf(decided.snapshot.id), depsOf(decided.db));
+
+  expectDeepEqual(
+    await refusalOf(() =>
+      captureEstimateSignature(
+        signatureBodyOf(decided.snapshot.id, { signer_name: "Someone Else", signer_email: "other@buyer.example" }),
+        depsOf(decided.db),
+      ),
+    ),
+    [{ field: "estimate_id", rule: "already_used" }],
+    "one quote holds one decision, and a second signer is told the quote is taken",
+  );
+  expectEqual(decided.db.signatures.length, 1, "so there is still exactly one row");
+  expectEqual(decided.db.signatures[0]?.["signer_name"], "Rina Akter", "and it is still the first signer's");
+  expectEqual(first.id, String(decided.db.signatures[0]?.["id"] ?? ""), "the row the first decision wrote");
+
+  const racing = await openQuoteWith();
+
+  racing.db.signatureConflict = true;
+
+  expectDeepEqual(
+    await refusalOf(() => captureEstimateSignature(signatureBodyOf(racing.snapshot.id), depsOf(racing.db))),
+    [{ field: "estimate_id", rule: "already_used" }],
+    "two signers arriving at once meet the unique index, which the service words rather than passes through bare",
+  );
+  expectEqual(racing.db.signatures.length, 0, "and only one of them is stored");
+
+  /* -- the fixture models `0027`'s own trigger, so the service's check is not the only guard -- */
+
+  const unissued = await draftWith({ lines: threeLines() });
+  const bareInsert = {
+    company_id: COMPANY_A,
+    estimate_id: unissued.snapshot.id,
+    decision: "accepted",
+    signer_name: "Rina Akter",
+    signer_email: "rina@buyer.example",
+    consent_text: "I accept.",
+    consent_accepted: true,
+    signed_at: new Date(NOW).toISOString(),
+    ip: "203.0.113.44",
+    document_hash: "a".repeat(ESTIMATE_DOCUMENT_HASH_LENGTH),
+  };
+
+  expectEqual(
+    await refusalReason(() =>
+      depsOf(unissued.db).rest.insertReturning(ESTIMATE_SIGNATURES_TABLE, [bareInsert], estimateSignatureRowSchema),
+    ),
+    "estimate_signatures_guard_decision",
+    "a write straight to the table is refused by the trigger the fixture models, not only by the service",
+  );
+  expectEqual(unissued.db.signatures.length, 0, "and it left no row behind");
+
+  // Against an open quote the trigger is satisfied, so the same straight write reaches the columns - which
+  // is the point of modelling them: a service that let one of these through would still not store it.
+  const guarded = await openQuoteWith();
+  const straight = (overrides: Readonly<Record<string, unknown>>): (() => Promise<unknown>) => () =>
+    depsOf(guarded.db).rest.insertReturning(
+      ESTIMATE_SIGNATURES_TABLE,
+      [{ ...bareInsert, estimate_id: guarded.snapshot.id, ...overrides }],
+      estimateSignatureRowSchema,
+    );
+
+  expectEqual(await refusalReason(straight({ consent_accepted: false })), "estimate_signatures_consent_check", "an unticked box is the column's refusal as well as the parser's");
+  expectEqual(await refusalReason(straight({ document_hash: "not a digest" })), "estimate_signatures_hash_check", "and so is a digest of the wrong shape");
+  expectEqual(await refusalReason(straight({ signer_name: "  Rina Akter  " })), "estimate_signatures_signer_name_check", "and a name the column would store trimmed, which is why the service refuses rather than repairs");
+  expectEqual(await refusalReason(straight({ decision: "maybe" })), "estimate_signatures_decision_check", "and a third decision");
+  expectEqual(guarded.db.signatures.length, 0, "with no row written by any of them");
+  expectEqual(await refusalReason(straight({})), null, "while the same row, whole and honest, is stored");
+  expectEqual(guarded.db.signatures.length, 1, "as exactly one evidence row");
+
+  /* -- the reader -- */
+
+  const reading = await openQuoteWith();
+  const readTrail = createInMemoryAuditTrail();
+
+  expectEqual(
+    await readEstimateSignature({ actor: owner, estimateId: reading.snapshot.id }, depsOf(reading.db, readTrail)),
+    null,
+    "an undecided quote reads as null rather than as a missing resource, because undecided is the normal state of a quote",
+  );
+  expectEqual(readTrail.entries.length, 0, "and a read earns no entry in the chain");
+
+  const written = await captureEstimateSignature(signatureBodyOf(reading.snapshot.id), depsOf(reading.db, readTrail));
+  const read: EstimateSignatureSnapshot | null = await readEstimateSignature(
+    { actor: owner, estimateId: reading.snapshot.id },
+    depsOf(reading.db, readTrail),
+  );
+
+  expectDeepEqual(read, written, "what was written is what is read back, element for element");
+  expectEqual(readTrail.entries.length, 1, "so the reads added nothing to the one entry the capture earned");
+  expect(
+    reading.db.queries.filter((query) => query.startsWith(ESTIMATE_SIGNATURES_TABLE)).every((query) => (query.split("?")[1] ?? "").includes("company_id=eq.")),
+    "and every read of the evidence is scoped to one merchant",
+  );
+
+  expectEqual(
+    await codeOf(() => readEstimateSignature({ actor: owner, estimateId: randomUUID() }, depsOf(reading.db))),
+    "RESOURCE_NOT_FOUND",
+    "a quote that is not there is still a missing quote, never a null that looks unsigned",
+  );
+  expectEqual(
+    await codeOf(() => readEstimateSignature({ actor: otherOwner, estimateId: reading.snapshot.id }, depsOf(reading.db))),
+    "RESOURCE_NOT_FOUND",
+    "and another merchant's owner finds nothing at all",
+  );
+  expectEqual(
+    await codeOf(() => readEstimateSignature({ actor: desk, estimateId: reading.snapshot.id }, depsOf(reading.db))),
+    "PERMISSION_DENIED",
+    "a role that may not manage quotes is refused before any read happens",
+  );
+
+  /* -- the row shape and the reader that validates it -- */
+
+  expectDeepEqual(
+    ESTIMATE_SIGNATURE_COLUMNS.split(","),
+    Object.keys(estimateSignatureRowSchema.shape),
+    "the columns a read asks for are exactly the columns the reader validates, so neither can drift alone",
+  );
+  expect(!ESTIMATE_SIGNATURE_COLUMNS.includes("number"), "and they include no number, because the evidence is not a document");
+
+  const storedRow = reading.db.signatures[0] as Readonly<Record<string, unknown>>;
+
+  expect(estimateSignatureRowSchema.safeParse(storedRow).success, "a stored row passes the reader's own schema");
+  expect(!estimateSignatureRowSchema.safeParse({ ...storedRow, document_hash: "nope" }).success, "and a row with a malformed digest does not");
+  expect(!estimateSignatureRowSchema.safeParse({ ...storedRow, ip: "" }).success, "nor one with no address");
+
+  // A third decision is a row the column admits and the vocabulary does not, so it can only arrive from a
+  // database that has been changed behind this build's back.
+  const alien = estimateSignatureRowSchema.parse({ ...storedRow, decision: "maybe" });
+
+  expectEqual(
+    await codeOf(() => Promise.resolve(estimateSignatureSnapshotOf(alien))),
+    "INTERNAL_ERROR",
+    "a decision outside the two `0027` admits is an internal failure",
+  );
+  expectDeepEqual(
+    await refusalOf(() => Promise.resolve(estimateSignatureSnapshotOf(alien))),
+    [{ field: "decision", rule: "invalid_format" }],
+    "named with a field and a rule, because guessing which of the two a signer made would be a lie",
+  );
+}
+
 /* ---- the run ---- */
 
 async function run(): Promise<void> {
@@ -3418,6 +4778,8 @@ async function run(): Promise<void> {
   await checkRoutes();
   await checkCompensation();
   await checkSources();
+  await checkSignature();
+  await checkCapture();
   await checkUi();
   await checkMigration();
 
@@ -3434,9 +4796,10 @@ async function run(): Promise<void> {
   }
 
   process.stdout.write(
-    `estimate gate passed: ${String(checks)} checks, 0025/0026/0117, draft only, ` +
+    `estimate gate passed: ${String(checks)} checks, 0025/0026/0027/0117, draft only, ` +
       `${String(INVOICE_MAXIMUM_LINES)} lines, both discount bases, add/edit/remove/move, ` +
-      "7 routes, one parser and one swap for one document family, and the two screens that use them\n",
+      "7 routes, one parser and one swap for one document family, the two screens that use them, " +
+      "the signature evidence vocabulary with its document hash, and the append-only capture that writes it\n",
   );
 }
 

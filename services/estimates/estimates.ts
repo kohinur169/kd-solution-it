@@ -875,13 +875,18 @@ export async function getEstimate(
     throw new AppError("RESOURCE_NOT_FOUND", { cause: { rule: "estimate", reason: "not_found" } });
   }
 
-  const lines = await readLines(dependencies.rest, companyId, row.id);
+  const lines = await readEstimateLines(dependencies.rest, companyId, row.id);
 
-  return snapshotOf(row, lines);
+  return estimateSnapshotOf(row, lines);
 }
 
-/** The rows of `0026` for one quote, in print order, live only. */
-async function readLines(
+/**
+ * The rows of `0026` for one quote, in print order, live only.
+ *
+ * Exported because the signature evidence hashes the same document `getEstimate` reads: one reader for one
+ * fact, rather than a second query that could disagree about what "live" or "print order" means.
+ */
+export async function readEstimateLines(
   rest: RestClient,
   companyId: string,
   estimateId: string,
@@ -974,7 +979,13 @@ export function estimateTotalsOf(row: EstimateTotalsRow): EstimateSnapshot["tota
   };
 }
 
-function snapshotOf(row: EstimateRow, lines: readonly EstimateItemRow[]): EstimateSnapshot {
+/**
+ * The document one quote is, as every reader prints it.
+ *
+ * Exported for the same reason as the line reader: the evidence hash has to be taken over the snapshot a
+ * merchant and a client both see, and a second mapper would be a second idea of what the document holds.
+ */
+export function estimateSnapshotOf(row: EstimateRow, lines: readonly EstimateItemRow[]): EstimateSnapshot {
   return {
     id: row.id,
     companyId: row.company_id,
