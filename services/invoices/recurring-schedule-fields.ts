@@ -99,6 +99,16 @@ export const RECURRING_SCHEDULE_RULES = [
 
 export type RecurringScheduleRule = (typeof RECURRING_SCHEDULE_RULES)[number];
 
+/**
+ * The name of the job that runs a schedule, which STEP 123 implements.
+ *
+ * Section 27 lists "Recurring invoice generation and client reminders" as background work. The name lives here,
+ * with the rest of the schedule's vocabulary, so the STEP that configures a schedule and the STEP that runs one
+ * cannot disagree about what the work is called - and so a screen or a health report can name it without
+ * importing the job module.
+ */
+export const RECURRING_SCHEDULE_JOB_NAME = "recurring_schedule.generate";
+
 /** Whether a string is one of the three statuses `0028` allows. */
 export function isRecurringScheduleStatus(value: unknown): value is RecurringScheduleStatus {
   return typeof value === "string" && (RECURRING_SCHEDULE_STATUSES as readonly string[]).includes(value);
