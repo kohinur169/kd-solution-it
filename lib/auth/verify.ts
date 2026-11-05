@@ -12744,11 +12744,16 @@ async function checkCsrfProtection(): Promise<void> {
   // editor, which writes one line, one order, one removal and the two amounts above the total - five
   // calls from one screen, because each is a different fact about the quote and each has its own refusal.
   // So the files arrive at forty four and the call sites at fifty seven.
-  expectEqual(browserMutations.length, 44, "forty four browser files send a mutation");
+  //
+  // STEP 122 adds one more file and two more calls: the recurring schedule panel, which creates a schedule and
+  // changes its state - a pause, a resume or an end - from one screen. They are two calls and not four because
+  // the three state changes share one route and one verb, which is the difference between a verb and a fact.
+  // So the files arrive at forty five and the call sites at fifty nine.
+  expectEqual(browserMutations.length, 45, "forty five browser files send a mutation");
   expectEqual(
     browserMutations.reduce((total, path) => total + mutationCalls(appSourceOf(appSources, path)), 0),
-    57,
-    "across fifty seven call sites",
+    59,
+    "across fifty nine call sites",
   );
   const postCalls = mutationCalls;
   const tokenSpreads = (source: string): number =>

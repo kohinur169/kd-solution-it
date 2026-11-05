@@ -128,6 +128,8 @@ export const CSRF_PROTECTED_PATHS: readonly string[] = Object.freeze([
   "/api/invoices/branding",
   "/api/invoices/branding/logo",
   "/api/invoices/numbering",
+  "/api/invoices/recurring",
+  "/api/invoices/recurring/[id]/state",
   "/api/estimates",
   "/api/estimates/[id]/lines",
   "/api/estimates/[id]/lines/[lineId]",
