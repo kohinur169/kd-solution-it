@@ -9872,7 +9872,9 @@ async function checkSessionRotation(): Promise<void> {
   // The office half is one of them because reading another account's sessions must not leave the
   // reader's own token unrotated, and the wizard is one because a merchant may sit on it for a
   // while.
-  expectEqual(keepers.length, 25, "every signed-in page keeps its session rotating");
+  // STEP 119 adds the estimate screens, which are one component mounted at three paths - the route that
+  // redirects to the form, the form itself and one quote's editor - so the count rises by the file.
+  expectEqual(keepers.length, 26, "every signed-in page keeps its session rotating");
 }
 
 /**
@@ -12737,12 +12739,16 @@ async function checkCsrfProtection(): Promise<void> {
 
   // STEP 118 adds the invoice branding form, which is the first browser file to send two different kinds of
   // mutation from one screen: a JSON settings save and a multipart logo upload. Both carry the token, and
-  // both are counted here, so the file arrives at forty two and the call sites at fifty one.
-  expectEqual(browserMutations.length, 42, "forty two browser files send a mutation");
+  // both are counted here.
+  // STEP 119 adds two more: the estimate create form, which writes one document, and the estimate line
+  // editor, which writes one line, one order, one removal and the two amounts above the total - five
+  // calls from one screen, because each is a different fact about the quote and each has its own refusal.
+  // So the files arrive at forty four and the call sites at fifty seven.
+  expectEqual(browserMutations.length, 44, "forty four browser files send a mutation");
   expectEqual(
     browserMutations.reduce((total, path) => total + mutationCalls(appSourceOf(appSources, path)), 0),
-    51,
-    "across fifty one call sites",
+    57,
+    "across fifty seven call sites",
   );
   const postCalls = mutationCalls;
   const tokenSpreads = (source: string): number =>

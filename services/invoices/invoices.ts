@@ -380,13 +380,22 @@ function detailPath(index: number | null, field: string): string {
 }
 
 /**
- * Parse one line, naming every broken field of that line.
+ * Parse one line of a document body, naming every broken field of that line.
  *
  * A line is seven independent judgements - the description, the unit, the quantity, the price, the
  * discount and the two catalogue references - and stopping at the first would make the merchant fix
  * one box per save on a list of twenty rows. Each is evaluated, the first rule per field wins.
+ *
+ * ## Why a quote parses its lines here
+ *
+ * Exported for `services/estimates/`, which writes the quote of the same section. `0026` mirrors `0023`
+ * exactly - the same seven columns under the same checks, down to the generated `line_total_minor` - so
+ * a quote's line is judged by these seven rules and not by a copy of them. This repository states that
+ * rule as a check: `verify.ts` asserts the line service defines no second parser, and a parser in another
+ * folder for the same columns is the drift that assertion exists to prevent. The name says "document"
+ * rather than "invoice" because both documents are what it parses a line of.
  */
-function parseLine(
+export function parseDocumentLine(
   raw: z.infer<typeof invoiceLineInputSchema>,
   index: number,
 ): { readonly line: ParsedLine | null; readonly problems: readonly ErrorDetail[] } {
@@ -486,6 +495,18 @@ function parseLine(
  * helper the create path runs over every line of a new invoice.
  */
 export function parseInvoiceLine(body: unknown): ParsedLine {
+  return parseDocumentLineBody(body);
+}
+
+/**
+ * Parse one line of either document family from an editor's body.
+ *
+ * The invoice's `parseInvoiceLine` is this function, and a quote's editor calls it directly: the seven
+ * fields, their ceilings and their rules are one definition (`invoiceLineInputSchema` and
+ * `parseDocumentLine`), so an edited line of a quote is judged exactly as a created line of an invoice is.
+ * A second parser for the second document would be the drift this codebase keeps designing away from.
+ */
+export function parseDocumentLineBody(body: unknown): ParsedLine {
   const attempt = invoiceLineInputSchema.safeParse(body);
 
   if (!attempt.success) {
@@ -502,7 +523,7 @@ export function parseInvoiceLine(body: unknown): ParsedLine {
     throw new AppError("VALIDATION_FAILED", { details: problems });
   }
 
-  const parsed = parseLine(attempt.data, 0);
+  const parsed = parseDocumentLine(attempt.data, 0);
 
   if (parsed.line === null) {
     // The problems came back under `lines[0].field`; the editor wants the bare field, so the prefix is
@@ -655,7 +676,7 @@ function parseBody(body: unknown, now: number): InvoiceInput {
   const lines: ParsedLine[] = [];
 
   for (const [index, raw] of value.lines.entries()) {
-    const parsed = parseLine(raw, index);
+    const parsed = parseDocumentLine(raw, index);
 
     problems.push(...parsed.problems);
 
@@ -706,17 +727,27 @@ function parseBody(body: unknown, now: number): InvoiceInput {
 }
 
 /**
- * Sort the details the way the screen reads them.
+ * Sort a document's refusals the way its screen reads them.
  *
- * The invoice's own fields first, in the order they appear on the page, then the lines in the order they
+ * The document's own fields first, in the order they appear on the page, then the lines in the order they
  * were typed with each line's boxes left to right. A plain string sort would put `lines[10]` before
  * `lines[2]`, so the comparison is numeric on the index.
+ *
+ * ## Why the two orders are parameters
+ *
+ * Exported for `services/estimates/`, which reports a quote's refusals the same way and differs only in
+ * the field list - `expires_at` where an invoice has `due_at`. The sorting rule is one fact and the field
+ * order is each document's, so the rule is written once and each document passes its own list.
  */
-function orderDetails(problems: readonly ErrorDetail[]): readonly ErrorDetail[] {
+export function orderDocumentDetails(
+  problems: readonly ErrorDetail[],
+  fieldOrder: readonly string[],
+  lineFieldOrder: readonly string[],
+): readonly ErrorDetail[] {
   const rankOf = (field: string): number => {
-    const index = (FIELD_ORDER as readonly string[]).indexOf(field);
+    const index = fieldOrder.indexOf(field);
 
-    return index === -1 ? FIELD_ORDER.length : index;
+    return index === -1 ? fieldOrder.length : index;
   };
 
   const lineRankOf = (field: string): readonly [number, number] => {
@@ -726,9 +757,9 @@ function orderDetails(problems: readonly ErrorDetail[]): readonly ErrorDetail[] 
       return [Number.MAX_SAFE_INTEGER, 0];
     }
 
-    const position = (LINE_FIELD_ORDER as readonly string[]).indexOf(match[2] ?? "");
+    const position = lineFieldOrder.indexOf(match[2] ?? "");
 
-    return [Number.parseInt(match[1] ?? "0", 10), position === -1 ? LINE_FIELD_ORDER.length : position];
+    return [Number.parseInt(match[1] ?? "0", 10), position === -1 ? lineFieldOrder.length : position];
   };
 
   return [...problems].sort((left, right) => {
@@ -748,6 +779,11 @@ function orderDetails(problems: readonly ErrorDetail[]): readonly ErrorDetail[] 
 
     return rankOf(left.field) - rankOf(right.field);
   });
+}
+
+/** The invoice's own order: `0022`'s fields as the create form reads them, then the lines. */
+function orderDetails(problems: readonly ErrorDetail[]): readonly ErrorDetail[] {
+  return orderDocumentDetails(problems, FIELD_ORDER, LINE_FIELD_ORDER);
 }
 
 /**
@@ -780,7 +816,15 @@ const invoiceSubtotalRowSchema = z.object({
 });
 
 /** The client snapshot's single address line, joined from the book's five address columns. */
-function addressOf(values: Readonly<Record<string, string | null>>): string | null {
+/**
+ * The printed address of a client book row, as one document snapshot column.
+ *
+ * Exported for `services/estimates/`, because `0025`'s `estimates_client_address_check` states `0022`'s
+ * `invoices_client_address_check` character for character - one to 600 characters, trimmed - and a quote
+ * prints the same client through the same six columns in the same order. Two ways of assembling one
+ * address is two documents that disagree about what a client's address looks like.
+ */
+export function addressOf(values: Readonly<Record<string, string | null>>): string | null {
   const parts = [
     values["address_line1"],
     values["address_line2"],

@@ -128,6 +128,11 @@ export const CSRF_PROTECTED_PATHS: readonly string[] = Object.freeze([
   "/api/invoices/branding",
   "/api/invoices/branding/logo",
   "/api/invoices/numbering",
+  "/api/estimates",
+  "/api/estimates/[id]/lines",
+  "/api/estimates/[id]/lines/[lineId]",
+  "/api/estimates/[id]/lines/[lineId]/move",
+  "/api/estimates/[id]/discount",
 ]);
 
 /** Why a request was refused, for the log and the gate - never for the response. */
