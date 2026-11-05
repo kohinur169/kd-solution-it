@@ -12735,11 +12735,14 @@ async function checkCsrfProtection(): Promise<void> {
     .map((file) => file.path)
     .sort();
 
-  expectEqual(browserMutations.length, 41, "forty one browser files send a mutation");
+  // STEP 118 adds the invoice branding form, which is the first browser file to send two different kinds of
+  // mutation from one screen: a JSON settings save and a multipart logo upload. Both carry the token, and
+  // both are counted here, so the file arrives at forty two and the call sites at fifty one.
+  expectEqual(browserMutations.length, 42, "forty two browser files send a mutation");
   expectEqual(
     browserMutations.reduce((total, path) => total + mutationCalls(appSourceOf(appSources, path)), 0),
-    49,
-    "across forty nine call sites",
+    51,
+    "across fifty one call sites",
   );
   const postCalls = mutationCalls;
   const tokenSpreads = (source: string): number =>

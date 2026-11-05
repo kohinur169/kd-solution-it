@@ -7,6 +7,7 @@ import { AppError } from "../../lib/errors/app-error.ts";
 import { sanitizeMultilineText, sanitizeSingleLineText } from "../../lib/security/text.ts";
 import { basisPointsToPercent } from "./invoice-discount.ts";
 import { INVOICE_STATUSES, type InvoiceStatus } from "./invoice-fields.ts";
+import { decodeInvoicePdfImage, type InvoicePdfImage } from "./invoice-pdf-image.ts";
 import { thousandthsToQuantity, quantityToThousandths } from "./invoice-totals.ts";
 
 /**
@@ -17,11 +18,11 @@ import { thousandthsToQuantity, quantityToThousandths } from "./invoice-totals.t
  * Rule 17 and section 28 put PDF generation outside the request path, and `package.json` is
  * integrator-owned, so a renderer that needed a new dependency could not ship in this STEP. What an
  * invoice needs from PDF is small and fixed: two of the fourteen standard fonts, text at absolute
- * positions, hairlines, and a page break. That is the subset written here - PDF 1.4, `Helvetica` and
- * `Helvetica-Bold` with `WinAnsiEncoding`, Flate-compressed content streams, a cross reference table
- * with real byte offsets and a deterministic file identifier. No embedded font program, no images, no
- * JavaScript, no annotation and no action: nothing a reader could execute, which is also why the
- * document survives the platform's own magic byte check on the way into storage.
+ * positions, hairlines, one image, and a page break. That is the subset written here - PDF 1.4, `Helvetica`
+ * and `Helvetica-Bold` with `WinAnsiEncoding`, Flate-compressed content streams, a cross reference table
+ * with real byte offsets and a deterministic file identifier. No embedded font program, no JavaScript, no
+ * annotation and no action: nothing a reader could execute, which is also why the document survives the
+ * platform's own magic byte check on the way into storage.
  *
  * ## Deterministic bytes
  *
@@ -46,6 +47,25 @@ import { thousandthsToQuantity, quantityToThousandths } from "./invoice-totals.t
  * Rule 1 keeps user-facing copy in the catalog, and a PDF is a document a client reads, so every label
  * on it - the stamp, the column heads, the totals, the footer - is a message read through
  * `invoicePdfLabels()`. The renderer itself holds no English: it places the strings it is given.
+ *
+ * ## The merchant's own brand
+ *
+ * Section 16 line 184 - "Merchants can set their own logo and invoice branding" - is what STEP 118 adds to
+ * this document, and it changes the header from one column into two: the merchant's own identity on the
+ * left (logo, name, tagline, address, contact) and the document's identity on the right (the word INVOICE,
+ * the number, the status). That is the layout a client expects, and it is the one place a merchant's brand
+ * belongs on a document that leaves the building.
+ *
+ * The identity is read at render time from `0116` and the merchant's business profile, never copied into
+ * the document row, so a merchant who moves office does not have to re-save their branding to fix the next
+ * invoice. What `0116` stores is the *choice*: which stored logo prints, which of the profile's facts are
+ * shown, the tagline, the note above the footer, and the accent colour of the rule under the letterhead. The accent is applied to lines and never to text, so a merchant cannot make a sentence
+ * unreadable with it.
+ *
+ * The logo is the one image this writer draws, on the first page only, inside a box of
+ * `INVOICE_PDF_LOGO_MAXIMUM_WIDTH` by `INVOICE_PDF_LOGO_MAXIMUM_HEIGHT` points and never scaled up: a small
+ * logo printed at its own pixel size is sharp, and the same logo stretched to fill the box is not. Reading
+ * the bytes into samples is `invoice-pdf-image.ts`; this file only places them.
  *
  * ## Text that has to survive the format
  *
@@ -74,6 +94,28 @@ export const INVOICE_PDF_PAGE_HEIGHT = 792;
 
 /** The margin on all four sides: three quarters of an inch. */
 export const INVOICE_PDF_MARGIN = 54;
+
+/**
+ * The box a logo is fitted into, in points, at the top of the first page.
+ *
+ * Two inches wide and a little over half an inch high is the space a letterhead gives a mark before the
+ * document's own words have to start. It is a box and not a size: the logo keeps its aspect ratio and is
+ * never scaled *up*, so a small mark prints sharp at its own pixel size instead of blurred to fill a
+ * rectangle it did not ask for.
+ */
+export const INVOICE_PDF_LOGO_MAXIMUM_WIDTH = 144;
+export const INVOICE_PDF_LOGO_MAXIMUM_HEIGHT = 44;
+
+/** The one form of the accent colour `0116` stores, which is also the form its column check enforces. */
+export const INVOICE_PDF_ACCENT_PATTERN = /^#[0-9a-f]{6}$/u;
+
+/**
+ * The name the logo's XObject is given in a page's resources.
+ *
+ * One image, one name: a document never draws a second picture, so there is no counter and nothing to
+ * allocate. The name is exported because the gate reads it back out of the resource dictionary.
+ */
+export const INVOICE_PDF_LOGO_NAME = "Im1";
 
 /** The faces used. Two of the fourteen standard fonts, so no font program is embedded. */
 export const INVOICE_PDF_FONTS = ["regular", "bold"] as const;
@@ -503,6 +545,30 @@ export interface InvoicePdfLine {
   readonly amount: string;
 }
 
+/** Where the logo goes, in points, with the samples it is drawn from. */
+export interface InvoicePdfLogoPlacement {
+  readonly image: InvoicePdfImage;
+  readonly width: number;
+  readonly height: number;
+}
+
+/**
+ * The merchant's half of the header, printable: text already sanitised and wrapped by the caller's column,
+ * a colour already turned into the three components a PDF stroke operator takes, and a logo already read
+ * into samples and fitted to its box.
+ */
+export interface InvoicePdfBranding {
+  readonly name: string | null;
+  readonly tagline: string | null;
+  /** Multiline text the header wraps to its own column, as `drawParties` wraps the client's address. */
+  readonly address: string | null;
+  readonly contact: string | null;
+  readonly footerNote: string | null;
+  /** Red, green and blue as fractions of one, or null for the default grey. */
+  readonly accent: readonly [number, number, number] | null;
+  readonly logo: InvoicePdfLogoPlacement | null;
+}
+
 /** The whole printable document. Data and words, and nothing that reads a clock or a database. */
 export interface InvoicePdfDocument {
   readonly invoiceId: string;
@@ -533,6 +599,8 @@ export interface InvoicePdfDocument {
     readonly hasTax: boolean;
   };
   readonly memo: string | null;
+  /** The merchant's own identity and logo, which the header's left column prints. */
+  readonly branding: InvoicePdfBranding;
   /** The instant this render is dated with, supplied by the caller so the bytes stay deterministic. */
   readonly generatedAt: string;
   /** The same instant in epoch milliseconds, which is what the file's own metadata carries. */
@@ -572,10 +640,74 @@ export interface InvoicePdfSourceLine {
   readonly lineTotalMinor: bigint;
 }
 
+/**
+ * The merchant's own half of the document, as the facts `0116` and the business profile hold them.
+ *
+ * Every field is nullable because a merchant who has set nothing still gets a complete invoice: the header
+ * simply prints the parts that exist. The bytes are the logo as it came out of storage, still sealed-open
+ * and still in whatever format the merchant uploaded; deciding whether they can be drawn is the renderer's
+ * job, through `invoice-pdf-image.ts`, and a refusal is a job failure with a code rather than a document
+ * with a hole in it.
+ */
+export interface InvoicePdfSourceBranding {
+  /** The name that prints, already chosen between the trading and the legal name by `0116`'s `name_style`. */
+  readonly name: string | null;
+  readonly tagline: string | null;
+  /** The address as one multiline string, which the renderer wraps to the column. */
+  readonly address: string | null;
+  /** The contact lines as one multiline string: an email, a phone, whichever the merchant chose to show. */
+  readonly contact: string | null;
+  readonly footerNote: string | null;
+  /** `#rrggbb` for the rule under the letterhead, or null for the default grey. */
+  readonly accentHex: string | null;
+  readonly logo: { readonly bytes: Uint8Array; readonly contentType: string } | null;
+}
+
 export interface InvoicePdfSource {
   readonly invoice: InvoicePdfSourceInvoice;
   readonly lines: readonly InvoicePdfSourceLine[];
+  readonly branding: InvoicePdfSourceBranding;
   readonly generatedAtEpochMs: number;
+}
+
+/**
+ * The accent colour as the three fractions of one that a PDF stroke operator takes.
+ *
+ * A value that does not match `0116`'s own check answers null rather than throwing. The check is enforced by
+ * the column and by the service, so a bad value here means a row that predates the check, and failing an
+ * invoice over the colour of a rule would be a worse answer than drawing the default grey.
+ */
+function accentOf(hex: string | null): readonly [number, number, number] | null {
+  if (hex === null || !INVOICE_PDF_ACCENT_PATTERN.test(hex)) {
+    return null;
+  }
+
+  const value = Number.parseInt(hex.slice(1), 16);
+
+  return [((value >> 16) & 0xff) / 255, ((value >> 8) & 0xff) / 255, (value & 0xff) / 255];
+}
+
+/**
+ * Read the merchant's logo into samples and fit it to its box.
+ *
+ * The decode happens here rather than in the service so the renderer stays the only module that has to know
+ * what a PDF can hold: a format `invoice-pdf-image.ts` refuses becomes an `AppError` carrying the reason,
+ * which the job records as its failure code and the merchant sees as one sentence. The scale is capped at
+ * one, which is the "never scaled up" half of the box's own comment.
+ */
+function logoPlacementOf(logo: InvoicePdfSourceBranding["logo"]): InvoicePdfLogoPlacement | null {
+  if (logo === null) {
+    return null;
+  }
+
+  const image = decodeInvoicePdfImage(logo.bytes, logo.contentType);
+  const scale = Math.min(
+    INVOICE_PDF_LOGO_MAXIMUM_WIDTH / image.width,
+    INVOICE_PDF_LOGO_MAXIMUM_HEIGHT / image.height,
+    1,
+  );
+
+  return { image, width: image.width * scale, height: image.height * scale };
 }
 
 /**
@@ -628,6 +760,19 @@ export function invoicePdfDocumentOf(source: InvoicePdfSource): InvoicePdfDocume
       hasTax: invoice.taxMinor > 0n,
     },
     memo: invoice.memo === null ? null : sanitizeMultilineText(invoice.memo, 2_000),
+    // The branding ceilings are `0116`'s own: a name and a tagline of 120, a note of 300. The address and
+    // the contact lines are assembled from profile columns whose own checks are tighter, and 400 and 300 are
+    // the room the header column has, not a new limit on anybody's data.
+    branding: {
+      name: source.branding.name === null ? null : sanitizeSingleLineText(source.branding.name, 120),
+      tagline: source.branding.tagline === null ? null : sanitizeSingleLineText(source.branding.tagline, 120),
+      address: source.branding.address === null ? null : sanitizeMultilineText(source.branding.address, 400),
+      contact: source.branding.contact === null ? null : sanitizeMultilineText(source.branding.contact, 300),
+      footerNote:
+        source.branding.footerNote === null ? null : sanitizeMultilineText(source.branding.footerNote, 300),
+      accent: accentOf(source.branding.accentHex),
+      logo: logoPlacementOf(source.branding.logo),
+    },
     generatedAt: instantOf(source.generatedAtEpochMs),
     generatedAtEpochMs: source.generatedAtEpochMs,
     labels,
@@ -658,6 +803,11 @@ const SIZE = Object.freeze({
   stamp: 15,
   heading: 8,
   client: 11,
+  /** The merchant's own name, at the same weight and size as the client's: neither outranks the other. */
+  merchant: 11,
+  tagline: 8.5,
+  /** The address, the contact lines and the note above the footer. */
+  identity: 8.5,
   body: 9.5,
   tableHead: 8,
   totalLabel: 10,
@@ -668,9 +818,14 @@ const SIZE = Object.freeze({
 });
 
 const LEADING = Object.freeze({
-  title: 30,
   heading: 12,
   body: 13,
+  /** The merchant's own block: tighter than the body, because it is a letterhead and not a sentence. */
+  identity: 11,
+  /** The gap under a logo, so the name does not sit on the mark's own bottom edge. */
+  logoGap: 8,
+  /** The height of the header's right column - title, number, status - which the left column shares. */
+  headerBand: 40,
   tableHead: 16,
   row: 13,
   rowPadding: 7,
@@ -678,6 +833,9 @@ const LEADING = Object.freeze({
   grandTotalRow: 22,
   block: 20,
 });
+
+/** The width the merchant's identity wraps to, which is the width the client block below it wraps to. */
+const MERCHANT_WIDTH = 240;
 
 const GREY = Object.freeze({
   rule: 0.78,
@@ -689,6 +847,9 @@ const GREY = Object.freeze({
 function points(value: number): string {
   return (Math.round(value * 100) / 100).toString();
 }
+
+/** A rule's stroke: either a grey, or the merchant's accent as red, green and blue in fractions of one. */
+type RuleStroke = number | readonly [number, number, number];
 
 interface TextPlacement {
   readonly x: number;
@@ -778,10 +939,32 @@ class InvoicePdfCanvas {
     );
   }
 
-  rule(y: number, grey: number = GREY.rule): void {
-    this.ops.push(
-      `${points(grey)} G 0.7 w ${INVOICE_PDF_MARGIN} ${points(y)} m ${CONTENT_RIGHT} ${points(y)} l S`,
-    );
+  /**
+   * A hairline across the content width.
+   *
+   * The stroke is either a grey - the default, and what every rule inside the table uses - or the merchant's
+   * accent as three fractions of one, which is what `0116` stores and what the rule under the letterhead
+   * carries. Colour is applied to lines and never to text: a merchant who picks white can make a rule
+   * disappear, and cannot make a sentence unreadable.
+   */
+  rule(y: number, stroke: RuleStroke = GREY.rule): void {
+    const colour =
+      typeof stroke === "number"
+        ? `${points(stroke)} G`
+        : `${points(stroke[0])} ${points(stroke[1])} ${points(stroke[2])} RG`;
+
+    this.ops.push(`${colour} 0.7 w ${INVOICE_PDF_MARGIN} ${points(y)} m ${CONTENT_RIGHT} ${points(y)} l S`);
+  }
+
+  /**
+   * Paint an image XObject into a rectangle, positioned by its bottom left corner.
+   *
+   * `cm` sets the transform and `Do` paints the named object, and the pair is wrapped in `q`/`Q` so the
+   * transform dies with the image instead of moving everything drawn after it - the mistake that would show
+   * up as a document whose whole table sits in the corner the logo was in.
+   */
+  image(name: string, x: number, y: number, width: number, height: number): void {
+    this.ops.push(`q ${points(width)} 0 0 ${points(height)} ${points(x)} ${points(y)} cm /${name} Do Q`);
   }
 
   moveBy(distance: number): void {
@@ -876,33 +1059,90 @@ class PdfWriter {
   }
 }
 
-function streamObject(content: string): Buffer {
-  const data = deflateSync(Buffer.from(content, "latin1"), { level: 9 });
-
+/** A dictionary, a `stream` keyword and the bytes between them, which is every stream this file writes. */
+function streamBody(dictionary: string, data: Buffer): Buffer {
   return Buffer.concat([
-    Buffer.from(`<< /Length ${data.length} /Filter /FlateDecode >>\nstream\n`, "latin1"),
+    Buffer.from(`${dictionary}\nstream\n`, "latin1"),
     data,
     Buffer.from("\nendstream", "latin1"),
   ]);
 }
 
+function streamObject(content: string): Buffer {
+  const data = deflateSync(Buffer.from(content, "latin1"), { level: 9 });
+
+  return streamBody(`<< /Length ${data.length} /Filter /FlateDecode >>`, data);
+}
+
+/**
+ * The logo's image XObject.
+ *
+ * A JPEG's samples are the file itself, which is why its filter is `DCTDecode` and why nothing was decoded
+ * on the way here; a PNG's are the pixels `invoice-pdf-image.ts` produced, deflated at the same level as
+ * every content stream so the document stays byte-deterministic. The soft mask, when the image has one, is
+ * named here and written next: PDF's way of saying where a logo is transparent is a second image of the same
+ * geometry holding one grey byte per pixel.
+ */
+function imageStreamObject(image: InvoicePdfImage, maskObject: number | null): Buffer {
+  const data =
+    image.filter === "DCTDecode"
+      ? Buffer.from(image.samples)
+      : deflateSync(Buffer.from(image.samples), { level: 9 });
+  const space = image.colorSpace === "gray" ? "/DeviceGray" : "/DeviceRGB";
+  const mask = maskObject === null ? "" : ` /SMask ${maskObject} 0 R`;
+
+  return streamBody(
+    `<< /Type /XObject /Subtype /Image /Width ${image.width} /Height ${image.height} /ColorSpace ${space} ` +
+      `/BitsPerComponent ${image.bitsPerComponent} /Filter /${image.filter}${mask} /Length ${data.length} >>`,
+    data,
+  );
+}
+
+/** The soft mask of a logo that has transparent pixels: one grey byte per pixel, same geometry. */
+function maskStreamObject(image: InvoicePdfImage, alpha: Uint8Array): Buffer {
+  const data = deflateSync(Buffer.from(alpha), { level: 9 });
+
+  return streamBody(
+    `<< /Type /XObject /Subtype /Image /Width ${image.width} /Height ${image.height} ` +
+      `/ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode /Length ${data.length} >>`,
+    data,
+  );
+}
+
 /* ---- the layout ---- */
 
+/**
+ * The letterhead: the merchant on the left, the document on the right.
+ *
+ * Both columns start at the same baseline - the cursor - and the band they occupy is the taller of the two,
+ * so a merchant with a logo and six lines of address pushes the rule down and a merchant who has set nothing
+ * leaves the header at the height its three right-hand lines need. Computing the band rather than fixing it
+ * is what keeps the rest of the document from ever overlapping the branding.
+ *
+ * The logo is painted from its bottom left corner at the cursor, which puts it inside the content area, and
+ * the title's own ascenders stay in the top margin where they have always been.
+ *
+ * A status line reads `Status: Sent`. It said `Invoice number: Sent` until this STEP rewrote the header,
+ * because it was built from the number's label rather than the status's - the number itself is the line
+ * above it, so the label belonged to nothing on the page.
+ */
 function drawHeader(canvas: InvoicePdfCanvas, document: InvoicePdfDocument): void {
-  const { labels } = document;
+  const { labels, branding } = document;
+  const topY = canvas.y;
 
   canvas.text({
-    x: INVOICE_PDF_MARGIN,
-    y: canvas.y,
+    x: CONTENT_RIGHT,
+    y: topY,
     text: labels.title,
     font: "bold",
     size: SIZE.title,
+    align: "right",
   });
 
   if (document.number === null) {
     canvas.text({
       x: CONTENT_RIGHT,
-      y: canvas.y + 4,
+      y: topY - 20,
       text: labels.draftStamp,
       font: "bold",
       size: SIZE.stamp,
@@ -911,7 +1151,7 @@ function drawHeader(canvas: InvoicePdfCanvas, document: InvoicePdfDocument): voi
     });
     canvas.text({
       x: CONTENT_RIGHT,
-      y: canvas.y - 12,
+      y: topY - 33,
       text: labels.notIssued,
       font: "regular",
       size: SIZE.body,
@@ -921,7 +1161,7 @@ function drawHeader(canvas: InvoicePdfCanvas, document: InvoicePdfDocument): voi
   } else {
     canvas.text({
       x: CONTENT_RIGHT,
-      y: canvas.y + 4,
+      y: topY - 20,
       text: document.number,
       font: "bold",
       size: SIZE.number,
@@ -929,8 +1169,8 @@ function drawHeader(canvas: InvoicePdfCanvas, document: InvoicePdfDocument): voi
     });
     canvas.text({
       x: CONTENT_RIGHT,
-      y: canvas.y - 12,
-      text: `${labels.numberLabel}: ${statusWordOf(labels, document.status)}`,
+      y: topY - 33,
+      text: `${labels.status}: ${statusWordOf(labels, document.status)}`,
       font: "regular",
       size: SIZE.body,
       align: "right",
@@ -938,8 +1178,41 @@ function drawHeader(canvas: InvoicePdfCanvas, document: InvoicePdfDocument): voi
     });
   }
 
-  canvas.moveBy(LEADING.title);
-  canvas.rule(canvas.y);
+  let y = topY;
+  const logo = branding.logo;
+
+  if (logo !== null) {
+    canvas.image(INVOICE_PDF_LOGO_NAME, INVOICE_PDF_MARGIN, y - logo.height, logo.width, logo.height);
+    y -= logo.height + LEADING.logoGap;
+  }
+
+  if (branding.name !== null && branding.name.length > 0) {
+    canvas.text({ x: INVOICE_PDF_MARGIN, y, text: branding.name, font: "bold", size: SIZE.merchant });
+    y -= LEADING.body;
+  }
+
+  if (branding.tagline !== null && branding.tagline.length > 0) {
+    for (const line of invoicePdfWrap(branding.tagline, "regular", SIZE.tagline, MERCHANT_WIDTH)) {
+      canvas.text({ x: INVOICE_PDF_MARGIN, y, text: line, font: "regular", size: SIZE.tagline, grey: GREY.muted });
+      y -= LEADING.identity;
+    }
+  }
+
+  // The address and the contact lines are stored multiline and wrapped here, exactly as the client's address
+  // is in the block below: the column decides the width, and the data keeps its own line breaks.
+  for (const block of [branding.address, branding.contact]) {
+    if (block === null || block.length === 0) {
+      continue;
+    }
+
+    for (const line of invoicePdfWrap(block, "regular", SIZE.identity, MERCHANT_WIDTH)) {
+      canvas.text({ x: INVOICE_PDF_MARGIN, y, text: line, font: "regular", size: SIZE.identity });
+      y -= LEADING.identity;
+    }
+  }
+
+  canvas.moveBy(Math.max(topY - y, LEADING.headerBand));
+  canvas.rule(canvas.y, branding.accent ?? GREY.rule);
   canvas.moveBy(LEADING.block);
 }
 
@@ -1297,10 +1570,45 @@ function drawMemo(canvas: InvoicePdfCanvas, document: InvoicePdfDocument): void 
 }
 
 /**
+ * The merchant's note, above the footer of the page the document ends on.
+ *
+ * It is drawn last, after the memo, so it lands where the reading finished rather than starting a page of
+ * its own: bank details or a thank-you belong at the end of a document, not floating between two halves of a
+ * table that broke. The width is the whole content column, because this is the one block on the page that is
+ * a sentence rather than a column of facts.
+ */
+function drawFooterNote(canvas: InvoicePdfCanvas, document: InvoicePdfDocument): void {
+  const note = document.branding.footerNote;
+
+  if (note === null || note.length === 0) {
+    return;
+  }
+
+  const lines = invoicePdfWrap(note, "regular", SIZE.identity, CONTENT_RIGHT - INVOICE_PDF_MARGIN);
+
+  canvas.reserve(LEADING.heading + lines.length * LEADING.identity + LEADING.block);
+  canvas.moveBy(LEADING.heading);
+
+  for (const line of lines) {
+    canvas.text({
+      x: INVOICE_PDF_MARGIN,
+      y: canvas.y,
+      text: line,
+      font: "regular",
+      size: SIZE.identity,
+      grey: GREY.muted,
+    });
+    canvas.moveBy(LEADING.identity);
+  }
+}
+
+/**
  * Render one invoice document to PDF bytes.
  *
  * The whole layout runs before the first byte is written, because the cross reference table needs the
- * offset of every object and the footer needs the page count, and both are known only at the end.
+ * offset of every object and the footer needs the page count, and both are known only at the end. The same
+ * is true of the logo's object number, which the first page's resources name before the image is written:
+ * it is the object after the last page's stream, and the page count is known before either.
  */
 export function renderInvoicePdf(document: InvoicePdfDocument): Uint8Array {
   const { labels } = document;
@@ -1311,6 +1619,7 @@ export function renderInvoicePdf(document: InvoicePdfDocument): Uint8Array {
   drawLines(canvas, document);
   drawTotals(canvas, document);
   drawMemo(canvas, document);
+  drawFooterNote(canvas, document);
 
   canvas.footers(
     formatMessage("invoices.pdfGeneratedAt", { instant: document.generatedAt }),
@@ -1327,6 +1636,14 @@ export function renderInvoicePdf(document: InvoicePdfDocument): Uint8Array {
   // before any of them is written: two objects per page, a page and its stream, starting at six.
   const streams = canvas.streams();
   const pageNumbers = streams.map((_, index) => firstPageObject + index * 2);
+
+  // The logo's objects come after every page's pair, so their numbers are already known and the first page's
+  // resources can name an object that is not written until the end of the file. A forward reference is
+  // ordinary in PDF: the cross reference table is what resolves it, and that is written last.
+  const logo = document.branding.logo;
+  const imageObject = logo === null ? null : firstPageObject + streams.length * 2;
+  const maskObject =
+    imageObject !== null && logo !== null && logo.image.alpha !== null ? imageObject + 1 : null;
 
   writer.add(
     `<< /Type /Pages /Kids [${pageNumbers.map((number) => `${number} 0 R`).join(" ")}] ` +
@@ -1346,13 +1663,27 @@ export function renderInvoicePdf(document: InvoicePdfDocument): Uint8Array {
 
   for (const [index, content] of streams.entries()) {
     const pageNumber = firstPageObject + index * 2;
+    // Only the first page carries the logo, so only its resources name an image and only its procedure set
+    // asks for `/ImageC`: a page that draws no picture should not claim it can.
+    const resources =
+      imageObject !== null && index === 0
+        ? `/Resources << /ProcSet [/PDF /Text /ImageC] /Font << /F1 3 0 R /F2 4 0 R >> ` +
+          `/XObject << /${INVOICE_PDF_LOGO_NAME} ${imageObject} 0 R >> >>`
+        : `/Resources << /ProcSet [/PDF /Text] /Font << /F1 3 0 R /F2 4 0 R >> >>`;
 
     writer.add(
       `<< /Type /Page /Parent ${pagesObject} 0 R /MediaBox [0 0 ${INVOICE_PDF_PAGE_WIDTH} ` +
-        `${INVOICE_PDF_PAGE_HEIGHT}] /Resources << /ProcSet [/PDF /Text] /Font << /F1 3 0 R /F2 4 0 R >> >> ` +
-        `/Contents ${pageNumber + 1} 0 R >>`,
+        `${INVOICE_PDF_PAGE_HEIGHT}] ${resources} /Contents ${pageNumber + 1} 0 R >>`,
     );
     writer.add(streamObject(content));
+  }
+
+  if (logo !== null && imageObject !== null) {
+    writer.add(imageStreamObject(logo.image, maskObject));
+
+    if (logo.image.alpha !== null) {
+      writer.add(maskStreamObject(logo.image, logo.image.alpha));
+    }
   }
 
   const bytes = writer.bytes(1, 5);

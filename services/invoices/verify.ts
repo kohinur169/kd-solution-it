@@ -2,7 +2,7 @@
 import process from "node:process";
 import { readFile } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
-import { inflateSync } from "node:zlib";
+import { crc32, deflateSync, inflateSync } from "node:zlib";
 import type { z } from "zod";
 import { createInMemoryAuditTrail, type AuditTrail } from "../../lib/auth/audit.ts";
 import type { RestClient } from "../../lib/auth/rest.ts";
@@ -101,10 +101,14 @@ import {
   type InvoiceNumberingDependencies,
 } from "./invoice-numbering.ts";
 import {
+  INVOICE_PDF_ACCENT_PATTERN,
   INVOICE_PDF_CONTENT_TYPE,
   INVOICE_PDF_EXTENSION,
   INVOICE_PDF_FONTS,
   INVOICE_PDF_HEADER,
+  INVOICE_PDF_LOGO_MAXIMUM_HEIGHT,
+  INVOICE_PDF_LOGO_MAXIMUM_WIDTH,
+  INVOICE_PDF_LOGO_NAME,
   INVOICE_PDF_MARGIN,
   INVOICE_PDF_MAXIMUM_BYTES,
   INVOICE_PDF_PAGE_HEIGHT,
@@ -120,8 +124,39 @@ import {
   invoicePdfWrap,
   renderInvoicePdf,
   type InvoicePdfSource,
+  type InvoicePdfSourceBranding,
   type InvoicePdfSourceLine,
 } from "./invoice-pdf.ts";
+import {
+  INVOICE_PDF_IMAGE_COLOR_SPACES,
+  INVOICE_PDF_IMAGE_FORMATS,
+  INVOICE_PDF_IMAGE_MAXIMUM_PIXELS,
+  INVOICE_PDF_IMAGE_REFUSALS,
+  decodeInvoicePdfImage,
+  inspectInvoicePdfImage,
+  sniffInvoicePdfImageFormat,
+  type InvoicePdfImage,
+} from "./invoice-pdf-image.ts";
+import {
+  COMPANY_LOGO_PURPOSE,
+  INVOICE_BRANDING_AUDIT_ENTITY,
+  INVOICE_BRANDING_DEFAULTS,
+  INVOICE_BRANDING_LIMITS,
+  INVOICE_BRANDING_NAME_STYLES,
+  INVOICE_BRANDING_TABLE,
+  INVOICE_BRANDING_UPDATED_AUDIT_ACTION,
+  invoiceBrandingInputSchema,
+  invoiceBrandingRowSchema,
+  invoiceBrandingWordsOf,
+  parseInvoiceBrandingInput,
+  readInvoiceBranding,
+  readInvoiceBrandingIdentity,
+  readInvoicePrintBranding,
+  updateInvoiceBranding,
+  uploadInvoiceLogo,
+  type InvoiceBrandingIdentity,
+  type InvoiceBrandingStorageDependencies,
+} from "./invoice-branding.ts";
 import {
   INVOICE_DOCUMENTS_TABLE,
   INVOICE_DOCUMENT_ENTITY,
@@ -284,6 +319,12 @@ interface InvoiceDb {
   readonly documents: Array<Record<string, unknown>>;
   /** `0057`: the file rows a render writes, archives and reads back. */
   readonly files: Array<Record<string, unknown>>;
+  /** `0116`: the merchant's invoice branding, one row per company, created on the first save. */
+  readonly branding: Array<Record<string, unknown>>;
+  /** `0103` as `0105` extended it: the facts an invoice prints about its own merchant. */
+  readonly profiles: Array<Record<string, unknown>>;
+  /** `0001`: the company itself, whose name is the last resort for a merchant with no profile. */
+  readonly companies: Array<Record<string, unknown>>;
   /** Every take, in order, so a test can see the sequence a merchant was actually issued. */
   readonly takenNumbers: string[];
   /** Set to make the lines insert fail, which is how the compensation path is reached. */
@@ -293,6 +334,11 @@ interface InvoiceDb {
    * write the service sends matches nothing and the service has to read the winner's state back.
    */
   raceDocumentVersion: boolean;
+  /**
+   * Set to make one branding save lose a race: the fixture moves the row first, so the version-scoped write
+   * the service sends matches nothing and the service has to answer `CONFLICT` rather than overwrite.
+   */
+  raceBrandingVersion: boolean;
   inserts: Array<{ readonly table: string; readonly rows: readonly Readonly<Record<string, unknown>>[] }>;
   updates: Array<{ readonly table: string; readonly query: string; readonly values: Record<string, unknown> }>;
   /** Set while a test wants every intermediate position write checked against the unique index. */
@@ -375,9 +421,13 @@ function createDb(): InvoiceDb {
     numberingCounters: [],
     documents: [],
     files: [],
+    branding: [],
+    profiles: [],
+    companies: [],
     takenNumbers: [],
     failItems: false,
     raceDocumentVersion: false,
+    raceBrandingVersion: false,
     strictPositions: false,
     inserts: [],
     updates: [],
@@ -662,6 +712,9 @@ const MODELLED_TABLES = [
   "invoice_number_counters",
   "invoice_documents",
   "files",
+  "invoice_branding",
+  "business_profiles",
+  "companies",
 ] as const;
 
 /**
@@ -711,6 +764,12 @@ function rowsOf(db: InvoiceDb, table: string): Array<Record<string, unknown>> {
       return db.documents;
     case "files":
       return db.files;
+    case "invoice_branding":
+      return db.branding;
+    case "business_profiles":
+      return db.profiles;
+    case "companies":
+      return db.companies;
     default:
       throw new Error(`the invoice service touches no table the gate does not model: ${table}`);
   }
@@ -726,14 +785,18 @@ function createInvoiceRest(db: InvoiceDb): RestClient {
       }
 
       const parts = queryParts(query);
-      const company = parts.get("company_id");
+      // `companies` *is* the tenant: it has no company_id column, so the scope a read of it owes is its own
+      // primary key. Every other table here is scoped by company_id, and a read that omits either is a bug
+      // the fixture refuses rather than quietly answering with another merchant's rows.
+      const scopeColumn = table === "companies" ? "id" : "company_id";
+      const company = parts.get(scopeColumn);
 
       if (company === undefined || !company.startsWith("eq.")) {
         return Promise.reject(new Error(`a read is not scoped to one company: ${query}`));
       }
 
       const companyId = company.slice(3);
-      let matched = rowsOf(db, table).filter((row) => row["company_id"] === companyId);
+      let matched = rowsOf(db, table).filter((row) => row[scopeColumn] === companyId);
 
       for (const [key, value] of parts) {
         if (key === "select" || key === "order" || key === "limit" || key === "offset" || key === "or") {
@@ -806,6 +869,29 @@ function createInvoiceRest(db: InvoiceDb): RestClient {
           }
 
           db.numberingSettings.push(created);
+        }
+
+        return Promise.resolve();
+      }
+
+      // `0116`'s branding row, created on a merchant's first save, exactly like `0114`'s series row.
+      if (table === "invoice_branding") {
+        for (const row of rows) {
+          const created: Record<string, unknown> = wireOf({
+            id: randomUUID(),
+            created_at: new Date(NOW + db.branding.length).toISOString(),
+            updated_at: new Date(NOW + db.branding.length).toISOString(),
+            deleted_at: null,
+            version: 1,
+            ...row,
+          });
+
+          // `invoice_branding_company_key`: one merchant has one brand.
+          if (db.branding.some((candidate) => candidate["company_id"] === created["company_id"])) {
+            return Promise.reject(new AppError("CONFLICT"));
+          }
+
+          db.branding.push(created);
         }
 
         return Promise.resolve();
@@ -1214,6 +1300,50 @@ function createInvoiceRest(db: InvoiceDb): RestClient {
           );
         }
 
+        Object.assign(row, wireOf(values), {
+          updated_at: new Date(NOW + 30_000).toISOString(),
+          version: Number(row["version"]) + 1,
+        });
+
+        return Promise.resolve();
+      }
+
+      // `0116`'s row on a merchant's later save, with the optimistic lock rule 13 asks for: the version in
+      // the filter, so a write that lost a race matches nothing and the service reads the winner back.
+      if (table === "invoice_branding") {
+        const parts = queryParts(query);
+        const id = parts.get("id")?.slice(3);
+        const company = parts.get("company_id")?.slice(3);
+        const version = parts.get("version")?.slice(3);
+
+        if (id === undefined || company === undefined) {
+          return Promise.reject(new Error(`a branding update is not scoped to one row of one company: ${query}`));
+        }
+
+        const row = db.branding.find(
+          (candidate) =>
+            candidate["id"] === id &&
+            candidate["company_id"] === company &&
+            (parts.get("deleted_at") !== "is.null" || candidate["deleted_at"] === null),
+        );
+
+        if (row === undefined || (version !== undefined && String(row["version"]) !== version)) {
+          return Promise.resolve();
+        }
+
+        if (db.raceBrandingVersion) {
+          db.raceBrandingVersion = false;
+
+          Object.assign(row, {
+            tagline: "the other owner's tagline",
+            updated_at: new Date(NOW + 5_000).toISOString(),
+            version: Number(row["version"]) + 1,
+          });
+
+          return Promise.resolve();
+        }
+
+        // `invoice_branding_set_row_metadata`, which is `set_row_metadata()`.
         Object.assign(row, wireOf(values), {
           updated_at: new Date(NOW + 30_000).toISOString(),
           version: Number(row["version"]) + 1,
@@ -4230,6 +4360,8 @@ interface ReadPdf {
   /** The hash of everything before the trailer, which is what a file's own identifier claims to be. */
   readonly bodySha256: string;
   readonly objectCount: number;
+  /** Every object's body by number, so a dictionary or a stream can be read back and asserted on. */
+  readonly bodies: ReadonlyMap<number, string>;
 }
 
 /** The file as bytes that survive a round trip through a Latin-1 string, which is what a PDF is. */
@@ -4424,6 +4556,7 @@ function readPdf(bytes: Uint8Array): ReadPdf {
       .update(Buffer.from(raw.slice(0, raw.indexOf("trailer", startxref)), "latin1"))
       .digest("hex"),
     objectCount: bodies.size,
+    bodies,
   };
 }
 
@@ -4473,6 +4606,40 @@ interface PdfSourceOverrides {
   readonly memo?: string | null;
   readonly issuedAt?: string | null;
   readonly generatedAtEpochMs?: number;
+  readonly branding?: InvoicePdfSourceBranding;
+}
+
+interface PdfBrandingOverrides {
+  readonly name?: string | null;
+  readonly tagline?: string | null;
+  readonly address?: string | null;
+  readonly contact?: string | null;
+  readonly footerNote?: string | null;
+  readonly accentHex?: string | null;
+  readonly logo?: { readonly bytes: Uint8Array; readonly contentType: string } | null;
+}
+
+/**
+ * A merchant's own half of the document, in the shape `readInvoicePrintBranding` hands the renderer.
+ *
+ * The default is a merchant who has a profile and has set a tagline: the case the header has to lay out
+ * beside the document's own title. Nothing is chosen by default - no logo, no accent, no footer note - so
+ * every assertion about those three is about a fixture that asked for them.
+ */
+function pdfBrandingOf(overrides: PdfBrandingOverrides = {}): InvoicePdfSourceBranding {
+  return {
+    name: overrides.name === undefined ? "Northlight Studio LLC" : overrides.name,
+    tagline: overrides.tagline === undefined ? "Design and hosting since 2014" : overrides.tagline,
+    address:
+      overrides.address === undefined ? "48 Commerce Row\nAustin, TX 78701\nUS" : overrides.address,
+    contact:
+      overrides.contact === undefined
+        ? "accounts@northlight.example\n+1 512 555 0143"
+        : overrides.contact,
+    footerNote: overrides.footerNote === undefined ? null : overrides.footerNote,
+    accentHex: overrides.accentHex === undefined ? null : overrides.accentHex,
+    logo: overrides.logo === undefined ? null : overrides.logo,
+  };
 }
 
 /**
@@ -4511,6 +4678,7 @@ function pdfSourceOf(overrides: PdfSourceOverrides = {}): InvoicePdfSource {
       dueAt: PDF_DUE_AT,
     },
     lines,
+    branding: overrides.branding ?? pdfBrandingOf(),
     generatedAtEpochMs: overrides.generatedAtEpochMs ?? NOW,
   };
 }
@@ -5650,6 +5818,1978 @@ async function checkPdfSources(): Promise<void> {
   expectEqual(getMessage("invoices.pdfFileStem"), "invoice", "the file name a merchant's download carries");
 }
 
+/* ---- STEP 118: image fixtures ----
+ *
+ * A PNG and a JPEG built here, byte by byte, because the reader this gate proves is the only thing between a
+ * merchant's logo and a client's document, and there is no image library in this repository to borrow a
+ * fixture from.
+ *
+ * The PNGs are real files: signature, chunk lengths, CRCs over type and payload, and deflated scanlines with
+ * their filter bytes, so a browser would open them and the decoder's filters, palettes, bit depths and
+ * transparency chunks are exercised by bytes that obey the specification rather than by bytes invented to
+ * please it. The JPEGs are marker streams - SOI, APP0, SOF0, DHT, SOS, EOI - which is everything the reader
+ * walks and nothing it decodes, because a baseline JPEG goes into the PDF as its own bytes under
+ * `/DCTDecode`. They are not decodable photographs, and no assertion here pretends they are.
+ */
+
+function be16(value: number): readonly number[] {
+  return [(value >>> 8) & 0xff, value & 0xff];
+}
+
+function be32(value: number): readonly number[] {
+  return [(value >>> 24) & 0xff, (value >>> 16) & 0xff, (value >>> 8) & 0xff, value & 0xff];
+}
+
+function concatBytes(chunks: readonly Uint8Array[]): Uint8Array {
+  const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+  const out = new Uint8Array(total);
+  let at = 0;
+
+  for (const chunk of chunks) {
+    out.set(chunk, at);
+    at += chunk.length;
+  }
+
+  return out;
+}
+
+/** One PNG chunk: its length, its four type bytes, its payload, and the CRC over the type and the payload. */
+function pngChunk(type: string, payload: readonly number[]): Uint8Array {
+  const typeBytes = [...type].map((character) => character.charCodeAt(0));
+  const crcInput = new Uint8Array(typeBytes.length + payload.length);
+
+  crcInput.set(typeBytes, 0);
+  crcInput.set(payload, typeBytes.length);
+
+  const out = new Uint8Array(12 + payload.length);
+
+  out.set(be32(payload.length), 0);
+  out.set(typeBytes, 4);
+  out.set(payload, 8);
+  out.set(be32(crc32(crcInput) >>> 0), 8 + payload.length);
+
+  return out;
+}
+
+interface PngFixture {
+  readonly width: number;
+  readonly height: number;
+  readonly bitDepth: number;
+  /** 0 grey, 2 truecolour, 3 indexed, 4 grey with alpha, 6 truecolour with alpha. */
+  readonly colorType: number;
+  readonly interlace?: number;
+  readonly palette?: readonly number[];
+  readonly transparency?: readonly number[];
+  /** The scanlines without their filter bytes: one array per row, already packed to the bit depth. */
+  readonly rows?: readonly (readonly number[])[];
+  /** The filter byte written before every scanline. */
+  readonly filter?: number;
+  /** One filter byte per scanline, when the rows differ - which is how a real encoder writes them. */
+  readonly filters?: readonly number[];
+  /** Write the IDAT as two chunks, which a real encoder does whenever it streams. */
+  readonly splitIdat?: boolean;
+  /** An IHDR to write instead of the one these numbers describe: how a pixel bomb is built. */
+  readonly declared?: readonly number[];
+  readonly omitIdat?: boolean;
+  readonly omitPalette?: boolean;
+}
+
+function pngOf(input: PngFixture): Uint8Array {
+  const ihdr =
+    input.declared ?? [
+      ...be32(input.width),
+      ...be32(input.height),
+      input.bitDepth,
+      input.colorType,
+      0,
+      0,
+      input.interlace ?? 0,
+    ];
+  const raw: number[] = [];
+
+  for (const [index, row] of (input.rows ?? []).entries()) {
+    raw.push(input.filters?.[index] ?? input.filter ?? 0, ...row);
+  }
+
+  const compressed = deflateSync(Uint8Array.from(raw));
+  const chunks: Uint8Array[] = [
+    Uint8Array.of(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a),
+    pngChunk("IHDR", ihdr),
+  ];
+
+  if (input.palette !== undefined && input.omitPalette !== true) {
+    chunks.push(pngChunk("PLTE", [...input.palette]));
+  }
+
+  if (input.transparency !== undefined) {
+    chunks.push(pngChunk("tRNS", [...input.transparency]));
+  }
+
+  if (input.omitIdat !== true) {
+    if (input.splitIdat === true) {
+      const half = Math.floor(compressed.length / 2);
+
+      chunks.push(
+        pngChunk("IDAT", [...compressed.subarray(0, half)]),
+        pngChunk("IDAT", [...compressed.subarray(half)]),
+      );
+    } else {
+      chunks.push(pngChunk("IDAT", [...compressed]));
+    }
+  }
+
+  chunks.push(pngChunk("IEND", []));
+
+  return concatBytes(chunks);
+}
+
+interface JpegFixture {
+  readonly width: number;
+  readonly height: number;
+  /** 8 is baseline; 12 is one of the precisions a PDF image XObject cannot take. */
+  readonly precision?: number;
+  readonly components?: number;
+  /** 0xc0 baseline, 0xc2 progressive: the marker the reader refuses or accepts. */
+  readonly startOfFrame?: number;
+  /** Fill bytes before the frame marker, which a real encoder emits and a naive walker trips on. */
+  readonly fill?: boolean;
+  readonly trailing?: readonly number[];
+}
+
+function jpegOf(input: JpegFixture): Uint8Array {
+  const components = input.components ?? 3;
+  const precision = input.precision ?? 8;
+  const marker = (type: number, payload: readonly number[]): Uint8Array =>
+    concatBytes([Uint8Array.of(0xff, type, ...be16(payload.length + 2)), Uint8Array.from(payload)]);
+  const sampling = components === 1 ? [1, 0x11, 0] : [1, 0x11, 0, 2, 0x11, 1, 3, 0x11, 1];
+  const frame = marker(input.startOfFrame ?? 0xc0, [
+    precision,
+    ...be16(input.height),
+    ...be16(input.width),
+    components,
+    ...sampling.slice(0, components * 3),
+  ]);
+
+  return concatBytes([
+    Uint8Array.of(0xff, 0xd8),
+    marker(0xe0, [0x4a, 0x46, 0x49, 0x46, 0x00, 1, 1, 0, 0, 1, 0, 1, 0, 0]),
+    input.fill === true ? Uint8Array.of(0xff) : new Uint8Array(0),
+    frame,
+    // A Huffman table and a start of scan, so the walk has something to step over and something to stop at.
+    marker(0xc4, [0x00, 0x1f, 0x00, 0x00, 0x01, 0x05, 0x01, 0x01, 0x01]),
+    marker(0xda, [components, ...Array.from({ length: components * 2 }, (_, index) => index + 1), 0, 63, 0]),
+    Uint8Array.of(0xff, 0xd9),
+    Uint8Array.from(input.trailing ?? []),
+  ]);
+}
+
+/** A 2x2 truecolour image with an alpha channel, from four RGBA pixels. */
+function rgbaPng(pixels: readonly (readonly [number, number, number, number])[]): Uint8Array {
+  const at = (index: number): readonly number[] => pixels[index] ?? [0, 0, 0, 255];
+
+  return pngOf({
+    width: 2,
+    height: 2,
+    bitDepth: 8,
+    colorType: 6,
+    rows: [
+      [...at(0), ...at(1)],
+      [...at(2), ...at(3)],
+    ],
+  });
+}
+
+/** The reason an inspection gave, or null when it accepted the bytes. */
+function inspectReason(bytes: Uint8Array, contentType: string): string | null {
+  const verdict = inspectInvoicePdfImage(bytes, contentType);
+
+  return verdict.ok ? null : verdict.reason;
+}
+
+async function checkPdfImageDecoder(): Promise<void> {
+  // ---- the vocabulary the module publishes ----
+  expectEqual(INVOICE_PDF_IMAGE_FORMATS.join(","), "png,jpeg", "two formats: the ones a PDF can draw");
+  expectEqual(
+    INVOICE_PDF_IMAGE_REFUSALS.join(","),
+    "not_an_image,unsupported_bit_depth,interlaced,unsupported_jpeg,too_many_pixels,malformed",
+    "and six reasons it says no, each of which a merchant can be told in one sentence",
+  );
+  expectEqual(INVOICE_PDF_IMAGE_COLOR_SPACES.join(","), "rgb,gray", "the two colour spaces an XObject is given");
+  expectEqual(
+    INVOICE_PDF_IMAGE_MAXIMUM_PIXELS,
+    2_048 * 2_048,
+    "the ceiling is four million pixels, which is checked before anything is inflated",
+  );
+
+  // ---- sniffing ----
+  const png = rgbaPng([
+    [255, 0, 0, 255],
+    [0, 255, 0, 255],
+    [0, 0, 255, 255],
+    [255, 255, 255, 0],
+  ]);
+  const jpeg = jpegOf({ width: 12, height: 9 });
+  const webp = concatBytes([
+    Uint8Array.from([..."RIFF"], (character) => character.charCodeAt(0)),
+    Uint8Array.of(0x1a, 0x00, 0x00, 0x00),
+    Uint8Array.from([..."WEBPVP8 "], (character) => character.charCodeAt(0)),
+  ]);
+
+  expectEqual(sniffInvoicePdfImageFormat(png), "png", "the signature says PNG");
+  expectEqual(sniffInvoicePdfImageFormat(jpeg), "jpeg", "and SOI says JPEG");
+  expectEqual(sniffInvoicePdfImageFormat(webp), null, "a WebP is not one of the two a PDF can draw");
+  expectEqual(sniffInvoicePdfImageFormat(new Uint8Array(0)), null, "nor is nothing at all");
+  expectEqual(sniffInvoicePdfImageFormat(Uint8Array.from([0x89, 0x50])), null, "nor a signature cut short");
+
+  // ---- inspecting, which is the cheap question ----
+  expect(inspectInvoicePdfImage(png, "image/png").ok, "a real PNG passes inspection");
+  expect(!inspectInvoicePdfImage(webp, "image/webp").ok, "and a WebP does not");
+  expectEqual(
+    inspectReason(webp, "image/webp"),
+    "not_an_image",
+    "because no PDF image XObject can hold one",
+  );
+  expectEqual(
+    inspectReason(png, "image/jpeg"),
+    "not_an_image",
+    "a declared type that disagrees with the bytes is refused rather than trusted",
+  );
+  expectEqual(
+    inspectReason(jpeg, "image/png"),
+    "not_an_image",
+    "in both directions",
+  );
+
+  // ---- decoding truecolour ----
+  const decoded = decodeInvoicePdfImage(png, "image/png");
+
+  expectEqual(decoded.format, "png", "the format is the one the signature declared");
+  expectEqual(decoded.width, 2, "two pixels wide");
+  expectEqual(decoded.height, 2, "and two high");
+  expectEqual(decoded.colorSpace, "rgb", "truecolour with alpha becomes the three samples a PDF draws");
+  expectEqual(decoded.bitsPerComponent, 8, "at eight bits a component");
+  expectEqual(decoded.filter, "FlateDecode", "deflated, because the samples were produced here");
+  expectEqual(decoded.samples.length, 12, "four pixels of three bytes, with the alpha lifted out");
+  expectEqual(
+    [...decoded.samples.subarray(0, 9)].map((byte) => byte.toString(16)).join(" "),
+    "ff 0 0 0 ff 0 0 0 ff",
+    "red, then green, then blue, in the order the scanlines hold them",
+  );
+  expect(decoded.alpha !== null, "and one clear pixel is enough to keep the mask");
+  expectEqual([...(decoded.alpha ?? [])].join(","), "255,255,255,0", "which is the fourth pixel's alpha");
+
+  const opaque = decodeInvoicePdfImage(
+    rgbaPng([
+      [1, 2, 3, 255],
+      [4, 5, 6, 255],
+      [7, 8, 9, 255],
+      [10, 11, 12, 255],
+    ]),
+    "image/png",
+  );
+
+  expectEqual(opaque.alpha, null, "an image with nothing transparent carries no mask at all");
+  expectEqual(opaque.samples.length, 12, "and still twelve samples");
+
+  // ---- the other colour types ----
+  const grey = decodeInvoicePdfImage(
+    pngOf({ width: 2, height: 2, bitDepth: 8, colorType: 0, rows: [[10, 20], [30, 40]] }),
+    "image/png",
+  );
+
+  expectEqual(grey.colorSpace, "gray", "a greyscale image stays greyscale rather than being tripled");
+  expectEqual(grey.samples.length, 4, "so four pixels are four samples");
+  expectEqual([...grey.samples].join(","), "10,20,30,40", "at the values stored");
+
+  const greyAlpha = decodeInvoicePdfImage(
+    pngOf({ width: 2, height: 1, bitDepth: 8, colorType: 4, rows: [[10, 255, 20, 0]] }),
+    "image/png",
+  );
+
+  expectEqual(greyAlpha.colorSpace, "gray", "greyscale with alpha is still greyscale");
+  expectEqual([...greyAlpha.samples].join(","), "10,20", "with the alpha lifted out of the scanline");
+  expectEqual([...(greyAlpha.alpha ?? [])].join(","), "255,0", "into a mask of its own");
+
+  // Sixteen bits become eight, taking the high byte: a PDF image XObject of sixteen bits a component is
+  // legal but twice the bytes for a logo nobody will look at that closely, and the choice is documented.
+  const sixteen = decodeInvoicePdfImage(
+    pngOf({ width: 2, height: 1, bitDepth: 16, colorType: 2, rows: [[0x12, 0x56, 0x9a, 0xde, 0x11, 0x33, 0x55, 0x77, 0x99, 0xbb, 0xdd, 0xff]] }),
+    "image/png",
+  );
+
+  expectEqual(sixteen.bitsPerComponent, 8, "a sixteen bit image is normalised to eight");
+  expectEqual([...sixteen.samples].join(","), "18,154,17,85,153,221", "by keeping the high byte of each");
+
+  // ---- sub-byte depths ----
+  const oneBit = decodeInvoicePdfImage(
+    pngOf({ width: 8, height: 1, bitDepth: 1, colorType: 0, rows: [[0b1010_1010]] }),
+    "image/png",
+  );
+
+  expectEqual(oneBit.samples.length, 8, "eight one-bit pixels are eight samples");
+  expectEqual([...oneBit.samples].join(","), "255,0,255,0,255,0,255,0", "scaled to the full range, not left as 1 and 0");
+
+  const palette = [255, 255, 255, 0, 128, 0, 0, 0, 255, 64, 64, 64];
+  const fourBit = decodeInvoicePdfImage(
+    pngOf({ width: 4, height: 1, bitDepth: 4, colorType: 3, palette, rows: [[0x10, 0x32]] }),
+    "image/png",
+  );
+
+  expectEqual(fourBit.colorSpace, "rgb", "an indexed image is decoded to the colours its palette names");
+  expectEqual(fourBit.samples.length, 12, "four pixels of three bytes");
+  expectEqual(
+    [...fourBit.samples.subarray(0, 3)].join(","),
+    palette.slice(3, 6).join(","),
+    "the first nibble is the high one, so the row starts at palette entry one",
+  );
+  expectEqual([...fourBit.samples.subarray(3, 6)].join(","), palette.slice(0, 3).join(","), "then entry zero");
+  expectEqual([...fourBit.samples.subarray(9, 12)].join(","), palette.slice(6, 9).join(","), "and ends at entry two");
+  expectEqual(fourBit.alpha, null, "with no transparent entry in the palette there is no mask");
+
+  // ---- transparency chunks ----
+  const indexedTransparent = decodeInvoicePdfImage(
+    pngOf({ width: 2, height: 1, bitDepth: 8, colorType: 3, palette, transparency: [255, 0], rows: [[0, 1]] }),
+    "image/png",
+  );
+
+  expectEqual(
+    [...(indexedTransparent.alpha ?? [])].join(","),
+    "255,0",
+    "a tRNS over a palette makes the entries it names transparent",
+  );
+
+  const truecolourTransparent = decodeInvoicePdfImage(
+    pngOf({
+      width: 2,
+      height: 1,
+      bitDepth: 8,
+      colorType: 2,
+      transparency: [0, 255, 0, 255, 0, 255],
+      rows: [[255, 255, 255, 7, 7, 7]],
+    }),
+    "image/png",
+  );
+
+  expectEqual(
+    [...(truecolourTransparent.alpha ?? [])].join(","),
+    "0,255",
+    "and over truecolour it names the one colour that disappears, as three sixteen bit values",
+  );
+
+  // ---- a stream in two chunks, and the filters ----
+  const split = decodeInvoicePdfImage(
+    pngOf({
+      width: 2,
+      height: 2,
+      bitDepth: 8,
+      colorType: 2,
+      rows: [
+        [1, 2, 3, 4, 5, 6],
+        [7, 8, 9, 10, 11, 12],
+      ],
+      splitIdat: true,
+    }),
+    "image/png",
+  );
+
+  expectEqual([...split.samples].join(","), "1,2,3,4,5,6,7,8,9,10,11,12", "an IDAT split in two is concatenated");
+
+  // Up: every byte of the second row is the stored byte plus the byte above it. The first row has nothing
+  // above it, so it is the stored row - which is what makes the second row's expectation statable.
+  const up = decodeInvoicePdfImage(
+    pngOf({
+      width: 2,
+      height: 2,
+      bitDepth: 8,
+      colorType: 2,
+      rows: [
+        [1, 2, 3, 4, 5, 6],
+        [10, 20, 30, 15, 25, 35],
+      ],
+      filter: 2,
+    }),
+    "image/png",
+  );
+
+  expectEqual([...up.samples.subarray(0, 6)].join(","), "1,2,3,4,5,6", "an Up filtered first row is the row stored");
+  expectEqual(
+    [...up.samples.subarray(6)].join(","),
+    "11,22,33,19,30,41",
+    "and the second is that plus the row above it",
+  );
+
+  // Paeth, over a first row that was not filtered. The predictor for each byte is whichever of `a` (the byte
+  // three positions back, which is one pixel in a three byte image), `b` (the byte above) and `c` (the byte
+  // above-left) is closest to `a + b - c`, and the row below is that prediction added to the stored byte.
+  // Worked by hand from the specification: the first three bytes have no pixel to their left, so `a` and `c`
+  // are zero and `b` wins; the last three have `a` from this row and the pa distance of three beats both
+  // others, so the prediction is the byte above-left in this row rather than the one above it.
+  const paeth = decodeInvoicePdfImage(
+    pngOf({
+      width: 2,
+      height: 2,
+      bitDepth: 8,
+      colorType: 2,
+      rows: [
+        [1, 2, 3, 4, 5, 6],
+        [10, 20, 30, 15, 25, 35],
+      ],
+      filters: [0, 4],
+    }),
+    "image/png",
+  );
+
+  expectEqual(
+    [...paeth.samples.subarray(6)].join(","),
+    "11,22,33,26,47,68",
+    "a Paeth filtered row is reconstructed against the row it predicts from",
+  );
+
+  // ---- the refusals ----
+  const refusals: readonly (readonly [string, Uint8Array, string])[] = [
+    [
+      "an interlaced PNG",
+      pngOf({ width: 2, height: 2, bitDepth: 8, colorType: 2, interlace: 1, rows: [[1, 2, 3, 4, 5, 6]] }),
+      "interlaced",
+    ],
+    [
+      "a PNG that declares fifty thousand pixels a side",
+      pngOf({
+        width: 1,
+        height: 1,
+        bitDepth: 8,
+        colorType: 2,
+        declared: [...be32(5_000), ...be32(5_000), 8, 2, 0, 0, 0],
+        rows: [[1, 2, 3]],
+      }),
+      "too_many_pixels",
+    ],
+    [
+      "truecolour at four bits, which the specification does not define",
+      pngOf({ width: 2, height: 1, bitDepth: 4, colorType: 2, rows: [[0x12, 0x34]] }),
+      "unsupported_bit_depth",
+    ],
+    ["an indexed image with no palette", pngOf({ width: 2, height: 1, bitDepth: 8, colorType: 3, omitPalette: true, rows: [[0, 1]] }), "malformed"],
+    ["a PNG with no image data", pngOf({ width: 2, height: 1, bitDepth: 8, colorType: 2, omitIdat: true }), "malformed"],
+    ["a PNG of zero width", pngOf({ width: 0, height: 1, bitDepth: 8, colorType: 2, rows: [[]] }), "malformed"],
+    [
+      "an indexed pixel beyond its own palette",
+      pngOf({ width: 1, height: 1, bitDepth: 8, colorType: 3, palette, rows: [[9]] }),
+      "malformed",
+    ],
+    [
+      "a scanline with a filter byte of nine",
+      pngOf({ width: 2, height: 1, bitDepth: 8, colorType: 2, filter: 9, rows: [[1, 2, 3, 4, 5, 6]] }),
+      "malformed",
+    ],
+    [
+      "an image whose data is longer than its own header declares",
+      pngOf({
+        width: 2,
+        height: 2,
+        bitDepth: 8,
+        colorType: 2,
+        rows: Array.from({ length: 400 }, () => [1, 2, 3, 4, 5, 6]),
+      }),
+      "malformed",
+    ],
+    ["a file cut in half", png.subarray(0, 40), "malformed"],
+    ["a WebP", webp, "not_an_image"],
+  ];
+
+  for (const [description, bytes, reason] of refusals) {
+    const thrown = await refusalReason(async () => {
+      decodeInvoicePdfImage(bytes, "image/png");
+    });
+
+    expectEqual(thrown.code, "VALIDATION_FAILED", `${description} is refused as a validation failure`);
+    expectEqual(thrown.reason, reason, `${description} says why`);
+    expectEqual(
+      JSON.stringify(thrown.details),
+      JSON.stringify([{ field: "logo", rule: "file_not_acceptable" }]),
+      `${description} names the field a form can mark`,
+    );
+  }
+
+  // ---- JPEG geometry, and what a PDF cannot take ----
+  const baseline = decodeInvoicePdfImage(jpeg, "image/jpeg");
+
+  expectEqual(baseline.format, "jpeg", "a baseline JPEG is the other format a PDF can hold");
+  expectEqual(baseline.width, 12, "its width comes out of the frame marker");
+  expectEqual(baseline.height, 9, "and so does its height");
+  expectEqual(baseline.colorSpace, "rgb", "three components are a colour image");
+  expectEqual(baseline.filter, "DCTDecode", "and it is passed through under its own filter");
+  expectEqual(
+    Buffer.compare(Buffer.from(baseline.samples), Buffer.from(jpeg)),
+    0,
+    "the samples are the merchant's own bytes, because nothing here decodes a JPEG",
+  );
+
+  const filled = decodeInvoicePdfImage(jpegOf({ width: 4, height: 3, fill: true }), "image/jpeg");
+
+  expectEqual(filled.width, 4, "fill bytes before a marker are stepped over, as the specification allows");
+
+  const greyJpeg = decodeInvoicePdfImage(jpegOf({ width: 6, height: 5, components: 1 }), "image/jpeg");
+
+  expectEqual(greyJpeg.colorSpace, "gray", "one component is a greyscale image");
+
+  const trimmed = decodeInvoicePdfImage(jpegOf({ width: 6, height: 5, trailing: [1, 2, 3, 4] }), "image/jpeg");
+
+  expectEqual(
+    trimmed.samples.length,
+    jpegOf({ width: 6, height: 5 }).length,
+    "anything after the end of image marker is trimmed rather than stored",
+  );
+
+  const jpegRefusals: readonly (readonly [string, JpegFixture, string])[] = [
+    ["a progressive JPEG", { width: 8, height: 8, startOfFrame: 0xc2 }, "unsupported_jpeg"],
+    ["a four component JPEG", { width: 8, height: 8, components: 4 }, "unsupported_jpeg"],
+    ["a twelve bit JPEG", { width: 8, height: 8, precision: 12 }, "unsupported_jpeg"],
+    ["a JPEG too large to draw", { width: 5_000, height: 5_000 }, "too_many_pixels"],
+  ];
+
+  for (const [description, fixture, reason] of jpegRefusals) {
+    const thrown = await refusalReason(async () => {
+      decodeInvoicePdfImage(jpegOf(fixture), "image/jpeg");
+    });
+
+    expectEqual(thrown.reason, reason, `${description} is refused with its own reason`);
+  }
+
+  expectEqual(
+    (await refusalReason(async () => {
+      decodeInvoicePdfImage(jpegOf({ width: 4, height: 4 }).subarray(0, 6), "image/jpeg");
+    })).reason,
+    "malformed",
+    "and a JPEG with no frame marker at all is malformed rather than guessed at",
+  );
+
+  // ---- the samples an image object is written from ----
+  const image: InvoicePdfImage = decoded;
+
+  expectEqual(image.samples.length, image.width * image.height * 3, "an rgb image holds three bytes a pixel");
+  expect(image.alpha === null || image.alpha.length === image.width * image.height, "and a mask one byte a pixel");
+}
+
+/** What a synchronous call threw, in the shape the gate reads an `AppError` everywhere else. */
+async function refusalReason(
+  run: () => Promise<unknown>,
+): Promise<{
+  readonly code: string | null;
+  readonly reason: string | null;
+  readonly details: readonly { readonly field?: unknown; readonly rule?: unknown }[];
+}> {
+  try {
+    await run();
+
+    return { code: null, reason: null, details: [] };
+  } catch (error) {
+    if (!isAppError(error)) {
+      return { code: "uncaught", reason: null, details: [] };
+    }
+
+    const cause = error.cause;
+
+    return {
+      code: error.code,
+      reason:
+        typeof cause === "object" && cause !== null && "reason" in cause
+          ? String((cause as { readonly reason: unknown }).reason)
+          : null,
+      details: error.details,
+    };
+  }
+}
+
+/* ---- STEP 118: the letterhead a merchant chooses ---- */
+
+/** A four byte riffle of a WebP: enough for a sniffer to recognise it and for a PDF to refuse it. */
+function webpFile(): Uint8Array {
+  const ascii = (text: string): readonly number[] => [...text].map((character) => character.charCodeAt(0));
+
+  return concatBytes([
+    Uint8Array.from(ascii("RIFF")),
+    Uint8Array.of(0x1a, 0x00, 0x00, 0x00),
+    Uint8Array.from(ascii("WEBPVP8 ")),
+    Uint8Array.of(0x0c, 0x00, 0x00, 0x00),
+  ]);
+}
+
+/** The two rules of the letterhead, as the accent reaches them: three fractions of one in the stroke. */
+function accentStroke(hex: string): string {
+  const value = Number.parseInt(hex.slice(1), 16);
+
+  return `${pointsOf((value >> 16) & 0xff)} ${pointsOf((value >> 8) & 0xff)} ${pointsOf(value & 0xff)} RG`;
+}
+
+/** The same rounding the renderer does, restated here so an assertion is not the implementation's echo. */
+function pointsOf(byte: number): string {
+  return (Math.round((byte / 255) * 100) / 100).toString();
+}
+
+async function checkPdfBranding(): Promise<void> {
+  const labels = invoicePdfLabels("0");
+  const branded = renderInvoicePdf(invoicePdfDocumentOf(pdfSourceOf()));
+  const read = readPdf(branded);
+  const text = read.text;
+  const content = pdfStreamText(read.bodies.get(7) ?? "");
+
+  // ---- the merchant's own half of the header ----
+  for (const [fact, description] of [
+    ["Northlight Studio LLC", "the name the merchant chose to print"],
+    ["Design and hosting since 2014", "their tagline"],
+    ["48 Commerce Row", "the first line of their address"],
+    ["Austin, TX 78701", "the second"],
+    ["accounts@northlight.example", "their email"],
+    ["+1 512 555 0143", "and their phone"],
+  ] as readonly (readonly [string, string])[]) {
+    expect(text.includes(fact), `the letterhead prints ${description}`);
+  }
+
+  expect(
+    /1 0 0 1 54 [\d.]+ Tm [(]Northlight Studio LLC[)] Tj/u.test(content),
+    "the merchant's name is drawn at the left margin, in the column the client's block sits in below it",
+  );
+  expect(
+    text.indexOf("Northlight Studio LLC") < text.indexOf("Acme Ltd"),
+    "and it is drawn above the client, because a letterhead comes before an addressee",
+  );
+  expect(
+    text.indexOf(labels.title) < text.indexOf("Northlight Studio LLC"),
+    "while the document's own title is still the first thing on the page",
+  );
+
+  // The status line names the status. It said "Invoice number: Sent" until this STEP rewrote the header,
+  // because it was built from the number's label while the number itself was the line above it.
+  expect(text.includes(`${labels.status}: ${labels.statusWords.sent}`), "the status line is labelled as a status");
+  expect(
+    !text.includes(`${labels.numberLabel}: ${labels.statusWords.sent}`),
+    "and the number's label is not used for it, which is what STEP 117 printed",
+  );
+
+  // ---- a merchant who has set nothing ----
+  const bare = readPdf(
+    renderInvoicePdf(
+      invoicePdfDocumentOf(
+        pdfSourceOf({
+          branding: pdfBrandingOf({ name: null, tagline: null, address: null, contact: null }),
+        }),
+      ),
+    ),
+  );
+
+  expect(!bare.text.includes("Northlight"), "a merchant who prints no name has none on the page");
+  expect(!bare.text.includes("accounts@northlight.example"), "and no contact line either");
+  expectEqual(
+    bare.objectCount,
+    5 + bare.pageCount * 2,
+    "with no logo the file holds nothing but the five fixed objects and two a page",
+  );
+  expectEqual(
+    read.objectCount,
+    5 + read.pageCount * 2,
+    "and a letterhead of words adds no object, because text needs no XObject",
+  );
+  expect(bare.text.includes(labels.title), "while the document still says what it is");
+
+  // ---- the accent ----
+  // The operators are inside a deflated stream, so the colour is read back inflated rather than searched for
+  // in the file's bytes: a compressed stream does not contain the words it draws with.
+  const accentRead = readPdf(
+    renderInvoicePdf(invoicePdfDocumentOf(pdfSourceOf({ branding: pdfBrandingOf({ accentHex: "#1f4e79" }) }))),
+  );
+  const accentContent = accentRead.pages
+    .map((_, index) => pdfStreamText(accentRead.bodies.get(7 + index * 2) ?? ""))
+    .join("\n");
+  const stroke = accentStroke("#1f4e79");
+
+  expect(accentContent.includes(stroke), "an accent reaches the rule as three fractions of one");
+  expectEqual(
+    accentContent.split(stroke).length - 1,
+    1,
+    "and it colours the rule under the letterhead, not the rules inside the table",
+  );
+  expect(!content.includes(" RG"), "a document with no accent strokes in grey alone");
+  expect(!accentContent.includes(" rg"), "and the accent is never a fill, so it can never be the colour of a sentence");
+
+  // A colour that does not match the column's own check falls back rather than failing an invoice.
+  const badAccent = pdfStreamText(
+    readPdf(
+      renderInvoicePdf(
+        invoicePdfDocumentOf(pdfSourceOf({ branding: { ...pdfBrandingOf(), accentHex: "#12345" } })),
+      ),
+    ).bodies.get(7) ?? "",
+  );
+
+  expect(!badAccent.includes(" RG"), "and a malformed accent draws the default grey instead of throwing");
+
+  // ---- the note above the footer ----
+  const manyLines = Array.from({ length: 60 }, (_, index) =>
+    pdfLineOf(index + 1, `Row ${String(index + 1).padStart(2, "0")}`, "1", 100_000n),
+  );
+  const noted = readPdf(
+    renderInvoicePdf(
+      invoicePdfDocumentOf(
+        pdfSourceOf({
+          lines: manyLines,
+          branding: pdfBrandingOf({ footerNote: "Payment by bank transfer within fourteen days." }),
+        }),
+      ),
+    ),
+  );
+  const lastPage = noted.pages[noted.pageCount - 1];
+
+  expect(noted.pageCount > 1, "the fixture is long enough to break to a second page");
+  expect(
+    lastPage !== undefined && lastPage.text.includes("Payment by bank transfer within fourteen days."),
+    "the merchant's note prints on the page the document ends on",
+  );
+  expect(
+    noted.pages[0] !== undefined && !noted.pages[0].text.includes("Payment by bank transfer"),
+    "and not on the first page, where it would float between two halves of a table",
+  );
+  expect(
+    !text.includes("Payment by bank transfer"),
+    "while a document whose merchant set no note prints none",
+  );
+
+  // A note wider than the column is wrapped rather than run off the page. Forty words and a last one is
+  // inside the 300 characters `0116` allows, so what is being proved here is the wrapping and not the cut.
+  const wrappedNote = pdfStreamText(
+    readPdf(
+      renderInvoicePdf(
+        invoicePdfDocumentOf(
+          pdfSourceOf({ branding: pdfBrandingOf({ footerNote: `${"word ".repeat(40)}end` }) }),
+        ),
+      ),
+    ).bodies.get(7) ?? "",
+  );
+
+  expectEqual(
+    wrappedNote.split("ET").filter((operation) => operation.includes("word ")).length > 1,
+    true,
+    "a long note is drawn as several lines, one text operation each, rather than run off the page",
+  );
+  expect(wrappedNote.includes("end"), "and no word of it is dropped by the wrapping");
+
+  // Beyond the ceiling the note is cut, as every other text field on the document is.
+  const cutNote = pdfStreamText(
+    readPdf(
+      renderInvoicePdf(
+        invoicePdfDocumentOf(
+          pdfSourceOf({ branding: pdfBrandingOf({ footerNote: `${"word ".repeat(60)}CUTMARK` }) }),
+        ),
+      ),
+    ).bodies.get(7) ?? "",
+  );
+
+  expect(!cutNote.includes("CUTMARK"), "and the part of a note beyond 300 characters is cut rather than printed");
+
+  // ---- a logo ----
+  const opaque = pngOf({
+    width: 4,
+    height: 2,
+    bitDepth: 8,
+    colorType: 2,
+    rows: [
+      [255, 0, 0, 0, 255, 0, 0, 0, 255, 12, 34, 56],
+      [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+    ],
+  });
+  const withLogo = renderInvoicePdf(
+    invoicePdfDocumentOf(
+      pdfSourceOf({ branding: pdfBrandingOf({ logo: { bytes: opaque, contentType: "image/png" } }) }),
+    ),
+  );
+  const logoRead = readPdf(withLogo);
+  const imageObject = 6 + logoRead.pageCount * 2;
+  const imageBody = logoRead.bodies.get(imageObject) ?? "";
+  const logoContent = pdfStreamText(logoRead.bodies.get(7) ?? "");
+
+  expectEqual(
+    logoRead.objectCount,
+    5 + logoRead.pageCount * 2 + 1,
+    "a logo with nothing transparent is one object, because a mask of all ones would say nothing",
+  );
+  expect(imageBody.includes("/Type /XObject"), "the logo is written as an XObject");
+  expect(imageBody.includes("/Subtype /Image"), "of the image subtype");
+  expect(imageBody.includes("/Width 4"), "four pixels wide");
+  expect(imageBody.includes("/Height 2"), "and two high");
+  expect(imageBody.includes("/ColorSpace /DeviceRGB"), "in the colour space its samples are in");
+  expect(imageBody.includes("/BitsPerComponent 8"), "at eight bits a component");
+  expect(imageBody.includes("/Filter /FlateDecode"), "deflated, because the samples were produced here");
+  expect(!imageBody.includes("/SMask"), "and with no soft mask it does not name one");
+  expect(
+    /q 4 0 0 2 54 [\d.]+ cm \/Im1 Do Q/u.test(logoContent),
+    "the page draws it at its own pixel size in the left margin, and never scaled up",
+  );
+  expect(
+    (logoRead.bodies.get(6) ?? "").includes(`/XObject << /${INVOICE_PDF_LOGO_NAME} ${String(imageObject)} 0 R >>`),
+    "the first page's resources name the object the file writes after the pages",
+  );
+  expect(
+    (logoRead.bodies.get(6) ?? "").includes("/ProcSet [/PDF /Text /ImageC]"),
+    "and ask for the image procedure set, because that page draws a picture",
+  );
+
+  // A logo that has a clear pixel carries its mask, and the mask is an image of the same geometry.
+  const clear = rgbaPng([
+    [9, 9, 9, 0],
+    [8, 8, 8, 255],
+    [7, 7, 7, 255],
+    [6, 6, 6, 128],
+  ]);
+  const masked = readPdf(
+    renderInvoicePdf(
+      invoicePdfDocumentOf(
+        pdfSourceOf({ branding: pdfBrandingOf({ logo: { bytes: clear, contentType: "image/png" } }) }),
+      ),
+    ),
+  );
+  const maskObject = 6 + masked.pageCount * 2 + 1;
+  const maskBody = masked.bodies.get(maskObject) ?? "";
+
+  expectEqual(masked.objectCount, 5 + masked.pageCount * 2 + 2, "an image and its mask are two objects");
+  expect(
+    (masked.bodies.get(6 + masked.pageCount * 2) ?? "").includes(`/SMask ${String(maskObject)} 0 R`),
+    "the image names the mask that follows it",
+  );
+  expect(maskBody.includes("/ColorSpace /DeviceGray"), "which is one grey byte a pixel");
+  expect(maskBody.includes("/Width 2") && maskBody.includes("/Height 2"), "of the same geometry as the image");
+
+  // Only the first page carries a picture, so only the first page claims it can draw one.
+  const manyWithLogo = readPdf(
+    renderInvoicePdf(
+      invoicePdfDocumentOf(
+        pdfSourceOf({
+          lines: manyLines,
+          branding: pdfBrandingOf({ logo: { bytes: opaque, contentType: "image/png" } }),
+        }),
+      ),
+    ),
+  );
+
+  expect(manyWithLogo.pageCount > 1, "a long invoice with a logo still breaks to a second page");
+  expect((manyWithLogo.bodies.get(6) ?? "").includes("/XObject"), "the first page names the image");
+  expect(!(manyWithLogo.bodies.get(8) ?? "").includes("/XObject"), "and no later page does");
+  expect(
+    (manyWithLogo.bodies.get(8) ?? "").includes("/ProcSet [/PDF /Text]"),
+    "a page that draws no picture does not ask for the image procedure set",
+  );
+  expectEqual(
+    manyWithLogo.objectCount,
+    5 + manyWithLogo.pageCount * 2 + 1,
+    "and one logo is one object however many pages the document fills",
+  );
+
+  // ---- the box ----
+  const oversized = pngOf({
+    width: 288,
+    height: 88,
+    bitDepth: 8,
+    colorType: 0,
+    rows: Array.from({ length: 88 }, () => Array.from({ length: 288 }, () => 128)),
+  });
+  const fitted = pdfStreamText(
+    readPdf(
+      renderInvoicePdf(
+        invoicePdfDocumentOf(
+          pdfSourceOf({ branding: pdfBrandingOf({ logo: { bytes: oversized, contentType: "image/png" } }) }),
+        ),
+      ),
+    ).bodies.get(7) ?? "",
+  );
+
+  expectEqual(INVOICE_PDF_LOGO_MAXIMUM_WIDTH, 144, "the box is two inches wide");
+  expectEqual(INVOICE_PDF_LOGO_MAXIMUM_HEIGHT, 44, "and forty four points high");
+  expect(
+    /q 144 0 0 44 54 [\d.]+ cm/u.test(fitted),
+    "a logo larger than the box is scaled down to it, keeping its aspect",
+  );
+  expectEqual(INVOICE_PDF_LOGO_NAME, "Im1", "one image, one name, and nothing to allocate");
+
+  // ---- a JPEG goes in as the merchant's own file ----
+  const jpeg = jpegOf({ width: 12, height: 9 });
+  const jpegRead = readPdf(
+    renderInvoicePdf(
+      invoicePdfDocumentOf(
+        pdfSourceOf({ branding: pdfBrandingOf({ logo: { bytes: jpeg, contentType: "image/jpeg" } }) }),
+      ),
+    ),
+  );
+  const jpegBody = jpegRead.bodies.get(6 + jpegRead.pageCount * 2) ?? "";
+  const jpegStart = jpegBody.indexOf("stream\n") + "stream\n".length;
+
+  expect(jpegBody.includes("/Filter /DCTDecode"), "a JPEG is passed through under its own filter");
+  expect(jpegBody.includes("/Width 12") && jpegBody.includes("/Height 9"), "at the geometry its frame declares");
+  expectEqual(
+    Buffer.compare(
+      Buffer.from(jpegBody.slice(jpegStart, jpegBody.indexOf("\nendstream", jpegStart)), "latin1"),
+      Buffer.from(jpeg),
+    ),
+    0,
+    "and the stream is the file the merchant uploaded, byte for byte",
+  );
+
+  // ---- determinism, and the ceiling ----
+  expectEqual(
+    Buffer.compare(Buffer.from(withLogo), Buffer.from(renderInvoicePdf(invoicePdfDocumentOf(pdfSourceOf({
+      branding: pdfBrandingOf({ logo: { bytes: opaque, contentType: "image/png" } }),
+    }))))),
+    0,
+    "a logo does not make the file less deterministic, so a retry stores an identical object",
+  );
+  expect(withLogo.length < INVOICE_PDF_MAXIMUM_BYTES, "and a document with a logo is far inside the ceiling");
+  expect(
+    withLogo.length > branded.length,
+    "while the samples are really in the file rather than described by it",
+  );
+
+  // ---- what the renderer refuses ----
+  const refused = await refusalReason(async () => {
+    renderInvoicePdf(
+      invoicePdfDocumentOf(
+        pdfSourceOf({
+          branding: pdfBrandingOf({ logo: { bytes: webpFile(), contentType: "image/webp" } }),
+        }),
+      ),
+    );
+  });
+
+  expectEqual(refused.code, "VALIDATION_FAILED", "a format no PDF can draw is refused at the render");
+  expectEqual(refused.reason, "not_an_image", "with the reason the reader gave");
+
+  const interlaced = await refusalReason(async () => {
+    renderInvoicePdf(
+      invoicePdfDocumentOf(
+        pdfSourceOf({
+          branding: pdfBrandingOf({
+            logo: {
+              bytes: pngOf({ width: 2, height: 2, bitDepth: 8, colorType: 2, interlace: 1, rows: [[1, 2, 3, 4, 5, 6]] }),
+              contentType: "image/png",
+            },
+          }),
+        }),
+      ),
+    );
+  });
+
+  expectEqual(interlaced.reason, "interlaced", "and an interlaced PNG says so rather than being guessed at");
+}
+
+/* ---- STEP 118: the branding row, the profile behind it and the logo ---- */
+
+function profileRow(overrides: Readonly<Record<string, unknown>> = {}): Record<string, unknown> {
+  return {
+    company_id: COMPANY_A,
+    legal_name: "Northlight Studio Limited Liability Company",
+    trading_name: "Northlight Studio",
+    business_type: "sole_proprietorship",
+    registration_number: null,
+    tax_id: "74-1234567",
+    website: "northlight.example",
+    address_line1: "48 Commerce Row",
+    address_line2: "Suite 3",
+    city: "Austin",
+    state_province: "TX",
+    postal_code: "78701",
+    country_code: "us",
+    contact_name: "Dana Reyes",
+    contact_email: "accounts@northlight.example",
+    contact_phone: "+1 512 555 0143",
+    created_at: new Date(NOW).toISOString(),
+    updated_at: new Date(NOW).toISOString(),
+    deleted_at: null,
+    version: 1,
+    ...overrides,
+  };
+}
+
+function brandingDeps(
+  db: InvoiceDb,
+  audit: ReturnType<typeof createInMemoryAuditTrail> = createInMemoryAuditTrail(),
+  adapter: PdfGateAdapter = new PdfGateAdapter(),
+): InvoiceBrandingStorageDependencies {
+  return {
+    rest: createInvoiceRest(db),
+    audit,
+    adapter,
+    encryption: createFileEncryption({ ENCRYPTION_MASTER_KEY: PDF_GATE_KEY }),
+    now: () => NOW,
+  };
+}
+
+function brandingBodyOf(overrides: Readonly<Record<string, unknown>> = {}): Record<string, unknown> {
+  return {
+    logo_file_id: null,
+    show_logo: true,
+    name_style: "trading",
+    show_address: true,
+    show_contact: true,
+    show_tax_id: false,
+    show_website: false,
+    tagline: "Design and hosting since 2014",
+    footer_note: null,
+    accent_colour: null,
+    version: 0,
+    ...overrides,
+  };
+}
+
+async function checkBrandingService(): Promise<void> {
+  // ---- a merchant who has never opened the screen ----
+  const fresh = createDb();
+
+  fresh.companies.push({ id: COMPANY_A, name: "Northlight Studio LLC", deleted_at: null });
+  fresh.profiles.push(profileRow());
+
+  const untouched = await readInvoiceBranding({ actor: owner }, brandingDeps(fresh));
+
+  expectEqual(untouched.settings.version, 0, "no row means version zero, which is what a first save posts back");
+  expectEqual(untouched.settings.updatedAtEpochMs, 0, "and no instant, because nothing has been saved");
+  expectEqual(untouched.settings.showAddress, INVOICE_BRANDING_DEFAULTS.showAddress, "the address shows by default");
+  expectEqual(untouched.settings.showContact, INVOICE_BRANDING_DEFAULTS.showContact, "and so does the contact");
+  expectEqual(untouched.settings.showTaxId, INVOICE_BRANDING_DEFAULTS.showTaxId, "while a tax id is kept off");
+  expectEqual(untouched.settings.showWebsite, INVOICE_BRANDING_DEFAULTS.showWebsite, "and a website with it");
+  expectEqual(untouched.settings.logoFileId, null, "with no logo, because a logo is a choice about a file");
+  expectEqual(untouched.adoptedLogo, null, "so there is nothing adopted");
+  expectEqual(untouched.newestLogo, null, "and nothing in storage either");
+  expectEqual(untouched.newestLogoUrl, null, "and no URL to sign");
+  expectEqual(fresh.branding.length, 0, "reading the settings writes no row");
+
+  // The defaults still print a seller, because the facts are the profile's and not this row's.
+  expectEqual(untouched.preview.name, "Northlight Studio", "the preview names the merchant by their trading name");
+  expectEqual(
+    untouched.preview.address,
+    "48 Commerce Row\nSuite 3\nAustin, TX 78701\nUS",
+    "and prints the address the profile holds, assembled as a document reads it",
+  );
+  expectEqual(
+    untouched.preview.contact,
+    "accounts@northlight.example\n+1 512 555 0143",
+    "with the contact lines the merchant chose to show",
+  );
+  expectEqual(untouched.preview.tagline, null, "no tagline, because none was set");
+  expectEqual(untouched.preview.accentHex, null, "and no accent, so the rule is the default grey");
+
+  // ---- the identity, and its fallbacks ----
+  expectEqual(
+    await readInvoiceBrandingIdentity(createInvoiceRest(fresh), COMPANY_A).then((identity) => identity.companyName),
+    "Northlight Studio LLC",
+    "the company's own name is read as the last resort",
+  );
+
+  const legalOnly = createDb();
+
+  legalOnly.companies.push({ id: COMPANY_A, name: "Northlight Studio LLC", deleted_at: null });
+  legalOnly.profiles.push(profileRow({ trading_name: null }));
+
+  const legalWords = invoiceBrandingWordsOf(
+    await readInvoiceBrandingIdentity(createInvoiceRest(legalOnly), COMPANY_A),
+    { ...INVOICE_BRANDING_DEFAULTS, version: 0, updatedAtEpochMs: 0 },
+  );
+
+  expectEqual(
+    legalWords.name,
+    "Northlight Studio Limited Liability Company",
+    "a merchant with no trading name prints their legal one rather than nothing",
+  );
+
+  const noProfile = createDb();
+
+  noProfile.companies.push({ id: COMPANY_A, name: "Northlight Studio LLC", deleted_at: null });
+
+  const companyWords = invoiceBrandingWordsOf(
+    await readInvoiceBrandingIdentity(createInvoiceRest(noProfile), COMPANY_A),
+    { ...INVOICE_BRANDING_DEFAULTS, version: 0, updatedAtEpochMs: 0 },
+  );
+
+  expectEqual(companyWords.name, "Northlight Studio LLC", "and with no profile at all, the company's name");
+  expectEqual(companyWords.address, null, "with no address to print");
+  expectEqual(companyWords.contact, null, "and no contact line");
+
+  const nothing = invoiceBrandingWordsOf(
+    {
+      companyName: null,
+      tradingName: null,
+      legalName: null,
+      taxId: null,
+      website: null,
+      addressLines: [],
+      email: null,
+      phone: null,
+    },
+    { ...INVOICE_BRANDING_DEFAULTS, version: 0, updatedAtEpochMs: 0 },
+  );
+
+  expectEqual(nothing.name, null, "so a document with no seller anywhere prints no name rather than a guess");
+
+  // The name style chooses, and each choice falls back to the other rather than to nothing.
+  const identity: InvoiceBrandingIdentity = await readInvoiceBrandingIdentity(createInvoiceRest(fresh), COMPANY_A);
+  const defaults = { ...INVOICE_BRANDING_DEFAULTS, version: 0, updatedAtEpochMs: 0 };
+
+  expectEqual(
+    invoiceBrandingWordsOf(identity, { ...defaults, nameStyle: "legal" }).name,
+    "Northlight Studio Limited Liability Company",
+    "the legal style prints the legal name",
+  );
+  expectEqual(
+    invoiceBrandingWordsOf(identity, { ...defaults, showAddress: false }).address,
+    null,
+    "an address the merchant turned off is not printed",
+  );
+  expectEqual(
+    invoiceBrandingWordsOf(identity, { ...defaults, showContact: false }).contact,
+    null,
+    "and neither is a contact they turned off",
+  );
+  expectEqual(
+    invoiceBrandingWordsOf(identity, { ...defaults, showWebsite: true, showContact: false }).contact,
+    "northlight.example",
+    "a website is its own choice, so it prints with the contact lines off",
+  );
+  expectEqual(
+    invoiceBrandingWordsOf(identity, { ...defaults, showTaxId: true, showContact: false }).contact,
+    formatMessage("invoices.brandingTaxIdLine", { taxId: "74-1234567" }),
+    "and a tax id prints under the label the catalog holds, because the renderer holds no English",
+  );
+  expectEqual(
+    invoiceBrandingWordsOf(identity, { ...defaults, showTaxId: true, showWebsite: true }).contact,
+    "accounts@northlight.example\n+1 512 555 0143\nnorthlight.example\nTax ID: 74-1234567",
+    "in the order a letterhead reads: how to reach them, then who they are to a tax authority",
+  );
+  expectEqual(
+    invoiceBrandingWordsOf({ ...identity, taxId: null }, { ...defaults, showTaxId: true }).contact,
+    "accounts@northlight.example\n+1 512 555 0143",
+    "and a tax id that was never stored prints no empty label",
+  );
+  expectEqual(INVOICE_BRANDING_NAME_STYLES.join(","), "trading,legal", "two name styles, and no third");
+
+  // ---- parsing a save ----
+  const parsed = parseInvoiceBrandingInput(brandingBodyOf());
+
+  expectEqual(parsed.expectedVersion, 0, "the version the caller read the settings from travels with them");
+  expectEqual(parsed.settings.tagline, "Design and hosting since 2014", "a tagline is kept as it was typed");
+  expectEqual(parsed.settings.nameStyle, "trading", "and the name style is one of the two");
+
+  expectEqual(
+    parseInvoiceBrandingInput(brandingBodyOf({ tagline: "   " })).settings.tagline,
+    null,
+    "emptying the box is a deliberate clear rather than a required field",
+  );
+  expectEqual(
+    parseInvoiceBrandingInput(brandingBodyOf({ accent_colour: "#1F4E79" })).settings.accentColour,
+    "#1f4e79",
+    "a colour picker's capitals are stored as the lowercase the column check enforces",
+  );
+  expectEqual(
+    parseInvoiceBrandingInput(brandingBodyOf({ accent_colour: "" })).settings.accentColour,
+    null,
+    "and an empty colour is the default grey",
+  );
+  expectEqual(
+    parseInvoiceBrandingInput(brandingBodyOf({ footer_note: "one\r\ntwo\r\n\r\n\r\n\r\nthree" })).settings.footerNote,
+    "one\ntwo\n\nthree",
+    "a note is normalised the way every multiline field on the platform is",
+  );
+
+  const refusals: readonly (readonly [string, Readonly<Record<string, unknown>>, string, string])[] = [
+    ["a tagline of 121 characters", { tagline: "x".repeat(INVOICE_BRANDING_LIMITS.tagline + 1) }, "tagline", "too_long"],
+    ["a note of 301 characters", { footer_note: "y".repeat(INVOICE_BRANDING_LIMITS.footerNote + 1) }, "footer_note", "too_long"],
+    ["a colour that is not six hexadecimal digits", { accent_colour: "#12345" }, "accent_colour", "invalid_format"],
+    ["a colour that is not a colour", { accent_colour: "rebeccapurple" }, "accent_colour", "invalid_format"],
+    ["no version", { version: undefined }, "version", "invalid_format"],
+    ["a name style that does not exist", { name_style: "nickname" }, "name_style", "invalid_format"],
+    ["a logo file id that is not a uuid", { logo_file_id: "12" }, "logo_file_id", "invalid_format"],
+    ["a toggle that is not a boolean", { show_logo: "yes" }, "show_logo", "invalid_format"],
+  ];
+
+  for (const [description, overrides, field, rule] of refusals) {
+    const details = await refusalOf(async () => {
+      parseInvoiceBrandingInput(brandingBodyOf(overrides));
+    });
+
+    expectEqual(
+      JSON.stringify(details),
+      JSON.stringify([{ field, rule }]),
+      `${description} is refused naming ${field}`,
+    );
+  }
+
+  // Every problem at once, so a form can mark all of them in one round trip.
+  const both = await refusalOf(async () => {
+    parseInvoiceBrandingInput(
+      brandingBodyOf({ tagline: "x".repeat(200), accent_colour: "nope" }),
+    );
+  });
+
+  expectEqual(both.length, 2, "a tagline and a colour that are both wrong are both reported");
+  expectEqual(
+    parseInvoiceBrandingInput(brandingBodyOf({ tagline: "x".repeat(INVOICE_BRANDING_LIMITS.tagline) })).settings
+      .tagline?.length,
+    INVOICE_BRANDING_LIMITS.tagline,
+    "while a tagline of exactly the ceiling is kept",
+  );
+  expectEqual(
+    invoiceBrandingInputSchema.shape.version.safeParse(0).success,
+    true,
+    "and version zero is the first save",
+  );
+
+  // ---- saving ----
+  const db = createDb();
+
+  db.companies.push({ id: COMPANY_A, name: "Northlight Studio LLC", deleted_at: null });
+  db.profiles.push(profileRow());
+
+  const audit = createInMemoryAuditTrail();
+  const dependencies = brandingDeps(db, audit);
+  const saved = await updateInvoiceBranding(
+    { actor: owner, values: parseInvoiceBrandingInput(brandingBodyOf({ show_tax_id: true })) },
+    dependencies,
+  );
+
+  expectEqual(db.branding.length, 1, "a first save creates the row rather than reading one into existence");
+  expectEqual(db.updates.length, 0, "and writes no update to do it");
+  expectEqual(saved.settings.version, 1, "the row starts at version one");
+  expectEqual(saved.settings.showTaxId, true, "holding what was posted");
+  expectEqual(saved.preview.contact?.includes("Tax ID:") ?? false, true, "so the preview already prints it");
+
+  const entries = audit.entries.filter((entry) => entry.action === INVOICE_BRANDING_UPDATED_AUDIT_ACTION);
+
+  expectEqual(entries.length, 1, "one save writes one audit entry");
+  expectEqual(entries[0]?.entityType, INVOICE_BRANDING_AUDIT_ENTITY, "against the branding entity");
+  expectEqual(entries[0]?.companyId, COMPANY_A, "for the merchant who made it");
+  expectEqual(entries[0]?.actorUserId, OWNER_ID, "by the owner who is signed in");
+  expectEqual(
+    JSON.stringify(entries[0]?.payload),
+    JSON.stringify({
+      logo_file_id: null,
+      show_logo: true,
+      name_style: "trading",
+      show_address: true,
+      show_contact: true,
+      show_tax_id: true,
+      show_website: false,
+      has_tagline: true,
+      has_footer_note: false,
+      accent_colour: null,
+    }),
+    "recording the choices and the fact of a tagline, but not the merchant's own words",
+  );
+
+  const second = await updateInvoiceBranding(
+    { actor: owner, values: parseInvoiceBrandingInput(brandingBodyOf({ tagline: null, version: 1 })) },
+    dependencies,
+  );
+
+  expectEqual(second.settings.version, 2, "a later save moves the version");
+  expectEqual(second.settings.tagline, null, "and clears what was cleared");
+  expectEqual(
+    db.updates[0]?.query.includes("&version=eq.1") ?? false,
+    true,
+    "scoped to the version it read, which is what makes a lost race write nothing",
+  );
+  expectEqual(
+    db.updates[0]?.query.includes(`company_id=eq.${COMPANY_A}`) ?? false,
+    true,
+    "and to the company, so a write to another merchant's row cannot be expressed",
+  );
+
+  // ---- the optimistic lock ----
+  expectEqual(
+    await codeOf(() =>
+      updateInvoiceBranding(
+        { actor: owner, values: parseInvoiceBrandingInput(brandingBodyOf({ version: 1 })) },
+        dependencies,
+      ),
+    ),
+    "CONFLICT",
+    "a save that posts a version the row has outgrown is a conflict",
+  );
+  expectEqual(
+    JSON.stringify(
+      await refusalOfAsync(() =>
+        updateInvoiceBranding(
+          { actor: owner, values: parseInvoiceBrandingInput(brandingBodyOf({ version: 1 })) },
+          dependencies,
+        ),
+      ),
+    ),
+    JSON.stringify([{ field: "version", rule: "stale" }]),
+    "naming the version as the stale field, which is the one a form can point at",
+  );
+  expectEqual(second.settings.tagline, null, "and the row is left as the winner of the race wrote it");
+
+  db.raceBrandingVersion = true;
+
+  expectEqual(
+    await codeOf(() =>
+      updateInvoiceBranding(
+        { actor: owner, values: parseInvoiceBrandingInput(brandingBodyOf({ version: 2 })) },
+        dependencies,
+      ),
+    ),
+    "CONFLICT",
+    "and when another request moves the row between the read and the write, the write matches nothing",
+  );
+  expectEqual(
+    db.branding[0]?.["tagline"],
+    "the other owner's tagline",
+    "so the loser of the race overwrites nothing",
+  );
+
+  // ---- tenancy and roles ----
+  expectEqual(
+    await codeOf(() => readInvoiceBranding({ actor: desk }, brandingDeps(createDb()))),
+    "PERMISSION_DENIED",
+    "an office account with no company has no brand to read",
+  );
+  expectEqual(
+    await codeOf(() =>
+      updateInvoiceBranding(
+        { actor: desk, values: parseInvoiceBrandingInput(brandingBodyOf()) },
+        brandingDeps(createDb()),
+      ),
+    ),
+    "PERMISSION_DENIED",
+    "and none to write",
+  );
+  expectEqual(
+    await codeOf(() =>
+      readInvoiceBranding({ actor: actorOf(["support"], COMPANY_A, { userId: OFFICE_ID }) }, brandingDeps(createDb())),
+    ),
+    "PERMISSION_DENIED",
+    "because branding is the owner's own configuration and not an office task",
+  );
+
+  const otherDb = createDb();
+
+  otherDb.companies.push({ id: COMPANY_A, name: "Northlight Studio LLC", deleted_at: null });
+  otherDb.companies.push({ id: COMPANY_B, name: "Ferris and Sons", deleted_at: null });
+  otherDb.profiles.push(profileRow());
+  otherDb.profiles.push(profileRow({ company_id: COMPANY_B, trading_name: "Ferris and Sons", legal_name: null }));
+  otherDb.branding.push({
+    id: randomUUID(),
+    company_id: COMPANY_A,
+    logo_file_id: null,
+    show_logo: true,
+    name_style: "trading",
+    show_address: true,
+    show_contact: true,
+    show_tax_id: true,
+    show_website: false,
+    tagline: "the other merchant's tagline",
+    footer_note: null,
+    accent_colour: "#010203",
+    created_at: new Date(NOW).toISOString(),
+    updated_at: new Date(NOW).toISOString(),
+    deleted_at: null,
+    version: 4,
+  });
+
+  const otherRead = await readInvoiceBranding({ actor: otherOwner }, brandingDeps(otherDb));
+
+  expectEqual(otherRead.settings.version, 0, "an owner of another company reads their own defaults");
+  expectEqual(otherRead.preview.name, "Ferris and Sons", "and their own name");
+  expectEqual(
+    otherRead.settings.tagline,
+    null,
+    "with no sight of the tagline the first merchant saved",
+  );
+
+  // ---- the logo, uploaded and adopted ----
+  const logoDb = createDb();
+
+  logoDb.companies.push({ id: COMPANY_A, name: "Northlight Studio LLC", deleted_at: null });
+  logoDb.profiles.push(profileRow());
+
+  const logoAudit = createInMemoryAuditTrail();
+  const logoAdapter = new PdfGateAdapter();
+  const logoDeps = brandingDeps(logoDb, logoAudit, logoAdapter);
+  const pngBytes = pngOf({
+    width: 6,
+    height: 3,
+    bitDepth: 8,
+    colorType: 2,
+    rows: Array.from({ length: 3 }, () => Array.from({ length: 18 }, (_, index) => index * 12)),
+  });
+
+  const uploaded = await uploadInvoiceLogo(
+    { actor: owner, fileName: "logo.png", declaredType: "image/png", bytes: pngBytes },
+    logoDeps,
+  );
+
+  expect(uploaded.adopted, "a verified PNG becomes the invoice logo in the same request");
+  expectEqual(uploaded.refusal, null, "with nothing to refuse");
+  expect(uploaded.snapshot.settings.logoFileId !== null, "so the settings name a file");
+  expectEqual(uploaded.snapshot.settings.showLogo, true, "and the logo is switched on");
+  expectEqual(uploaded.snapshot.settings.version, 1, "in a row created by the upload");
+  expectEqual(logoDb.files.length, 1, "one file row was written");
+  expectEqual(logoDb.files[0]?.["purpose"], COMPANY_LOGO_PURPOSE, "of the logo purpose");
+  expectEqual(logoDb.files[0]?.["status"], "ready", "verified, because its bytes matched what they claimed");
+  expectEqual(logoAdapter.uploads, 1, "one object was stored");
+  expectEqual(
+    uploaded.snapshot.adoptedLogo?.fileId,
+    uploaded.snapshot.settings.logoFileId,
+    "and the screen shows the file that prints",
+  );
+  expectEqual(uploaded.snapshot.newestLogo?.printable, true, "described as printable, because it is");
+  expect(
+    uploaded.snapshot.newestLogoUrl !== null,
+    "with a signed URL, because a picture the merchant cannot see is not a preview",
+  );
+  expectEqual(
+    logoAudit.entries.filter((entry) => entry.action === INVOICE_BRANDING_UPDATED_AUDIT_ACTION).length,
+    1,
+    "and the adoption is audited as the branding change it is",
+  );
+
+  // What the render then draws is the file the merchant uploaded.
+  const printed = await readInvoicePrintBranding({ companyId: COMPANY_A }, logoDeps);
+
+  expectEqual(printed.words.name, "Northlight Studio", "the render reads the same identity");
+  expect(printed.logo !== null, "and carries a logo");
+  expectEqual(
+    Buffer.compare(Buffer.from(printed.logo?.bytes ?? new Uint8Array(0)), Buffer.from(pngBytes)),
+    0,
+    "whose bytes are the merchant's own, decrypted from the envelope storage holds",
+  );
+  expectEqual(printed.logo?.contentType, "image/png", "with the type the record carries");
+
+  // Turning the logo off keeps the choice and stops the printing.
+  const hidden = await updateInvoiceBranding(
+    {
+      actor: owner,
+      values: parseInvoiceBrandingInput(
+        brandingBodyOf({
+          logo_file_id: uploaded.snapshot.settings.logoFileId,
+          show_logo: false,
+          version: uploaded.snapshot.settings.version,
+        }),
+      ),
+    },
+    logoDeps,
+  );
+
+  expectEqual(hidden.settings.logoFileId, uploaded.snapshot.settings.logoFileId, "the choice is kept");
+  expectEqual((await readInvoicePrintBranding({ companyId: COMPANY_A }, logoDeps)).logo, null, "and nothing prints");
+
+  // A WebP is stored, because the platform allows a logo to be one, and is not adopted.
+  const webpUpload = await uploadInvoiceLogo(
+    { actor: owner, fileName: "logo.webp", declaredType: "image/webp", bytes: webpFile() },
+    logoDeps,
+  );
+
+  expectEqual(webpUpload.adopted, false, "a WebP does not become the invoice logo");
+  expectEqual(webpUpload.refusal, "not_an_image", "because a PDF cannot draw one");
+  expectEqual(
+    webpUpload.snapshot.settings.logoFileId,
+    uploaded.snapshot.settings.logoFileId,
+    "so the merchant's invoice logo is still the file that prints",
+  );
+  expectEqual(webpUpload.snapshot.newestLogo?.printable, false, "and the screen can say which file cannot print");
+
+  // Bytes whose declared type did not match their own are quarantined by storage and adopted by nobody.
+  const quarantined = await uploadInvoiceLogo(
+    { actor: owner, fileName: "logo.png", declaredType: "image/png", bytes: jpegOf({ width: 8, height: 8 }) },
+    logoDeps,
+  );
+
+  expectEqual(quarantined.adopted, false, "a quarantined upload is not adopted");
+  expectEqual(quarantined.refusal, "quarantined", "and says it was kept aside");
+  expectEqual(
+    quarantined.snapshot.settings.logoFileId,
+    uploaded.snapshot.settings.logoFileId,
+    "leaving the invoice logo as it was",
+  );
+
+  // A JPEG is the other format a PDF can hold.
+  const jpegUpload = await uploadInvoiceLogo(
+    {
+      actor: owner,
+      fileName: "logo.jpg",
+      declaredType: "image/jpeg",
+      bytes: jpegOf({ width: 20, height: 10 }),
+    },
+    brandingDeps(createDb(), createInMemoryAuditTrail(), new PdfGateAdapter()),
+  );
+
+  expect(jpegUpload.adopted, "and a baseline JPEG is adopted like a PNG");
+
+  // An upload beyond the policy's ceiling is refused before anything is stored.
+  const oversizedAdapter = new PdfGateAdapter();
+
+  expectEqual(
+    await codeOf(() =>
+      uploadInvoiceLogo(
+        {
+          actor: owner,
+          fileName: "logo.png",
+          declaredType: "image/png",
+          bytes: new Uint8Array(UPLOAD_POLICIES.company_logo.maximumBytes + 1),
+        },
+        brandingDeps(createDb(), createInMemoryAuditTrail(), oversizedAdapter),
+      ),
+    ),
+    "VALIDATION_FAILED",
+    "an upload over the logo ceiling is refused",
+  );
+  expectEqual(oversizedAdapter.uploads, 0, "and nothing reaches the object store");
+
+  // ---- what the render refuses ----
+  const brokenDb = createDb();
+
+  brokenDb.companies.push({ id: COMPANY_A, name: "Northlight Studio LLC", deleted_at: null });
+  brokenDb.profiles.push(profileRow());
+
+  const brokenAdapter = new PdfGateAdapter();
+  const brokenDeps = brandingDeps(brokenDb, createInMemoryAuditTrail(), brokenAdapter);
+  const chosen = await uploadInvoiceLogo(
+    { actor: owner, fileName: "logo.png", declaredType: "image/png", bytes: pngBytes },
+    brokenDeps,
+  );
+  const chosenId = String(chosen.snapshot.settings.logoFileId ?? "");
+  const record = brokenDb.files.find((row) => row["id"] === chosenId);
+  const storedKey = String(record?.["storage_key"] ?? "");
+
+  expect(record !== undefined, "the fixture holds the record the merchant chose");
+
+  if (record !== undefined) {
+    // A file the platform has not verified never reaches a client's document.
+    record["status"] = "quarantined";
+    expectEqual(
+      await codeOf(() => readInvoicePrintBranding({ companyId: COMPANY_A }, brokenDeps)),
+      "CONFLICT",
+      "a logo the platform quarantined fails the render rather than drawing without it",
+    );
+
+    record["status"] = "pending";
+    expectEqual(
+      await codeOf(() => readInvoicePrintBranding({ companyId: COMPANY_A }, brokenDeps)),
+      "CONFLICT",
+      "and one it has not finished verifying fails it too",
+    );
+
+    record["status"] = "ready";
+    record["purpose"] = "invoice_pdf";
+    expectEqual(
+      await codeOf(() => readInvoicePrintBranding({ companyId: COMPANY_A }, brokenDeps)),
+      "PERMISSION_DENIED",
+      "and a record of another purpose is not a logo whatever its key says",
+    );
+
+    record["purpose"] = COMPANY_LOGO_PURPOSE;
+    record["storage_key"] = `${COMPANY_B}/logo/${randomUUID()}.png`;
+    expectEqual(
+      await codeOf(() => readInvoicePrintBranding({ companyId: COMPANY_A }, brokenDeps)),
+      "PERMISSION_DENIED",
+      "nor is a key under another merchant's prefix, which is the tenancy the key check exists for",
+    );
+
+    // Back to the key the object really is stored under, so the only thing wrong is the hash: a download
+    // that failed would answer a missing file, and the assertion below is about bytes that disagree with
+    // their own record.
+    record["storage_key"] = storedKey;
+    record["content_sha256"] = "0".repeat(64);
+    expectEqual(
+      await codeOf(() => readInvoicePrintBranding({ companyId: COMPANY_A }, brokenDeps)),
+      "INTERNAL_ERROR",
+      "and bytes that do not hash to what the record says are a defect, not a document",
+    );
+  }
+
+  // A file that is archived by a later upload still prints, because the merchant chose it and the bytes exist.
+  const archivedDb = createDb();
+
+  archivedDb.companies.push({ id: COMPANY_A, name: "Northlight Studio LLC", deleted_at: null });
+  archivedDb.profiles.push(profileRow());
+
+  const archivedDeps = brandingDeps(archivedDb, createInMemoryAuditTrail(), new PdfGateAdapter());
+  const first = await uploadInvoiceLogo(
+    { actor: owner, fileName: "first.png", declaredType: "image/png", bytes: pngBytes },
+    archivedDeps,
+  );
+  const firstId = String(first.snapshot.settings.logoFileId ?? "");
+  const secondUpload = await uploadInvoiceLogo(
+    { actor: owner, fileName: "second.png", declaredType: "image/png", bytes: pngBytes },
+    archivedDeps,
+  );
+
+  expectEqual(
+    secondUpload.snapshot.settings.logoFileId === firstId,
+    false,
+    "a second upload adopts the second file",
+  );
+  expectEqual(
+    archivedDb.files.find((row) => row["id"] === firstId)?.["status"],
+    "archived",
+    "and archives the first, as STEP 105's category does",
+  );
+
+  archivedDb.branding[0] = { ...(archivedDb.branding[0] ?? {}), logo_file_id: firstId };
+
+  expect(
+    (await readInvoicePrintBranding({ companyId: COMPANY_A }, archivedDeps)).logo !== null,
+    "while a logo the merchant chose still prints after it was archived, because the object exists",
+  );
+
+  const pointing = await readInvoiceBranding({ actor: owner }, archivedDeps);
+
+  expectEqual(pointing.adoptedLogo?.fileId, firstId, "and the screen shows the file that prints");
+  expectEqual(pointing.adoptedLogo?.status, "archived", "with the status it now has, rather than hiding it");
+  expectEqual(
+    pointing.newestLogo?.fileId,
+    secondUpload.snapshot.settings.logoFileId,
+    "while the newest in storage is the second",
+  );
+}
+
+/* ---- STEP 118: the sources ---- */
+
+async function checkBrandingSources(): Promise<void> {
+  const owned: readonly string[] = [
+    "services/invoices/invoice-branding.ts",
+    "services/invoices/invoice-pdf-image.ts",
+    "app/api/invoices/branding/route.ts",
+    "app/api/invoices/branding/logo/route.ts",
+    "app/(dashboard)/invoices/branding/page.tsx",
+    "app/(dashboard)/invoices/branding/branding-form.tsx",
+    "migrations/0116_invoice_branding.sql",
+    "migrations/0116_invoice_branding.down.sql",
+  ];
+
+  for (const path of owned) {
+    const source = await readRepositoryFile(path);
+    const comment = path.endsWith(".sql") ? `-- path: ${path}` : `// path: ${path}`;
+
+    expect(source.length > 0, `${path} exists`);
+    expect(source.split("\n", 1)[0]?.trim() === comment, `${path} starts with its path comment`);
+    expect(
+      !/[^\u0009\u000a\u000d\u0020-\u007e]/u.test(source.replaceAll("\ufeff", "")),
+      `${path} is ASCII only`,
+    );
+  }
+
+  // ---- the migration ----
+  const migration = await readRepositoryFile("migrations/0116_invoice_branding.sql");
+  const rollback = await readRepositoryFile("migrations/0116_invoice_branding.down.sql");
+
+  for (const [fact, description] of [
+    ["create table public.invoice_branding", "the table is created"],
+    ["company_id uuid not null", "scoped to a merchant"],
+    ["unique (company_id)", "and one merchant has one brand"],
+    ["unique (id, company_id)", "with the tenant key a scoped write needs"],
+    ["logo_file_id uuid", "the logo is a reference to a file row"],
+    ["references public.files (id)", "and not a copy of its bytes"],
+    ["name_style text not null default 'trading'", "the name style has a default"],
+    ["name_style in ('trading', 'legal')", "and two values"],
+    ["show_logo boolean not null default true", "a logo prints unless the merchant turns it off"],
+    ["show_address boolean not null default true", "an address prints unless they turn it off"],
+    ["show_tax_id boolean not null default false", "while a tax id is kept off until asked for"],
+    ["show_website boolean not null default false", "and a website with it"],
+    ["char_length(tagline) between 1 and 120", "a tagline is bounded by the column"],
+    ["char_length(footer_note) between 1 and 300", "and so is a note"],
+    ["accent_colour ~ '^#[0-9a-f]{6}$'", "the accent is six lowercase hexadecimal digits"],
+    ["version integer not null default 1", "with the version rule 13's optimistic locking needs"],
+    ["invoice_branding_set_row_metadata", "the metadata trigger the platform's rows carry"],
+    ["invoice_branding_guard_identity", "and the guard that freezes the row's identity"],
+    ["enable row level security", "row level security, on by default"],
+    ["invoice_branding_default_deny", "with a policy that denies everything"],
+    ["using (false)", "so a connection that is not the platform's own sees no row"],
+  ] as readonly (readonly [string, string])[]) {
+    expect(migration.includes(fact), `0116 ${description}`);
+  }
+
+  expect(
+    !migration.includes("trading_name") && !migration.includes("address_line1"),
+    "0116 copies no identity out of the business profile, because a copy is a second truth that goes stale",
+  );
+  expect(
+    !migration.includes("logo_bytes") && !migration.includes("bytea"),
+    "and stores no bytes, which belong to the object store",
+  );
+  expect(
+    migration.includes("create function public.invoice_branding_guard_identity()") &&
+      migration.includes("set search_path = ''"),
+    "the guard is a function of its own with an empty search path",
+  );
+
+  for (const [fact, description] of [
+    ["drop policy if exists invoice_branding_default_deny", "the policy is dropped first"],
+    ["drop trigger if exists invoice_branding_set_row_metadata", "then the triggers"],
+    ["drop trigger if exists invoice_branding_guard_identity", "both of them"],
+    ["drop table if exists public.invoice_branding", "then the table"],
+    ["drop function if exists public.invoice_branding_guard_identity", "and the function it owned"],
+  ] as readonly (readonly [string, string])[]) {
+    expect(rollback.includes(fact), `the rollback ${description}`);
+  }
+
+  expect(
+    rollback.indexOf("drop policy") < rollback.indexOf("drop table"),
+    "in the order a rollback has to run, because a policy cannot outlive its table",
+  );
+
+  // ---- the routes ----
+  const settings = await readRepositoryFile("app/api/invoices/branding/route.ts");
+  const logo = await readRepositoryFile("app/api/invoices/branding/logo/route.ts");
+
+  expectEqual(INVOICE_BRANDING_TABLE, "invoice_branding", "the service names the table the migration created");
+  expectEqual(
+    INVOICE_BRANDING_UPDATED_AUDIT_ACTION,
+    "invoice.branding_updated",
+    "and the audit action the trail reads",
+  );
+
+  const csrf = await readRepositoryFile("lib/security/csrf.ts");
+
+  expect(csrf.includes('"/api/invoices/branding"'), "the settings route is on the CSRF list");
+  expect(csrf.includes('"/api/invoices/branding/logo"'), "and so is the upload");
+
+  for (const [path, source] of [
+    ["the settings route", settings],
+    ["the upload route", logo],
+  ] as readonly (readonly [string, string])[]) {
+    const post = source.slice(source.indexOf("export const POST"));
+
+    expect(post.length > 0, `${path} answers a POST`);
+    expect(post.indexOf("requireCsrfToken") >= 0, `${path} checks the token`);
+    expect(
+      post.indexOf("requireCsrfToken") < post.indexOf("readRequestActor"),
+      `${path} checks it before it reads a session, so a forged request costs a string comparison`,
+    );
+    expect(post.includes("maximumBodyBytes"), `${path} bounds the body it will read`);
+    expect(source.includes('export const dynamic = "force-dynamic"'), `${path} is never cached`);
+    expect(source.includes('"cache-control": "no-store"'), `${path} answers with no-store`);
+    expect(source.includes("withErrorResponse"), `${path} answers through the platform's error envelope`);
+  }
+
+  expect(settings.includes("PAYLOAD_TOO_LARGE"), "the settings route refuses a body it will not read");
+  expect(
+    logo.includes("UPLOAD_POLICIES.company_logo.maximumBytes"),
+    "and the upload route takes its ceiling from the policy rather than restating a number",
+  );
+  expect(
+    logo.includes("request.formData()"),
+    "the upload reads multipart, because the bytes are the payload",
+  );
+  expect(
+    logo.includes("file instanceof File"),
+    "and refuses a form that carries anything but a file",
+  );
+  const get = settings.slice(settings.indexOf("export const GET"), settings.indexOf("export const POST"));
+
+  expect(get.length > 0, "the settings route answers a GET");
+  expect(!get.includes("requireCsrfToken"), "which asks for no token, because it changes nothing");
+  expect(get.includes("readRequestActor"), "and still reads the session, because the company comes from it");
+
+  // ---- the image reader has no dependency of its own ----
+  const image = await readRepositoryFile("services/invoices/invoice-pdf-image.ts");
+  const imageImports = [...image.matchAll(/^import .* from "(.*)";$/gmu)].map((match) => match[1] ?? "");
+
+  expect(
+    imageImports.every(
+      (specifier) => specifier.startsWith("node:") || specifier.startsWith("./") || specifier.startsWith("../"),
+    ),
+    "the image reader imports nothing but the platform and the standard library",
+  );
+  expect(imageImports.includes("node:zlib"), "inflating a PNG is the standard library's own deflate");
+  expect(!image.includes("require("), "and reaches for no module at runtime");
+
+  const branding = await readRepositoryFile("services/invoices/invoice-branding.ts");
+
+  expect(
+    branding.includes('formatMessage("invoices.brandingTaxIdLine"'),
+    "the one label a document needs is catalog copy, so no English lives in the service",
+  );
+  expect(
+    !branding.includes("from \"./invoice-pdf-document.ts\""),
+    "and the branding service does not import the document service, which imports it: one direction only",
+  );
+  expect(
+    branding.includes("&version=eq."),
+    "every update is scoped to the version it read",
+  );
+  expect(
+    branding.includes("deleted_at=is.null") && branding.includes("company_id=eq."),
+    "and to the live rows of one company",
+  );
+
+  // ---- the screen ----
+  const form = await readRepositoryFile("app/(dashboard)/invoices/branding/branding-form.tsx");
+  const page = await readRepositoryFile("app/(dashboard)/invoices/branding/page.tsx");
+  const serviceImports = [...form.matchAll(/import (type )?\{[^}]*\} from "(@\/services\/[^"]*)";/gu)];
+
+  expect(
+    form.startsWith('// path: app/(dashboard)/invoices/branding/branding-form.tsx\n"use client";'),
+    "the form is a client component",
+  );
+  expect(
+    serviceImports.length > 0 && serviceImports.every((match) => match[1] === "type "),
+    "and it imports nothing from a service but types, so no REST client reaches the browser bundle",
+  );
+  expectEqual(
+    [...form.matchAll(/method: "POST"/gu)].length,
+    2,
+    "two mutations: the settings save and the logo upload",
+  );
+  expectEqual(
+    [...form.matchAll(/csrfHeaders\(\)/gu)].length,
+    2,
+    "and each of them carries the rotating token",
+  );
+  expect(
+    form.includes("newestLogoId !== adoptedLogoId && newestLogoPrintable"),
+    "the button that prints the newest logo is only offered for a file the writer can draw, " +
+      "so a merchant is never offered an upload that ends in a refusal",
+  );
+  expect(form.includes("sm:grid-cols-2"), "the form is one column on a phone and two from sm up");
+  expect(form.includes("max-h-full max-w-full object-contain"), "a logo is fitted to its box, never cropped");
+  expect(page.includes('export const dynamic = "force-dynamic"'), "the page is read per request");
+  expect(page.includes("InvoiceBrandingScreen"), "and renders the screen the invoice screens own");
+
+  // ---- the preview, which is a restatement and not an import
+  //
+  // A client component cannot call `invoiceBrandingWordsOf`, because that module holds a REST client. So the
+  // form restates the assembly for the merchant to look at before they save, and what keeps a restatement
+  // honest is that it does not restate the parts most likely to drift: the address arrives already
+  // assembled, and the tax id line comes out of the same catalog message the service uses. Only the name
+  // choice and the four toggles are local, and each is pinned here against the service's own answer above.
+  const preview = form.slice(
+    form.indexOf("function previewLinesOf"),
+    form.indexOf("export interface BrandingFormProps"),
+  );
+
+  expect(preview.length > 0, "the preview is a function of its own, which is what lets this gate hold it");
+  expect(
+    preview.includes("for (const line of identity.addressLines)"),
+    "the address arrives assembled from the server, so the form cannot reassemble it differently",
+  );
+  expect(
+    preview.includes('formatMessage("invoices.brandingTaxIdLine"'),
+    "and the tax id line is the catalog's, not a sentence the form spells out",
+  );
+  expect(
+    preview.includes("identity.tradingName ?? identity.legalName ?? identity.companyName"),
+    "a trading name falls back to the legal name and then to whatever the company is called, as the service does",
+  );
+  expect(
+    preview.includes("identity.legalName ?? identity.tradingName ?? identity.companyName"),
+    "and a legal name falls back the other way round",
+  );
+  expect(!preview.includes("await"), "the preview builds strings and nothing else, so it cannot fail a render");
+
+  for (const [toggle, fact] of [
+    ["state.showAddress", "identity.addressLines"],
+    ["state.showContact", "identity.email"],
+    ["state.showWebsite", "identity.website"],
+    ["state.showTaxId", "brandingTaxIdLine"],
+  ] as const) {
+    expect(
+      preview.indexOf(toggle) < preview.indexOf(fact),
+      `${toggle} gates ${fact}, so a fact the merchant switched off is not drawn in the preview either`,
+    );
+  }
+
+  const screens = await readRepositoryFile("app/(dashboard)/invoices/invoice-screens.tsx");
+
+  expect(screens.includes('href="/invoices/branding"'), "the branding screen is one click from the editor");
+  expect(screens.includes("export async function InvoiceBrandingScreen"), "and lives with the other invoice screens");
+
+  // ---- the catalog ----
+  for (const key of [
+    "invoices.brandingTitle",
+    "invoices.brandingDescription",
+    "invoices.brandingLogoHeading",
+    "invoices.brandingLogoNone",
+    "invoices.brandingLogoCurrent",
+    "invoices.brandingLogoHidden",
+    "invoices.brandingLogoNewer",
+    "invoices.brandingLogoUseNewer",
+    "invoices.brandingLogoNotPrintable",
+    "invoices.brandingLogoQuarantined",
+    "invoices.brandingLogoFormatNote",
+    "invoices.brandingNameStyle",
+    "invoices.brandingNameTrading",
+    "invoices.brandingNameLegal",
+    "invoices.brandingShowAddress",
+    "invoices.brandingShowContact",
+    "invoices.brandingShowTaxId",
+    "invoices.brandingShowWebsite",
+    "invoices.brandingTaglineLabel",
+    "invoices.brandingFooterNoteLabel",
+    "invoices.brandingAccentLabel",
+    "invoices.brandingAccentDefault",
+    "invoices.brandingPreviewHeading",
+    "invoices.brandingNoProfile",
+    "invoices.brandingSave",
+    "invoices.brandingSaved",
+    "invoices.brandingFailed",
+    "invoices.brandingStale",
+    "invoices.brandingTooLong",
+    "invoices.brandingBadColour",
+    "invoices.brandingBack",
+    "invoices.brandingLink",
+  ]) {
+    expect(getMessage(key as Parameters<typeof getMessage>[0]).length > 0, `${key} is catalog copy`);
+  }
+
+  // The one message with a parameter is left out of the loop above, because `getMessage` refuses to print a
+  // sentence with a hole in it - which is the guard that makes a placeholder impossible to forget.
+
+  expectEqual(
+    formatMessage("invoices.brandingTaxIdLine", { taxId: "74-1234567" }),
+    "Tax ID: 74-1234567",
+    "and the tax id line reads as a label and a value",
+  );
+  expect(
+    !INVOICE_PDF_ACCENT_PATTERN.test("#12345"),
+    "the renderer's accent pattern is the column check's, so a value one accepts the other can draw",
+  );
+  expect(INVOICE_PDF_ACCENT_PATTERN.test("#010203"), "and a colour it stores is a colour it accepts");
+  expect(
+    invoiceBrandingRowSchema.safeParse({
+      id: randomUUID(),
+      company_id: COMPANY_A,
+      logo_file_id: null,
+      show_logo: true,
+      name_style: "trading",
+      show_address: true,
+      show_contact: true,
+      show_tax_id: false,
+      show_website: false,
+      tagline: null,
+      footer_note: null,
+      accent_colour: "#010203",
+      created_at: new Date(NOW).toISOString(),
+      updated_at: new Date(NOW).toISOString(),
+      version: 1,
+    }).success,
+    "a row of 0116 is a row the service can read",
+  );
+  expectEqual(
+    invoiceBrandingRowSchema.safeParse({
+      id: randomUUID(),
+      company_id: COMPANY_A,
+      logo_file_id: null,
+      show_logo: true,
+      name_style: "nickname",
+      show_address: true,
+      show_contact: true,
+      show_tax_id: false,
+      show_website: false,
+      tagline: null,
+      footer_note: null,
+      accent_colour: null,
+      created_at: new Date(NOW).toISOString(),
+      updated_at: new Date(NOW).toISOString(),
+      version: 1,
+    }).success,
+    false,
+    "and a name style the migration does not list is refused on the way in",
+  );
+}
+
 /* ---- the run ---- */
 
 async function run(): Promise<void> {
@@ -5670,9 +7810,13 @@ async function run(): Promise<void> {
   await checkDiscountCreate();
   await checkDiscountUpdate();
   await checkPdfRenderer();
+  await checkPdfImageDecoder();
+  await checkPdfBranding();
   await checkPdfDocument();
+  await checkBrandingService();
   await checkSources();
   await checkPdfSources();
+  await checkBrandingSources();
 
   if (failures.length > 0) {
     process.stderr.write(`invoice gate failed with ${String(failures.length)} problem(s):\n`);
@@ -5687,8 +7831,9 @@ async function run(): Promise<void> {
   }
 
   process.stdout.write(
-    `invoice gate passed: ${String(checks)} checks, 0022/0023/0115, draft, ` +
-      `${String(INVOICE_MAXIMUM_LINES)} lines, half-away-from-zero rounding, PDF as a background job\n`,
+    `invoice gate passed: ${String(checks)} checks, 0022/0023/0115/0116, draft, ` +
+      `${String(INVOICE_MAXIMUM_LINES)} lines, half-away-from-zero rounding, PDF as a background job, ` +
+      `a merchant's own logo and branding on it\n`,
   );
 }
 

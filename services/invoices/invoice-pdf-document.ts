@@ -34,6 +34,7 @@ import {
   type StorageAdapter,
 } from "../../lib/storage/types.ts";
 import { priceColumnSchema } from "../products/price.ts";
+import { readInvoicePrintBranding } from "./invoice-branding.ts";
 import { discountStateOf } from "./invoice-discount.ts";
 import { INVOICE_MANAGE_ROLES } from "./invoices.ts";
 import {
@@ -686,10 +687,11 @@ function classifyStorageFailure(error: unknown): never {
 }
 
 async function readPrintableInvoice(
-  rest: RestClient,
+  dependencies: InvoicePdfStorageDependencies,
   companyId: string,
   invoiceId: string,
 ): Promise<InvoicePdfSource> {
+  const rest = dependencies.rest;
   const invoices = await rest.select(
     "invoices",
     `${INVOICE_PRINT_COLUMNS}&id=eq.${invoiceId}&company_id=eq.${companyId}&deleted_at=is.null`,
@@ -713,6 +715,11 @@ async function readPrintableInvoice(
   );
 
   const discount = discountStateOf(invoice);
+  // The merchant's own half of the document: their choices from `0116`, their facts from the business
+  // profile, and - when they chose one - the logo's bytes out of storage. Read here rather than passed in,
+  // because the render is the moment the document is built, and branding saved a minute ago has to be the
+  // branding this document carries.
+  const branding = await readInvoicePrintBranding({ companyId }, dependencies);
 
   return {
     invoice: {
@@ -745,6 +752,7 @@ async function readPrintableInvoice(
       discountMinor: line.discount_minor,
       lineTotalMinor: line.line_total_minor,
     })),
+    branding: { ...branding.words, logo: branding.logo },
     generatedAtEpochMs: 0,
   };
 }
@@ -858,7 +866,7 @@ export async function renderInvoicePdfDocument(
   });
 
   try {
-    const source = await readPrintableInvoice(dependencies.rest, companyId, payload.invoice_id);
+    const source = await readPrintableInvoice(dependencies, companyId, payload.invoice_id);
     const printable = invoicePdfDocumentOf({ ...source, generatedAtEpochMs: now });
     const bytes = renderInvoicePdf(printable);
 

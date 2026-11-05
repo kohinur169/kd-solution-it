@@ -17,14 +17,21 @@ import {
 } from "@/services/invoices/invoices";
 import {
   INVOICE_PDF_NO_DOCUMENT,
+  invoicePdfDependencies,
   readInvoicePdfState,
   type InvoicePdfState,
 } from "@/services/invoices/invoice-pdf-document";
+import {
+  INVOICE_BRANDING_DEFAULT_ACCENT,
+  readInvoiceBranding,
+  type InvoiceBrandingSnapshot,
+} from "@/services/invoices/invoice-branding";
 import { readOwnerActor } from "../onboarding/owner-actor";
 import { InvoiceForm } from "./invoice-form";
 import { InvoicePdfPanel } from "./invoice-pdf-panel";
 import { getInvoiceNumberSettings, type InvoiceNumberSettings } from "@/services/invoices/invoice-numbering";
 import { NumberingForm } from "./numbering/numbering-form";
+import { BrandingForm } from "./branding/branding-form";
 import { InvoiceLineEditor } from "./invoice-line-editor";
 
 /**
@@ -284,6 +291,11 @@ export async function InvoiceEditorScreen({
           <Link className={linkClasses} href="/invoices/numbering">
             {getMessage("invoices.numberingLink")}
           </Link>
+          {/* The branding is one click from the editor for the same reason the series is: a merchant who is
+              looking at a document is the one who notices what it says about them. */}
+          <Link className={linkClasses} href="/invoices/branding">
+            {getMessage("invoices.brandingLink")}
+          </Link>
           <Link className={linkClasses} href="/">
             {getMessage("invoices.homeLink")}
           </Link>
@@ -350,6 +362,78 @@ export async function InvoiceNumberingScreen(): Promise<ReactNode> {
             </p>
             <NumberingForm settings={state.settings} />
           </>
+        ) : (
+          <p className="text-sm text-destructive" role="alert">
+            {refusalSentence(state as ScreenState)}
+          </p>
+        )}
+      </div>
+    </main>
+  );
+}
+
+/**
+ * Section 16's branding screen: the merchant's logo, and the details their invoices print about them.
+ *
+ * ## Why a merchant with no branding row is not an error
+ *
+ * `readInvoiceBranding` answers the defaults, exactly as the numbering read answers `INV` and five digits for
+ * a merchant who has never saved a series. It has to: `0116`'s defaults say show the address and show the
+ * contact, and the facts behind them come from the business profile rather than from this row, so a merchant
+ * who has never opened this screen already has their name and address on their invoices. What they do not
+ * have yet is a logo, and the form says so in words instead of showing an empty box.
+ *
+ * ## Why the storage bundle is in the dependencies
+ *
+ * The screen shows the merchant their own logo, and section 21 stores every file sealed with AES-256-GCM - so
+ * the picture is a short-lived signed URL minted for this response and never a public path. The bundle is
+ * `invoicePdfDependencies()`, which is the process's one storage runtime (adapter registry plus file
+ * encryption) rather than anything PDF specific: building a second one here would give the process two
+ * registries and two encryptions for the same environment.
+ *
+ * ## The three refusals
+ *
+ * Signed out, not an owner, and unavailable are the same three the other invoice screens word, and none of
+ * them restates a role: the service decides who may read, and the screen only says what the merchant can do.
+ */
+export async function InvoiceBrandingScreen(): Promise<ReactNode> {
+  const actorState = await readOwnerActor();
+  let state:
+    | { readonly kind: "ready"; readonly snapshot: InvoiceBrandingSnapshot }
+    | { readonly kind: string } = { kind: "unavailable" };
+
+  if (actorState.kind === "anonymous") {
+    state = { kind: "signed-out" };
+  } else if (actorState.kind === "actor") {
+    try {
+      state = {
+        kind: "ready",
+        snapshot: await readInvoiceBranding({ actor: actorState.actor }, invoicePdfDependencies()),
+      };
+    } catch (error) {
+      state =
+        error instanceof AppError && error.code === "AUTHENTICATION_REQUIRED"
+          ? { kind: "signed-out" }
+          : error instanceof AppError && error.code === "PERMISSION_DENIED"
+            ? { kind: "forbidden" }
+            : { kind: "unavailable" };
+    }
+  }
+
+  return (
+    <main className="min-h-dvh bg-background px-4 py-8 text-foreground sm:px-6 lg:px-8">
+      <SessionKeeper />
+      <div className="mx-auto flex w-full max-w-2xl flex-col gap-6">
+        <header className="flex flex-col gap-2">
+          <p className="text-sm font-medium text-muted-foreground">{getMessage("invoices.editorEyebrow")}</p>
+          <h1 className="text-2xl font-semibold tracking-tight sm:text-3xl">
+            {getMessage("invoices.brandingTitle")}
+          </h1>
+          <p className="text-sm text-muted-foreground">{getMessage("invoices.brandingDescription")}</p>
+        </header>
+
+        {"snapshot" in state && state.snapshot !== undefined ? (
+          <BrandingForm defaultAccent={INVOICE_BRANDING_DEFAULT_ACCENT} snapshot={state.snapshot} />
         ) : (
           <p className="text-sm text-destructive" role="alert">
             {refusalSentence(state as ScreenState)}
