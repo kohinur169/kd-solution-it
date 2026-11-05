@@ -93,6 +93,24 @@ PostgreSQL. A trigger's `raise exception` is mapped to `VALIDATION_FAILED` and a
 and every other class-23 failure is invalid input. Getting that backwards would have let the service relabel a
 closed quote as a taken one.
 
+### The column names are the table's, proved both ways
+
+A fixture mints its rows itself, so it never notices a column name that does not exist: a typo in the read's
+column list, or a key in an insert the table does not have, is a statement PostgREST refuses **in production**
+and nothing refuses here. That is a whole class of defect the fixture is structurally blind to, so the gate now
+reads `0027`'s own `create table` and compares both sides of the service's queries against it:
+
+- the read's 17 columns are all real columns, and all 18 of the table's columns are asked for except
+  `deleted_at` — the one column the read filters on rather than reads;
+- every key the insert sends is a real column, and so is every key of the stored row, which also pins the
+  fixture's own defaults to the real table;
+- neither `id` nor `version` is sent, because both are the column's default and an append-only row never
+  moves off version one.
+
+Both claims were **failure-probed** rather than trusted: renaming `signer_name` to `signed_by` in the column
+list fails the gate with *"the read asks for "signed_by", a column `0027` actually has"*, and adding an
+invented `signer_ip` to the insert payload fails it twice, once for the payload and once for the stored row.
+
 ## Environment
 
 No new variable. `ENCRYPTION_MASTER_KEY` and the rest are untouched; the evidence table needs no secret of its
@@ -192,7 +210,7 @@ excluding the document's lifecycle and excluding any second spelling of a fact a
 
 ### Gate
 
-`npx --yes tsx services/estimates/verify.ts` — **1 465 checks in 16 groups**, run twice for stability:
+`npx --yes tsx services/estimates/verify.ts` — **1 536 checks in 16 groups**, run twice for stability:
 `checkVocabulary, checkCreate, checkDiscount, checkValidation, checkConflict, checkTenancy, checkBoundaries,
 checkLines, checkRoutes, checkCompensation, checkSources, checkSignature, checkCapture, checkUi,
 checkEvidence, checkMigration`.
@@ -219,7 +237,7 @@ absent elements, and that a stored image is named without its key.
 
 | Gate | Result |
 | --- | --- |
-| `services/estimates` | 1 465 checks, 16 groups |
+| `services/estimates` | 1 536 checks, 16 groups |
 | `services/invoices` | 1 442 checks |
 | `lib/auth` | 2 774 checks |
 | `migrations` | 3 433 checks, 117 migrations, 89 tables |

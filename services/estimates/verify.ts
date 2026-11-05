@@ -3745,6 +3745,31 @@ function matchOf(source: string, pattern: RegExp, what: string): readonly [strin
   return [found[1] ?? "", found[2] ?? ""];
 }
 
+/**
+ * The columns `0027` really has, read out of its own `create table`.
+ *
+ * A fixture mints its rows itself, so it never notices a column name that does not exist: a typo in the
+ * read's column list, or a key in an insert that the table does not have, is a statement PostgREST refuses
+ * in production and nothing refuses here. So the real list comes from the migration's text, and both sides
+ * of the service's queries are compared against it rather than against the fixture's idea of the table.
+ */
+async function estimateSignatureTableColumns(): Promise<readonly string[]> {
+  const migration = await readRepositoryFile("migrations/0027_estimate_signatures.sql");
+  const start = migration.indexOf("create table public.estimate_signatures (");
+
+  if (start === -1) {
+    throw new Error("gate fixture: 0027 creates no estimate_signatures table");
+  }
+
+  const body = migration.slice(start, migration.indexOf("\n);", start));
+
+  return body
+    .split("\n")
+    .map((line) => line.trim())
+    .map((line) => /^([a-z_]+) (?:uuid|text|boolean|inet|integer|timestamptz)\b/u.exec(line)?.[1] ?? "")
+    .filter((column) => column.length > 0);
+}
+
 /** The floor and ceiling a column's `char_length` check states. */
 function boundsOf(source: string, column: string): { readonly min: number; readonly max: number } {
   const found = new RegExp(`char_length\\(${column}\\) between (\\d+) and (\\d+)`, "u").exec(source);
@@ -4004,6 +4029,27 @@ async function checkSignature(): Promise<void> {
   expect(migration.includes("signed_at timestamptz not null"), "and the time is a zoned timestamp in server time, not a string a client sent");
   expectEqual(ESTIMATE_SIGNATURES_TABLE, "estimate_signatures", "the table has one name in this family");
   expect(migration.includes(`create table public.${ESTIMATE_SIGNATURES_TABLE} (`), "which is the table `0027` creates");
+
+  // The read asks for a column list, and that list has to be the table's own: a name the table does not
+  // have is a query refused in production while the fixture, which builds its own rows, answers it happily.
+  // `deleted_at` is the one column the read filters on rather than reads, so the two lists differ by it.
+  const tableColumns = await estimateSignatureTableColumns();
+  const askedColumns = ESTIMATE_SIGNATURE_COLUMNS.split(",");
+
+  expectEqual(tableColumns.length, 18, "`0027` creates eighteen columns, counted out of the file rather than remembered");
+
+  for (const column of askedColumns) {
+    expect(tableColumns.includes(column), `the read asks for "${column}", a column \`0027\` actually has`);
+  }
+
+  for (const column of tableColumns) {
+    expect(
+      askedColumns.includes(column) || column === "deleted_at",
+      `and "${column}" is asked for, unless it is the one column the read filters on instead`,
+    );
+  }
+
+  expectEqual(askedColumns.length, tableColumns.length - 1, "so the read asks for every column but that one");
 
   // The two decisions and the two open statuses, read out of the CHECK and out of the trigger.
   expectDeepEqual(
@@ -4517,6 +4563,25 @@ async function checkCapture(): Promise<void> {
   expectEqual(row["version"], 1, "at version one, which is the only version an append-only row ever has");
   expectEqual(row["company_id"], COMPANY_A, "scoped to the merchant it belongs to");
   expectEqual(row["estimate_id"], issued.snapshot.id, "and to the quote's own stable id");
+
+  // Every key the service sent, and every key the fixture stored, has to be a column the table has. The
+  // fixture supplies its own defaults, so an invented key would sit in the stored row unnoticed here and
+  // refuse the whole statement in production - a capture that fails only where it matters.
+  const columns = await estimateSignatureTableColumns();
+  const sent = issued.db.inserts.at(-1)?.rows[0] ?? {};
+
+  expect(Object.keys(sent).length > 0, "the insert sent a row");
+
+  for (const key of Object.keys(sent)) {
+    expect(columns.includes(key), `the insert sends "${key}", a column \`0027\` actually has`);
+  }
+
+  for (const key of Object.keys(row)) {
+    expect(columns.includes(key), `and the stored row's "${key}" is one too, so the fixture invents no column of its own`);
+  }
+
+  expect(!Object.keys(sent).includes("id"), "the id is the column's own default, not a value the service picks");
+  expect(!Object.keys(sent).includes("version"), "and so is the version, which an append-only row never moves off one");
 
   expectEqual(stored.decision, "accepted", "the caller gets the decision back");
   expectEqual(stored.documentHash, String(row["document_hash"] ?? ""), "with the digest it stored");
