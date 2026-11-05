@@ -104,7 +104,7 @@ async function checkStepInventory() {
 
   // The two holes are named, not tolerated. When one of them is implemented its handoff appears here
   // and this list must shrink; a gate that simply allowed "up to two missing" would hide the third.
-  const knownGaps = ["096", "116"];
+  const knownGaps = ["116"];
   const unexpected = missing.filter((number) => !knownGaps.includes(number));
   const filled = knownGaps.filter((number) => handoffSet.has(number));
 
