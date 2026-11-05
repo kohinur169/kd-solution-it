@@ -2681,6 +2681,26 @@ const catalog = {
     recurringRuleAlreadyChanged: "Somebody changed this schedule first",
     recurringFieldInvalid: "Check this field",
   },
+  settlements: {
+    /** Section 17: the settlement statement and the download of STEP 125. */
+    pageTitle: "Settlement statement",
+    pageDescription: "One line per movement on your settlement balance, for the period you pick.",
+    panelTitle: "Settlement statement",
+    lead: "The statement lists the movements of your settlement balance for the period you pick: the payments you collected, the platform fees, the holds, the reserve, the refunds, the chargebacks and the payouts. It is one line per movement, newest first, in a CSV your spreadsheet opens.",
+    fromLabel: "First day",
+    toLabel: "Last day",
+    fromHint: "The statement starts at the beginning of this day.",
+    toHint: "The statement ends at the end of this day.",
+    download: "Download CSV",
+    preparing: "Preparing",
+    periodReversed: "The first day must be on or before the last day.",
+    periodInvalid: "That is not a day in the form this statement takes.",
+    statementTooLong:
+      "That period carries more than ten thousand movements. Pick a shorter period and try again.",
+    signedOut: "Sign in again, then try the download.",
+    forbidden: "This account cannot read the statement.",
+    failed: "The statement could not be downloaded. Try again.",
+  },
   estimates: {
     /** Section 16: the quote, and the create form and line items of STEP 119. */
     eyebrow: "Estimates",
