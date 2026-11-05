@@ -2,7 +2,16 @@
 import process from "node:process";
 import { readFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
-import { recurringScheduleJobPayloadSchema, RECURRING_SCHEDULE_JOB } from "./recurring-schedule-job.ts";
+import { JobRegistry } from "../../lib/jobs/registry.ts";
+import { createInMemoryAuditTrail } from "../../lib/auth/audit.ts";
+import type { RestClient } from "../../lib/auth/rest.ts";
+import {
+  createDefaultRecurringGenerationJob,
+  recurringScheduleJobPayloadSchema,
+  RECURRING_SCHEDULE_JOB,
+  registerRecurringGenerationJob,
+  runRecurringScheduleJob,
+} from "./recurring-schedule-job.ts";
 import { RECURRING_SCHEDULE_JOB_NAME } from "./recurring-schedule-fields.ts";
 import {
   RECURRING_SCHEDULE_AUDIT_ENTITY,
@@ -36,10 +45,12 @@ import {
  *
  * ## Why the job contract is proved by absence
  *
- * STEP 123 implements the generator. STEP 122 must therefore state the payload and register nothing, and the
- * proof of "registers nothing" is that a fresh registry is still empty after this module has been imported -
- * which is what the first group does. A handler written here to satisfy a registration would be a job that
- * accepts work and invoices nobody.
+ * STEP 123 implements the generator. STEP 122 therefore stated the payload and registered nothing of its own
+ * accord, and the durable form of that claim is not "the file mentions no handler" - STEP 123 has since added
+ * one, legitimately - but "importing the file runs nothing": no top-level await, no top-level registration, and
+ * no registry constructed at module scope. A gate that still asserted the literal absence of a handler would
+ * have to choose between lying and forbidding the work this STEP exists to do, which is why it was narrowed
+ * rather than deleted when the handler arrived.
  */
 
 /* ---- the harness ---- */
@@ -187,8 +198,112 @@ async function checkJobContract(): Promise<void> {
     "registering twice is a no-op rather than a second definition of one name",
   );
 
-  // Nothing in this file executes work.
-  expect(!/await\s/.test(source.replaceAll(/\/\*[\s\S]*?\*\//gu, "")), "the contract module awaits nothing, because it does no work");
+  // Nothing in this file executes work **at import time**.
+  //
+  // STEP 122 asserted the stronger claim that the module awaited nothing at all, because the module was a
+  // contract and no handler existed yet. STEP 123 adds the handler, so that exact sentence is no longer true and
+  // keeping it would mean either a lie in the gate or a handler smuggled into a string. The claim that still
+  // matters is the one the import-time guarantee rests on: the file's top level runs no work, so importing it
+  // cannot generate an invoice or register a job as a side effect. Work happens only inside a function that a
+  // caller invokes.
+  const codeOnly = source.replaceAll(/\/\*[\s\S]*?\*\//gu, "").replaceAll(/\/\/.*/gu, "");
+  const topLevelLines = codeOnly
+    .split("\n")
+    .filter((line) => line.trim().length > 0 && !line.startsWith(" ") && !line.startsWith("}"));
+  expect(
+    !topLevelLines.some((line) => /\bawait\b/u.test(line)),
+    "no top-level await, so importing this module still does no work",
+  );
+  expect(
+    !topLevelLines.some((line) => /\.register\(/u.test(line)),
+    "and no top-level registration, so a job exists only after a caller asks for one",
+  );
+}
+
+
+/* ---- the registration, proved against a real registry ---- */
+
+/**
+ * STEP 123's other half: the seam is now called, and calling it is checkable.
+ *
+ * The contract group above proves absence - importing the module registers nothing. This group proves
+ * **presence**, and it can, because a real `JobRegistry` driven by the real registration function is the actual
+ * object the worker would consult. That is the difference between the two proofs and the reason both exist: an
+ * absence proved from a source text is worth having only alongside a presence proved from the code path.
+ *
+ * Note what this group does *not* claim. It does not claim the process registers this job at boot. There is no
+ * boot-time registration anywhere in this repository - the PDF job registers itself lazily when a document is
+ * requested (`registerInvoicePdfJob` inside `requestInvoicePdf`), and the sub-merchant jobs are registered by
+ * whoever needs them. Wiring a scheduler that calls these functions on startup is the deployment STEP's work, and
+ * the handoff says so rather than letting a reader infer that a scheduled run happens by itself.
+ */
+async function checkRegistration(): Promise<void> {
+  const registry = new JobRegistry();
+  const neverCalled: RestClient = {
+    select: () => Promise.resolve([]),
+    insert: () => Promise.resolve(),
+    insertReturning: () => Promise.resolve([]),
+    update: () => Promise.resolve(),
+    rpc: () => Promise.resolve(null),
+  };
+  const dependencies = () => ({ rest: neverCalled, audit: createInMemoryAuditTrail(), today: () => "2026-11-05" });
+
+  expectEqual(registry.names().length, 0, "a fresh registry is empty, so what follows is the registration's doing");
+
+  registerRecurringGenerationJob(registry, dependencies);
+
+  expect(registry.has(RECURRING_SCHEDULE_JOB), "registering once puts the job in the registry under its fixed name");
+  expectEqual(registry.names().length, 1, "and adds exactly one name, with no second job smuggled in");
+  expectEqual(RECURRING_SCHEDULE_JOB, RECURRING_SCHEDULE_JOB_NAME, "under the name STEP 122 declared, unchanged");
+
+  // Registering twice is a no-op rather than a second definition of one name: a process that boots twice must not
+  // end up with two handlers whose difference decides which invoices exist.
+  registerRecurringGenerationJob(registry, dependencies);
+  expectEqual(registry.names().length, 1, "registering twice leaves one job, because two definitions would be a coin toss");
+
+  // The registered job carries the attempt ceiling and the payload the definition promised.
+  const registered = registry.get(RECURRING_SCHEDULE_JOB);
+
+  expectEqual(registered.maxAttempts, 1, "the registered job is attempted once, as section 16 requires");
+  expect(registered.timeoutMs > 0, "and carries a finite timeout rather than running unbounded");
+
+  const parses = (payload: unknown): boolean => {
+    try {
+      registered.parsePayload(payload);
+
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  expect(
+    parses({ schedule_id: "018f2b9c-4444-7000-8000-000000000001", run_on: "2026-11-01" }),
+    "the registered schema accepts the contract",
+  );
+  expect(
+    !parses({ schedule_id: "018f2b9c-4444-7000-8000-000000000001", run_on: "2026-11-01", amount_minor: 100 }),
+    "and refuses a payload that tries to carry an amount, which the queue must never be trusted with",
+  );
+  expect(!parses({ schedule_id: "018f2b9c-4444-7000-8000-000000000001" }), "and refuses a payload with no run date");
+
+  // The default definition is the same name, so a route that imports it cannot register a second spelling.
+  expectEqual(
+    createDefaultRecurringGenerationJob().name,
+    RECURRING_SCHEDULE_JOB,
+    "the default definition uses the same name",
+  );
+
+  // The handler is real work: an empty run is the failure that looks like a working billing system, so the check
+  // is that running it against a store which finds nothing reports a skip rather than resolving silently.
+  const emptyStore: RestClient = { ...neverCalled };
+  const outcome = await runRecurringScheduleJob(
+    { schedule_id: "018f2b9c-4444-7000-8000-000000000009", run_on: "2026-11-01" },
+    { rest: emptyStore, audit: createInMemoryAuditTrail(), today: () => "2026-11-05" },
+  );
+
+  expectEqual(outcome.kind, "skipped", "the registered handler does work and reports what it found");
+  expectEqual(outcome.reason, "missing", "and says the schedule was not there rather than claiming a success");
 }
 
 /* ---- the six security claims ---- */
@@ -335,6 +450,7 @@ async function run(): Promise<void> {
   await group("job contract", checkJobContract);
   await group("security sweep", checkSecuritySweep);
   await group("STEP boundary", checkStepBoundary);
+  await group("registration", checkRegistration);
 
   if (failures.length > 0) {
     process.stderr.write(`recurring schedule job gate failed with ${String(failures.length)} problem(s):\n`);
@@ -350,8 +466,8 @@ async function run(): Promise<void> {
 
   process.stdout.write(
     `recurring schedule job gate passed: ${String(checks)} checks, a payload that names one schedule and one run ` +
-      "date and refuses to carry anything else, no registration and no placeholder handler because STEP 123 " +
-      "owns the work, " +
+      "date and refuses to carry anything else, no work and no registration at import time so the contract " +
+      "still imports safely now that STEP 123 has added the handler, " +
       "and the six security claims of the STEP - validation, RLS, five audit actions, the owner role and the " +
       "session's company, CSRF on every mutating route, and no client data in a log line or a trail\n",
   );

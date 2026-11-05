@@ -1,8 +1,16 @@
 // path: services/invoices/recurring-schedule-job.ts
 import { z } from "zod";
+import type { AuditTrail } from "../../lib/auth/audit.ts";
+import type { RestClient } from "../../lib/auth/rest.ts";
 import type { JobContext, JobDefinition } from "../../lib/jobs/types.ts";
 import type { JobRegistry } from "../../lib/jobs/registry.ts";
+import { getAuthRuntime } from "../../lib/auth/runtime.ts";
 import { RECURRING_SCHEDULE_JOB_NAME } from "./recurring-schedule-fields.ts";
+import {
+  generateRecurringInvoice,
+  sweepRecurringReminders,
+  type RecurringGenerationResult,
+} from "./recurring-generation.ts";
 
 /**
  * The contract of section 27's recurring invoice job, which STEP 123 implements.
@@ -106,4 +114,123 @@ export function registerRecurringScheduleJob(
     handler,
     maxAttempts: 1,
   });
+}
+
+/* ---------------------------------------------------------------------------------------------------------
+ * STEP 123: the handler the contract above was written for.
+ *
+ * The split the two STEPs agreed on is kept exactly: the payload, the outcome shape, the attempt ceiling and the
+ * registration seam above are STEP 122's and are untouched. What is added here is the body that does the work,
+ * wired the way every other job in this repository is wired - a factory that takes its dependencies, and one
+ * default instance that closes over the auth runtime so a route or a scheduler can register it without passing
+ * anything.
+ *
+ * `createRecurringGenerationJob` exists so the gate can drive the real handler against a fake `RestClient` and a
+ * fake clock. A handler that could only run against a live database would be a handler nobody had ever executed,
+ * and the whole point of this STEP is that a repeated run must not double-bill a client.
+ * ------------------------------------------------------------------------------------------------------- */
+
+/**
+ * What the handler needs to run: the storage client, the audit trail and the calendar.
+ *
+ * `today` is injected rather than read from `Date` inside the handler, for the same reason every date in this
+ * family is injected: a gate has to be able to say "it is the fifth of November" and get the same answer in
+ * 2032. The scheduler that enqueues the work decides which day it is enqueuing for; the worker merely runs it.
+ */
+export interface RecurringScheduleJobDependencies {
+  readonly rest: RestClient;
+  readonly audit: AuditTrail;
+  /** The calendar day the run is being evaluated on, `YYYY-MM-DD`. */
+  readonly today: () => string;
+}
+
+/** The default handler wiring: the process's own storage and audit trail. */
+function defaultRecurringGenerationJob(
+  dependenciesOf: () => RecurringScheduleJobDependencies,
+): JobDefinition<RecurringScheduleJobPayload> {
+  return {
+    name: RECURRING_SCHEDULE_JOB,
+    payloadSchema: recurringScheduleJobPayloadSchema,
+    maxAttempts: 1,
+    handler: async (context) => {
+      await runRecurringScheduleJob(context.payload, dependenciesOf());
+    },
+  };
+}
+
+/**
+ * The handler's body: one occurrence of one schedule, then the reminders its invoices earned.
+ *
+ * The order is deliberate. Generation happens first, because a reminder is about an invoice that exists; the
+ * sweep runs second and only over invoices that were already issued, so a generated draft is left alone - see
+ * `RECURRING_REMINDER_STATUSES` for why a document nobody has received cannot be late.
+ *
+ * A skipped generation is not a failure and does not raise: the queue delivered a run for a schedule a merchant
+ * paused, or one another worker already filled. The outcome is logged through the job's own return value rather
+ * than an exception, so `maxAttempts: 1` is not spent on a run that had nothing to do.
+ */
+export async function runRecurringScheduleJob(
+  payload: RecurringScheduleJobPayload,
+  dependencies: RecurringScheduleJobDependencies,
+): Promise<RecurringGenerationResult> {
+  const result = await generateRecurringInvoice(
+    { scheduleId: payload.schedule_id, runOn: payload.run_on },
+    { rest: dependencies.rest, audit: dependencies.audit },
+  );
+
+  // Reminders are swept for the schedule's own merchant only when this run actually produced an invoice, because
+  // a sweep is a per-merchant question and there is nothing new to remind about otherwise. Each one schedules its
+  // own sweep; doing it here would make an idle run quadratic in the merchant's backlog.
+  if (result.kind === "generated") {
+    const [schedule] = await dependencies.rest.select(
+      "recurring_schedules",
+      `select=company_id&id=eq.${result.scheduleId}`,
+      z.object({ company_id: z.string().uuid() }),
+    );
+
+    if (schedule !== undefined) {
+      await sweepRecurringReminders(
+        { companyId: schedule.company_id, today: dependencies.today() },
+        { rest: dependencies.rest, audit: dependencies.audit },
+      );
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Register the generator, once, under the name STEP 122 fixed.
+ *
+ * Unlike the seam above this function writes no registration: it hands the seam a real handler, which is what the
+ * seam was written for. A second call is a no-op inside the seam itself, so a process that boots twice registers
+ * once.
+ */
+export function registerRecurringGenerationJob(
+  registry: JobRegistry,
+  dependenciesOf: () => RecurringScheduleJobDependencies,
+): void {
+  registerRecurringScheduleJob(registry, async (context) => {
+    await runRecurringScheduleJob(context.payload, dependenciesOf());
+  });
+}
+
+/** The default instance, closing over the auth runtime like every other route in this repository. */
+export function createDefaultRecurringGenerationJob(): JobDefinition<RecurringScheduleJobPayload> {
+  return defaultRecurringGenerationJob(() => {
+    const runtime = getAuthRuntime();
+
+    return { rest: runtime.rest, audit: runtime.audit, today: currentCalendarDay };
+  });
+}
+
+/**
+ * Today, in UTC, as `YYYY-MM-DD`.
+ *
+ * UTC and not the server's local zone: schedules are stored as calendar dates, the database writes `date` without
+ * a zone, and two workers in two regions must agree on which occurrence they are filling. A local-time "today"
+ * would make a run at 23:30 in Dhaka and one at 00:30 in UTC disagree by a day about the same schedule.
+ */
+export function currentCalendarDay(now: number = Date.now()): string {
+  return new Date(now).toISOString().slice(0, 10);
 }
