@@ -972,6 +972,32 @@ Delivered by this STEP in `lib/payments/adapters/airwallex.ts`, with no network 
   platform fee on the attempt for the ledger and **sends none**: guessing a parameter name into a live payment body
   is not something this adapter does. The payments-for-platforms pages must still be read before a fee can be
   collected through Airwallex rather than through the platform's own settlement.
+- **STEP 169 books the payout and receives the delivery.** `lib/payments/adapters/airwallex-payout.ts` books a payout
+  only for a connected account that is `ACTIVE` per STEP 167's readiness and belongs to the company asking, derives
+  the documented `request_id` from the company and the reference (namespaced `payout|` so it can never collide with a
+  payment's), and writes the row with **no** outcome and **no** transfer id — booking is the platform's decision, not
+  evidence that money moved. The transfer id attaches once and proves existence, not status; a read is accepted only
+  when the answer names the id that was asked about; and the documented transfer mapping is applied unchanged, so
+  `PAID` is recorded `paid` **and provisional** and may still move to `failed`, while `FAILED` and `CANCELLED` are
+  final. Only `closeAirwallexPayoutWindow`, called by the ledger once the platform's own window has elapsed, makes a
+  paid payout final — and a failure arriving after that is refused rather than absorbed, so it reaches a person.
+  `lib/payments/adapters/airwallex-webhook.ts` verifies `x-signature` over `x-timestamp` plus the raw body **before**
+  the body is parsed, parses that same string, deduplicates on the `evt_` id (a retry applies nothing), maps a
+  payment intent through the Intent vocabulary, a payment attempt as evidence only, and a transfer through the
+  transfer vocabulary, ignores any name it does not subscribe to, and answers `200` for applied, ignored and
+  duplicate, `401` unverified, `400` unparseable and `500` only when it could not record the work. The two gates
+  (`airwallex-payout-verify.ts`, `airwallex-webhook-verify.ts`) run 284 and 214 checks against recorded answers; no
+  call and no delivery reached Airwallex.
+- **The transfer and beneficiary create bodies were never read, so neither is built.** STEP 165 recorded both paths
+  and their statuses; it did not record the field names of either request body. A guessed field name in a payout body
+  is the one mistake that moves real money the wrong way, so `createAirwallexTransfer` and
+  `createAirwallexBeneficiary` answer `unsupported` naming the unread page and the create path is **not** on the
+  callable allowlist — a gate asserts that it is not. The payout is therefore booked here and its transfer id
+  attached when the surface that created the transfer reports it; until those pages are read, this adapter reads and
+  settles transfers and never starts one.
+- **The account-status event names are still unread, so no account event is subscribed.** STEP 165's record holds an
+  empty account group, and the receiver has no account branch to get wrong: an account event parses, is acknowledged
+  `200`, and is recorded as `ignored`. A subscription review sees exactly the twenty-four names the record carries.
 
 ### Sandbox Notes
 
@@ -984,8 +1010,10 @@ Delivered by this STEP in `lib/payments/adapters/airwallex.ts`, with no network 
 | Read the account's verification status | `GET /api/v1/accounts/{id}` | Not run | No account exists to read. STEP 167 implements the read that records the documented status, maps it to `ready`/`waiting`/`blocked`, and flags a `404` or an unsettled answer for reconciliation; it has never seen a real one. |
 | Take a payment with a documented test card | `POST /api/v1/pa/payment_intents/create` | Not run | No credential exists. The required test cases and cards (`4035501000000008` succeeds, `4012000300000013` fails 3DS, `5307837360544518` with `80.51` is insufficient funds) are recorded and unused. STEP 168 implements the create call, the readiness gate and the client-secret hand-off, and gates them against recorded answers only. |
 | Confirm the payment by reading the intent | `GET /api/v1/pa/payment_intents/{id}` | Not run | No PaymentIntent exists to read, so the read that turns a browser's claim into a settled payment never reached Airwallex. STEP 168 implements it, refuses an amount or currency that does not match the attempt, and records `SUCCEEDED` as the only `paid`. |
-| Pay out to a beneficiary | `POST /api/v1/transfers/create` | Not run | No balance, beneficiary or credential exists; the eleven statuses and `PAID`'s late failure are recorded. |
-| Verify and deduplicate a delivery | the endpoint's raw body plus `x-timestamp`/`x-signature` | Not run | No webhook subscription exists; the verifier was exercised only with self-computed signatures in the gate. |
+| Pay out to a beneficiary | `POST /api/v1/transfers/create` | Not run | No balance, beneficiary or credential exists; the eleven statuses and `PAID`'s late failure are recorded. STEP 169 books the payout, attaches the transfer id and settles every status, and **refuses to build the create body** because its field names were never read — so the call itself remains unimplemented on purpose. |
+| Read the transfer back | `GET /api/v1/transfers/{id}` | Not run | No transfer exists to read. STEP 169 implements the read, refuses an answer about another transfer id, and records `PAID` as provisional so a later `FAILED` may still take it back. |
+| Register a payout beneficiary | `POST /api/v1/beneficiaries/create` | Not run | The path is recorded; its request body was never read, so `createAirwallexBeneficiary` answers `unsupported` and the path is not on the allowlist. |
+| Verify and deduplicate a delivery | the endpoint's raw body plus `x-timestamp`/`x-signature` | Not run | No webhook subscription exists; the verifier was exercised only with self-computed signatures in the gate. STEP 169's receiver verifies before it parses, deduplicates on the `evt_` id and answers 200/400/401/500, but no delivery from Airwallex has ever arrived. |
 
 The record these notes produce is `partial`, never `verified`: `calculateAirwallexStatus` requires all five step
 ids to be recorded as `verified` **with evidence**, and the gate asserts that a record claiming more than its
@@ -1001,3 +1029,5 @@ steps prove is refused.
 - Hosted components: Yes (hosted payment page, drop-in element, embedded elements, embedded KYC)
 - Sandbox for connected accounts: **No** without Airwallex Sales or the Simulation APIs — recorded as this
   provider's one matrix gap
+- Record status after STEP 169, this provider's last: `partial` — every capability above is implemented against the
+  documented pages and gated against recorded answers, and none was exercised against Airwallex
