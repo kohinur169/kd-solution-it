@@ -112,6 +112,8 @@ export interface LedgerEntryStore {
   findByGroup(entryGroupId: string): LedgerEntry[];
   /** The reversal that undoes this entry, or null when the entry is not reversed. */
   findByReversalOf(entryId: string): LedgerEntry | null;
+  /** The ids of every group the store holds. */
+  listGroupIds(): string[];
   /** Store a posted entry. */
   insert(entry: LedgerEntry): void;
 }
@@ -140,6 +142,10 @@ export class InMemoryLedgerEntryStore implements LedgerEntryStore {
       }
     }
     return null;
+  }
+
+  listGroupIds(): string[] {
+    return [...this.groups.keys()];
   }
 
   insert(entry: LedgerEntry): void {
