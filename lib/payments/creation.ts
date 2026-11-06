@@ -67,6 +67,9 @@ export interface Payment {
   readonly amountMinor: bigint;
   /** The capability the payment asked for. */
   readonly capability: ProviderCapability;
+  /** The routing inputs included in the idempotency comparison. */
+  readonly method: string | null;
+  readonly country: string | null;
   /** The provider the routing engine routed the payment to. */
   readonly providerKey: ProviderKey;
   /** The idempotency key that produced this payment. */
@@ -117,7 +120,7 @@ export class InMemoryPaymentStore implements PaymentStore {
   }
 
   private compoundKey(companyId: string, idempotencyKey: string): string {
-    return `${companyId}:${idempotencyKey}`;
+    return JSON.stringify([companyId, idempotencyKey]);
   }
 }
 
@@ -136,6 +139,9 @@ export function createPayment(
     readonly store: PaymentStore;
   },
 ): PaymentCreationResult {
+  if (!request.companyId.trim() || !request.idempotencyKey.trim()) {
+    return { status: "rejected", reason: "company and idempotency key are required" };
+  }
   if (request.amountMinor <= 0n) {
     return { status: "rejected", reason: "the payment amount must be positive" };
   }
@@ -144,7 +150,7 @@ export function createPayment(
   const existing = options.store.findByIdempotencyKey(request.companyId, request.idempotencyKey);
 
   if (existing !== null) {
-    if (existing.amountMinor === request.amountMinor && existing.capability === request.capability) {
+    if (existing.amountMinor === request.amountMinor && existing.capability === request.capability && existing.method === (request.method ?? null) && existing.country === (request.country ?? null)) {
       return { status: "deduplicated", payment: existing };
     }
 
@@ -171,6 +177,8 @@ export function createPayment(
     companyId: request.companyId,
     amountMinor: request.amountMinor,
     capability: request.capability,
+    method: request.method ?? null,
+    country: request.country ?? null,
     providerKey: decision.providerKey,
     idempotencyKey: request.idempotencyKey,
     status: "created",

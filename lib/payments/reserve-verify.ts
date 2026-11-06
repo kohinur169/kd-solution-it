@@ -142,18 +142,21 @@ expect(zeroDayStore.findReleaseable(capturedAt).length === 1, "a zero-day reserv
 
 /* ---- scenario 10: a reserve can be released individually ---- */
 
-const releaseResult = releaseReserve(hold?.id ?? "", { holdStore, ledgerStore });
+expect(releaseReserve(hold?.id ?? "", { holdStore, ledgerStore, nowEpochMs: capturedAt }) === null, "reserve cannot be released before maturity");
+expect(postReserve(10_000n, NaN, 30, { holdStore, ledgerStore, companyId: "company-1", capturedAtEpochMs: capturedAt }).status === "rejected", "invalid reserve rate is rejected");
+expect(postReserve(10_000n, 500, 0.5, { holdStore, ledgerStore, companyId: "company-1", capturedAtEpochMs: capturedAt }).status === "rejected", "fractional reserve period is rejected");
+const releaseResult = releaseReserve(hold?.id ?? "", { holdStore, ledgerStore, nowEpochMs: nowAfterThirtyDays });
 expect(releaseResult !== null, "a reserve can be released individually");
 expect(releaseResult?.status === "released", "the released reserve has the released status");
 
 /* ---- scenario 11: a reserve that does not exist cannot be released ---- */
 
-const missingResult = releaseReserve("nonexistent-id", { holdStore, ledgerStore });
+const missingResult = releaseReserve("nonexistent-id", { holdStore, ledgerStore, nowEpochMs: nowAfterThirtyDays });
 expect(missingResult === null, "a reserve that does not exist cannot be released");
 
 /* ---- scenario 12: an already-released reserve is not released again ---- */
 
-const againResult = releaseReserve(hold?.id ?? "", { holdStore, ledgerStore });
+const againResult = releaseReserve(hold?.id ?? "", { holdStore, ledgerStore, nowEpochMs: nowAfterThirtyDays });
 expect(againResult?.status === "released", "an already-released reserve stays released");
 expect(againResult?.releaseAtEpochMs === hold?.releaseAtEpochMs, "the already-released reserve keeps its release date");
 

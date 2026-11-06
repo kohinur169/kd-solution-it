@@ -147,6 +147,9 @@ expect(fee === 358n, "a 2.9% fee on 12345 minor units is 358");
 
 expect(fee > 0n, "the fee is positive for a non-zero amount and rate");
 
+expect(postPlatformFee(10_000n, NaN, { store, companyId: "c", sourceId: "s", paymentId: "p" }).status === "rejected", "NaN rate is rejected");
+expect(postPlatformFee(10_000n, 1.5, { store, companyId: "c", sourceId: "s", paymentId: "p" }).status === "rejected", "fractional basis points are rejected");
+
 /* ---- the verdict ---- */
 
 if (failures.length > 0) {

@@ -56,7 +56,7 @@ export function postPlatformFee(
     readonly paymentId: string;
   },
 ): LedgerPostingResult {
-  if (basisPoints < MIN_FEE_BPS || basisPoints > MAX_FEE_BPS) {
+  if (!Number.isInteger(basisPoints) || basisPoints < MIN_FEE_BPS || basisPoints > MAX_FEE_BPS) {
     return {
       status: "rejected",
       reason: `the platform fee rate must be between ${MIN_FEE_BPS} and ${MAX_FEE_BPS} basis points`,

@@ -24,8 +24,10 @@
  * constant, the calculation, and the can-payout check.
  */
 
-/** The minimum payout amount: 100 USD in minor units (cents). */
-export const MINIMUM_PAYOUT_MINOR = 100n * 100n;
+import { MINOR_PER_UNIT } from "./money.ts";
+
+/** The minimum payout amount: 100 USD at the platform four-decimal scale. */
+export const MINIMUM_PAYOUT_MINOR = 100n * MINOR_PER_UNIT;
 
 /** The result of calculating a payout amount. */
 export type PayoutDecision =

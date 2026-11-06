@@ -161,6 +161,14 @@ export function postLedgerEntries(
   group: LedgerPostingGroup,
   options: { readonly store: LedgerEntryStore },
 ): LedgerPostingResult {
+  // A repeated group must never silently post twice. Persistent stores must also enforce this atomically.
+  if (options.store.findByGroup(group.entryGroupId).length > 0) {
+    return { status: "rejected", reason: "the ledger group already exists" };
+  }
+  if (group.postings.some((posting) => posting.entrySide !== "debit" && posting.entrySide !== "credit")) {
+    return { status: "rejected", reason: "invalid ledger entry side" };
+  }
+
   // 1. The balance. The sum of debits must equal the sum of credits, and both must be present.
   const debits = sumOf(group.postings, "debit");
   const credits = sumOf(group.postings, "credit");

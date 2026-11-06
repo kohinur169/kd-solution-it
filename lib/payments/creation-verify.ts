@@ -213,6 +213,13 @@ function run(): void {
   checkKeyScopedToCompany();
   checkBalancedOnePaymentPerKey();
   checkRejectsNonPositiveAmount();
+  const store = new InMemoryPaymentStore();
+  const request = { companyId: "a:b", idempotencyKey: "c", amountMinor: 100n, capability: "acceptance" as const, method: "card", country: "US" };
+  expectEqual(createPayment(request, { store, routingRules: DEFAULT_ROUTING_RULES }).status, "created", "initial routing inputs are saved");
+  expectEqual(createPayment({ ...request, country: "CA" }, { store, routingRules: DEFAULT_ROUTING_RULES }).status, "rejected", "changed country is a conflict");
+  expectEqual(createPayment({ ...request, method: "bank" }, { store, routingRules: DEFAULT_ROUTING_RULES }).status, "rejected", "changed method is a conflict");
+  expectEqual(createPayment({ ...request, companyId: "a", idempotencyKey: "b:c" }, { store, routingRules: DEFAULT_ROUTING_RULES }).status, "created", "compound keys do not collide");
+  expectEqual(createPayment({ ...request, idempotencyKey: " " }, { store, routingRules: DEFAULT_ROUTING_RULES }).status, "rejected", "empty idempotency key is rejected");
 
   if (failures.length > 0) {
     process.stderr.write(`payments creation gate failed with ${String(failures.length)} problem(s):\n`);

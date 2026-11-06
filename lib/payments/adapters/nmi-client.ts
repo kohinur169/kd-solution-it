@@ -7,7 +7,7 @@
  * ## What the key configuration is
  *
  * Section 29 says "provider keys... entered in admin screens are AES-256-GCM encrypted at rest and shown
- * only masked." The NMI API requires an API key and a secret key. When the super admin enters them in the
+ * only masked." The configuration carries a public tokenization key and a private API security key. When the super admin enters them in the
  * gateway settings, the platform encrypts them with AES-256-GCM before storing. The plaintext keys never
  * rest in the database. When the platform needs to call NMI's API, it decrypts the keys in memory, uses
  * them for the call, and never writes them back in plaintext.
@@ -38,7 +38,9 @@ const TAG_LENGTH = 16;
 export interface NmiKeyConfig {
   readonly id: string;
   readonly companyId: string;
+  /** Encrypted public tokenization key. */
   readonly apiKeyEncrypted: string;
+  /** Encrypted private API security key. */
   readonly secretKeyEncrypted: string;
   readonly environment: "sandbox" | "production";
   readonly createdAtEpochMs: number;

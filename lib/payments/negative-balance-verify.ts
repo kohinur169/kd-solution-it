@@ -176,6 +176,9 @@ if (limited.status === "partially_covered") {
   expect(limited.collection.amountMinor === 17_000n, "the collection amount is the difference");
 }
 
+const invalidSource = handleNegativeBalance(100n, { ...makeOptions(new InMemoryContractCollectionStore(), new InMemoryLedgerEntryStore()), disputeId: null });
+expect(invalidSource.status === "rejected", "a rejected reserve posting cannot be reported as covered");
+
 /* ---- the verdict ---- */
 
 if (failures.length > 0) {

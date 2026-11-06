@@ -4,7 +4,6 @@ import {
   generateCollectJsConfig,
   validateCollectJsToken,
   COLLECT_JS_SCRIPT_URL,
-  COLLECT_JS_TOKEN_URL,
 } from "./nmi-collectjs.ts";
 
 /* ---- the check book ---- */
@@ -36,7 +35,6 @@ if (config1.status === "generated") {
 if (config1.status === "generated") {
   expect(config1.config.collectJsScriptUrl === COLLECT_JS_SCRIPT_URL, "the config carries the Collect.js script URL");
   expect(config1.config.collectJsScriptUrl === "https://secure.nmi.com/token/Collect.js", "the script URL is the NMI Collect.js URL");
-  expect(config1.config.collectJsTokenUrl === COLLECT_JS_TOKEN_URL, "the config carries the Collect.js token URL");
 }
 
 /* ---- scenario 3: the config URLs are the same for sandbox and production ---- */
@@ -44,7 +42,6 @@ if (config1.status === "generated") {
 const config3 = generateCollectJsConfig("company-1", { apiKey: "api-key-123", environment: "production" });
 if (config3.status === "generated" && config1.status === "generated") {
   expect(config3.config.collectJsScriptUrl === config1.config.collectJsScriptUrl, "the script URL is the same for sandbox and production");
-  expect(config3.config.collectJsTokenUrl === config1.config.collectJsTokenUrl, "the token URL is the same for sandbox and production");
   expect(config3.config.environment === "production", "the production config carries the production environment");
 }
 
@@ -101,7 +98,7 @@ expect(badChars.status === "failed", "a token with invalid characters is rejecte
 /* ---- scenario 12: a token with special characters is rejected ---- */
 
 const specialChars = validateCollectJsToken("tok_with_dashes-12345", "card");
-expect(specialChars.status === "failed", "a token with dashes is rejected");
+expect(specialChars.status === "valid", "a token with dashes is accepted");
 
 /* ---- scenario 13: multiple configs for different companies ---- */
 
@@ -127,7 +124,6 @@ if (configDup1.status === "generated" && configDup2.status === "generated") {
 /* ---- scenario 15: the Collect.js constants are correct ---- */
 
 expect(COLLECT_JS_SCRIPT_URL === "https://secure.nmi.com/token/Collect.js", "the Collect.js script URL constant is correct");
-expect(COLLECT_JS_TOKEN_URL === "https://secure.nmi.com/token/Collect.js", "the Collect.js token URL constant is correct");
 
 /* ---- scenario 16: a 10-character token is accepted ---- */
 
@@ -150,5 +146,5 @@ if (failures.length > 0) {
 }
 
 process.stdout.write(
-  `payments NMI Collect.js gate passed: ${checks} checks, a service that generates the Collect.js configuration for payment pages and validates the payment tokens Collect.js returns - the config carries the company, API key, environment, and Collect.js URLs, the token validation accepts valid alphanumeric tokens of 10+ characters for card, bank, and crypto types, and invalid tokens are rejected\n`,
+  `payments NMI Collect.js gate passed: ${checks} checks, a service that generates the Collect.js configuration for payment pages and validates the payment tokens Collect.js returns - the config carries the company, public tokenization key, environment, and Collect.js script URL, the token validation accepts tokens with underscores or hyphens for card, bank, and crypto types, and invalid tokens are rejected\n`,
 );

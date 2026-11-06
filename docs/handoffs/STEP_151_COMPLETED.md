@@ -1,5 +1,7 @@
 # STEP 151 — NMI shared server payment module exchanging Collect.js tokens through the NMI API per official documentation
 
+> Review correction: Protocol and test details in this historical handoff were superseded by `docs/handoffs/STEP_117_151_REVIEW.md`. Do not rely on the old endpoint, field names or response mappings.
+
 **Status: COMPLETED**
 
 ## What was built

@@ -144,18 +144,24 @@ expect(multiStore.findByCompany("company-1").length === 2, "two holds are stored
 
 /* ---- scenario 10: a hold can be released individually ---- */
 
-const releaseResult = releaseSettlementHold(hold?.id ?? "", { holdStore, ledgerStore });
+const earlyRelease = releaseSettlementHold(hold?.id ?? "", { holdStore, ledgerStore, nowEpochMs: capturedAt });
+expect(earlyRelease === null, "direct release before maturity is rejected");
+expect(holdStore.findById(hold?.id ?? "")?.status === "held", "early release leaves the hold unchanged");
+expect(createSettlementHold(100n, NaN, { holdStore, ledgerStore, companyId: "company-1", capturedAtEpochMs: capturedAt }).status === "rejected", "non-finite hold periods are rejected");
+expect(createSettlementHold(100n, 0.5, { holdStore, ledgerStore, companyId: "company-1", capturedAtEpochMs: capturedAt }).status === "rejected", "fractional hold days are rejected");
+
+const releaseResult = releaseSettlementHold(hold?.id ?? "", { holdStore, ledgerStore, nowEpochMs: capturedAt + 5 * MILLISECONDS_PER_DAY });
 expect(releaseResult !== null, "a hold can be released individually");
 expect(releaseResult?.status === "released", "the released hold has the released status");
 
 /* ---- scenario 11: a hold that does not exist cannot be released ---- */
 
-const missingResult = releaseSettlementHold("nonexistent-id", { holdStore, ledgerStore });
+const missingResult = releaseSettlementHold("nonexistent-id", { holdStore, ledgerStore, nowEpochMs: capturedAt + 5 * MILLISECONDS_PER_DAY });
 expect(missingResult === null, "a hold that does not exist cannot be released");
 
 /* ---- scenario 12: a hold that is already released is not released again ---- */
 
-const againResult = releaseSettlementHold(hold?.id ?? "", { holdStore, ledgerStore });
+const againResult = releaseSettlementHold(hold?.id ?? "", { holdStore, ledgerStore, nowEpochMs: capturedAt + 5 * MILLISECONDS_PER_DAY });
 expect(againResult?.status === "released", "an already-released hold stays released");
 expect(againResult?.releaseAtEpochMs === hold?.releaseAtEpochMs, "the already-released hold keeps its release date");
 

@@ -1,41 +1,17 @@
 // path: lib/payments/adapters/nmi-api.ts
-
-/**
- * The NMI adapter's API transaction types: the service that builds NMI API requests and parses NMI API
- * responses for the five transaction types — sale, authorization, capture, refund, and void.
- *
- * ## What the transaction types are
- *
- * The NMI API supports five transaction types, each with its own request shape:
- *
- * - **sale**: Charge a card. Authorization and capture in one step. Requires amount and token.
- * - **authorization**: Authorize a card without capturing. Requires amount and token. The `capture` flag
- *   controls whether the authorization is captured immediately.
- * - **capture**: Capture a previously authorized transaction. Requires the original transaction id.
- * - **refund**: Refund a previously captured transaction. Requires the original transaction id.
- * - **void**: Void a previously authorized transaction. Requires the original transaction id.
- *
- * ## What this file is not
- *
- * It is not the HTTP transport that sends the request to NMI's API (STEP 151 owns that). It is not the
- * Collect.js token integration (STEP 149 owns that — this file receives the token). It is not the key
- * configuration (STEP 148 owns that). This file is the core service: the request building, the response
- * parsing, and the request validation.
+/** NMI Classic Payment API (form-encoded requests and query-string responses).
+ * https://docs.nmi.com/reference/transactions-processing
+ * https://docs.nmi.com/docs/payment-code-examples
+ * Sandbox: https://sandbox.nmi.com/api/transact.php
  */
+import { validateCollectJsToken } from "./nmi-collectjs.ts";
 
-/** The five NMI API transaction types. */
 export type NmiTransactionType = "sale" | "authorization" | "capture" | "refund" | "void";
-
-/** The transaction types that require a card token (sale and authorization). */
-const TOKEN_REQUIRED_TYPES: Set<NmiTransactionType> = new Set(["sale", "authorization"]);
-
-/** The transaction types that require an original transaction id (capture, refund, void). */
-const ORIGINAL_ID_REQUIRED_TYPES: Set<NmiTransactionType> = new Set(["capture", "refund", "void"]);
-
-/** A NMI API transaction request. */
 export interface NmiTransactionRequest {
   readonly type: NmiTransactionType;
+  /** Public tokenization key; never sent as a private API credential. */
   readonly apiKey: string;
+  /** Private NMI API security key. */
   readonly secretKey: string;
   readonly amount: string | null;
   readonly token: string | null;
@@ -44,89 +20,47 @@ export interface NmiTransactionRequest {
   readonly originalTransactionId: string | null;
   readonly capture: boolean;
 }
+export type ValidateNmiRequestResult = { status: "valid" } | { status: "rejected"; reason: string };
 
-/** The result of validating a NMI transaction request. */
-export type ValidateNmiRequestResult =
-  | { status: "valid" }
-  | { status: "rejected"; reason: string };
-
-/** Validate a NMI transaction request: check required fields for the transaction type. */
 export function validateNmiRequest(input: NmiTransactionRequest): ValidateNmiRequestResult {
-  // 1. API key and secret key are always required.
-  if (input.apiKey.trim().length === 0) {
-    return { status: "rejected", reason: "the API key must not be empty" };
+  if (!input.secretKey.trim()) return { status: "rejected", reason: "the API security key must not be empty" };
+  if (!["sale", "authorization", "capture", "refund", "void"].includes(input.type)) {
+    return { status: "rejected", reason: "unknown transaction type" };
   }
-  if (input.secretKey.trim().length === 0) {
-    return { status: "rejected", reason: "the secret key must not be empty" };
+  if (input.capture) return { status: "rejected", reason: "use a sale for immediate capture" };
+  // A platform customer ID is not necessarily an NMI vault ID. Never substitute it for a token.
+  if (input.customerId !== null) return { status: "rejected", reason: "customer vault transactions are not supported" };
+  if (input.amount !== null && (!/^(?:0|[1-9]\d*)\.\d{2}$/.test(input.amount) || !/[1-9]/.test(input.amount))) {
+    return { status: "rejected", reason: "amount must be positive and formatted as dollars and cents" };
   }
-
-  // 2. Sale and authorization require an amount and a token.
-  if (TOKEN_REQUIRED_TYPES.has(input.type)) {
-    if (input.amount === null || input.amount.trim().length === 0) {
-      return { status: "rejected", reason: `a ${input.type} transaction requires an amount` };
+  if (input.type === "sale" || input.type === "authorization") {
+    if (input.amount === null) return { status: "rejected", reason: "amount is required" };
+    if (input.token === null || validateCollectJsToken(input.token, "card").status !== "valid") {
+      return { status: "rejected", reason: "a valid payment token is required" };
     }
-    const amount = Number(input.amount);
-    if (!Number.isFinite(amount) || amount <= 0) {
-      return { status: "rejected", reason: "the amount must be a positive number" };
-    }
-    if (input.token === null || input.token.trim().length === 0) {
-      return { status: "rejected", reason: `a ${input.type} transaction requires a token` };
-    }
+    if (input.originalTransactionId !== null) return { status: "rejected", reason: "original transaction id is not allowed" };
+  } else {
+    if (!input.originalTransactionId?.trim()) return { status: "rejected", reason: "original transaction id is required" };
+    if (input.token !== null) return { status: "rejected", reason: "payment token is not allowed for this transaction" };
+    if (input.type === "void" && input.amount !== null) return { status: "rejected", reason: "amount is not allowed for void" };
   }
-
-  // 3. Capture, refund, and void require an original transaction id.
-  if (ORIGINAL_ID_REQUIRED_TYPES.has(input.type)) {
-    if (input.originalTransactionId === null || input.originalTransactionId.trim().length === 0) {
-      return { status: "rejected", reason: `a ${input.type} transaction requires an original transaction id` };
-    }
-  }
-
   return { status: "valid" };
 }
 
-/** Build a NMI API request payload: the form-encoded fields the NMI API expects. */
 export function buildNmiRequest(input: NmiTransactionRequest): Record<string, string> {
+  const validation = validateNmiRequest(input);
+  if (validation.status === "rejected") throw new Error(validation.reason);
   const payload: Record<string, string> = {
-    api_key: input.apiKey,
-    secret_key: input.secretKey,
-    type: input.type,
+    security_key: input.secretKey,
+    type: input.type === "authorization" ? "auth" : input.type,
   };
-
-  // Amount and token for sale and authorization.
-  if (TOKEN_REQUIRED_TYPES.has(input.type)) {
-    payload["amount"] = input.amount ?? "";
-    payload["token"] = input.token ?? "";
-  }
-
-  // Amount is optional for capture and refund (defaults to full amount on the NMI side).
-  if (input.type === "capture" || input.type === "refund") {
-    if (input.amount !== null && input.amount.trim().length > 0) {
-      payload["amount"] = input.amount;
-    }
-  }
-
-  // Original transaction id for capture, refund, and void.
-  if (input.originalTransactionId !== null) {
-    payload["original_transaction_id"] = input.originalTransactionId;
-  }
-
-  // Optional fields.
-  if (input.customerId !== null) {
-    payload["customer_id"] = input.customerId;
-  }
-  if (input.reference !== null) {
-    payload["reference"] = input.reference;
-  }
-
-  // Capture flag for authorization.
-  if (input.type === "authorization") {
-    payload["capture"] = input.capture ? "true" : "false";
-  }
-
+  if (input.amount !== null) payload["amount"] = input.amount;
+  if (input.token !== null) payload["payment_token"] = input.token;
+  if (input.originalTransactionId !== null) payload["transactionid"] = input.originalTransactionId;
+  if (input.reference !== null) payload["orderid"] = input.reference;
   return payload;
 }
 
-/** A parsed NMI API response. */
 export interface NmiApiResponse {
   readonly success: boolean;
   readonly responseCode: string;
@@ -137,56 +71,26 @@ export interface NmiApiResponse {
   readonly avsResultCode: string | null;
   readonly cvvResultCode: string | null;
 }
-
-/** Parse a raw NMI API response (form-encoded or JSON object) into a structured response. */
 export function parseNmiResponse(raw: Record<string, string>): NmiApiResponse {
   return {
-    success: raw["response_code"] === "0",
+    success: raw["response"] === "1" && !!raw["transactionid"]?.trim(),
     responseCode: raw["response_code"] ?? "",
-    responseMessage: raw["response_message"] ?? "",
-    transactionId: raw["transaction_id"] ?? "",
+    responseMessage: raw["responsetext"] ?? "",
+    transactionId: raw["transactionid"] ?? "",
     amount: raw["amount"] ?? "",
-    authCode: raw["auth_code"] ?? null,
-    avsResultCode: raw["avs_result_code"] ?? null,
-    cvvResultCode: raw["cvv_result_code"] ?? null,
+    authCode: raw["authcode"] || null,
+    avsResultCode: raw["avsresponse"] || null,
+    cvvResultCode: raw["cvvresponse"] || null,
   };
 }
-
-/** The result of executing a NMI transaction (validated request + parsed response). */
 export type NmiTransactionResult =
   | { status: "success"; transactionId: string; authCode: string | null; amount: string }
   | { status: "failed"; responseCode: string; responseMessage: string }
   | { status: "rejected"; reason: string };
-
-/** Execute a NMI transaction: validate the request, build the payload, parse the response. */
-export function executeNmiTransaction(
-  input: NmiTransactionRequest,
-  rawResponse: Record<string, string>,
-): NmiTransactionResult {
-  // 1. Validate the request.
+export function executeNmiTransaction(input: NmiTransactionRequest, rawResponse: Record<string, string>): NmiTransactionResult {
   const validation = validateNmiRequest(input);
-  if (validation.status === "rejected") {
-    return { status: "rejected", reason: validation.reason };
-  }
-
-  // 2. Build the request payload.
-  buildNmiRequest(input);
-
-  // 3. Parse the response.
+  if (validation.status === "rejected") return validation;
   const response = parseNmiResponse(rawResponse);
-
-  if (!response.success) {
-    return {
-      status: "failed",
-      responseCode: response.responseCode,
-      responseMessage: response.responseMessage,
-    };
-  }
-
-  return {
-    status: "success",
-    transactionId: response.transactionId,
-    authCode: response.authCode,
-    amount: response.amount,
-  };
+  if (!response.success) return { status: "failed", responseCode: response.responseCode, responseMessage: response.responseMessage };
+  return { status: "success", transactionId: response.transactionId, authCode: response.authCode, amount: response.amount };
 }

@@ -105,8 +105,8 @@ export function createSettlementHold(
     return { status: "rejected", reason: "a settlement hold amount must be positive" };
   }
 
-  if (holdDays < 0) {
-    return { status: "rejected", reason: "a settlement hold period must not be negative" };
+  if (!Number.isSafeInteger(holdDays) || holdDays < 0 || !Number.isSafeInteger(options.capturedAtEpochMs) || !Number.isSafeInteger(options.capturedAtEpochMs + holdDays * MILLISECONDS_PER_DAY)) {
+    return { status: "rejected", reason: "invalid settlement hold period or capture time" };
   }
 
   const releaseAtEpochMs = options.capturedAtEpochMs + holdDays * MILLISECONDS_PER_DAY;
@@ -122,7 +122,7 @@ export function createSettlementHold(
   };
 
   // Post the hold group: debit and credit merchant_payable by the hold amount. The group balances.
-  postLedgerEntries(
+  const posting = postLedgerEntries(
     {
       companyId: options.companyId,
       entryGroupId: randomUUID(),
@@ -139,6 +139,7 @@ export function createSettlementHold(
     },
     { store: options.ledgerStore },
   );
+  if (posting.status === "rejected") return posting;
 
   options.holdStore.insert(hold);
 
@@ -151,6 +152,7 @@ export function releaseSettlementHold(
   options: {
     readonly holdStore: SettlementHoldStore;
     readonly ledgerStore: LedgerEntryStore;
+    readonly nowEpochMs: number;
   },
 ): SettlementHold | null {
   const hold = options.holdStore.findById(holdId);
@@ -163,13 +165,17 @@ export function releaseSettlementHold(
     return hold;
   }
 
+  if (!Number.isSafeInteger(options.nowEpochMs) || options.nowEpochMs < hold.releaseAtEpochMs) {
+    return null;
+  }
+
   const released: SettlementHold = {
     ...hold,
     status: "released",
   };
 
   // Post the settlement group: mirror the hold group. The group balances.
-  postLedgerEntries(
+  const posting = postLedgerEntries(
     {
       companyId: hold.companyId,
       entryGroupId: randomUUID(),
@@ -186,6 +192,7 @@ export function releaseSettlementHold(
     },
     { store: options.ledgerStore },
   );
+  if (posting.status === "rejected") return null;
 
   options.holdStore.insert(released);
 
@@ -207,6 +214,7 @@ export function releaseSettlementHolds(
     const result = releaseSettlementHold(hold.id, {
       holdStore: options.holdStore,
       ledgerStore: options.ledgerStore,
+      nowEpochMs: options.nowEpochMs,
     });
 
     if (result !== null) {

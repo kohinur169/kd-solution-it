@@ -11,13 +11,14 @@
  * provider says happened — payments, refunds, chargebacks, payouts. The system has its own records of
  * those same transactions. Reconciliation compares the two sides and finds the differences.
  *
- * There are four outcomes:
+ * There are five outcomes:
  *
  * - **matched**: the system and the processor both have the transaction with the same amount.
  * - **processor_only**: the processor reports a transaction the system does not have. The system is
  *   missing a record — this is a system-side gap.
  * - **system_only**: the system has a transaction the processor does not report. The processor is
  *   missing a record — this is a processor-side gap.
+ * - **type_mismatch**: both sides use the same ID for different transaction types.
  * - **amount_mismatch**: both sides have the transaction but the amounts differ. Something is wrong
  *   with one of the records.
  *
@@ -64,7 +65,7 @@ export interface SystemRecordLookup {
 }
 
 /** The four match outcomes. */
-export type ReconciliationMatchStatus = "matched" | "system_only" | "processor_only" | "amount_mismatch";
+export type ReconciliationMatchStatus = "matched" | "system_only" | "processor_only" | "amount_mismatch" | "type_mismatch";
 
 /** A single match result: one comparison between a processor entry and a system record. */
 export interface ReconciliationMatch {
@@ -83,6 +84,7 @@ export interface ReconciliationImportResult {
   readonly systemOnly: number;
   readonly processorOnly: number;
   readonly amountMismatches: number;
+  readonly typeMismatches: number;
   readonly matches: ReconciliationMatch[];
 }
 
@@ -100,7 +102,10 @@ export function importProcessorReport(
   if (report.periodStartEpochMs >= report.periodEndEpochMs) {
     throw new Error("the processor report period must have a start before the end");
   }
+  const seenIds = new Set<string>();
   for (const entry of report.entries) {
+    if (seenIds.has(entry.providerTransactionId)) throw new Error("duplicate processor transaction id");
+    seenIds.add(entry.providerTransactionId);
     if (entry.providerTransactionId.trim().length === 0) {
       throw new Error("a processor report entry must have a provider transaction id");
     }
@@ -119,6 +124,11 @@ export function importProcessorReport(
         processorAmountMinor: entry.amountMinor,
         systemAmountMinor: null,
         status: "processor_only",
+      });
+    } else if (systemRecord.type !== entry.type) {
+      matches.push({
+        providerTransactionId: entry.providerTransactionId, type: entry.type,
+        processorAmountMinor: entry.amountMinor, systemAmountMinor: systemRecord.amountMinor, status: "type_mismatch",
       });
     } else if (systemRecord.amountMinor === entry.amountMinor) {
       matches.push({
@@ -160,6 +170,7 @@ export function importProcessorReport(
   let systemOnly = 0;
   let processorOnly = 0;
   let amountMismatches = 0;
+  let typeMismatches = 0;
 
   for (const match of matches) {
     switch (match.status) {
@@ -167,6 +178,7 @@ export function importProcessorReport(
       case "system_only": systemOnly++; break;
       case "processor_only": processorOnly++; break;
       case "amount_mismatch": amountMismatches++; break;
+      case "type_mismatch": typeMismatches++; break;
     }
   }
 
@@ -177,6 +189,7 @@ export function importProcessorReport(
     systemOnly,
     processorOnly,
     amountMismatches,
+    typeMismatches,
     matches,
   };
 }

@@ -196,6 +196,14 @@ if (result5.totalEntries === 4) {
   expect(result5.matches[3]?.status === "system_only", "the fourth match is the system-only record");
 }
 
+const differentType = importProcessorReport(makeReport([{ id: "txn-001", type: "refund", amount: 10_000n }]), { systemRecords: lookup1 });
+expect(differentType.typeMismatches === 1 && differentType.matched === 0, "different transaction types never match, even with equal amounts");
+let duplicateRejected = false;
+try {
+  importProcessorReport(makeReport([{ id: "dup", type: "payment", amount: 1n }, { id: "dup", type: "payment", amount: 1n }]), { systemRecords: lookup1 });
+} catch { duplicateRejected = true; }
+expect(duplicateRejected, "duplicate processor transaction ids are rejected");
+
 /* ---- the verdict ---- */
 
 if (failures.length > 0) {
@@ -207,5 +215,5 @@ if (failures.length > 0) {
 }
 
 process.stdout.write(
-  `payments reconciliation import gate passed: ${checks} checks, a service that matches processor report entries against system records and reports the four match outcomes - matched, processor_only, system_only, and amount_mismatch - with correct counts and match metadata for every entry type\n`,
+  `payments reconciliation import gate passed: ${checks} checks, a service that matches processor report entries against system records and reports match outcomes including type mismatches - with correct counts and match metadata for every entry type\n`,
 );

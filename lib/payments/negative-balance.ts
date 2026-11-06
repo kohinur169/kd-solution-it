@@ -115,7 +115,7 @@ export function handleNegativeBalance(
 
   // 2. Post the reserve draw group: debit reserve_held, credit merchant_payable. The group balances.
   if (reserveDrawn > 0n) {
-    postLedgerEntries(
+    const posting = postLedgerEntries(
       {
         companyId: options.companyId,
         entryGroupId: randomUUID(),
@@ -132,6 +132,7 @@ export function handleNegativeBalance(
       },
       { store: options.ledgerStore },
     );
+    if (posting.status === "rejected") return posting;
   }
 
   // 3. If the reserve did not cover the full amount, create a contract collection record for the remainder.

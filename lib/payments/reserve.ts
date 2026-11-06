@@ -115,15 +115,15 @@ export function postReserve(
     return { status: "rejected", reason: "a reserve amount must be positive" };
   }
 
-  if (basisPoints < MIN_FEE_BPS || basisPoints > MAX_FEE_BPS) {
+  if (!Number.isInteger(basisPoints) || basisPoints < MIN_FEE_BPS || basisPoints > MAX_FEE_BPS) {
     return {
       status: "rejected",
       reason: `the reserve rate must be between ${MIN_FEE_BPS} and ${MAX_FEE_BPS} basis points`,
     };
   }
 
-  if (reserveDays < 0) {
-    return { status: "rejected", reason: "a reserve release period must not be negative" };
+  if (!Number.isSafeInteger(reserveDays) || reserveDays < 0 || !Number.isSafeInteger(options.capturedAtEpochMs) || !Number.isSafeInteger(options.capturedAtEpochMs + reserveDays * MILLISECONDS_PER_DAY)) {
+    return { status: "rejected", reason: "invalid reserve period or capture time" };
   }
 
   const reserve = calculateReserve(amountMinor, basisPoints);
@@ -145,7 +145,7 @@ export function postReserve(
   };
 
   // Post the reserve group: debit merchant_payable, credit reserve_held. The group balances.
-  postLedgerEntries(
+  const posting = postLedgerEntries(
     {
       companyId: options.companyId,
       entryGroupId: randomUUID(),
@@ -162,6 +162,7 @@ export function postReserve(
     },
     { store: options.ledgerStore },
   );
+  if (posting.status === "rejected") return posting;
 
   options.holdStore.insert(hold);
 
@@ -174,6 +175,7 @@ export function releaseReserve(
   options: {
     readonly holdStore: ReserveHoldStore;
     readonly ledgerStore: LedgerEntryStore;
+    readonly nowEpochMs: number;
   },
 ): ReserveHold | null {
   const hold = options.holdStore.findById(holdId);
@@ -186,13 +188,15 @@ export function releaseReserve(
     return hold;
   }
 
+  if (!Number.isSafeInteger(options.nowEpochMs) || options.nowEpochMs < hold.releaseAtEpochMs) return null;
+
   const released: ReserveHold = {
     ...hold,
     status: "released",
   };
 
   // Post the release group: debit reserve_held, credit merchant_payable. The group balances.
-  postLedgerEntries(
+  const posting = postLedgerEntries(
     {
       companyId: hold.companyId,
       entryGroupId: randomUUID(),
@@ -209,6 +213,7 @@ export function releaseReserve(
     },
     { store: options.ledgerStore },
   );
+  if (posting.status === "rejected") return null;
 
   options.holdStore.insert(released);
 
@@ -230,6 +235,7 @@ export function releaseReserves(
     const result = releaseReserve(hold.id, {
       holdStore: options.holdStore,
       ledgerStore: options.ledgerStore,
+      nowEpochMs: options.nowEpochMs,
     });
 
     if (result !== null) {

@@ -29,9 +29,6 @@
 /** The Collect.js script URL. Loaded by the browser to render the hosted fields. */
 export const COLLECT_JS_SCRIPT_URL = "https://secure.nmi.com/token/Collect.js";
 
-/** The Collect.js token endpoint URL. The browser sends card data here; NMI returns a token. */
-export const COLLECT_JS_TOKEN_URL = "https://secure.nmi.com/token/Collect.js";
-
 /** The token types Collect.js can return. */
 export type CollectJsTokenType = "card" | "bank" | "crypto";
 
@@ -44,10 +41,10 @@ export interface CollectJsToken {
 /** A Collect.js configuration for a payment page. */
 export interface NmiCollectJsConfig {
   readonly companyId: string;
+  /** Public tokenization key only; never use a private API security key here. */
   readonly apiKey: string;
   readonly environment: "sandbox" | "production";
   readonly collectJsScriptUrl: string;
-  readonly collectJsTokenUrl: string;
 }
 
 /** The result of generating a Collect.js configuration. */
@@ -79,7 +76,6 @@ export function generateCollectJsConfig(
       apiKey: options.apiKey,
       environment: options.environment,
       collectJsScriptUrl: COLLECT_JS_SCRIPT_URL,
-      collectJsTokenUrl: COLLECT_JS_TOKEN_URL,
     },
   };
 }
@@ -104,8 +100,8 @@ export function validateCollectJsToken(
     return { status: "failed", reason: "the Collect.js token is too short" };
   }
 
-  // 3. The token must contain only alphanumeric characters and underscores. NMI tokens use underscores as separators.
-  if (!/^[a-zA-Z0-9_]+$/.test(token)) {
+  // 3. The token must contain only letters, digits, underscores and hyphens (NMI publishes hyphenated examples).
+  if (!/^[a-zA-Z0-9_-]+$/.test(token)) {
     return { status: "failed", reason: "the Collect.js token contains invalid characters" };
   }
 

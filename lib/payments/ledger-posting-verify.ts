@@ -232,6 +232,9 @@ const storedEntries = scopedStore.findByGroup(storeGroup.entryGroupId);
 
 expect(storedEntries.length === (storeResult.status === "posted" ? 2 : 0), "the store holds exactly the entries that were posted");
 
+expect(postLedgerEntries(balancedGroup, { store: balancedStore }).status === "rejected", "a repeated group is rejected");
+expect(balancedStore.findByGroup(balancedGroup.entryGroupId).length === 2, "a repeated group does not add entries");
+
 /* ---- the verdict ---- */
 
 if (failures.length > 0) {
