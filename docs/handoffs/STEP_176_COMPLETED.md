@@ -39,8 +39,8 @@ The v1 documentation index (`https://docs.taxcloud.com/api-v-1/llms.txt`) was re
 
 Owned and used: `lib/tax/` only, per `docs/final/STEP_PLAN_250.md:118` ("TaxCloud STEPs 176-180 own `lib/tax/` and tax settings").
 
-- `lib/tax/taxcloud.ts` — new, 1079 lines. The host and refusal rules, sixteen documentation sources with URLs, thirteen recorded rules with the page that produced them, twelve documented endpoints and their path builder, the header and request builder, the failure table, the ping outcomes, the connection draft, the stored connection and its invariants, the collection gate, masking and the decimal-dollar conversions, and eight open questions.
-- `lib/tax/taxcloud-verify.ts` — new, the gate, **654 checks**.
+- `lib/tax/taxcloud.ts` — new, 1079 lines. The host and refusal rules, sixteen documentation sources with URLs, fourteen recorded rules with the page that produced them, twelve documented endpoints and their path builder, the header and request builder, the failure table, the ping outcomes, the connection draft, the stored connection and its invariants, the collection gate, masking and the decimal-dollar conversions, and eight open questions.
+- `lib/tax/taxcloud-verify.ts` — new, 743 lines, the gate, **654 checks**.
 - `docs/handoffs/STEP_176_COMPLETED.md` — this file.
 
 Untouched, deliberately: `package.json` (the gate runs by path, as every STEP since 170 does), `config/structure.json` (STEP 001's file, and it verifies that listed directories exist rather than that no others do), `migrations/` (this block is granted no schema exception, and the record adds no table), `app/` (a connect screen and its route belong to STEP 177, which owns the tax settings surfaces), `lib/security/`, `lib/payments/` and `docs/final/PROVIDER_DOCS.md` (created by STEP 147 and extended only by adapter STEPs 147-169).
