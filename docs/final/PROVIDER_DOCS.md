@@ -120,6 +120,13 @@ sub-merchants). The service that records a verification is `lib/payments/adapter
 - A failed notification delivery is retried; the published integration guide documents five additional attempts before an email is sent to a pre-configured address in the client's organization.
 - The reference publishes error, field-validation, payee-declined, pending-payout and cancel-payout reason tables; STEP 156 must map against those tables rather than inventing status strings.
 
+### Verified for STEP 155: credential shape and the token grant (2026-11-06)
+
+- The Payoneer credential set this platform stores is the OAuth2 client id, the client secret and the program id, plus the environment. Sandbox and production credentials differ (see the sandbox environment page recorded above).
+- The connection test performs the OAuth2 **client-credentials grant** against `https://login.sandbox.payoneer.com/oauth2/token` or `https://login.payoneer.com/oauth2/token`. A token answer proves the client id and secret; it does **not** prove the program id, because no program-level probe is published on the pages read. The test therefore reports `programVerified: false` and the first program-scope read in STEP 156 confirms the program.
+- The request encoding and the answer field used here are the standard client-credentials grant (`application/x-www-form-urlencoded` with `grant_type=client_credentials`, `client_id`, `client_secret`; the token read from `access_token`, with `token` accepted as an alias). Payoneer's token-management section is present in the reference but its text is script-rendered and was not readable in this session, so this standard shape is recorded as **to be confirmed** on the first sandbox token call rather than claimed as provider-specific documentation.
+- The credentials are sealed with the platform's single encryption module (`lib/security/encryption.ts`) under the scope `gateway:<companyId>:payoneer:<client_id|client_secret>`, so a sealed value cannot be opened for another company, another provider or the other credential.
+
 ### Open Questions (recorded, not assumed)
 
 - **Webhook signing is not yet read.** The API reference lists a Webhooks Security section, but its text is rendered by script and was not readable in this session. The exact header and digest must be read from that section before STEP 157 implements verification, and until then no Payoneer signature may be trusted. (A third-party SDK describes an `Authorization: hmacauth <AppName>:<Signature>:<Nonce>:<Timestamp>` header with HMAC-SHA256 over app name, method, URL, timestamp, nonce and body digest; that is **not** first-party and is recorded here only so nobody mistakes it for verified documentation.)
