@@ -923,6 +923,16 @@ Delivered by this STEP in `lib/payments/adapters/airwallex.ts`, with no network 
   names the host and the version it proved, so activation can refuse a test made anywhere else. The token lives
   in an in-memory cache only — never in the record, the view or an audit entry. The gate
   (`airwallex-client-verify.ts`) runs 323 checks against recorded answers; no call reached Airwallex.
+- **STEP 167 creates the account, submits it and reads it back.** `lib/payments/adapters/airwallex-accounts.ts`
+  refuses to act without an `approved` KYC submission for the same company, validates the page's own create rules
+  (both agreement flags `true`, a primary contact email, a two-letter upper-case country code, a named individual
+  or business), writes a `pending` row before the call so a crash cannot create a second account, and answers
+  `already_created` / `in_flight` to a replay instead of asking Airwallex again. Only `CREATED` and
+  `ACTION_REQUIRED` accounts are submitted; every read records just the five documented statuses, refuses one it
+  does not know rather than storing it, and marks a `404` or an unsettled answer `requiresReconciliation`. The
+  readiness rule is `ACTIVE` alone, and `acct_` is never treated as proof of ownership because Stripe uses the
+  same prefix. The gate (`airwallex-accounts-verify.ts`) runs 266 checks against recorded answers; no call
+  reached Airwallex.
 - **The version question is answered by evidence, not by guessing.** `probeAirwallexApiVersions` tries the pin
   and every recorded version **newer** than it — `2026-05-29` then `2026-08-21` — reports which one the account
   accepted, and **never rewrites the stored pin**, so whichever answer the account gives, the change is an
@@ -958,8 +968,9 @@ Delivered by this STEP in `lib/payments/adapters/airwallex.ts`, with no network 
 |---|---|---|---|
 | Obtain and reuse an access token | `POST /api/v1/authentication/login` | Not run | No Airwallex sandbox account, client id or API key exists in this environment. The documented 201 shape, the 30-minute lifetime and the expiry skew are recorded and gated, not exercised. STEP 166 implements the call and its token cache, and gates them against recorded answers only. |
 | Prove a configuration with an authenticated read | `GET /api/v1/balances/current` | Not run | No credential exists, so the read that turns a token into a proof never reached Airwallex. STEP 166 requires both calls before it reports `connected`, and only the balance **count** is kept. |
-| Create one connected account after approval | `POST /api/v1/accounts/create` | Not run | The sandbox does not offer the Connected Account APIs without Airwallex Sales, and no credential exists anyway. The documented body, `acct_` id and five statuses are recorded. |
-| Submit the account for verification | `POST /api/v1/accounts/{id}/submit` | Not run | No account exists to submit; `SUBMITTED`, `ACTION_REQUIRED` and `SUSPENDED` are recorded with their RFI meaning. |
+| Create one connected account after approval | `POST /api/v1/accounts/create` | Not run | The sandbox does not offer the Connected Account APIs without Airwallex Sales, and no credential exists anyway. The documented body, `acct_` id and five statuses are recorded. STEP 167 implements the call, the approval gate and the single-attempt rule, and gates them against recorded answers only. |
+| Submit the account for verification | `POST /api/v1/accounts/{id}/submit` | Not run | No account exists to submit; `SUBMITTED`, `ACTION_REQUIRED` and `SUSPENDED` are recorded with their RFI meaning. STEP 167 implements the submit and refuses it for any status but `CREATED` or `ACTION_REQUIRED`, gated only against recorded answers. |
+| Read the account's verification status | `GET /api/v1/accounts/{id}` | Not run | No account exists to read. STEP 167 implements the read that records the documented status, maps it to `ready`/`waiting`/`blocked`, and flags a `404` or an unsettled answer for reconciliation; it has never seen a real one. |
 | Take a payment with a documented test card | `POST /api/v1/pa/payment_intents/create` | Not run | No credential exists. The required test cases and cards (`4035501000000008` succeeds, `4012000300000013` fails 3DS, `5307837360544518` with `80.51` is insufficient funds) are recorded and unused. |
 | Pay out to a beneficiary | `POST /api/v1/transfers/create` | Not run | No balance, beneficiary or credential exists; the eleven statuses and `PAID`'s late failure are recorded. |
 | Verify and deduplicate a delivery | the endpoint's raw body plus `x-timestamp`/`x-signature` | Not run | No webhook subscription exists; the verifier was exercised only with self-computed signatures in the gate. |
