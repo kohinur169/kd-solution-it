@@ -476,6 +476,8 @@ test are STEP 162, onboarding and charges 163-166, and the sandbox cycle and cap
 | Account updates, requirements and future requirements | https://docs.stripe.com/connect/handle-verification-updates | Reviewed |
 | Testing Connect | https://docs.stripe.com/connect/testing | Reviewed |
 | Accounts v1 and v2 request shapes | https://docs.stripe.com/api/accounts/create | Reviewed |
+| Configure connected accounts (responsibilities, dashboard, requirement collection) | https://docs.stripe.com/connect/accounts-v2/connected-account-configuration | Reviewed in STEP 163 |
+| Create an account link | https://docs.stripe.com/api/account_links/create | Reviewed in STEP 163 |
 
 Nothing in this section was read from anywhere else: the pages above are `docs.stripe.com` only, and
 `STRIPE_DOCUMENTATION_HOSTS` holds that one host so a record naming any other host is refused.
@@ -593,6 +595,48 @@ Delivered by this STEP in `lib/payments/adapters/stripe-client.ts`, with no netw
   environment, so the connection test was exercised against a recording transport only, and every row below is
   `Not run`.
 
+### Verified for STEP 163: connected account creation after KYC approval (2026-11-06)
+
+Delivered by this STEP in `lib/payments/adapters/stripe-accounts.ts`, with no network call and no credential:
+
+- **The configuration the pages fix is now recorded in code.** Accounts v2 requires
+  `defaults.responsibilities` and `dashboard` to be chosen when the merchant configuration is added, and the
+  configuration page says neither can be changed afterwards. This platform sets
+  `fees_collector: application`, `losses_collector: application` and `dashboard: none`:
+  `STRIPE_PLATFORM_RESPONSIBILITIES`, `STRIPE_PLATFORM_DASHBOARD` and their reasons. The page's own
+  restriction (`losses_collector: application` requires `fees_collector: application`) is enforced by
+  `validateStripeResponsibilities`, and its derivation of requirement collection is implemented as
+  `stripeRequirementsCollectorOf` — the platform collects when `losses_collector` is `application` **and**
+  `dashboard` is `none`, which is this configuration. That is consistent with the flow: the company was
+  already KYC-approved here, and Stripe's `requirements` hash is the delta left to satisfy.
+- **One account per company, created only after approval, never twice.** `provisionStripeAccount` refuses a
+  submission that is not `approved`, refuses an approval that belongs to another company, refuses an
+  approval naming no submission, validates the profile, requires an active configuration proven on the
+  Accounts v2 surface, writes the `pending` row **before** the call, and answers `already_created` from the
+  record on a replay — so a retry cannot create a second `acct_`.
+- **The create body carries business identity only.** `POST https://api.stripe.com/v2/core/accounts` with
+  `contact_email`, `display_name`, `dashboard`, `identity` (registered name, country, entity type),
+  `configuration.merchant.capabilities.card_payments.requested`,
+  `configuration.recipient.capabilities.stripe_balance.stripe_transfers.requested` (STEP 161 recorded that
+  `card_payments` is requested together with transfers), `defaults` (currency, responsibilities, locale) and
+  `include: ["configuration.merchant", "identity", "requirements"]`. No tax identifier, owner, date of birth,
+  SSN, bank account number, routing number or IBAN appears — the input type has no field for any of them, and
+  the gate asserts that a built body carries none of their shapes.
+- **The verdicts are honest.** `400`/`409`/`422` are `rejected` with the provider's message and may be
+  reopened; `401`/`403`/`404`/`405`/`415`/redirects are `failed`; a timeout-class code, `429`, any `5XX`, a
+  thrown transport or a `2XX` that names no `acct_` id are `unknown` with `requiresReconciliation`, and a
+  second attempt over an `unknown` row answers `in_flight` instead of creating another account.
+- **The documented onboarding link.** `createStripeOnboardingLink` posts the form-encoded body the documented
+  example sends (`account`, `type`, `refresh_url`, `return_url`) to `/v1/account_links`, refuses a link type
+  this record does not name, refuses a non-HTTPS return or refresh URL, requires a created account, keeps the
+  documented `expires_at` (and falls back to the documented 300-second lifetime only when the answer omits
+  it), and refuses any answer whose `url` is not an absolute HTTPS URL.
+- **Readiness is derived, not asserted.** `stripeAccountReadinessOf` lets an account accept payments only when
+  it exists and both `card_payments` and `stripe_transfers` are `active`, and calls it onboarded only when
+  this platform — the requirements collector — has nothing outstanding.
+- **None of it ran against Stripe.** No Stripe account, sandbox key or `acct_` id exists in this environment,
+  so every call was exercised against a recording transport and every row below is `Not run`.
+
 ### Open Questions (recorded, not assumed)
 
 - **The account surface is settled (STEP 162): Accounts v2.** `STRIPE_ACCOUNT_SURFACE` and
@@ -602,6 +646,16 @@ Delivered by this STEP in `lib/payments/adapters/stripe-client.ts`, with no netw
   `Stripe-Version`, defaulted to `2026-10-28.preview` (the only version the documentation review observed), and
   a `live` configuration may not pin a preview value. Which released version operations pins when the live
   account is connected remains an operational decision, recorded on the configuration rather than in code.
+- **The pinned version and the Accounts v2 surface are not yet proven together in live mode (STEP 163).** Every
+  documented v2 example carried a preview version (`2026-10-28.preview`), while STEP 162 forbids a preview pin on a
+  live configuration. The sandbox cycle must confirm that the released version a live key pins accepts
+  `POST /v2/core/accounts`; if it does not, the refusal surfaces as a `400` (`failed`) from
+  `parseStripeAccountAnswer`, never as a silent success.
+- **Stripe's own idempotency header was not read.** This repository guards account creation with a stored,
+  version-guarded row and makes no call on a replay, which is the guard every other adapter uses. Stripe also
+  documents an `Idempotency-Key` request header, but `docs.stripe.com/api/idempotent_requests` was not read in
+  these sessions, so no such header is sent; STEP 164, the first STEP that spends money, must read that page
+  before sending one.
 - **A `whsec_` value carries no mode**, so the signing secret's mode cannot be checked from its shape; it is
   bound to the configuration's declared environment only. A sandbox secret pasted into a live configuration
   would fail on the first delivery rather than at configuration time, and that limit is recorded here.
@@ -632,6 +686,15 @@ Added by STEP 162 (same reason: no Stripe account, sandbox key or signing secret
 | Activate after a passing test | none (a state transition) | Not run | Implemented as `activateStripeConfig`; the refusal table was exercised locally, and no configuration is active in a real environment. |
 | Roll the signing secret with its overlap | none (a state transition) | Not run | Implemented as `rollStripeWebhookSecret` and `stripeWebhookSecretsFor`; no real `whsec_` value exists to roll. |
 | Rotate the key and retire the old one | none (state transitions) | Not run | Implemented as `activateStripeConfig` plus `retireStripeConfig`; no second real key exists. |
+
+Added by STEP 163 (same reason: no Stripe account or sandbox key exists here):
+
+| Step | Call | Result | Details |
+|---|---|---|---|
+| Create the connected account for an approved company | `POST /v2/core/accounts` | Not run | Implemented as `provisionStripeAccount`; exercised against a recording transport only, so no `acct_` id exists. |
+| Issue the hosted onboarding link | `POST /v1/account_links` | Not run | Implemented as `createStripeOnboardingLink`; no account exists to link and no link was issued by Stripe. |
+| Satisfy the requirements Stripe reports | the `requirements` hash in the account answer | Not run | Summarised by `parseStripeAccountAnswer` into `ready`/`waiting`/`blocked`; no real requirements were collected because no account exists. |
+| Settle an unknown creation outcome | a replay of `POST /v2/core/accounts` | Not run | The `in_flight` and `requiresReconciliation` paths were exercised locally; no real ambiguous outcome was produced. |
 
 The record these notes produce is `partial`, never `verified`: `calculateStripeStatus` requires all five
 step ids to be present and passed before a record can read as verified, and the gate asserts it.
