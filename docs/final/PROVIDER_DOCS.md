@@ -850,8 +850,8 @@ change how the adapter must be written:
   a factor of a hundred here, in the opposite direction from Stripe's.
 - **The idempotency key is `request_id`, in the body.** "Your unique idempotency key (v4 UUID) used to prevent
   duplicate transactions by ensuring that retried API calls with the same ID are only processed once." The
-  transfers changelog adds a documented `409 Conflict` while a duplicate is being processed. STEP 168 must send
-  the field, not a header.
+  transfers changelog adds a documented `409 Conflict` while a duplicate is being processed. STEP 168 sends the
+  field, not a header, and records a `409` as a duplicate needing reconciliation.
 - **The client secret lives 60 minutes and is never logged.** "Never log the `client_secret` in plain text
   server logs." It cannot be refreshed or extended, so an expired checkout creates a new PaymentIntent.
 - **A payout's `PAID` is not final.** A paid transfer "may subsequently fail if it is rejected by the local
@@ -958,9 +958,20 @@ Delivered by this STEP in `lib/payments/adapters/airwallex.ts`, with no network 
   must read that page before subscribing.
 - **The connected-account sandbox gap stands.** Until Airwallex Sales grants connected-account access or a
   Simulation API run is recorded as its own evidence, STEP 169's account steps are `partial` by definition.
-- **The platform's own fee on a connected account's payment was not read.** The pages read here describe payment
-  intents and transfers separately; STEP 168 must read the payments-for-platforms pages before deciding how the
-  platform's fee is collected.
+- **STEP 168 takes the payment and never trusts the browser.** `lib/payments/adapters/airwallex-payment.ts` refuses
+  to charge unless the connected account is `ACTIVE` per STEP 167's readiness, validates the amount, currency,
+  reference, descriptor and metadata with STEP 165's rules, derives the documented `request_id` from the company and
+  the reference, writes a `pending` attempt **before** the call, sends the documented major-unit body with
+  `x-on-behalf-of` naming the connected account, and hands the client secret back exactly once — storing only the
+  boolean that one was issued. A `409` is recorded as a **duplicate** that needs reconciliation, not as a refusal,
+  because that is what the documented idempotency rule says it means; and only a read whose amount and currency
+  match the attempt settles `paid`, so a mismatch becomes `requiresReconciliation` instead of a ledger entry. The
+  gate (`airwallex-payment-verify.ts`) runs 249 checks against recorded answers; no call reached Airwallex.
+- **The platform's own fee on a connected account's payment is still not documented here.** The pages read for
+  STEP 165 describe payment intents and transfers separately and name no fee parameter, so STEP 168 **records** the
+  platform fee on the attempt for the ledger and **sends none**: guessing a parameter name into a live payment body
+  is not something this adapter does. The payments-for-platforms pages must still be read before a fee can be
+  collected through Airwallex rather than through the platform's own settlement.
 
 ### Sandbox Notes
 
@@ -971,7 +982,8 @@ Delivered by this STEP in `lib/payments/adapters/airwallex.ts`, with no network 
 | Create one connected account after approval | `POST /api/v1/accounts/create` | Not run | The sandbox does not offer the Connected Account APIs without Airwallex Sales, and no credential exists anyway. The documented body, `acct_` id and five statuses are recorded. STEP 167 implements the call, the approval gate and the single-attempt rule, and gates them against recorded answers only. |
 | Submit the account for verification | `POST /api/v1/accounts/{id}/submit` | Not run | No account exists to submit; `SUBMITTED`, `ACTION_REQUIRED` and `SUSPENDED` are recorded with their RFI meaning. STEP 167 implements the submit and refuses it for any status but `CREATED` or `ACTION_REQUIRED`, gated only against recorded answers. |
 | Read the account's verification status | `GET /api/v1/accounts/{id}` | Not run | No account exists to read. STEP 167 implements the read that records the documented status, maps it to `ready`/`waiting`/`blocked`, and flags a `404` or an unsettled answer for reconciliation; it has never seen a real one. |
-| Take a payment with a documented test card | `POST /api/v1/pa/payment_intents/create` | Not run | No credential exists. The required test cases and cards (`4035501000000008` succeeds, `4012000300000013` fails 3DS, `5307837360544518` with `80.51` is insufficient funds) are recorded and unused. |
+| Take a payment with a documented test card | `POST /api/v1/pa/payment_intents/create` | Not run | No credential exists. The required test cases and cards (`4035501000000008` succeeds, `4012000300000013` fails 3DS, `5307837360544518` with `80.51` is insufficient funds) are recorded and unused. STEP 168 implements the create call, the readiness gate and the client-secret hand-off, and gates them against recorded answers only. |
+| Confirm the payment by reading the intent | `GET /api/v1/pa/payment_intents/{id}` | Not run | No PaymentIntent exists to read, so the read that turns a browser's claim into a settled payment never reached Airwallex. STEP 168 implements it, refuses an amount or currency that does not match the attempt, and records `SUCCEEDED` as the only `paid`. |
 | Pay out to a beneficiary | `POST /api/v1/transfers/create` | Not run | No balance, beneficiary or credential exists; the eleven statuses and `PAID`'s late failure are recorded. |
 | Verify and deduplicate a delivery | the endpoint's raw body plus `x-timestamp`/`x-signature` | Not run | No webhook subscription exists; the verifier was exercised only with self-computed signatures in the gate. |
 
