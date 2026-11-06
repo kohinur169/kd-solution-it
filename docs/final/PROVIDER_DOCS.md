@@ -546,14 +546,65 @@ Delivered by this STEP, with no network call and no credential:
   environment, so every cycle step is `not_tested` with the reason recorded, `STRIPE_SESSION_STATUS` is
   `partial` by construction, and the gate asserts that the session record cannot read as `verified`.
 
+### Verified for STEP 162: encrypted keys, the connection test and the signing-secret roll (2026-11-06)
+
+Delivered by this STEP in `lib/payments/adapters/stripe-client.ts`, with no network call and no credential:
+
+- **Both decisions STEP 161 left open are now made in code.** `STRIPE_ACCOUNT_SURFACE = "accounts_v2"` with
+  `STRIPE_ACCOUNT_SURFACE_REASON` and `STRIPE_ACCOUNT_SURFACE_PATH = "/v2/core/accounts"`, so STEP 163 creates
+  connected accounts through Accounts v2 configurations and never through the legacy Standard/Express/Custom
+  types. The API version is **configuration, not a constant**: `STRIPE_DEFAULT_API_VERSION` is the dated value
+  the documentation examples carried, every configuration stores the version it will send, the connection test
+  sends it as `Stripe-Version`, and a `live` configuration may not pin a `.preview` version
+  (`validateStripeCredentials` refuses it by name).
+- **Two credentials are sealed and one deliberately is not.** The secret (or restricted) key is sealed under
+  `gateway:<companyId>:stripe:secret_key`; the webhook signing secret under
+  `gateway:<companyId>:stripe:webhook_secret`; the publishable key is stored as text because it is designed to
+  ship to a browser, and the settings view shows it in full so the checkout step has a source. Sealing a
+  publishable key would be theatre, and a `pk_` value in the secret field is refused with a message that says
+  exactly that. A sealed value opens only under its own scope: the secret key cannot be opened as a signing
+  secret, for another company, or with a foreign keyring.
+- **The mode is cross-checked before anything is sealed.** A live key in a sandbox configuration, a sandbox key
+  in a live one, and a publishable key of another mode are all refused, because the connection test against the
+  wrong mode would report a rejection that says nothing about the key the operator meant to store. An
+  organization key (`sk_org_`) is refused too: it manages several Stripe accounts, and this adapter is bound to
+  one company.
+- **The connection test is the documented read** `GET /v1/accounts?limit=1` — the same endpoint STEP 163 uses —
+  against `https://api.stripe.com`, with `Authorization: Bearer`, `Accept: application/json` and the pinned
+  `Stripe-Version`. The transport allowlists that one URL, refuses to run without a key or a dated version,
+  refuses redirects, bounds the timeout at 15 s and the answer at 64 KiB.
+- **The answer table distinguishes outcomes the way Stripe's does**: `401` is `rejected` (the documented
+  authentication error); `403` is `not_permitted` — the key authenticated but a restricted key lacks the
+  accounts permission, so the operator is told to fix permissions rather than replace the key; `400` is
+  `failed` with the pinned version named as the likely cause; `3xx`, other `4xx` and a `200` that is not a
+  Stripe list prove nothing; `408`/`425`/`429`/`5xx` and an unreachable host are `unreachable`. Only a `2XX`
+  carrying `object: "list"` and a `data` array reports `secretKeyAccepted` and `environmentVerified`.
+- **A provider cannot be enabled on a test it did not pass.** `activateStripeConfig` refuses without a recorded
+  `connected` test, refuses a test made in another environment or on another API version, and refuses a
+  configuration with no webhook signing secret — a provider that could take money while its deliveries cannot be
+  verified would leave every payment in an unknown state. Activation supersedes the previous key, audits
+  `provider_key.activated` and `provider_key.rotated`, and `retireStripeConfig` removes the old key afterwards.
+- **The signing-secret roll has its documented overlap.** `rollStripeWebhookSecret` keeps the previous secret
+  for `STRIPE_WEBHOOK_SECRET_OVERLAP_SECONDS` (24 hours), refuses a roll to the same value, and audits
+  `provider_webhook_secret.rolled`. `stripeWebhookSecretsFor` opens the current secret and, only while the
+  window is open, the previous one — which is what STEP 164's receiver will feed to
+  `verifyStripeWebhookSignature`, because that verifier already reads every `v1` signature in the header.
+- **None of it ran against Stripe.** No Stripe account, sandbox key or `whsec_` value exists in this
+  environment, so the connection test was exercised against a recording transport only, and every row below is
+  `Not run`.
+
 ### Open Questions (recorded, not assumed)
 
-- **Which account surface the code will use is STEP 162's decision.** The pages recommend Accounts v2 for new
-  platforms and keep Accounts v1 with controller properties for features v2 does not cover; this record names
-  both, and the adapter must record which one it calls and why.
-- **The API version to pin is not chosen here.** The v2 examples carried a dated preview value
-  (`2026-10-28.preview`), and the account default is not visible from the documentation, so `Stripe-Version`
-  must be sent explicitly and the choice recorded in STEP 162.
+- **The account surface is settled (STEP 162): Accounts v2.** `STRIPE_ACCOUNT_SURFACE` and
+  `STRIPE_ACCOUNT_SURFACE_REASON` in `stripe-client.ts` record the choice; Accounts v1 with controller
+  properties is kept in the sources only as the documented alternative for features v2 does not cover.
+- **The API version is settled as configuration (STEP 162).** It is stored per configuration, sent as
+  `Stripe-Version`, defaulted to `2026-10-28.preview` (the only version the documentation review observed), and
+  a `live` configuration may not pin a preview value. Which released version operations pins when the live
+  account is connected remains an operational decision, recorded on the configuration rather than in code.
+- **A `whsec_` value carries no mode**, so the signing secret's mode cannot be checked from its shape; it is
+  bound to the configuration's declared environment only. A sandbox secret pasted into a live configuration
+  would fail on the first delivery rather than at configuration time, and that limit is recorded here.
 - **The event subscription set is decided with the receiver**, because the documentation recommends
   subscribing only to the events the integration needs. `account.updated` is the recorded one for account and
   requirement changes; the payment events are recorded but not yet subscribed.
@@ -571,6 +622,16 @@ Delivered by this STEP, with no network call and no credential:
 | Onboard the merchant through a hosted link | `POST /v1/account_links` | Not run | No connected account exists to link, and no sandbox key was available. |
 | Take a test payment | `POST /v1/payment_intents` | Not run | No sandbox key exists; the documented test cards and tokens are recorded but unused. |
 | Receive and verify a signed delivery | `POST /webhooks/stripe` | Not run | No endpoint is registered and no `whsec_` secret exists; the verifier was exercised with self-computed signatures only. |
+
+Added by STEP 162 (same reason: no Stripe account, sandbox key or signing secret exists here):
+
+| Step | Call | Result | Details |
+|---|---|---|---|
+| Configure a sealed key pair | none (a local state transition) | Not run | Implemented as `configureStripeKeys`; the secret key and signing secret were sealed with a keyring built for the gate, and no real credential was stored. |
+| Prove the key against the API | `GET /v1/accounts?limit=1` | Not run | Implemented as `testStripeConnection`; exercised against a recording transport only. No key was sent to Stripe. |
+| Activate after a passing test | none (a state transition) | Not run | Implemented as `activateStripeConfig`; the refusal table was exercised locally, and no configuration is active in a real environment. |
+| Roll the signing secret with its overlap | none (a state transition) | Not run | Implemented as `rollStripeWebhookSecret` and `stripeWebhookSecretsFor`; no real `whsec_` value exists to roll. |
+| Rotate the key and retire the old one | none (state transitions) | Not run | Implemented as `activateStripeConfig` plus `retireStripeConfig`; no second real key exists. |
 
 The record these notes produce is `partial`, never `verified`: `calculateStripeStatus` requires all five
 step ids to be present and passed before a record can read as verified, and the gate asserts it.
