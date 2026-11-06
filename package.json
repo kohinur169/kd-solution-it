@@ -16,7 +16,7 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "check:structure": "node scripts/verify-structure.mjs",
-    "verify": "npm run check:audit && npm run check:structure && npm run check:env && npm run check:config && npm run check:i18n && npm run check:logger && npm run check:errors && npm run check:lint && npm run check:shell && npm run check:jobs && npm run check:migrations && npm run check:estimates && npm run check:recurring && npm run check:recurring-service && npm run check:recurring-job && npm run check:recurring-generation && npm run check:settlement-statement && npm run check:settlement-statement-pdf && npm run check:payments-money && npm run check:payments-registry && npm run check:payments-routing && npm run check:payments-creation && npm run check:payments-ledger-accounts && npm run check:payments-ledger-posting && npm run check:payments-ledger-reversal && npm run check:payments-ledger-balance && npm run check:payments-platform-fee && npm run check:payments-settlement-hold && npm run check:payments-reserve && npm run check:payments-negative-balance && npm run check:payments-payout-bank-account && npm run check:payments-bank-change-verification && npm run check:payments-bank-change-cooling && npm run check:payments-minimum-payout && npm run typecheck && npm run lint && npm run build",
+    "verify": "npm run check:audit && npm run check:structure && npm run check:env && npm run check:config && npm run check:i18n && npm run check:logger && npm run check:errors && npm run check:lint && npm run check:shell && npm run check:jobs && npm run check:migrations && npm run check:estimates && npm run check:recurring && npm run check:recurring-service && npm run check:recurring-job && npm run check:recurring-generation && npm run check:settlement-statement && npm run check:settlement-statement-pdf && npm run check:payments-money && npm run check:payments-registry && npm run check:payments-routing && npm run check:payments-creation && npm run check:payments-ledger-accounts && npm run check:payments-ledger-posting && npm run check:payments-ledger-reversal && npm run check:payments-ledger-balance && npm run check:payments-platform-fee && npm run check:payments-settlement-hold && npm run check:payments-reserve && npm run check:payments-negative-balance && npm run check:payments-payout-bank-account && npm run check:payments-bank-change-verification && npm run check:payments-bank-change-cooling && npm run check:payments-minimum-payout && npm run check:payments-payout-execution && npm run typecheck && npm run lint && npm run build",
     "env:example": "node lib/env/generate-example.ts",
     "check:env": "node lib/env/generate-example.ts --check",
     "check:config": "node config/verify.ts",
@@ -50,6 +50,7 @@
     "check:payments-bank-change-verification": "node lib/payments/bank-change-verification-verify.ts",
     "check:payments-bank-change-cooling": "node lib/payments/bank-change-cooling-verify.ts",
     "check:payments-minimum-payout": "node lib/payments/minimum-payout-verify.ts",
+    "check:payments-payout-execution": "node lib/payments/payout-execution-verify.ts",
     "check:migrations": "node migrations/verify.ts"
   },
   "dependencies": {
