@@ -162,6 +162,16 @@ Added by STEP 156 (same reason: no Payoneer sandbox credential exists here):
 | Read the payout status to `Transferred` | `GET /v4/programs/{program_id}/payouts/{client_reference_id}/status` | Not run | Implemented as `readPayoneerPayoutStatus`; only a recorded `Transferred` answer with `load_date` maps to success. |
 | Apply a payout notification through a verifier | `POST /ipcn/{notification}` | Not run | Implemented as `applyPayoneerPayoutNotification`, which refuses every delivery while no verifier exists. |
 
+Added by STEP 164 (same reason: no sandbox key, connected account or signing secret exists here):
+
+| Step | Call | Result | Details |
+|---|---|---|---|
+| Charge a customer with the platform fee | `POST /v1/payment_intents` | Not run | Implemented as `createStripeCharge`; exercised against a recording transport only. The documented test cards (4242…4242 succeeds, 4000…3155 needs authentication, 4000…9995 is declined) are recorded and unused. |
+| Confirm the charge without trusting the browser | `GET /v1/payment_intents/{id}` | Not run | Implemented as `readStripePaymentIntent` and `applyStripePaymentIntentRead`; no intent exists to read. |
+| Pay the merchant's balance out | `POST /v1/transfers` | Not run | Implemented as `createStripeTransfer`; no connected account has a balance, so the documented `balance_insufficient` path was produced by a fixture, not by Stripe. |
+| Receive a signed delivery | the endpoint's raw body plus `Stripe-Signature` | Not run | Implemented as `receiveStripeWebhook`; every delivery in the gate was signed with a fixture secret, and no endpoint is registered with Stripe. |
+| Replay a delivery | the same `evt_` id twice | Not run | The duplicate path was exercised locally; no real retry was received. |
+
 The record these notes produce is `partial`, never `verified`: `calculatePayoneerStatus` requires the whole five
 step cycle to be present and passed before a record can read as verified.
 
@@ -443,6 +453,16 @@ Added by STEP 160 (same reason: no Rainforest sandbox account, API key or signin
 | Receive and verify a signed webhook | `POST /webhooks/rainforest` | Not run | Implemented as `receiveRainforestWebhook` with a pluggable verifier; exercised with self-signed deliveries only, because no portal signing key exists here and the recipe is unread. |
 | Survive a replay of the same event | `POST /webhooks/rainforest` (replay) | Not run | Implemented as the resource-id-plus-event-type idempotency record; a replayed delivery was exercised locally. No real replay was received. |
 
+Added by STEP 164 (same reason: no sandbox key, connected account or signing secret exists here):
+
+| Step | Call | Result | Details |
+|---|---|---|---|
+| Charge a customer with the platform fee | `POST /v1/payment_intents` | Not run | Implemented as `createStripeCharge`; exercised against a recording transport only. The documented test cards (4242…4242 succeeds, 4000…3155 needs authentication, 4000…9995 is declined) are recorded and unused. |
+| Confirm the charge without trusting the browser | `GET /v1/payment_intents/{id}` | Not run | Implemented as `readStripePaymentIntent` and `applyStripePaymentIntentRead`; no intent exists to read. |
+| Pay the merchant's balance out | `POST /v1/transfers` | Not run | Implemented as `createStripeTransfer`; no connected account has a balance, so the documented `balance_insufficient` path was produced by a fixture, not by Stripe. |
+| Receive a signed delivery | the endpoint's raw body plus `Stripe-Signature` | Not run | Implemented as `receiveStripeWebhook`; every delivery in the gate was signed with a fixture secret, and no endpoint is registered with Stripe. |
+| Replay a delivery | the same `evt_` id twice | Not run | The duplicate path was exercised locally; no real retry was received. |
+
 The record these notes produce is `partial`, never `verified`: `calculateRainforestStatus` requires the
 whole five step cycle to be present and passed before a record can read as verified.
 
@@ -478,6 +498,11 @@ test are STEP 162, onboarding and charges 163-166, and the sandbox cycle and cap
 | Accounts v1 and v2 request shapes | https://docs.stripe.com/api/accounts/create | Reviewed |
 | Configure connected accounts (responsibilities, dashboard, requirement collection) | https://docs.stripe.com/connect/accounts-v2/connected-account-configuration | Reviewed in STEP 163 |
 | Create an account link | https://docs.stripe.com/api/account_links/create | Reviewed in STEP 163 |
+| Idempotent requests (`Idempotency-Key`) | https://docs.stripe.com/api/idempotent_requests | Reviewed in STEP 164 |
+| Destination charges (Payment Element flow) | https://docs.stripe.com/connect/destination-charges | Reviewed in STEP 164 |
+| PaymentIntent lifecycle and statuses | https://docs.stripe.com/payments/paymentintents/lifecycle | Reviewed in STEP 164 |
+| Separate charges and transfers | https://docs.stripe.com/connect/separate-charges-and-transfers | Reviewed in STEP 164 |
+| Create a transfer | https://docs.stripe.com/api/transfers/create | Reviewed in STEP 164 |
 
 Nothing in this section was read from anywhere else: the pages above are `docs.stripe.com` only, and
 `STRIPE_DOCUMENTATION_HOSTS` holds that one host so a record naming any other host is refused.
@@ -637,6 +662,65 @@ Delivered by this STEP in `lib/payments/adapters/stripe-accounts.ts`, with no ne
 - **None of it ran against Stripe.** No Stripe account, sandbox key or `acct_` id exists in this environment,
   so every call was exercised against a recording transport and every row below is `Not run`.
 
+### Verified for STEP 164: destination charges, payouts and signature-verified idempotent webhooks (2026-11-06)
+
+Delivered by this STEP in `lib/payments/adapters/stripe-payment.ts` and
+`lib/payments/adapters/stripe-webhook.ts`, with no network call and no credential:
+
+- **The charge type is settled: destination charges.** STEP 163 fixed
+  `fees_collector`/`losses_collector` to `application` with `dashboard: none`, and the configuration page
+  says that pair is the recommended configuration for destination charges, so
+  `STRIPE_CHARGE_TYPE = "destination"` with its reason. The body is the page's own:
+  `amount`, `currency`, `transfer_data[destination]` and `application_fee_amount`. The page's effect is
+  recorded beside it: the full amount transfers to the connected account on capture and the application fee
+  transfers back to the platform, and because this platform collects the fees (`fees_collector:
+  application`), the fee it sets must also cover Stripe's processing fee.
+- **The amount unit is converted exactly once.** `lib/payments/money.ts` counts ten-thousandths of a
+  currency unit while Stripe counts the smallest unit (cents for USD), so
+  `stripeAmountFromPlatformMinor` divides by `10 ** (MONEY_SCALE - exponent)` and refuses anything that is
+  not a whole cent instead of rounding. A 2.90 USD fee is `29_000n` in the platform's scale and `290` to
+  Stripe; the gate asserts both directions, so the hundred-fold charge bug cannot arrive by accident.
+- **`Idempotency-Key` is now read and sent — and the two guards work together.** The page documents the
+  header on `POST` only (no effect on `GET`/`DELETE`), up to 255 characters, no sensitive data, keys pruned
+  after at least 24 hours. `stripe-payment.ts` sends `stripeIdempotencyKeyFor(...)` on every `POST` and
+  never on a `GET`, and the stored `pending` attempt written **before** the call is the guard that survives
+  key pruning: a replay answers `already_created` (charge) or `already_created` (transfer) without a call.
+- **Only a matching read is paid.** `readStripePaymentIntent` performs the documented
+  `GET /v1/payment_intents/{id}`, and `applyStripePaymentIntentRead` compares the answer's amount, currency
+  and application fee against the attempt in the platform's own units. Only `succeeded` with all three
+  matching is `paid`; a mismatch is `failed` with `requiresReconciliation`. The lifecycle page's mapping is
+  kept: `processing` and `requires_capture` are pending, `requires_action`, `requires_confirmation` and
+  `requires_payment_method` need the customer, `canceled` is not paid, and an unrecorded status is `unknown`.
+- **The client secret is never stored.** The page says a client secret "can complete the charge" and must not
+  be logged, embedded in URLs or exposed to anyone but the customer, so it is returned to the caller once,
+  the record keeps only `clientSecretIssued: true`, and the gate asserts that the serialised record carries
+  neither the value nor a `_secret_` fragment. The same rule refuses a card-shaped description or metadata
+  value (`carriesCardLikeText`), which is the PCI barrier of the Rainforest section restated for this
+  provider.
+- **The payout leg is a documented transfer.** `POST /v1/transfers` with `amount`, `currency`,
+  `destination`, `transfer_group` and metadata, carrying its own `Idempotency-Key`; the answer's `tr_` id,
+  amount, currency and destination are compared to the request, and the page's own warning is recorded — a
+  transfer made before an asynchronous payment fails debits the platform's balance and must be reversed
+  manually — which is why the group is required and the amount is immutable. The page's documented failure,
+  an insufficient platform balance, is reported as `insufficientFunds` from the `balance_insufficient` code.
+- **The webhook receiver verifies before it reads.** `receiveStripeWebhook` takes the raw body and the
+  signature header, opens the company's sealed signing secrets, and verifies STEP 161's `t` + `v1` HMAC
+  (300-second tolerance) against the current secret, or the previous one only while STEP 162's 24-hour
+  overlap window is open. Nothing in the body is parsed before that; a refusal is `400` with a named error
+  and an audit entry, and an unopenable secret is `500` because that is this platform's outage, not a bad
+  delivery.
+- **Idempotency is the event's own id.** The `evt_` id is unique per company; the record is written before
+  the effect runs, a second delivery of a settled record answers `200` with `duplicate: true` and repeats
+  nothing, and a second delivery of a record still `stored` re-runs the effect — which is what a retry after
+  a `500` means. The record keeps the event id, type, object id, API version, the delivery count and a
+  SHA-256 fingerprint of the body; the body, the signature and the secret are never stored.
+- **The three payment events the page names, plus `account.updated`.** `payment_intent.succeeded`,
+  `payment_intent.processing` and `payment_intent.payment_failed` are classified `payment`;
+  `account.updated` is `account` and asks for a synchronisation; every other type is stored, acknowledged and
+  never acted on, because an endpoint receives types this integration did not ask for.
+- **None of it ran against Stripe.** No sandbox key, connected account or `whsec_` secret exists here, so
+  every call was exercised against a recording transport and every delivery was signed by the gate itself.
+
 ### Open Questions (recorded, not assumed)
 
 - **The account surface is settled (STEP 162): Accounts v2.** `STRIPE_ACCOUNT_SURFACE` and
@@ -651,11 +735,17 @@ Delivered by this STEP in `lib/payments/adapters/stripe-accounts.ts`, with no ne
   live configuration. The sandbox cycle must confirm that the released version a live key pins accepts
   `POST /v2/core/accounts`; if it does not, the refusal surfaces as a `400` (`failed`) from
   `parseStripeAccountAnswer`, never as a silent success.
-- **Stripe's own idempotency header was not read.** This repository guards account creation with a stored,
-  version-guarded row and makes no call on a replay, which is the guard every other adapter uses. Stripe also
-  documents an `Idempotency-Key` request header, but `docs.stripe.com/api/idempotent_requests` was not read in
-  these sessions, so no such header is sent; STEP 164, the first STEP that spends money, must read that page
-  before sending one.
+- **Stripe's idempotency header is settled (STEP 164).** `docs.stripe.com/api/idempotent_requests` was read:
+  the header applies to `POST` only, may be up to 255 characters, must not carry sensitive data, and keys are
+  pruned after at least 24 hours. Both spending calls send one and neither `GET` does, and the stored attempt
+  remains the guard that outlives the pruning. What is *not* proven is the API's own replay behaviour against a
+  real account, because no key exists here.
+- **Payment Intents were chosen over Checkout Sessions for a reason that may be revisited (STEP 164).** The
+  lifecycle page recommends Checkout Sessions over Payment Intents "for most integrations" because the Intent
+  API needs more code. This adapter uses Payment Intents because the fee split is explicit
+  (`transfer_data[destination]` plus `application_fee_amount`), the platform's own payment page (STEP 183) owns
+  the Elements mount, and the same read serves the webhook receiver. If STEP 183 finds that a hosted Checkout
+  Session fits its screen better, that is a surface change recorded against this STEP, not a new charge type.
 - **A `whsec_` value carries no mode**, so the signing secret's mode cannot be checked from its shape; it is
   bound to the configuration's declared environment only. A sandbox secret pasted into a live configuration
   would fail on the first delivery rather than at configuration time, and that limit is recorded here.
@@ -696,12 +786,22 @@ Added by STEP 163 (same reason: no Stripe account or sandbox key exists here):
 | Satisfy the requirements Stripe reports | the `requirements` hash in the account answer | Not run | Summarised by `parseStripeAccountAnswer` into `ready`/`waiting`/`blocked`; no real requirements were collected because no account exists. |
 | Settle an unknown creation outcome | a replay of `POST /v2/core/accounts` | Not run | The `in_flight` and `requiresReconciliation` paths were exercised locally; no real ambiguous outcome was produced. |
 
+Added by STEP 164 (same reason: no sandbox key, connected account or signing secret exists here):
+
+| Step | Call | Result | Details |
+|---|---|---|---|
+| Charge a customer with the platform fee | `POST /v1/payment_intents` | Not run | Implemented as `createStripeCharge`; exercised against a recording transport only. The documented test cards (4242…4242 succeeds, 4000…3155 needs authentication, 4000…9995 is declined) are recorded and unused. |
+| Confirm the charge without trusting the browser | `GET /v1/payment_intents/{id}` | Not run | Implemented as `readStripePaymentIntent` and `applyStripePaymentIntentRead`; no intent exists to read. |
+| Pay the merchant's balance out | `POST /v1/transfers` | Not run | Implemented as `createStripeTransfer`; no connected account has a balance, so the documented `balance_insufficient` path was produced by a fixture, not by Stripe. |
+| Receive a signed delivery | the endpoint's raw body plus `Stripe-Signature` | Not run | Implemented as `receiveStripeWebhook`; every delivery in the gate was signed with a fixture secret, and no endpoint is registered with Stripe. |
+| Replay a delivery | the same `evt_` id twice | Not run | The duplicate path was exercised locally; no real retry was received. |
+
 The record these notes produce is `partial`, never `verified`: `calculateStripeStatus` requires all five
 step ids to be present and passed before a record can read as verified, and the gate asserts it.
 
 ### Capability Matrix
 
-- Charges: Yes (direct, destination, or separate charges and transfers — one to be chosen in STEP 163)
+- Charges: Yes, destination charges (`transfer_data[destination]` with `application_fee_amount`; separate charges and transfers remain available)
 - Payouts: Yes (the platform's own payout path stays STEPs 133-141; Connect payouts are the connected account's)
 - Connected accounts: Yes (Accounts v2 configurations, or Accounts v1 with controller properties)
 - Refunds and disputes: Yes, on the balance the charge type names
