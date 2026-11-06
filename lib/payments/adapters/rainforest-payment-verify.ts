@@ -48,6 +48,9 @@ import {
   RAINFOREST_SESSION_KEY_PATTERN,
   RAINFOREST_SESSION_KEY_PREFIX,
   RAINFOREST_SESSION_MAXIMUM_TTL_SECONDS,
+  RAINFOREST_SESSION_PURPOSES,
+  RAINFOREST_MERCHANT_ONBOARDING_PERMISSION,
+  rainforestSessionPermissionOf,
   RAINFOREST_SESSIONS_PATH,
   RAINFOREST_MAXIMUM_AMOUNT_MINOR,
   rainforestComponentScriptUrlFor,
@@ -892,6 +895,17 @@ const constraints = statements[0]?.["constraints"] as Record<string, Record<stri
 expectEqual(constraints["merchant"]?.["merchant_id"], merchantId, "the statement is constrained to the merchant");
 expectEqual(json(sessionBody).includes("group#all"), false, "a browser credential never asks for group#all");
 expectEqual(buildRainforestSessionBody(sessionInput({ ttlSeconds: 900 }))["ttl"], 900, "a custom lifetime is sent");
+expectEqual(RAINFOREST_SESSION_PURPOSES.length, 2, "a session may be created for one of two documented component purposes");
+expectEqual(rainforestSessionPermissionOf("payment"), "group#payment_component", "a payment session asks for the payment group");
+expectEqual(rainforestSessionPermissionOf("onboarding"), RAINFOREST_MERCHANT_ONBOARDING_PERMISSION, "an onboarding session asks for the onboarding group");
+expectEqual(json(sessionBody).includes("merchant_onboarding_component"), false, "a payment session never asks for the onboarding group");
+const onboardingSession = buildRainforestSessionBody(sessionInput({ purpose: "onboarding" }));
+expectEqual(
+  ((onboardingSession["statements"] as Array<Record<string, unknown>>)[0]?.["permissions"] as string[])[0],
+  "group#merchant_onboarding_component",
+  "an onboarding session body carries the onboarding group",
+);
+expectEqual(json(onboardingSession).includes("group#payment_component"), false, "an onboarding session never asks for the payment group");
 
 {
   const configStore = await activeStoreFor(companyId);

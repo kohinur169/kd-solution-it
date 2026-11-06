@@ -111,6 +111,26 @@ export const RAINFOREST_SESSION_DEFAULT_TTL_SECONDS = 3_600;
 /** The documented permission group the payment component needs. */
 export const RAINFOREST_PAYMENT_COMPONENT_PERMISSION = "group#payment_component";
 
+/** The documented permission group the merchant onboarding component needs (STEP 160). */
+export const RAINFOREST_MERCHANT_ONBOARDING_PERMISSION = "group#merchant_onboarding_component";
+
+/** The two documented component purposes a session may be created for. */
+export const RAINFOREST_SESSION_PURPOSES: readonly RainforestSessionPurpose[] = deepFreeze(["payment", "onboarding"]);
+
+/**
+ * What a session is for.
+ *
+ * A session grants one documented component group. Keeping the purpose in the input rather than letting
+ * a caller name a permission is what makes "a payment session cannot ask for onboarding" a property of
+ * the code: the group is chosen from this table, and the gate asserts the two never cross.
+ */
+export type RainforestSessionPurpose = "payment" | "onboarding";
+
+/** The documented permission group of a session purpose. */
+export function rainforestSessionPermissionOf(purpose: RainforestSessionPurpose): string {
+  return purpose === "onboarding" ? RAINFOREST_MERCHANT_ONBOARDING_PERMISSION : RAINFOREST_PAYMENT_COMPONENT_PERMISSION;
+}
+
 /** The documented component element name. */
 export const RAINFOREST_COMPONENT_TAG = "rainforest-payment";
 
@@ -452,25 +472,31 @@ function paymentEndpointsFor(environment: RainforestEnvironment): readonly strin
   ];
 }
 
-/**
- * Performs one documented API call.
- *
- * The endpoint must be one of the three documented endpoints of one of the two environments (the payin
- * read is checked by prefix, because it carries an id), the call is refused without a key, `POST`
- * carries a JSON body and a content type while `GET` carries neither, redirects are refused, the
- * timeout is bounded and an oversized answer is refused. The documented
- * `Rainforest-Api-Version` header is always sent, because the platform's minimum version is a portal
- * setting the documentation does not expose.
- */
-export const rainforestFetchPaymentTransport: RainforestPaymentTransport = async (endpoint, method, apiKey, body) => {
-  const allowed = (["sandbox", "production"] as const).some((environment) =>
+/** True when an endpoint is one of the three documented payment endpoints of one of the environments. */
+function isPaymentEndpoint(endpoint: string): boolean {
+  return (["sandbox", "production"] as const).some((environment) =>
     paymentEndpointsFor(environment).some((prefix) =>
       prefix.endsWith("/v1/payins/")
         ? endpoint.startsWith(prefix) && RAINFOREST_PAYIN_ID_PATTERN.test(endpoint.slice(prefix.length))
         : endpoint === prefix,
     ),
   );
-  if (allowed === false) throw new Error("invalid API endpoint");
+}
+
+/**
+ * Perform one API call against an endpoint the caller's allowlist already approved.
+ *
+ * The call is refused without a key, `POST` carries a JSON body and a content type while `GET` carries
+ * neither, redirects are refused, the timeout is bounded and an oversized answer is refused. The
+ * documented `Rainforest-Api-Version` header is always sent, because the platform's minimum version is
+ * a portal setting the documentation does not expose.
+ */
+async function performRainforestRequest(
+  endpoint: string,
+  method: "GET" | "POST",
+  apiKey: string,
+  body: string | null,
+): Promise<RainforestPaymentAnswer> {
   if (apiKey.trim().length === 0) throw new Error("an API key is required");
   if (method === "POST" && (body === null || body.trim().length === 0)) throw new Error("a POST needs a body");
   if (method === "GET" && body !== null) throw new Error("a GET carries no body");
@@ -493,14 +519,44 @@ export const rainforestFetchPaymentTransport: RainforestPaymentTransport = async
   const text = await response.text();
   if (text.length > RAINFOREST_PAYMENT_ANSWER_MAXIMUM_BYTES) throw new Error("invalid API answer");
   return { status: response.status, body: text };
+}
+
+/**
+ * The payment transport: the three documented payment endpoints and nothing else.
+ *
+ * STEP 160's merchant onboarding needs the merchant endpoints, and rather than widening this allowlist
+ * for every adapter, `rainforestTransportAllowing` builds a transport for a named set of extra
+ * documented paths — so a transport's ability is always the list its own adapter wrote down.
+ */
+export const rainforestFetchPaymentTransport: RainforestPaymentTransport = async (endpoint, method, apiKey, body) => {
+  if (isPaymentEndpoint(endpoint) === false) throw new Error("invalid API endpoint");
+  return performRainforestRequest(endpoint, method, apiKey, body);
 };
+
+/**
+ * A transport for the documented payment endpoints plus the extra documented paths an adapter names.
+ *
+ * Each extra path must be a documented `/v1/...` path; the endpoint the caller passes must equal the
+ * absolute URL that path builds for one of the two environments. Everything else is refused before a
+ * request is made.
+ */
+export function rainforestTransportAllowing(extraPaths: readonly string[]): RainforestPaymentTransport {
+  return async (endpoint, method, apiKey, body) => {
+    if (isPaymentEndpoint(endpoint)) return performRainforestRequest(endpoint, method, apiKey, body);
+    const extra = extraPaths.some((path) =>
+      (["sandbox", "production"] as const).some((environment) => rainforestApiUrlFor(environment, path) === endpoint),
+    );
+    if (extra === false) throw new Error("invalid API endpoint");
+    return performRainforestRequest(endpoint, method, apiKey, body);
+  };
+}
 
 /* -------------------------------------------------------------------------------------------------
  * Reading a provider answer
  * ---------------------------------------------------------------------------------------------- */
 
-/** The documented error object: a field, a code and a message. */
-function errorMessageOf(payload: unknown): string {
+/** The documented error object: a field, a code and a message, sanitised and capped. */
+export function rainforestErrorMessageOf(payload: unknown): string {
   if (typeof payload !== "object" || payload === null) return "";
   const errors = (payload as Readonly<Record<string, unknown>>)["errors"];
   if (Array.isArray(errors)) {
@@ -638,7 +694,15 @@ export class InMemoryRainforestPayinConfigStore implements RainforestPayinConfig
 
 /** One audit entry this file hands to the caller's audit writer. Never carries a key or a payment detail. */
 export interface RainforestPaymentAuditEntry {
-  readonly action: "payin.rainforest_config_created" | "payin.rainforest_session_created" | "payin.rainforest_status_read";
+  readonly action:
+    | "payin.rainforest_config_created"
+    | "payin.rainforest_session_created"
+    | "payin.rainforest_status_read"
+    | "payin.rainforest_merchant_provisioned"
+    | "webhook.rainforest_verified"
+    | "webhook.rainforest_refused"
+    | "webhook.rainforest_applied"
+    | "webhook.rainforest_duplicate";
   readonly providerKey: typeof RAINFOREST_PROVIDER_KEY;
   readonly companyId: string;
   readonly merchantId: string;
@@ -809,7 +873,7 @@ export async function createRainforestPayinConfig(
   }
 
   if (answer.status === 400 || answer.status === 409 || answer.status === 422) {
-    const message = errorMessageOf(payload);
+    const message = rainforestErrorMessageOf(payload);
     const reason = message.length > 0 ? message : `the API refused the payin config with status ${answer.status}`;
     const rejected = settle(store, submission, "rejected", reason, false, null, options);
     return { status: "rejected", reason, submission: rejected };
@@ -886,6 +950,8 @@ export interface RainforestSessionInput {
   readonly merchantId: string;
   /** The documented lifetime in seconds, at most 86,400. */
   readonly ttlSeconds?: number;
+  /** What the session is for: the payment component (the default) or the onboarding component. */
+  readonly purpose?: RainforestSessionPurpose;
 }
 
 /** The component contract a page renders: the element, its attributes and the bundle to load. */
@@ -916,6 +982,8 @@ export function validateRainforestSessionInput(input: RainforestSessionInput): s
   if (RAINFOREST_MERCHANT_ID_PATTERN.test(input.merchantId) === false) {
     return "the merchant id must carry the documented mid_ or sbx_mid_ prefix";
   }
+  const purpose = input.purpose ?? "payment";
+  if (RAINFOREST_SESSION_PURPOSES.includes(purpose) === false) return "the session purpose must be payment or onboarding";
   const ttl = input.ttlSeconds ?? RAINFOREST_SESSION_DEFAULT_TTL_SECONDS;
   if (Number.isInteger(ttl) === false) return "the session lifetime must be a whole number of seconds";
   if (ttl < 60) return "the session lifetime must be at least 60 seconds";
@@ -937,7 +1005,7 @@ export function buildRainforestSessionBody(input: RainforestSessionInput): Recor
     ttl: input.ttlSeconds ?? RAINFOREST_SESSION_DEFAULT_TTL_SECONDS,
     statements: [
       {
-        permissions: [RAINFOREST_PAYMENT_COMPONENT_PERMISSION],
+        permissions: [rainforestSessionPermissionOf(input.purpose ?? "payment")],
         constraints: { merchant: { merchant_id: input.merchantId } },
       },
     ],
@@ -977,7 +1045,7 @@ export async function createRainforestSession(
 
   const payload = parseJson(answer.body);
   if (answer.status === 400 || answer.status === 422) {
-    const message = errorMessageOf(payload);
+    const message = rainforestErrorMessageOf(payload);
     return { status: "rejected", reason: message.length > 0 ? message : "the API refused the session request" };
   }
   if (answer.status < 200 || answer.status >= 300) {
@@ -1172,7 +1240,7 @@ export async function readRainforestPayin(
   }
 
   if (answer.status < 200 || answer.status >= 300) {
-    const message = errorMessageOf(parseJson(answer.body));
+    const message = rainforestErrorMessageOf(parseJson(answer.body));
     const suffix = message.length > 0 ? `: ${message}` : "";
     return {
       status: "unknown",

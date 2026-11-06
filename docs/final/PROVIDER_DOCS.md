@@ -333,9 +333,77 @@ its published markdown form.
   `lib/payments/adapters/rainforest-payment-verify.ts`). No payin was taken, no session was issued and no
   card was ever collected.
 
+### Verified for STEP 160: sub-merchant onboarding and signature-verified idempotent webhooks (2026-11-06)
+
+- **The onboarding path is the component path, for the same reason the payin path is.** Rainforest publishes
+  two onboarding integrations. The direct-to-API one (`docs/onboarding-merchants-via-api.md`) is gated behind
+  Rainforest approval and its payload carries `encrypted_tax_id`, `owner_1.encrypted_ssn` and the deposit
+  method's `account_number` and `routing_number`. The component one
+  (`docs/onboarding-merchants-via-component.md`) is four documented steps: create the merchant
+  (`POST /v1/merchants`), create a session with `group#merchant_onboarding_component` constrained to that
+  merchant, render `<rainforest-merchant-onboarding session-key merchant-id merchant-application-id
+  terms-and-conditions-url>` with `https://static.rainforestpay.com/sandbox.merchant.js` (production
+  `https://static.rainforestpay.com/merchant.js`), and read the decision from the
+  `merchant_application.*` / `merchant.*` webhooks. That is what this STEP implements.
+- **No sensitive onboarding field can reach the platform.** The merchant body is built from a fixed
+  documented field list — `name`, `dba_name`, `legal_name`, `merchant_type`, `mcc`, `email`, `website`,
+  `phone_number`, `average_ticket`, `high_ticket`, `average_monthly_volume` and a `billing_contact` address —
+  and the gate asserts that a built body carries no tax identifier, no `encrypted_tax_id`, no `owner_*`, no
+  SSN, no deposit route, no account number, no routing number, no IBAN and no card number. The eight
+  documented merchant types, the four digit MCC, the https website and the volume ordering are validated
+  before a call is made.
+- **One merchant per company, and a created merchant is final.** The attempt is stored before the call. A row
+  that carries a provider merchant id answers `already_created` with no provider call; a `pending` row answers
+  `in_flight`; a `rejected` or `unknown` row **without** a merchant id is reopened and retried, because neither
+  created anything Rainforest could duplicate. The create answer table: `2XX` with a `mid_`/`sbx_mid_` id is
+  `created` (an application id that does not parse is recorded as absent with `requiresReconciliation`, never
+  invented); `400`/`409`/`422` are `rejected` with the sanitised provider message; `401`/`403`/`404`/`405`/`415`
+  and redirects are `failed`; `408`/`425`/`429`/`5XX`, a thrown transport and a `2XX` without a merchant id are
+  `unknown` with `requiresReconciliation`.
+- **The onboarding session is scoped exactly like the payment one.** The body is
+  `{ttl, statements: [{permissions: ["group#merchant_onboarding_component"], constraints: {merchant: {merchant_id}}}]}`,
+  with the documented example lifetime of 24 hours as the onboarding default and the documented 86,400 second
+  maximum. A payment session cannot ask for the onboarding group and an onboarding session cannot ask for the
+  payment group: the group is chosen from a two-value purpose table, and both gates assert the two never cross.
+  The session key goes to the browser and is never stored or audited.
+- **Signature verification comes before anything else, and the receiver refuses when it cannot verify.** The
+  "Verify Webhooks" recipe is still unpublished (see open questions), so `receiveRainforestWebhook` requires a
+  verifier and ships `refuseRainforestWebhookVerifier` as the default: with no verifier configured, every
+  delivery is refused `401` and nothing is stored. The header names, signed content and encoding are a
+  *scheme value* rather than constants in the comparison, so confirming the recipe changes one table. The
+  reference verifier is HMAC-SHA256 over the versioned `v1,<base64>` signature list with a ±300 second
+  timestamp tolerance, using the raw body (never a re-serialised payload) and `timingSafeEqual`; it is
+  exported together with `RAINFOREST_WEBHOOK_SIGNATURE_CONFIRMED = false` and
+  `RAINFOREST_WEBHOOK_SIGNATURE_ASSUMPTION`, so the state of the integration is visible without reading code.
+- **Idempotency uses the documented pair.** The key is the resource id from `data` plus `event_type`, exactly
+  as Rainforest's on-premises guide says. The first delivery inserts a `received` row and applies the event;
+  every later delivery of that pair — including a manual portal replay, which the documentation says
+  redelivers events you may already have processed, and including the same event under a new message id — is
+  answered `duplicate` without applying anything.
+- **An event's own numbers are never the money.** A `payin.*` delivery is applied by re-reading the payin
+  through STEP 159's `readRainforestPayin`, with the amount and currency the platform expects from its own
+  record; only the documented `SUCCEEDED` at that amount and currency is `succeeded`. A delivery the platform
+  cannot tie to a known payin, a read that returns another amount, another currency, an undocumented status,
+  a `404` or an unreachable API are all `unknown` — never a success and never a failure. `merchant_application.*`
+  maps through the recorded application vocabulary (`COMPLETED` → approved, `DECLINED` → declined, everything
+  else pending) and `merchant.*` through the merchant vocabulary (`ACTIVE` → processes, `SUSPENDED`/
+  `DEACTIVATED`/`CANCELED` → blocked, `PENDING`/`ONBOARDING` → waiting); an unpublished value is `unknown`.
+- **The receiver answers the way the retry schedule requires.** Any `2XX` stops the documented retry schedule,
+  so an applied event and a duplicate both answer `200` with `{received: true}`; a signature failure is `401`,
+  an unreadable envelope is `400`, and a failure to record or apply is `500` so Rainforest retries. The
+  documented 15 second acknowledgement budget is recorded as `RAINFOREST_WEBHOOK_ACK_SECONDS`. The stored
+  delivery keeps a SHA-256 hash of the raw body and never the body or the signature.
+- **A documented resource this receiver does not act on is acknowledged and ignored** — `deposit.*`,
+  `refund.*`, `message.attempt.exhausted` and the rest still answer `200`, so an endpoint subscribed to all
+  events never accumulates failures.
+- **None of it ran against Rainforest.** No sandbox account, API key or signing key exists in this environment,
+  so the onboarding flow and every webhook path were exercised against recording transports and self-signed
+  deliveries only (260 + 193 checks). No merchant was created, no session was issued and no real signature was
+  verified.
+
 ### Open Questions (recorded, not assumed)
 
-- **The webhook signature scheme is not yet read.** The Webhooks page points to a "Verify webhooks" recipe, and that recipe answers *not found* at both `/recipes/verify-webhooks-1` and `/recipes/verify-webhooks` in this environment. The header names, the signed content, the digest algorithm and the replay tolerance must be read from it before STEP 160 implements verification, and until then no Rainforest signature may be trusted.
+- **The webhook signature scheme is still not read.** The Webhooks page points to a "Verify webhooks" recipe, and that recipe answers *not found* at `/recipes/verify-webhooks-1` and `/recipes/verify-webhooks` in this environment. STEP 160 therefore did not guess it into the code: the receiver refuses every delivery until a verifier is configured (`refuseRainforestWebhookVerifier` is the default), the header names, signed content and encoding are a scheme value, and the reference HMAC verifier is exported with `RAINFOREST_WEBHOOK_SIGNATURE_CONFIRMED = false` and `RAINFOREST_WEBHOOK_SIGNATURE_ASSUMPTION`. The recipe must be read before a production endpoint is enabled; until then no Rainforest signature may be trusted, and the reference scheme must be checked against a real delivery.
 - **The direct-to-API approval is not public.** Both the payin guide and the onboarding guide say the feature requires Rainforest approval. STEPs 159 and 160 must not assume it, and the PCI rule holds either way: no raw card number and no raw bank account number reaches this platform's servers or database.
 - **The platform's minimum API version is a portal setting** the documentation does not expose, so STEP 158 must send the `Rainforest-Api-Version` header explicitly rather than relying on a default.
 - **No sandbox account exists here.** Sandbox keys are created in the Sandbox Platform Portal, so no sandbox call was executed, no webhook endpoint was registered and nothing below is claimed as passed.
@@ -365,6 +433,15 @@ Added by STEP 159 (same reason: no Rainforest sandbox account or API key exists 
 | Create the component session | `POST /v1/sessions` | Not run | Implemented as `createRainforestSession`; the `group#payment_component` statement scoped to one merchant was exercised against a recording transport. No session key was issued by Rainforest. |
 | Render the component and take a payin | `<rainforest-payment>` in the browser | Not run | The contract is built by `rainforestPaymentComponentFor`; the page itself is STEP 183. No card was collected and no bundle was loaded. |
 | Read a payin to its documented outcome | `GET /v1/payins/{payin_id}` | Not run | Implemented as `readRainforestPayin`; the whole status and refusal table was exercised against recorded answers only. No payin exists. |
+
+Added by STEP 160 (same reason: no Rainforest sandbox account, API key or signing key exists here):
+
+| Step | Call | Result | Details |
+|---|---|---|---|
+| Create a merchant for a company | `POST /v1/merchants` | Not run | Implemented as `provisionRainforestMerchant` with a stored, version-guarded one-per-company record; exercised against a recording transport only. No merchant exists at Rainforest. |
+| Start onboarding and render the component | `POST /v1/sessions` + `<rainforest-merchant-onboarding>` | Not run | Implemented as `startRainforestOnboarding` and `rainforestOnboardingComponentFor`; the scoped session and the component contract were exercised against a recording transport. No session key was issued by Rainforest and no component was rendered. |
+| Receive and verify a signed webhook | `POST /webhooks/rainforest` | Not run | Implemented as `receiveRainforestWebhook` with a pluggable verifier; exercised with self-signed deliveries only, because no portal signing key exists here and the recipe is unread. |
+| Survive a replay of the same event | `POST /webhooks/rainforest` (replay) | Not run | Implemented as the resource-id-plus-event-type idempotency record; a replayed delivery was exercised locally. No real replay was received. |
 
 The record these notes produce is `partial`, never `verified`: `calculateRainforestStatus` requires the
 whole five step cycle to be present and passed before a record can read as verified.
