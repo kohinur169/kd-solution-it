@@ -86,3 +86,62 @@ Recorded rules from those pages:
 - Charges: Yes
 - Payouts: No (NMI is payments only)
 - Connected accounts: Yes (creates sub-merchants)
+
+## Payoneer (STEP 154)
+
+Payoneer is a payouts-only provider for this platform: it accepts no card payments and creates no
+sub-merchant. The provider matrix in `lib/gateways/registry.ts` records it as `-P-` (no acceptance, payouts, no
+sub-merchants). The service that records a verification is `lib/payments/adapters/payoneer.ts`.
+
+### Documentation Sources (read in the STEP 154 session, 2026-11-06)
+
+| Topic | URL | What it established |
+|---|---|---|
+| Developer platform index | https://www.payoneer.com/developers-docs/ | The product families; payouts live under Mass Payout, and the program-scope API reference is the separate reference document. |
+| Mass Payout product index | https://www.payoneer.com/developers-docs/mass-payout/ | The three payout pages: payee onboarding, submit mass payout, and the China SAFE variant. |
+| Submit mass payout | https://www.payoneer.com/developers-docs/mass-payout/mass-submit-payout/ | `POST /v4/programs/{program_id}/masspayouts`, the `Payments` array fields, the 500 payout limit, pre-deposited funds and asynchronous processing. |
+| Payee onboarding | https://www.payoneer.com/developers-docs/mass-payout/mass-payee-onboarding/ | `POST /v4/programs/{program_id}/payees/registration-link` and its redirect URL, `already_have_an_account`, prefill and `lock_type`, and the payee status endpoint. |
+| Payout status query | https://www.payoneer.com/developers-docs/business-funding/business-funding-getting-started/ | `GET /v4/programs/{program_id}/payouts/{client_reference_id}/status` and its `result` fields, including `load_date` present only once the status is `Transferred`. |
+| Program API reference | https://developer.payoneer.com/docs/mass-payouts-and-services.html | The endpoint catalogue, the token management APIs, payee and payout submission groups, the webhook catalogue, and the reference tables. |
+| White-label payouts guide V4 | https://developer.payoneer.com/docs/white-label-payouts-v4.html | The integration flow and the IPCN notification sections. |
+| Sandbox environment and communication security | https://developer.payoneer.com/psd2/get-started | The sandbox and production authorization hosts (`login.sandbox.payoneer.com`, `login.payoneer.com`) and the TLS 1.2 requirement. |
+
+### Recorded Rules
+
+- Sandbox API base `https://api.sandbox.payoneer.com`; production `https://api.payoneer.com`. Sandbox and production credentials differ, so moving to production changes the base URL and the credentials only.
+- Authorization hosts `https://login.sandbox.payoneer.com` and `https://login.payoneer.com`; calls carry an OAuth2 bearer token, and the token management APIs cover access tokens, application tokens, refresh and revoke.
+- Communications require TLS 1.2 or better.
+- Mass payout is `POST /v4/programs/{program_id}/masspayouts` with a `Payments` array; each payment carries `client_reference_id`, `payee_id`, `amount`, `currency` and `description`. One call carries at most 500 payouts, and the program must already hold deposited funds.
+- Payout processing is asynchronous: the platform follows a payout through the status endpoint or the IPCN notifications, never through the submit answer alone.
+- Payee onboarding is `POST /v4/programs/{program_id}/payees/registration-link`, which answers a URL the payee is redirected to. `payee_id` is the platform's own identifier and is what every later payout names. The link can pre-fill payee data and lock fields with `lock_type`, and `already_have_an_account` links an existing Payoneer account instead of a sign-up.
+- A payee must be `Active` before it can receive payments; the status is read with `GET /v4/programs/{program_id}/payees/{ClientPayeeID}/status` or notified by webhook.
+- Payout status is `GET /v4/programs/{program_id}/payouts/{client_reference_id}/status`, answered with `status`, `amount`, `currency`, `target_amount`, `target_currency`, `payee_id`, `payout_id`, `scheduled_payout_date` and `load_date`.
+- Webhook consumer URLs are configured per notification in the Settings tab of the Payoneer Admin Console. The documented notifications cover payee approved and declined, payout request received and accepted, account or card loaded, sent to bank, failed bank transfer, payout canceled, and account funded.
+- A failed notification delivery is retried; the published integration guide documents five additional attempts before an email is sent to a pre-configured address in the client's organization.
+- The reference publishes error, field-validation, payee-declined, pending-payout and cancel-payout reason tables; STEP 156 must map against those tables rather than inventing status strings.
+
+### Open Questions (recorded, not assumed)
+
+- **Webhook signing is not yet read.** The API reference lists a Webhooks Security section, but its text is rendered by script and was not readable in this session. The exact header and digest must be read from that section before STEP 157 implements verification, and until then no Payoneer signature may be trusted. (A third-party SDK describes an `Authorization: hmacauth <AppName>:<Signature>:<Nonce>:<Timestamp>` header with HMAC-SHA256 over app name, method, URL, timestamp, nonce and body digest; that is **not** first-party and is recorded here only so nobody mistakes it for verified documentation.)
+- **Token lifetime is not stated** on the pages read; STEP 155 must treat expiry as unknown and refresh from the token answer rather than assuming a fixed lifetime.
+- **No sandbox credentials exist** in this environment: Payoneer issues them during account setup, so no sandbox call was executed and nothing below is claimed as passed.
+
+### Sandbox Notes
+
+| Step | Call | Result | Details |
+|---|---|---|---|
+| Create a registration link | `POST /v4/programs/{program_id}/payees/registration-link` | Not run | No Payoneer sandbox credentials exist in this environment. |
+| Read the payee status | `GET /v4/programs/{program_id}/payees/{payee_id}/status` | Not run | No Payoneer sandbox credentials exist in this environment. |
+| Submit a single payout | `POST /v4/programs/{program_id}/masspayouts` | Not run | No Payoneer sandbox credentials exist in this environment. |
+| Read the payout status to `Transferred` | `GET /v4/programs/{program_id}/payouts/{client_reference_id}/status` | Not run | No Payoneer sandbox credentials exist in this environment. |
+| Receive and verify a signed IPCN | `POST /ipcn/{notification}` | Not run | No endpoint is registered and the signing scheme is not yet read (see open questions). |
+
+The record these notes produce is `partial`, never `verified`: `calculatePayoneerStatus` requires the whole five
+step cycle to be present and passed before a record can read as verified.
+
+### Capability Matrix
+
+- Charges: No
+- Payouts: Yes
+- Connected accounts: No (Payoneer pays registered payees; it does not create sub-merchants)
+
