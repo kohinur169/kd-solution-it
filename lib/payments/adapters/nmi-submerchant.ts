@@ -278,7 +278,7 @@ const BANK_ACCOUNT_PATTERN = /^[0-9]{4,17}$/u;
 const BANK_ROUTING_PATTERN = /^[0-9]{9}$/u;
 
 /** The gateway merchant id shape: `0054`'s `provider_submerchant_id` check, applied here first. */
-export const NMI_MERCHANT_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/u;
+export const NMI_MERCHANT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/u;
 
 /** The affiliate reference shape: `0054`'s `master_account_ref` check, applied here first. */
 export const NMI_AFFILIATE_REFERENCE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,119}$/u;
@@ -1058,6 +1058,11 @@ export const NMI_PROVISION_EVENT_TYPES: Readonly<Record<string, NmiProvisionEven
   "settlement.batch.complete": "submerchant.verified",
 });
 
+/** True when every mapping key is a documented NMI event name; the gate asserts this. */
+export function nmiProvisionEventTypesAreDocumented(): boolean {
+  return Object.keys(NMI_PROVISION_EVENT_TYPES).every((name) => NMI_DOCUMENTED_WEBHOOK_EVENTS.includes(name));
+}
+
 /** The provisioning event a provider event becomes, or null when it is not provisioning evidence. */
 export function nmiProvisionEventOf(providerEventType: string): NmiProvisionEventType | null {
   const mapped = NMI_PROVISION_EVENT_TYPES[providerEventType];
@@ -1132,8 +1137,10 @@ function isTestModeOfEventBody(eventBody: Readonly<Record<string, unknown>>): bo
  * - A delivery that fails verification is stored as `rejected` with `signature_ok = false` when its
  *   body names an event id, and writes no event and no status. It is kept because section 29 wants
  *   the attempt visible; `0032`'s own check is what forbids such a row from ever being `processed`.
- * - A delivery whose event id is already stored answers `duplicate` and writes nothing. The
- *   signature scheme has no replay window, so this is the replay defence.
+ * - A delivery that verifies but whose event id is already stored answers `duplicate` and writes
+ *   nothing. The signature scheme has no replay window, so this is the replay defence. Verification
+ *   is decided first: an unverified delivery is always `rejected`, even when it names a known event,
+ *   so a forged body can never be answered as "already received".
  * - A delivery whose body does not parse, whose envelope is not the documented `{ event_id,
  *   event_type, event_body }`, or whose body is too large is recorded as `failed` with a bounded
  *   detail, and nothing is applied.
@@ -1167,20 +1174,20 @@ export function receiveNmiWebhook(delivery: NmiWebhookDelivery, options: NmiWebh
   }
 
   const envelope = payload.envelope;
-  const existing = options.eventStore.findByExternalEventId(delivery.mode, envelope.eventId);
-  if (existing !== null) {
-    return {
-      status: "duplicate",
-      reason: "the gateway event was already received",
-      event: existing,
-      providerEventType: existing.eventType,
-      normalized: null,
-    };
-  }
-
   const payloadHash = nmiWebhookPayloadHash(delivery.rawBody);
 
   if (signatureOk === false) {
+    const alreadyStored = options.eventStore.findByExternalEventId(delivery.mode, envelope.eventId);
+    if (alreadyStored !== null) {
+      return {
+        status: "rejected",
+        reason: "the delivery signature did not verify",
+        event: alreadyStored,
+        providerEventType: alreadyStored.eventType,
+        normalized: null,
+      };
+    }
+
     const rejectedEvent: NmiWebhookEventRecord = {
       id: randomUUID(),
       companyId: null,
@@ -1205,6 +1212,17 @@ export function receiveNmiWebhook(delivery: NmiWebhookDelivery, options: NmiWebh
       reason: "the delivery signature did not verify",
       event: rejectedEvent,
       providerEventType: envelope.eventType,
+      normalized: null,
+    };
+  }
+
+  const existing = options.eventStore.findByExternalEventId(delivery.mode, envelope.eventId);
+  if (existing !== null) {
+    return {
+      status: "duplicate",
+      reason: "the gateway event was already received",
+      event: existing,
+      providerEventType: existing.eventType,
       normalized: null,
     };
   }
