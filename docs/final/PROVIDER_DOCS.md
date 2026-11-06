@@ -261,6 +261,78 @@ its published markdown form.
   It does not prove payments or merchants — that is STEP 159 and STEP 160, and they may only run once a key
   is active.
 
+### Verified for STEP 159: payment acceptance through the component (2026-11-06)
+
+- **The acceptance path is the component path, not the API path.** `POST /v1/payins` with a card or a bank
+  account is the direct-to-API flow, which the documentation gates behind Rainforest approval (see open
+  questions) and which would put the platform's servers inside cardholder-data scope. STEP 159 therefore
+  builds the three documented component steps and nothing else: create the payin config
+  (`POST /v1/payin_configs`), create the session (`POST /v1/sessions`), and read the outcome
+  (`GET /v1/payins/{payin_id}`) that the component's `approved` event hands back as `payin_id`.
+- **No input type in the adapter can carry a card or a bank account number.** The payin config body is built
+  from a fixed documented field list — `merchant_id`, `idempotency_key`, `amount`, `currency_code` and, when
+  supplied, `billing_contact`, `amount_splits` and `metadata` — and the gate asserts that a built body holds
+  no card, card-number, CVV, account-number, routing-number or IBAN field and no card-number text. Anything
+  sensitive is collected by the component in the browser, which is what the documentation means by
+  "without exposing your platform to the sensitive payment data".
+- **The payin config is validated against the documented field rules.** `amount` is minor units with the
+  documented minimum of 1 and a ceiling of the largest integer the provider's `integer` field carries
+  safely; `currency_code` is the platform's single currency, USD; the merchant id must carry the documented
+  `mid_`/`sbx_mid_` prefix; at most one `PLATFORM` split is allowed, each `MERCHANT` split must name a valid
+  and unique merchant, and the splits may not add up past the payin; metadata is non-sensitive and capped
+  (20 keys, key shape, 200 characters per value). A `billing_contact` is only sent when it is valid, and its
+  documented keys are `name`, `postal_code`, `country`, `state`, `email` and `phone` — the component asks the
+  user for whatever the config does not pre-fill, and a card payin needs the postal code while an ACH payin
+  needs the name.
+- **Creation is idempotent and never sends twice.** The submission row (one per company and idempotency key,
+  company/key/merchant/amount/currency immutable, forward-only outcome, version-guarded) is stored **before**
+  the call. A replay answers from the store; a replay with another amount, merchant or currency is refused
+  because the same key with different details is a mistake, not a retry; an in-flight duplicate answers
+  `unknown` without a provider call. A payin config may back **one successful payin** and may be reused to
+  retry after a failure, which is what the caller's retry loop relies on.
+- **The creation answer table.** `2XX` naming a documented `cfg_`/`sbx_cfg_` id is `created`. `400`, `409` and
+  `422` are the documented validation answers and are `rejected` with the `errors[].field` and
+  `errors[].message` carried sanitised. `401`, `403`, `404`, `405`, `415` and any redirect prove no config was
+  created and are `failed`. `408`, `425`, `429`, every `5XX`, a thrown transport, and a `2XX` without a usable
+  config id are `unknown` with `requiresReconciliation` — the config may exist, and replaying the same key is
+  how the caller settles it.
+- **The session is scoped down to one merchant and one permission group.** The body is
+  `{ttl, statements: [{permissions: ["group#payment_component"], constraints: {merchant: {merchant_id}}}]}`,
+  straight from the session reference: the documented maximum lifetime is 86,400 seconds, this adapter
+  defaults to 3,600 and refuses anything under 60 or over the maximum, and it never asks for `group#all`
+  because a browser credential must do the one thing the page needs. The `session_key` (`sessionkey_…`) is
+  returned to the caller — the documentation says a session is designed to be transmitted to the front-end —
+  and is **never** written to the submission store, an audit entry or an error message; the gate asserts
+  that. A session answer without a usable key fails; a `400`/`422` is `rejected`; anything else fails, which
+  is safe to retry because a session moves no money.
+- **The component contract is published as data, not rendered here.** `rainforestPaymentComponentFor`
+  returns the documented element `<rainforest-payment session-key="…" payin-config-id="…">`, the bundle of
+  the environment (`https://static.rainforestpay.com/sandbox.payment.js`, production
+  `https://static.rainforestpay.com/payment.js`), and refuses to build half a contract from a session key or
+  config id of the wrong shape. A Content Security Policy must allow `*.rainforestpay.com` in `script-src`
+  and `frame-src` for the component to load; STEP 183 renders it.
+- **Reading a payin has exactly one success.** Only the documented `SUCCEEDED` status — funds available to
+  deposit — maps to `succeeded`, and only when the amount and the currency the provider reports equal the
+  ones the platform created the config for. A mismatch is `unknown` with `requiresReconciliation`, never a
+  success, because a payin that settled another amount is a person's problem, not a ledger entry. `CREATED`,
+  `PRESENTING`, `AUTHORIZED`, `PROCESSING` and `IN_REVIEW` are `pending`; `FAILED`, `RETURNED` and `CANCELED`
+  are `failed` with the provider's `refusal_code` and its `detailed_refusal_desc` (preferred) or `refusal_desc`,
+  sanitised and capped. The 23 documented refusal codes are recorded verbatim, and a code Rainforest has not
+  published is carried as text with `refusalCodeKnown: false` rather than being treated as known.
+- **A read never produces evidence that no money moved.** An undocumented status, a missing `data`, an empty
+  or unparseable body, a `404`, and every non-`2XX` answer or thrown transport are `unknown` with
+  `requiresReconciliation`. That is the platform's rule from STEP 130/132: only a success may post, and an
+  unreadable answer may not be recorded as a failure.
+- **This is not the payment core.** The adapter writes no payment record, no ledger entry and no invoice; the
+  core has no acceptance port yet, so the adapter publishes the provider-side contract
+  (`succeeded`/`pending`/`failed`/`unknown`) that the route or job maps onto STEP 130's payment and STEP 132's
+  ledger. It is not the webhook receiver either — delivery verification and `payin.processing` /
+  `payin.failed` are STEP 160's.
+- **None of it ran against Rainforest.** No sandbox account or API key exists in this environment, so the
+  creation, session and read paths were exercised against recording transports only (440 checks in
+  `lib/payments/adapters/rainforest-payment-verify.ts`). No payin was taken, no session was issued and no
+  card was ever collected.
+
 ### Open Questions (recorded, not assumed)
 
 - **The webhook signature scheme is not yet read.** The Webhooks page points to a "Verify webhooks" recipe, and that recipe answers *not found* at both `/recipes/verify-webhooks-1` and `/recipes/verify-webhooks` in this environment. The header names, the signed content, the digest algorithm and the replay tolerance must be read from it before STEP 160 implements verification, and until then no Rainforest signature may be trusted.
@@ -284,6 +356,15 @@ Added by STEP 158 (same reason: no Rainforest sandbox account or API key exists 
 |---|---|---|---|
 | Test a sealed key against the API | `GET /v1/api_keys` | Not run | Implemented as `testRainforestConnection`; exercised against a recording transport only. No key was sent to Rainforest. |
 | Activate a key after a passing test | none (a state transition) | Not run | Implemented as `activateRainforestConfig`; no configuration is active in any real environment. |
+
+Added by STEP 159 (same reason: no Rainforest sandbox account or API key exists here):
+
+| Step | Call | Result | Details |
+|---|---|---|---|
+| Create a payin config for a merchant | `POST /v1/payin_configs` | Not run | Implemented as `createRainforestPayinConfig` with a stored, version-guarded idempotency record; exercised against a recording transport only. No config exists at Rainforest. |
+| Create the component session | `POST /v1/sessions` | Not run | Implemented as `createRainforestSession`; the `group#payment_component` statement scoped to one merchant was exercised against a recording transport. No session key was issued by Rainforest. |
+| Render the component and take a payin | `<rainforest-payment>` in the browser | Not run | The contract is built by `rainforestPaymentComponentFor`; the page itself is STEP 183. No card was collected and no bundle was loaded. |
+| Read a payin to its documented outcome | `GET /v1/payins/{payin_id}` | Not run | Implemented as `readRainforestPayin`; the whole status and refusal table was exercised against recorded answers only. No payin exists. |
 
 The record these notes produce is `partial`, never `verified`: `calculateRainforestStatus` requires the
 whole five step cycle to be present and passed before a record can read as verified.
