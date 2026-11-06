@@ -6,6 +6,7 @@ import { requireAnyRole, requireCompanyId } from "../../lib/auth/session.ts";
 import type { RequestActor } from "../../lib/auth/types.ts";
 import { AppError } from "../../lib/errors/app-error.ts";
 import { INVOICE_CREATED_STATUS, INVOICE_ITEMS_TABLE } from "./invoice-fields.ts";
+import { INVOICE_PAID_LOCKED_RULE, INVOICE_PAID_STATUS } from "./invoice-status.ts";
 import { INVOICE_LINE_COLUMNS, invoiceLineRowSchema, lineOf, type InvoiceLine } from "./invoice-lines.ts";
 
 /**
@@ -53,25 +54,80 @@ import { INVOICE_LINE_COLUMNS, invoiceLineRowSchema, lineOf, type InvoiceLine } 
  * else rather than pretending to support it.
  */
 
-/** The audit action of a move. */
+/** The audit action of an invoice's move. */
 export const INVOICE_LINE_MOVED_AUDIT_ACTION = "invoice.line_moved";
 
-/** The two directions the editor offers, named for the button that sends them. */
-export const INVOICE_LINE_MOVE_DIRECTIONS = ["up", "down"] as const;
+/** The two directions an editor offers, named for the button that sends them. */
+export const DOCUMENT_LINE_MOVE_DIRECTIONS = ["up", "down"] as const;
 
-export type InvoiceLineMoveDirection = (typeof INVOICE_LINE_MOVE_DIRECTIONS)[number];
+export type DocumentLineMoveDirection = (typeof DOCUMENT_LINE_MOVE_DIRECTIONS)[number];
 
-export interface InvoiceLineOrderDependencies {
+/** The invoice's own names for the same two directions, kept because its gate and its route use them. */
+export const INVOICE_LINE_MOVE_DIRECTIONS = DOCUMENT_LINE_MOVE_DIRECTIONS;
+
+export type InvoiceLineMoveDirection = DocumentLineMoveDirection;
+
+export interface DocumentLineOrderDependencies {
   readonly rest: RestClient;
   readonly audit: AuditTrail;
   readonly now?: () => number;
 }
+
+/** The invoice's own name for the same dependencies. */
+export type InvoiceLineOrderDependencies = DocumentLineOrderDependencies;
 
 /** The role and the company, read from the session and never from the body. */
 function requireOrderActor(actor: RequestActor): string {
   requireAnyRole(actor, Object.freeze(["owner"] as const));
 
   return requireCompanyId(actor);
+}
+
+/**
+ * What one document family's line order needs to know about itself.
+ *
+ * ## Why the swap is written once
+ *
+ * `0023` and `0026` declare the same shape of index - a partial unique key on `(parent, position)` over the
+ * live rows, not deferrable - so the three-write argument above is not an invoice argument, it is an
+ * argument about that index. A quote's editor needs the identical swap, and a second copy of a
+ * concurrency-critical sequence is a second place to get it wrong with nothing to catch the difference:
+ * both copies pass their own gate. So the swap lives here once, parameterised by the two table names, the
+ * column a line points at its parent with, the columns the editor reads, the status whose lines may move,
+ * and the vocabulary the move is reported and audited in.
+ *
+ * What stays document-specific is the mapping from a row to the printed line, which each family owns.
+ */
+export interface DocumentLineOrder<TRow, TLine> {
+  /** `invoices`, `estimates`. */
+  readonly parentTable: string;
+  /** `invoice_items`, `estimate_items`. */
+  readonly itemsTable: string;
+  /** The column a line points at its parent with: `invoice_id`, `estimate_id`. */
+  readonly parentColumn: string;
+  /** The `select=`-prefixed columns the editor reads one line with: rule 17, never a `*`. */
+  readonly lineColumns: string;
+  /** The only status whose lines may move; a decided document is frozen by its own trigger. */
+  readonly draftStatus: string;
+  /**
+   * Optional: a status that is refused with its own rule rather than the generic "already changed",
+   * because the section gives it a sentence of its own. An invoice is locked once it is paid.
+   */
+  readonly lockedStatus?: string;
+  /** The rule the locked status is refused with. */
+  readonly lockedRule?: string;
+  /** The audit action of a move in this family's vocabulary. */
+  readonly movedAction: string;
+  /** The audit entity a line is: `invoice_line`, `estimate_line`. */
+  readonly lineEntity: string;
+  /** The rule name a missing parent is reported under. */
+  readonly parentRule: string;
+  /** The rule name a missing line is reported under. */
+  readonly lineRule: string;
+  /** The row schema of the items table, which is also what the returned lines are validated by. */
+  readonly rowSchema: z.ZodType<TRow>;
+  /** One row as this family prints it. */
+  readonly lineOf: (row: TRow) => TLine;
 }
 
 async function appendTolerated(audit: AuditTrail, entry: Parameters<AuditTrail["append"]>[0]): Promise<void> {
@@ -84,45 +140,63 @@ async function appendTolerated(audit: AuditTrail, entry: Parameters<AuditTrail["
 
 /** The parent's status, or a refusal. Mirrors `requireDraftParent` in `invoice-lines.ts`. */
 async function requireDraftStatus(
+  document: {
+    readonly parentTable: string;
+    readonly draftStatus: string;
+    readonly parentRule: string;
+    readonly lockedStatus?: string;
+    readonly lockedRule?: string;
+  },
   dependencies: InvoiceLineOrderDependencies,
-  input: { readonly companyId: string; readonly invoiceId: string },
+  input: { readonly companyId: string; readonly parentId: string },
 ): Promise<void> {
   const rows = await dependencies.rest.select(
-    "invoices",
-    `select=id,status&id=eq.${input.invoiceId}&company_id=eq.${input.companyId}&deleted_at=is.null`,
+    document.parentTable,
+    `select=id,status&id=eq.${input.parentId}&company_id=eq.${input.companyId}&deleted_at=is.null`,
     z.object({ id: z.string().uuid(), status: z.string().min(1) }),
   );
 
   if (rows[0] === undefined) {
-    throw new AppError("RESOURCE_NOT_FOUND", { cause: { rule: "invoice", reason: "not_found" } });
+    throw new AppError("RESOURCE_NOT_FOUND", {
+      cause: { rule: document.parentRule, reason: "not_found" },
+    });
   }
 
-  if (rows[0].status !== INVOICE_CREATED_STATUS) {
+  // The locked status, when the family names one, is answered with its own sentence: a document that
+  // is refused because the money has settled is not the same answer as one that merely is no longer a
+  // draft. Mirrors `requireDraftParent` in `invoice-lines.ts`.
+  if (document.lockedStatus !== undefined && rows[0].status === document.lockedStatus) {
+    throw new AppError("CONFLICT", { details: [{ field: "status", rule: document.lockedRule ?? "locked" }] });
+  }
+
+  if (rows[0].status !== document.draftStatus) {
     throw new AppError("CONFLICT", { details: [{ field: "status", rule: "already_changed" }] });
   }
 }
 
-/** The live lines of one invoice in print order. */
+/** The live lines of one document in print order. */
 async function readOrderedLines(
+  document: { readonly itemsTable: string; readonly parentColumn: string },
   rest: RestClient,
   companyId: string,
-  invoiceId: string,
+  parentId: string,
 ): Promise<readonly { readonly id: string; readonly position: number }[]> {
   return rest.select(
-    INVOICE_ITEMS_TABLE,
-    `select=id,position&invoice_id=eq.${invoiceId}&company_id=eq.${companyId}&deleted_at=is.null&order=position.asc`,
+    document.itemsTable,
+    `select=id,position&${document.parentColumn}=eq.${parentId}&company_id=eq.${companyId}&deleted_at=is.null&order=position.asc`,
     z.object({ id: z.string().uuid(), position: z.number().int() }),
   );
 }
 
 /** One scoped position write. */
 async function writePosition(
+  document: { readonly itemsTable: string; readonly parentColumn: string },
   rest: RestClient,
-  input: { readonly companyId: string; readonly invoiceId: string; readonly lineId: string; readonly position: number },
+  input: { readonly companyId: string; readonly parentId: string; readonly lineId: string; readonly position: number },
 ): Promise<void> {
   await rest.update(
-    INVOICE_ITEMS_TABLE,
-    `id=eq.${input.lineId}&company_id=eq.${input.companyId}&invoice_id=eq.${input.invoiceId}&deleted_at=is.null`,
+    document.itemsTable,
+    `id=eq.${input.lineId}&company_id=eq.${input.companyId}&${document.parentColumn}=eq.${input.parentId}&deleted_at=is.null`,
     { position: input.position },
   );
 }
@@ -137,7 +211,120 @@ async function writePosition(
  * disables, and a request that arrives anyway is answered with the list unchanged rather than a refusal.
  * That is a deliberate difference from a bad id, which is a 404: a move that cannot happen is a no-op the
  * caller can ignore, while an id that does not exist is a mistake worth naming.
+ *
+ * The sequence is the three-write swap described at the top of this module, and it is the same sequence for
+ * every document family that declares a non-deferrable partial unique key on `(parent, position)`.
  */
+export async function moveDocumentLine<TRow, TLine>(
+  document: DocumentLineOrder<TRow, TLine>,
+  input: {
+    readonly actor: RequestActor;
+    readonly parentId: string;
+    readonly lineId: string;
+    readonly direction: DocumentLineMoveDirection;
+  },
+  dependencies: DocumentLineOrderDependencies,
+): Promise<{ readonly movedLineId: string; readonly lines: readonly TLine[] }> {
+  const companyId = requireOrderActor(input.actor);
+
+  await requireDraftStatus(document, dependencies, { companyId, parentId: input.parentId });
+
+  const ordered = await readOrderedLines(document, dependencies.rest, companyId, input.parentId);
+  const index = ordered.findIndex((line) => line.id === input.lineId);
+
+  if (index === -1) {
+    throw new AppError("RESOURCE_NOT_FOUND", { cause: { rule: document.lineRule, reason: "not_found" } });
+  }
+
+  const neighbourIndex = input.direction === "up" ? index - 1 : index + 1;
+
+  // A move past either end is a no-op, and answers with the list as it stands.
+  if (neighbourIndex < 0 || neighbourIndex >= ordered.length) {
+    const unchanged = await dependencies.rest.select(
+      document.itemsTable,
+      `${document.lineColumns}&${document.parentColumn}=eq.${input.parentId}&company_id=eq.${companyId}&deleted_at=is.null&order=position.asc`,
+      document.rowSchema,
+    );
+
+    return { movedLineId: input.lineId, lines: unchanged.map((line) => document.lineOf(line)) };
+  }
+
+  const moving = ordered[index];
+  const displaced = ordered[neighbourIndex];
+
+  if (moving === undefined || displaced === undefined) {
+    throw new AppError("INTERNAL_ERROR", { cause: { rule: document.lineRule, reason: "order_changed" } });
+  }
+
+  // The parking position: one past the highest live position, which by definition no row holds.
+  const parked = ordered.reduce((highest, line) => Math.max(highest, line.position), 0) + 1;
+
+  // 1. park the moving line, freeing the position it held.
+  await writePosition(document, dependencies.rest, {
+    companyId,
+    parentId: input.parentId,
+    lineId: moving.id,
+    position: parked,
+  });
+
+  // 2. the displaced line takes the moving line's old position, which is now free.
+  await writePosition(document, dependencies.rest, {
+    companyId,
+    parentId: input.parentId,
+    lineId: displaced.id,
+    position: moving.position,
+  });
+
+  // 3. the moving line takes the displaced line's old position, which step 2 just freed.
+  await writePosition(document, dependencies.rest, {
+    companyId,
+    parentId: input.parentId,
+    lineId: moving.id,
+    position: displaced.position,
+  });
+
+  await appendTolerated(dependencies.audit, {
+    action: document.movedAction,
+    actorUserId: input.actor.userId,
+    entityType: document.lineEntity,
+    entityId: moving.id,
+    companyId,
+    sessionId: input.actor.sessionId ?? null,
+    payload: {
+      [document.parentColumn]: input.parentId,
+      direction: input.direction,
+      from_position: moving.position,
+      to_position: displaced.position,
+    },
+  });
+
+  const reordered = await dependencies.rest.select(
+    document.itemsTable,
+    `${document.lineColumns}&${document.parentColumn}=eq.${input.parentId}&company_id=eq.${companyId}&deleted_at=is.null&order=position.asc`,
+    document.rowSchema,
+  );
+
+  return { movedLineId: moving.id, lines: reordered.map((line) => document.lineOf(line)) };
+}
+
+/** The invoice's own line order, which is `0023`'s table and column names and this module's swap. */
+const INVOICE_LINE_ORDER: DocumentLineOrder<z.infer<typeof invoiceLineRowSchema>, InvoiceLine> = {
+  parentTable: "invoices",
+  itemsTable: INVOICE_ITEMS_TABLE,
+  parentColumn: "invoice_id",
+  lineColumns: INVOICE_LINE_COLUMNS,
+  draftStatus: INVOICE_CREATED_STATUS,
+  lockedStatus: INVOICE_PAID_STATUS,
+  lockedRule: INVOICE_PAID_LOCKED_RULE,
+  movedAction: INVOICE_LINE_MOVED_AUDIT_ACTION,
+  lineEntity: "invoice_line",
+  parentRule: "invoice",
+  lineRule: "invoice_line",
+  rowSchema: invoiceLineRowSchema,
+  lineOf,
+};
+
+/** Move one line of a draft invoice, which is the invoice's names on the shared swap. */
 export async function moveInvoiceLine(
   input: {
     readonly actor: RequestActor;
@@ -147,84 +334,9 @@ export async function moveInvoiceLine(
   },
   dependencies: InvoiceLineOrderDependencies,
 ): Promise<{ readonly movedLineId: string; readonly lines: readonly InvoiceLine[] }> {
-  const companyId = requireOrderActor(input.actor);
-
-  await requireDraftStatus(dependencies, { companyId, invoiceId: input.invoiceId });
-
-  const ordered = await readOrderedLines(dependencies.rest, companyId, input.invoiceId);
-  const index = ordered.findIndex((line) => line.id === input.lineId);
-
-  if (index === -1) {
-    throw new AppError("RESOURCE_NOT_FOUND", { cause: { rule: "invoice_line", reason: "not_found" } });
-  }
-
-  const neighbourIndex = input.direction === "up" ? index - 1 : index + 1;
-
-  // A move past either end is a no-op, and answers with the list as it stands.
-  if (neighbourIndex < 0 || neighbourIndex >= ordered.length) {
-    const unchanged = await dependencies.rest.select(
-      INVOICE_ITEMS_TABLE,
-      `${INVOICE_LINE_COLUMNS}&invoice_id=eq.${input.invoiceId}&company_id=eq.${companyId}&deleted_at=is.null&order=position.asc`,
-      invoiceLineRowSchema,
-    );
-
-    return { movedLineId: input.lineId, lines: unchanged.map((line) => lineOf(line)) };
-  }
-
-  const moving = ordered[index];
-  const displaced = ordered[neighbourIndex];
-
-  if (moving === undefined || displaced === undefined) {
-    throw new AppError("INTERNAL_ERROR", { cause: { rule: "invoice_line", reason: "order_changed" } });
-  }
-
-  // The parking position: one past the highest live position, which by definition no row holds.
-  const parked = ordered.reduce((highest, line) => Math.max(highest, line.position), 0) + 1;
-
-  // 1. park the moving line, freeing the position it held.
-  await writePosition(dependencies.rest, {
-    companyId,
-    invoiceId: input.invoiceId,
-    lineId: moving.id,
-    position: parked,
-  });
-
-  // 2. the displaced line takes the moving line's old position, which is now free.
-  await writePosition(dependencies.rest, {
-    companyId,
-    invoiceId: input.invoiceId,
-    lineId: displaced.id,
-    position: moving.position,
-  });
-
-  // 3. the moving line takes the displaced line's old position, which step 2 just freed.
-  await writePosition(dependencies.rest, {
-    companyId,
-    invoiceId: input.invoiceId,
-    lineId: moving.id,
-    position: displaced.position,
-  });
-
-  await appendTolerated(dependencies.audit, {
-    action: INVOICE_LINE_MOVED_AUDIT_ACTION,
-    actorUserId: input.actor.userId,
-    entityType: "invoice_line",
-    entityId: moving.id,
-    companyId,
-    sessionId: input.actor.sessionId ?? null,
-    payload: {
-      invoice_id: input.invoiceId,
-      direction: input.direction,
-      from_position: moving.position,
-      to_position: displaced.position,
-    },
-  });
-
-  const reordered = await dependencies.rest.select(
-    INVOICE_ITEMS_TABLE,
-    `${INVOICE_LINE_COLUMNS}&invoice_id=eq.${input.invoiceId}&company_id=eq.${companyId}&deleted_at=is.null&order=position.asc`,
-    invoiceLineRowSchema,
+  return moveDocumentLine(
+    INVOICE_LINE_ORDER,
+    { actor: input.actor, parentId: input.invoiceId, lineId: input.lineId, direction: input.direction },
+    dependencies,
   );
-
-  return { movedLineId: moving.id, lines: reordered.map((line) => lineOf(line)) };
 }

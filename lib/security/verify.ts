@@ -3432,8 +3432,10 @@ async function checkEncryptionWiring(): Promise<void> {
     "the file ceiling is the one the files table states",
   );
 
-  const roots = [new URL("../../lib/", import.meta.url), new URL("../../app/", import.meta.url)];
-  const cryptoUsers: string[] = [];
+  const libRoot = new URL("../../lib/", import.meta.url);
+  const roots = [libRoot, new URL("../../app/", import.meta.url)];
+  const cipherCallers: string[] = [];
+  const algorithmNamers: string[] = [];
 
   for (const root of roots) {
     const prefix = root.pathname.endsWith("/lib/") ? "lib/" : "app/";
@@ -3444,17 +3446,44 @@ async function checkEncryptionWiring(): Promise<void> {
     for (const entry of entries) {
       const text = await readFile(new URL(entry, root), "utf8");
 
-      if (!entry.endsWith("verify.ts") && text.includes("aes-256-gcm")) {
-        cryptoUsers.push(`${prefix}${entry}`);
+      if (entry.endsWith("verify.ts")) {
+        continue;
+      }
+
+      // A module encrypts when it calls a cipher constructor. Naming the algorithm is not encrypting:
+      // `lib/storage` stores the name beside a sealed file so a reader knows what would unseal it, and
+      // delegates the cipher itself to this module. Counting names therefore counted readers as writers,
+      // which is the one mistake this claim cannot afford - it is the claim that keeps encryption in two
+      // places rather than letting a fifth module quietly grow its own.
+      if (/createCipheriv|createDecipheriv/u.test(text)) {
+        cipherCallers.push(`${prefix}${entry}`);
+      }
+
+      if (text.includes("aes-256-gcm")) {
+        algorithmNamers.push(`${prefix}${entry}`);
       }
     }
   }
 
   expectEqual(
-    cryptoUsers.sort().join(","),
+    cipherCallers.sort().join(","),
     "lib/auth/secrets.ts,lib/security/encryption.ts",
     "exactly two modules encrypt anything in this repository",
   );
+  expectEqual(
+    algorithmNamers.sort().join(","),
+    "lib/auth/secrets.ts,lib/security/encryption.ts,lib/storage/encryption.ts,lib/storage/records.ts",
+    "and exactly four name the algorithm: the two that run a cipher, and the two that store its name beside a sealed file",
+  );
+
+  // The name a sealed file carries in `files.encryption_algorithm` has to be the cipher that sealed it, or
+  // a reader would go looking for an algorithm nobody ever ran.
+  const cipherRun = /createCipheriv\("([^"]+)"/u.exec(await readFile(new URL("security/encryption.ts", libRoot), "utf8"));
+  const nameStored = /FILE_ENCRYPTION_ALGORITHM = "([^"]+)"/u.exec(
+    await readFile(new URL("storage/encryption.ts", libRoot), "utf8"),
+  );
+
+  expectEqual(nameStored?.[1] ?? "", cipherRun?.[1] ?? "", "the algorithm storage names is the algorithm the cipher runs");
 }
 
 /** ---- Portal tokens: one signed link, an expiry, and a revocation lookup. */

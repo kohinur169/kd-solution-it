@@ -1,0 +1,238 @@
+# Audit of STEPs 001–123 — inventory, security posture, and how each claim is verified
+
+Date: 2026-11-05. Branch `arena/17762737-kd-solution-it`.
+Companion gate: `npm run check:audit` (`scripts/verify-audit.mjs`, **2784 checks**).
+
+This document answers three questions asked in one breath: which STEPs are done, what was missed, and
+**how** the security and coding-vulnerability claims are actually verified rather than assumed.
+
+---
+
+## 1. Inventory: 123 of 123 STEPs have a handoff
+
+| Measure | Result |
+|---|---|
+| STEP entries declared in `docs/final/STEP_PLAN_250.md` up to 123 | **123** |
+| Handoffs in `docs/handoffs/` | **123** (121 at audit time) |
+| Missing | **none** (STEP 096 closed in `df49387`, STEP 116 in `9c00ea7`, both after this audit) |
+
+The gaps were recorded as `knownGaps` in the gate. That means they cannot be quietly forgotten **and**
+they cannot be used to excuse a third: any *other* missing handoff fails the build with its number. The
+list is now empty, and it stays a trap rather than a certificate: a missing handoff that is not listed
+fails the build with its number.
+
+**Addendum (post-audit).** STEP 096 was completed in `df49387` ("STEP 096: Provisioning queue and
+office alert…"), which added the queue read and acknowledgement under `services/submerchant/`, the
+`/provisioning-alerts` office screen and its route, and `docs/handoffs/STEP_096_COMPLETED.md`. The gate's
+`knownGaps` dropped from `["096","116"]` to `["116"]` and `npm run verify` is green. The STEP 096
+subsection below is preserved as it was written at audit time.
+
+**Addendum 2 (post-audit).** STEP 116 was completed in `9c00ea7` ("STEP 116: Invoice status workflow
+transitions with paid invoice edit lock and audit entries"), which added the transition graph and the
+send/void moves under `services/invoices/invoice-status.ts`, the `/api/invoices/[id]/send` and
+`/api/invoices/[id]/void` routes, the action bar on the invoice screen, the `paid_locked` rule on the
+line-edit paths, and `docs/handoffs/STEP_116_COMPLETED.md`. The gate's `knownGaps` is now empty and
+`npm run verify` is green. The STEP 116 subsection below is preserved as it was written at audit
+time.
+
+**Addendum 3 (second pass, post-audit).** A code pass over the two steps completed after this audit
+(096 and 116), and over the paths they touch, found and fixed two code defects and one stale comment,
+and named two gaps that are plan-level rather than code-level. The overdue gap was closed after this
+pass, on instruction; the timeline gap remains, by design.
+
+*Fixed in this pass:*
+
+1. **The provisioning acknowledgement read could lose a mark.** The read of the acknowledgement
+   trail used a limit equal to the number of rows on the page, newest first. A duplicate
+   acknowledgement on one row - which the service explicitly allows, because two officers may both
+   look - would push an older provision's single acknowledgement out of the window, and the screen
+   would show "not yet" for a row that had been seen. The limit is now a stated bound (500, against
+   a page of at most 100 rows whose acknowledgements each cost a second factor and a fresh
+   reauthentication), not the page's own arithmetic.
+2. **The invoice transition answer reported a column the move had not written.** For any move other
+   than send and void, the result's instant would have been the document's issue instant, read from a
+   column the move never touched. The answer now reports the issue instant only for a send, the void
+   instant only for a void, and the move's own instant for everything else - the behaviour its
+   comment always promised.
+3. **A stale comment in the recurring generator** claimed the issue action did not exist and that the
+   number function was called only from the workflow step; both are false now, and the comment says
+   what is true.
+
+*Named, not fixed, because fixing them would invent work the plan does not allocate:*
+
+- **No writer moves an invoice to `overdue`.** The graph allows the move and `invoices_due_idx`
+  exists for a sweep, but no STEP in 001-123 owns the sweep, and `0024`'s event vocabulary has no word
+  for the status move itself (only `overdue_reminder`, which the STEP 123 sweep records). A production
+  invoice therefore cannot reach the sixth of the seven states; the reminder half of section 16 works,
+  the state half does not.
+
+  *(Now closed. On instruction, the overdue-state half of STEP 123 was completed after this pass:
+  `0120` adds the `overdue` word to the vocabulary, `sweepOverdueInvoices` performs the move through
+  the STEP 116 engine, `invoice.overdue_sweep` is the job that runs it, and reminders continue while a
+  document is overdue. See the addendum to `docs/handoffs/STEP_123_COMPLETED.md`.)*
+- **The timeline is written incrementally.** `invoice_events` carries `sent`, `voided` (this audit's
+  steps) and `overdue_reminder` (STEP 123) today; `created`, `viewed`, `payment_received` and `paid`
+  are written by the steps that own those moments as they land. The table's contract is "every step is
+  a row", and the rows arrive with their steps.
+
+### STEP 096 — Provisioning queue and office alert when no master account is connected
+
+**At audit time: partly built, and the missing part was the whole point of the STEP.** *(Now closed; see
+the addendum above.)*
+
+Present: `0054_submerchant_provisions.sql` carries `master_account_ref` (null while queued), the
+"queue the office alert reads" index, and `services/submerchant/provision.ts` writes and reads the
+queued state.
+
+Missing: **nothing in the application ever reads that queue for a human.** The index exists, is
+commented as the alert's source, and has no reader. FEATURE_LIST line 70 promises *"If no master
+platform account is connected, provisioning stays queued and the office is alerted"* — the first half
+is true, the second is not. No office screen lists stuck provisions, and no notification is sent.
+
+Consequence: a sub-merchant whose provisioning is blocked by a missing platform master account waits
+indefinitely with no signal. This is a **real operational gap**, not a cosmetic one.
+
+### STEP 116 — Invoice status workflow with paid-invoice edit lock and audit entries
+
+**At audit time: not built at all.** *(Now closed; see Addendum 2 above.)* No handoff, no service
+function, no route, no UI. Confirmed by search: there is
+no `updateInvoiceStatus`, no `transitionInvoice`, and `services/invoices/invoices.ts` exports only
+`createInvoice`, `getInvoice` and two option lists.
+
+What exists is the database half from `0022`:
+
+- the seven-status vocabulary (`draft, sent, viewed, partially_paid, paid, overdue, void`);
+- `invoices_issue_check` (non-draft needs a number and an `issued_at`);
+- `invoices_guard_paid`, which locks a paid invoice against every change except `updated_at`/`version`;
+- `invoices_voided_instant_check`, `invoices_paid_instant_check`.
+
+So the *lock* that FEATURE_LIST line 181 promises is real and enforced in SQL. What is missing is the
+*workflow* that moves a draft to `sent`, records who did it, and audits the transition.
+
+**This is the single most consequential gap in the whole feature line**, and this audit found it rather
+than assuming it:
+
+1. FEATURE_LIST line 170 promises `draft, sent, viewed, partially_paid, paid, overdue, void` as a
+   workflow. Today no invoice can leave `draft` through any code path.
+2. Line 178 (recurring) says a generated invoice "shows as due or overdue" and "reminders go to the
+   client". STEP 123 correctly generates drafts and correctly refuses to remind about them — but that
+   means **the reminder half of STEP 123 is inert until STEP 116 exists**.
+3. STEP 124 (partial payments, next) needs an issued invoice to partially pay.
+
+STEP 116 is therefore a blocker for the invoice half of the product, and it should be implemented
+before STEP 124 rather than after it.
+
+---
+
+## 2. How the security claims are verified — and what each method cannot see
+
+Four independent layers, because no single one is honest on its own.
+
+### Layer 1 — static gates (run on every `npm run verify`)
+
+| Claim | Gate | Count |
+|---|---|---|
+| Every table enables RLS and carries a default-deny policy | `check:migrations` (per file) + `check:audit` (in total) | 3475 + included |
+| Every mutating route calls the CSRF guard | `check:audit` | included in 2784 |
+| No literal credential, shell import, `eval`, `new Function`, or body spliced into a query | `check:audit` | included in 2784 |
+| No advisory in anything that ships | `check:audit` → `npm audit --omit=dev` | `0` |
+| Injections of markup confined to one constant | `check:security` | 2378 |
+| Text/host/URL/HTML/SSRF rules | `check:security` | 2378 |
+| CSP and security headers wired on every response | `check:security` + `check:shell` | 2378 + 774 |
+| Rate limiting on auth and payment surfaces | `check:security` | 2378 |
+| Audit log written, redacted, chained and signed | `check:security` | 2378 |
+| Money never a float; i18n keys complete; no `TODO` | `check:structure`, `check:i18n`, `check:config` | 458 / 2315 / 10 |
+
+### Layer 2 — mutation testing (done by hand when a gate is written, recorded here)
+
+A gate that has never failed is a gate nobody has tested. Each new claim was broken deliberately and
+the gate was required to notice:
+
+| Mutation | Expected | Observed |
+|---|---|---|
+| Remove `invoice_events_default_deny` from `0024` | fail | `every one carries a default-deny policy (missing: invoice_events)` |
+| `requireCsrfToken(x)` → `void (x)` | fail | named the route as unexplained |
+| Delete the `requireCsrfToken(...)` call outright | fail | named the route as unexplained |
+| Move one handoff away | fail | `missing: 096, 100, 116` (at audit time; the same mutation now reports `missing: 100`) |
+
+The third of those exposed a **real defect in the first version of the audit gate**: it matched the
+*name* `requireCsrfToken` anywhere in the file, so wrapping the call in `void (` disabled the guard
+while the gate stayed green. The check now requires an actual call (`requireCsrfToken(`) on the line.
+
+### Layer 3 — live adversarial probing (against the production build)
+
+The built app was started and **70 mutating route/verb pairs** were attacked with no session cookie,
+no CSRF token, a hostile `Origin`, and a body containing `amount_minor` and a `company_id`:
+
+| Result | Count | Meaning |
+|---|---|---|
+| `422 VALIDATION_FAILED {field: "csrf"}` | 57 | refused at the CSRF guard — correct |
+| `503 SERVICE_UNAVAILABLE` (auth routes, rate limiter) | 12 | refused before any work — correct |
+| `2xx` | **0** | **no unauthenticated mutation succeeded** |
+
+Spot checks confirm the reason rather than the status code:
+
+```
+POST /api/invoices            → {"details":[{"field":"csrf","rule":"csrf_token_invalid"}]}
+POST /api/invoices/recurring  → same
+POST /api/products|/api/services|/api/estimates|/api/clients → same
+POST /api/auth/signin         → 503 from the rate limiter (config absent in this sandbox)
+GET  /api/invoices/recurring  → 401 AUTHENTICATION_REQUIRED
+```
+
+### Layer 4 — the gaps, stated
+
+- **No PostgreSQL and no Docker in this sandbox.** `migrations/verify.ts` and the audit gate read the
+  SQL as *text*: they prove a policy is declared, not that it behaves. Actual RLS enforcement, the
+  `invoices_guard_paid` trigger, the append-only trigger and every partial unique index need a scratch
+  database to be proven. That is the highest-value remaining verification and it cannot be done here.
+- **No browser.** XSS is proven by policy and by the single-`dangerouslySetInnerHTML` rule, not by
+  executing a payload. The rich-text sanitiser is unit-gated (2378 checks) but not fuzzed in a DOM.
+- **No network in some runs.** `npm audit` needs the registry. When it cannot reach one, the gate says
+  so in one line rather than reporting green — a stated skip, never a silent pass.
+- **No pen-test.** SSRF, header injection, session fixation and timing attacks are covered by unit
+  gates over the rule modules, not by an external test.
+
+---
+
+## 3. Dependency posture
+
+```
+npm audit --omit=dev   →  found 0 vulnerabilities
+npm audit              →  8 moderate
+```
+
+All eight are the `@typescript-eslint/*` → `minimatch` chain, which is **development tooling only** and
+ships nowhere. No `npm audit fix --force` was run: it would downgrade or replace the lint toolchain to
+close an advisory that cannot reach a user, and a broken lint chain would cost more than it buys. The
+runtime tree is clean, and the gate enforces that it stays clean.
+
+---
+
+## 4. Coding-vulnerability scan results
+
+| Vector | Method | Result |
+|---|---|---|
+| SQL injection | no raw SQL; PostgREST filters escaped by callers; gate rejects a body spliced into a query | **0 found** |
+| XSS | one `dangerouslySetInnerHTML`, a static `THEME_SCRIPT` under a CSP nonce; sanitiser in `lib/security/html.ts` | **0 found** |
+| RCE / shell | no `node:child_process`, no `eval`, no `new Function` in `app/ lib/ services/` | **0 found** |
+| Hardcoded secrets | regex scan for provider key shapes and PEM headers | **0 found** |
+| Tenant crossing | every read in the service gates carries `company_id`; three discovery reads are named and bounded | **0 found** |
+| Open redirect / host trust | no `host` header read in application code | **0 found** |
+| CSRF | 54 mutating routes, one explained exemption (`/api/jobs/health`) | **0 unexplained** |
+| Auth bypass | 70 live probes, 0 accepted | **0 found** |
+| Broken access control | `requireAnyRole` + `requireCompanyId` on every service entry point, tenant from the session | **0 found** |
+
+---
+
+## 5. What to do next, in order
+
+1. **A scratch database** — apply `0001…0119` forward, run the rollback proofs, and `EXPLAIN` the
+   overdue sweep against `invoices_due_idx`. This is the one verification this sandbox cannot give.
+   No missing STEP remains in 1–123.
+2. **A startup hook** — `registerRecurringGenerationJob` and the due-schedule enqueue have no caller at
+   boot (`/api/jobs/health` reports `scheduler.registered: 0`). Deployment work.
+3. **STEP 124** — partial payment recording with the 20 USD minimum, the next STEP in the plan after
+   the now-complete 123. It moves an invoice to `partially_paid`/`paid` through the STEP 116 engine.
+
+STEP 124 was **not** started as of this audit; it is now the next thing in the plan.

@@ -9872,7 +9872,9 @@ async function checkSessionRotation(): Promise<void> {
   // The office half is one of them because reading another account's sessions must not leave the
   // reader's own token unrotated, and the wizard is one because a merchant may sit on it for a
   // while.
-  expectEqual(keepers.length, 25, "every signed-in page keeps its session rotating");
+  // STEP 119 adds the estimate screens, which are one component mounted at three paths - the route that
+  // redirects to the form, the form itself and one quote's editor - so the count rises by the file.
+  expectEqual(keepers.length, 26, "every signed-in page keeps its session rotating");
 }
 
 /**
@@ -12735,11 +12737,34 @@ async function checkCsrfProtection(): Promise<void> {
     .map((file) => file.path)
     .sort();
 
-  expectEqual(browserMutations.length, 40, "forty browser files send a mutation");
+  // STEP 118 adds the invoice branding form, which is the first browser file to send two different kinds of
+  // mutation from one screen: a JSON settings save and a multipart logo upload. Both carry the token, and
+  // both are counted here.
+  // STEP 119 adds two more: the estimate create form, which writes one document, and the estimate line
+  // editor, which writes one line, one order, one removal and the two amounts above the total - five
+  // calls from one screen, because each is a different fact about the quote and each has its own refusal.
+  // So the files arrive at forty four and the call sites at fifty seven.
+  //
+  // STEP 122 adds one more file and two more calls: the recurring schedule panel, which creates a schedule and
+  // changes its state - a pause, a resume or an end - from one screen. They are two calls and not four because
+  // the three state changes share one route and one verb, which is the difference between a verb and a fact.
+  // So the files arrive at forty five and the call sites at fifty nine.
+  //
+  // STEP 096 adds one more file and one more call: the provisioning console, which acknowledges a queued
+  // provision from the office alert.
+  //
+  // STEP 116 adds one more file and two more calls: the invoice status actions, which send a draft and void
+  // a document - the two moves the status workflow gives a merchant, each its own route and its own token.
+  // So the files arrive at forty seven and the call sites at sixty two.
+  //
+  // STEP 124 adds one more call to that same file: the payment form, which records one amount on the
+  // document it sits under, on its own route with its own token.
+  // So the files stay at forty seven and the call sites arrive at sixty three.
+  expectEqual(browserMutations.length, 47, "forty seven browser files send a mutation");
   expectEqual(
     browserMutations.reduce((total, path) => total + mutationCalls(appSourceOf(appSources, path)), 0),
-    48,
-    "across forty eight call sites",
+    63,
+    "across sixty three call sites",
   );
   const postCalls = mutationCalls;
   const tokenSpreads = (source: string): number =>
@@ -12943,10 +12968,53 @@ async function checkOutboundGuard(): Promise<void> {
     }
   }
 
+  // ---- how many doors there are, and what each one guarantees
+  //
+  // Two server doors and one browser door. `auth/http.ts` speaks to the auth provider and
+  // `storage/http.ts` to the object store; the storage transport was written to the same four
+  // guarantees, and the assertions below hold it to its own rather than trusting the comment that
+  // claims them. The third module is the browser's, which dials this application and nothing else.
+  //
+  // A name appearing here that is not one of those four is a module that opened a socket nobody
+  // decided on, which is the whole reason the list is an equality and not a minimum. The storage door
+  // was missing from it between STEP 105 and STEP 117, so the gate answered red for eleven STEPs:
+  // a red gate teaches a reader to skip it, which is worse than the gap it was reporting.
   expectEqual(
     dialling.sort().join(","),
-    ["auth/device-proof-store.ts", "auth/http.ts", "security/csrf-client.ts"].join(","),
-    "the server has one door and the browser has its own, and no third module dials",
+    ["auth/device-proof-store.ts", "auth/http.ts", "security/csrf-client.ts", "storage/http.ts"].join(","),
+    "the server has two doors and the browser has its own, and no fourth module dials",
+  );
+
+  const storageHttpSource = await readFile(new URL("../storage/http.ts", import.meta.url), "utf8");
+
+  expect(
+    storageHttpSource.includes("checkOutboundUrl(url, policy)"),
+    "the storage transport asks the same guard about its destination",
+  );
+  expect(
+    storageHttpSource.indexOf("checkOutboundUrl(") < storageHttpSource.indexOf("fetchImpl(decision.target.url"),
+    "before it opens a socket, so a refused destination costs no request",
+  );
+  expect(
+    storageHttpSource.includes('redirect: "error"'),
+    "a redirect is an error there too, so a service role key cannot be carried to another origin",
+  );
+  expect(storageHttpSource.includes("AbortSignal.timeout("), "no provider call can hang");
+  expect(
+    storageHttpSource.includes("decision.target.url"),
+    "and it dials the canonical form the guard decided on, not the string it was given",
+  );
+  expect(
+    storageHttpSource.includes("outboundPolicy({ projectUrl, extraHosts, allowLoopback })"),
+    "with a policy built from the endpoint it belongs to",
+  );
+  expect(
+    storageHttpSource.includes('nodeEnv !== "production" && isLoopbackHost('),
+    "and the same single development exception, stated once",
+  );
+  expect(
+    !storageHttpSource.includes("logger"),
+    "logging nothing itself, because a provider answer carries signature material",
   );
 }
 

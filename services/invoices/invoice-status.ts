@@ -1,0 +1,823 @@
+// path: services/invoices/invoice-status.ts
+import { z } from "zod";
+import type { AuditTrail } from "../../lib/auth/audit.ts";
+import type { RestClient } from "../../lib/auth/rest.ts";
+import { isConflictError } from "../../lib/auth/rest.ts";
+import { requireAnyRole, requireCompanyId } from "../../lib/auth/session.ts";
+import type { RequestActor } from "../../lib/auth/types.ts";
+import { AppError, isAppError } from "../../lib/errors/app-error.ts";
+import { appConfig } from "../../config/app.ts";
+import { deepFreeze } from "../../lib/utils/freeze.ts";
+import { priceFromMinor, priceToMinor } from "../products/price.ts";
+import { INVOICE_AUDIT_ENTITY, INVOICE_MANAGE_ROLES } from "./invoices.ts";
+import { INVOICE_STATUSES, type InvoiceStatus } from "./invoice-fields.ts";
+import { takeInvoiceNumber } from "./invoice-numbering.ts";
+
+/**
+ * The status workflow of section 16: which state may become which, and the one engine that performs
+ * the move.
+ *
+ * ## What was missing, exactly
+ *
+ * `0022` carries the whole workflow in constraints - the seven statuses, `invoices_status_money_check`
+ * tying each one to its money, `invoices_issue_check` tying the number to the issue instant,
+ * `invoices_paid_instant_check` and `invoices_voided_instant_check` tying the instants to the states,
+ * and `invoices_guard_paid` freezing a paid row. `0024` carries the timeline, with `sent` and `voided`
+ * already in its event vocabulary. **Nothing in the application performed a move.** A draft could not be
+ * sent, a document could not be voided, and an attempt to change a paid one would die inside the
+ * trigger as a `check_violation` and surface as a 500.
+ *
+ * This module is the application half. It owns the transition graph, the two moves a merchant makes
+ * (send, void), the paid lock as a sentence rather than an exception, and the two entries every move
+ * leaves behind: the row in `invoice_events` and the entry in `audit_logs`.
+ *
+ * ## Why one engine, not one function per move
+ *
+ * STEP 123's sweep will move an invoice to `overdue`, STEP 124's payment will move it to
+ * `partially_paid` and `paid`, and the client's tokenized view will move it to `viewed`. If each of
+ * those wrote its own update, its own re-read and its own event, four copies of the rule would exist,
+ * and a copy is the one thing that drifts. The engine performs one move - graph check, guarded write,
+ * re-read, event, audit - and each caller supplies the columns its move writes and the facts its move
+ * records. A caller that cannot name a legal move cannot perform it, whatever it calls itself.
+ *
+ * ## Why the write is guarded and then re-read
+ *
+ * The update's predicate carries the status the engine just read (`status=eq.<from>`), so two moves on
+ * the same invoice cannot both succeed: the second misses its row. PostgREST reports a zero-row update
+ * as success, so the engine reads the row back and answers `CONFLICT` when the status it expected is
+ * not the one that is there. The guard makes the race a miss, and the re-read makes the miss a refusal.
+ */
+
+/** The audit action of a send, the moment a draft becomes a numbered, issued document. */
+export const INVOICE_SENT_AUDIT_ACTION = "invoice.sent";
+
+/** The audit action of a void. */
+export const INVOICE_VOIDED_AUDIT_ACTION = "invoice.voided";
+
+/** The words this module writes to the `0024` timeline. */
+const INVOICE_EVENT_SENT = "sent";
+const INVOICE_EVENT_VOIDED = "voided";
+
+/** The actor words of `0024`: a move is named for the one who made it, or for the system that did. */
+export type InvoiceEventActor = "merchant" | "client" | "office" | "system";
+
+/** The status the lock belongs to, named once rather than spelled in every refusal. */
+export const INVOICE_PAID_STATUS: InvoiceStatus = "paid";
+
+/** The rule the paid lock answers with, so a screen can print "locked" rather than "something changed". */
+export const INVOICE_PAID_LOCKED_RULE = "paid_locked";
+
+/** The rule an illegal move answers with. */
+export const INVOICE_ILLEGAL_TRANSITION_RULE = "illegal_transition";
+
+/** A reason for a void, kept short: it prints on the timeline, not in a document. */
+export const INVOICE_VOID_REASON_LIMITS = deepFreeze({ min: 1, max: 200 });
+
+/**
+ * The legal moves, the whole workflow in one place.
+ *
+ * Read against `0022`'s constraints, which they never contradict:
+ *
+ *   - `draft` has no number and no issue instant, so its only way out of the editor is `sent` (which
+ *     takes both together) or `void` (which `invoices_issue_check` allows with or without a number).
+ *   - The open states `sent`, `viewed`, `partially_paid` and `overdue` accept the same exits in
+ *     principle: the money moves, the clock move and `void` from any of them, because
+ *     `invoices_status_money_check` puts no money condition on a void. The two view moves are the
+ *     exception: `sent` goes to `viewed` because first viewing opens the document, and `overdue` goes
+ *     to `viewed` because a client can open a past-due document; `viewed` does not leave, because
+ *     `first_viewed_at` keeps the view fact and only the money or the clock moves the state after it.
+ *   - `partially_paid` accepts itself: a second partial payment records money on a document that is
+ *     already partially paid, and `invoices_status_money_check` describes the state after the write,
+ *     not the move - the accumulated amount grows, the state stays the one the first payment made.
+ *   - `overdue` does not go back to `sent`: an unpaid document past its due date stays overdue until
+ *     the money or a void ends it.
+ *   - `paid` and `void` are terminal. The first is frozen by `invoices_guard_paid` in the database;
+ *     the second by the same reasoning - a cancelled document is not one that comes back.
+ */
+export const INVOICE_STATUS_TRANSITIONS: Readonly<Record<InvoiceStatus, readonly InvoiceStatus[]>> =
+  deepFreeze({
+    draft: ["sent", "void"],
+    sent: ["viewed", "partially_paid", "paid", "overdue", "void"],
+    viewed: ["partially_paid", "paid", "overdue", "void"],
+    partially_paid: ["partially_paid", "paid", "overdue", "void"],
+    overdue: ["viewed", "partially_paid", "paid", "void"],
+    paid: [],
+    void: [],
+  });
+
+/** True when the workflow allows the move. The screen and the gate read the same table. */
+export function isLegalInvoiceTransition(from: InvoiceStatus, to: InvoiceStatus): boolean {
+  return INVOICE_STATUS_TRANSITIONS[from].includes(to);
+}
+
+/** The answer a move gives: the document, the move and the instant it happened. */
+export interface InvoiceStatusResult {
+  readonly invoiceId: string;
+  readonly companyId: string;
+  readonly from: InvoiceStatus;
+  readonly to: InvoiceStatus;
+  /** The issued number after a send, the number the row already carried otherwise, null for a draft. */
+  readonly number: string | null;
+  /** The issue instant after a send, the void instant after a void, the move instant otherwise. */
+  readonly at: string;
+}
+
+export interface InvoiceStatusDependencies {
+  readonly rest: RestClient;
+  readonly audit: AuditTrail;
+  readonly now?: () => number;
+}
+
+/**
+ * The columns the engine reads: the workflow's own, one by one (rule 17, never a `*`).
+ *
+ * `client_name`, `client_email`, `client_address`, the memo and the line totals are deliberately
+ * absent. A status move is a move, and a function whose only purpose is to move a status does not need
+ * the document's printed fields to do it.
+ */
+const STATUS_ROW_COLUMNS =
+  "select=id,company_id,number,status,currency,total_minor,amount_paid_minor" +
+  ",issued_at,due_at,first_viewed_at,paid_at,voided_at,deleted_at,version";
+
+const statusRowSchema = z.object({
+  id: z.string().uuid(),
+  company_id: z.string().uuid(),
+  number: z.string().nullable(),
+  status: z.enum(INVOICE_STATUSES),
+  currency: z.string().length(3),
+  total_minor: z.union([z.string(), z.number()]),
+  amount_paid_minor: z.union([z.string(), z.number()]),
+  issued_at: z.string().nullable(),
+  due_at: z.string(),
+  first_viewed_at: z.string().nullable(),
+  paid_at: z.string().nullable(),
+  voided_at: z.string().nullable(),
+  deleted_at: z.string().nullable(),
+  version: z.number().int().min(1),
+});
+
+type StatusRow = z.infer<typeof statusRowSchema>;
+
+/**
+ * One move of the workflow, performed the same way whatever the move is.
+ *
+ * The caller has already read the row (it needs the facts only its move knows), and the engine trusts
+ * that read for nothing it can check itself: the graph is checked here, the write is guarded on the
+ * status the read saw, and the re-read after the write is the authority on what actually happened.
+ * `extra` carries the columns the move writes beside the status - the number and the issue instant for
+ * a send, the void instant for a void - in the same statement, because `0022`'s checks tie those
+ * columns to the status and a row checked between them would be refused in the middle of a legal
+ * change.
+ */
+async function applyTransition(
+  dependencies: InvoiceStatusDependencies,
+  input: {
+    readonly row: StatusRow;
+    readonly to: InvoiceStatus;
+    /** The columns the move writes beside the status, in the same statement. */
+    readonly extra: Readonly<Record<string, unknown>>;
+    /**
+     * The predicates the guarded write carries beside `status = eq.<from>`, a move's own
+     * invariants: the accumulated amount a payment read, which the write must still find or
+     * the payment it carries is not the payment of this row.
+     */
+    readonly guard?: Readonly<Record<string, unknown>>;
+    readonly event: {
+      readonly type: string;
+      readonly detail: string | null;
+      /** The word `0024` names the move under: who made it, or the system that did. */
+      readonly actor: InvoiceEventActor;
+      /** The person who acted; null for a system move, which `0024`'s own check requires. */
+      readonly actorUserId: string | null;
+      /** The session the move was made from; null for a system move, which has none. */
+      readonly sessionId: string | null;
+    };
+    readonly audit: {
+      readonly action: string;
+      readonly payload: Readonly<Record<string, unknown>>;
+    };
+  },
+): Promise<InvoiceStatusResult> {
+  // The paid lock is checked before the graph, because it deserves its own sentence: a move the
+  // workflow merely does not offer is "not offered", and a move the platform refuses because the money
+  // has settled is "locked". The trigger stays the authority - this check turns its exception into a
+  // refusal the screen can print.
+  if (input.row.status === "paid") {
+    throw new AppError("CONFLICT", {
+      details: [{ field: "status", rule: INVOICE_PAID_LOCKED_RULE }],
+    });
+  }
+
+  if (!isLegalInvoiceTransition(input.row.status, input.to)) {
+    throw new AppError("CONFLICT", {
+      details: [{ field: "status", rule: INVOICE_ILLEGAL_TRANSITION_RULE }],
+      cause: { rule: "invoice_status", reason: `${input.row.status}_to_${input.to}` },
+    });
+  }
+
+  const at = new Date(dependencies.now?.() ?? Date.now()).toISOString();
+
+  const guardParts = Object.entries(input.guard ?? {})
+    .map(([column, value]) => `${column}=eq.${encodeURIComponent(String(value))}`)
+    .join("&");
+
+  try {
+    await dependencies.rest.update(
+      "invoices",
+      `id=eq.${input.row.id}&company_id=eq.${input.row.company_id}&status=eq.${input.row.status}` +
+        (guardParts.length > 0 ? `&${guardParts}` : ""),
+      { status: input.to, ...input.extra },
+    );
+  } catch (error) {
+    if (isConflictError(error)) {
+      // A constraint the database raised on the way out: the move the engine thought was legal met a row
+      // that no longer agrees. That is a conflict, not an outage.
+      throw new AppError("CONFLICT", {
+        details: [{ field: "status", rule: INVOICE_ILLEGAL_TRANSITION_RULE }],
+        cause: { rule: "invoice_status", reason: "constraint" },
+      });
+    }
+
+    throw error;
+  }
+
+  // The zero-row problem: an update that matches nothing is a success to PostgREST. Read the row back
+  // and take what the row says, not what the engine hoped for. The read carries every column a move
+  // writes beside the status, one by one (rule 17): the number and instants a send and a void write,
+  // the money a payment writes, the paid instant a full payment writes.
+  const rows = await dependencies.rest.select(
+    "invoices",
+    `select=id,status,number,issued_at,voided_at,amount_paid_minor,paid_at` +
+      `&id=eq.${input.row.id}&company_id=eq.${input.row.company_id}&limit=1`,
+    z.object({
+      id: z.string().uuid(),
+      status: z.enum(INVOICE_STATUSES),
+      number: z.string().nullable(),
+      issued_at: z.string().nullable(),
+      voided_at: z.string().nullable(),
+      amount_paid_minor: z.union([z.string(), z.number()]).nullable(),
+      paid_at: z.string().nullable(),
+    }),
+  );
+  const after = rows[0];
+
+  if (after === undefined || after.status !== input.to) {
+    throw new AppError("CONFLICT", {
+      details: [{ field: "status", rule: "already_changed" }],
+      cause: { rule: "invoice_status", reason: "moved_while_in_flight" },
+    });
+  }
+
+  // The written columns, checked back against the row: a zero-row update is only distinguishable from
+  // a success by what the move was meant to leave behind. When the move is the state itself (a payment
+  // on a document already partially paid), the state alone proves nothing, and the money does.
+  for (const [column, written] of Object.entries(input.extra)) {
+    if (String((after as Record<string, unknown>)[column] ?? null) !== String(written)) {
+      throw new AppError("CONFLICT", {
+        details: [{ field: "status", rule: "already_changed" }],
+        cause: { rule: "invoice_status", reason: "moved_while_in_flight" },
+      });
+    }
+  }
+
+  await dependencies.rest.insert(
+    "invoice_events",
+    [
+      {
+        company_id: input.row.company_id,
+        invoice_id: input.row.id,
+        type: input.event.type,
+        actor: input.event.actor,
+        actor_user_id: input.event.actorUserId,
+        detail: input.event.detail,
+        occurred_at: at,
+      },
+    ],
+  );
+
+  await dependencies.audit.append({
+    action: input.audit.action,
+    actorUserId: input.event.actorUserId,
+    entityType: INVOICE_AUDIT_ENTITY,
+    entityId: input.row.id,
+    companyId: input.row.company_id,
+    sessionId: input.event.sessionId,
+    payload: { from: input.row.status, to: input.to, ...input.audit.payload },
+  });
+
+  // The instant the answer reports is the move's own: the issue instant a send writes, the void instant a
+  // void writes, and for every other move the instant the engine performed it. A column the move did not
+  // write (the issue instant on a document that was issued long ago) is not what the move happened at.
+  const atAnswer =
+    input.to === "sent"
+      ? (after.issued_at ?? at)
+      : input.to === "void"
+        ? (after.voided_at ?? at)
+        : at;
+
+  return {
+    invoiceId: input.row.id,
+    companyId: input.row.company_id,
+    from: input.row.status,
+    to: input.to,
+    number: after.number,
+    at: atAnswer,
+  };
+}
+
+/** Read one live invoice of the actor's own company, in the columns a move needs. */
+async function readStatusRow(
+  dependencies: InvoiceStatusDependencies,
+  input: { readonly companyId: string; readonly invoiceId: string },
+): Promise<StatusRow> {
+  if (!z.string().uuid().safeParse(input.invoiceId).success) {
+    throw new AppError("VALIDATION_FAILED", { details: [{ field: "id", rule: "invalid_format" }] });
+  }
+
+  const rows = await dependencies.rest.select(
+    "invoices",
+    `${STATUS_ROW_COLUMNS}&id=eq.${input.invoiceId}&company_id=eq.${input.companyId}&deleted_at=is.null&limit=1`,
+    statusRowSchema,
+  );
+  const row = rows[0];
+
+  if (row === undefined) {
+    throw new AppError("RESOURCE_NOT_FOUND", { cause: { rule: "invoice", reason: "not_found" } });
+  }
+
+  return row;
+}
+
+/**
+ * Send a draft: the draft becomes a numbered, issued document.
+ *
+ * The number comes from `0114`'s counter through `takeInvoiceNumber`, and the sequence is fixed by
+ * `invoices_issue_check`, which requires the number and the issue instant to appear with the status:
+ * take the number, then write status + number + issued_at in one update. If the update fails after the
+ * number was taken, the number stays consumed - a gap in a series is evident, a duplicate is a legal
+ * problem, and the counter is not something this service returns numbers to.
+ */
+export async function sendInvoice(
+  input: { readonly actor: RequestActor; readonly invoiceId: unknown },
+  dependencies: InvoiceStatusDependencies,
+): Promise<InvoiceStatusResult> {
+  requireAnyRole(input.actor, INVOICE_MANAGE_ROLES);
+  const companyId = requireCompanyId(input.actor);
+
+  if (typeof input.invoiceId !== "string") {
+    throw new AppError("VALIDATION_FAILED", { details: [{ field: "id", rule: "invalid_format" }] });
+  }
+
+  const row = await readStatusRow(dependencies, { companyId, invoiceId: input.invoiceId });
+
+  if (row.status !== "draft") {
+    // A document that has left the editor is not sent twice: a number is assigned once, and a second
+    // send would ask the counter for a second number for a document that already has one.
+    throw new AppError("CONFLICT", {
+      details: [{ field: "status", rule: "already_changed" }],
+      cause: { rule: "invoice_status", reason: "not_a_draft" },
+    });
+  }
+
+  const at = new Date(dependencies.now?.() ?? Date.now()).toISOString();
+  const taken = await takeInvoiceNumber(
+    { actor: input.actor, companyId },
+    {
+      rest: dependencies.rest,
+      audit: dependencies.audit,
+      ...(dependencies.now === undefined ? {} : { now: dependencies.now }),
+    },
+  );
+
+  return applyTransition(dependencies, {
+    row,
+    to: "sent",
+    extra: { number: taken.number, issued_at: at },
+    event: {
+      type: INVOICE_EVENT_SENT,
+      detail: null,
+      actor: "merchant",
+      actorUserId: input.actor.userId,
+      sessionId: input.actor.sessionId ?? null,
+    },
+    audit: {
+      action: INVOICE_SENT_AUDIT_ACTION,
+      payload: { number: taken.number, total_minor: row.total_minor, currency: row.currency },
+    },
+  });
+}
+
+/**
+ * Void an open document: a draft, or anything issued that is not yet paid, becomes void.
+ *
+ * The reason is the merchant's own words for the timeline - what the void means - and it is optional,
+ * because a void does not need one. It is not written to the document itself: `0022` has no reason
+ * column on the invoice, and the timeline row that exists exactly for this keeps it.
+ */
+export async function voidInvoice(
+  input: {
+    readonly actor: RequestActor;
+    readonly invoiceId: unknown;
+    readonly reason?: unknown;
+  },
+  dependencies: InvoiceStatusDependencies,
+): Promise<InvoiceStatusResult> {
+  requireAnyRole(input.actor, INVOICE_MANAGE_ROLES);
+  const companyId = requireCompanyId(input.actor);
+
+  if (typeof input.invoiceId !== "string") {
+    throw new AppError("VALIDATION_FAILED", { details: [{ field: "id", rule: "invalid_format" }] });
+  }
+
+  const reason = parseVoidReason(input.reason);
+  const row = await readStatusRow(dependencies, { companyId, invoiceId: input.invoiceId });
+
+  if (row.status === "void") {
+    throw new AppError("CONFLICT", {
+      details: [{ field: "status", rule: "already_changed" }],
+      cause: { rule: "invoice_status", reason: "already_void" },
+    });
+  }
+
+  // The engine raises the paid lock too; it is answered here as well, so the refusal is the same
+  // sentence on every path that meets a paid document.
+  if (row.status === "paid") {
+    throw new AppError("CONFLICT", {
+      details: [{ field: "status", rule: INVOICE_PAID_LOCKED_RULE }],
+    });
+  }
+
+  const at = new Date(dependencies.now?.() ?? Date.now()).toISOString();
+
+  return applyTransition(dependencies, {
+    row,
+    to: "void",
+    extra: { voided_at: at },
+    event: {
+      type: INVOICE_EVENT_VOIDED,
+      detail: reason,
+      actor: "merchant",
+      actorUserId: input.actor.userId,
+      sessionId: input.actor.sessionId ?? null,
+    },
+    audit: {
+      action: INVOICE_VOIDED_AUDIT_ACTION,
+      payload: {
+        number: row.number,
+        total_minor: row.total_minor,
+        currency: row.currency,
+        reason_present: reason !== null,
+      },
+    },
+  });
+}
+
+/** The reason the merchant gives for a void, trimmed and bounded, or nothing at all. */
+function parseVoidReason(value: unknown): string | null {
+  if (value === undefined || value === null) {
+    return null;
+  }
+
+  if (typeof value !== "string") {
+    throw new AppError("VALIDATION_FAILED", { details: [{ field: "reason", rule: "invalid_format" }] });
+  }
+
+  const trimmed = value.trim();
+
+  if (
+    trimmed.length < INVOICE_VOID_REASON_LIMITS.min ||
+    trimmed.length > INVOICE_VOID_REASON_LIMITS.max
+  ) {
+    throw new AppError("VALIDATION_FAILED", {
+      details: [{ field: "reason", rule: trimmed.length === 0 ? "empty" : "too_long" }],
+    });
+  }
+
+  return trimmed;
+}
+
+/**
+ * The overdue sweep of STEP 123's other half: the move from `0022`'s graph that no person makes.
+ *
+ * ## Why the sweep is per company
+ *
+ * Every other read in this family is scoped to one company from the session; a platform-wide read would
+ * be the first query here that answers "which merchants have a past-due document" instead of "what does
+ * this merchant's document say". The sweep therefore runs as one job per company, named in the job's
+ * payload, and the scheduler that decides which companies to sweep - when, and how often - is the same
+ * deployment work that wires the recurring job to a clock.
+ *
+ * ## Why it reads two states, not the three the index carries
+ *
+ * `invoices_due_idx` is built for the three open states, because it serves the read. The sweep moves
+ * only the two that hold no money: `0022`'s `invoices_status_money_check` puts `amount_paid_minor = 0`
+ * on an overdue document, and a partially paid one holds some by definition, so the database would
+ * refuse the move it offers. A sweep that offered it anyway would spend a guarded write and a re-read
+ * on a refusal the constraint makes certain, every run, for every such document.
+ *
+ * ## Why the due date is checked twice
+ *
+ * The query asks `invoices_due_idx` for the company's open documents past their due date; the code then
+ * checks each row's due date again, against the sweep's own instant. The query is a fast path and the
+ * row is the authority, for the same reason the guarded update is followed by a re-read: a sweep that
+ * trusted the query alone would mark a document whose due date changed under it, and the sweep's only
+ * promise is that it marks a document whose due date has actually passed.
+ *
+ * ## Why a raced row is a skip, not a failure
+ *
+ * Between the list read and the move a row can pay, void or be sent its way out of the sweep's reach.
+ * The move is guarded on the status the sweep read, so the race is a miss, and a missed row is counted
+ * as skipped rather than raised: a sweep that failed on a race would be a sweep nobody left running,
+ * and the next run will find whatever is still due.
+ *
+ * ## The entries
+ *
+ * Each move writes the timeline row with the actor `system` and no user, because `0024`'s
+ * `invoice_events_actor_user_check` exists exactly for this: a scheduled sweep has no person behind it,
+ * and naming one would blame a person for the platform's timetable. The audit entry carries the same
+ * actor facts, `0013` allowing a null actor for the same reason. The detail is deliberately null: the
+ * document's number and due date are on the invoice itself, and a row that copies them would copy them
+ * wrong the first time the document changes.
+ */
+
+/**
+ * The statuses an overdue sweep may move: the open states that hold no money.
+ *
+ * `sent` and `viewed`, and not `partially_paid`, because `0022`'s `invoices_status_money_check`
+ * forbids an overdue document from holding money - and a partially paid one always holds some. The
+ * index the due read rides on still carries the three open states, because it serves the read; the
+ * sweep moves only the states the database would let it move.
+ */
+const OVERDUE_SWEEP_SOURCE_STATUSES: readonly InvoiceStatus[] = deepFreeze(["sent", "viewed"]);
+
+/** How many of one company's due documents one sweep run marks. The rest wait for the next run. */
+export const OVERDUE_SWEEP_INVOICE_LIMIT = 200;
+
+/** The audit action of the sweep, one entry per document it moves. */
+export const INVOICE_OVERDUE_AUDIT_ACTION = "invoice.overdue";
+
+/** The word the sweep writes to the timeline; `0120` added it to `0024`'s vocabulary. */
+const INVOICE_OVERDUE_EVENT = "overdue";
+
+export interface OverdueSweepResult {
+  readonly companyId: string;
+  /** The ids of the documents the sweep moved to `overdue`, in the order it moved them. */
+  readonly marked: readonly string[];
+  /** The rows that moved out of the sweep's reach while it was running. */
+  readonly skipped: number;
+}
+
+/** One company's overdue sweep, at the sweep's own instant. */
+export async function sweepOverdueInvoices(
+  input: { readonly companyId: unknown },
+  dependencies: InvoiceStatusDependencies,
+): Promise<OverdueSweepResult> {
+  if (typeof input.companyId !== "string" || !z.string().uuid().safeParse(input.companyId).success) {
+    throw new AppError("VALIDATION_FAILED", {
+      details: [{ field: "company_id", rule: "invalid_format" }],
+    });
+  }
+
+  const companyId = input.companyId;
+  const nowMs = dependencies.now?.() ?? Date.now();
+  const at = new Date(nowMs).toISOString();
+
+  const candidates = await dependencies.rest.select(
+    "invoices",
+    "select=id,company_id,status,due_at" +
+      `&company_id=eq.${companyId}` +
+      `&status=in.(${OVERDUE_SWEEP_SOURCE_STATUSES.join(",")})` +
+      `&deleted_at=is.null` +
+      `&due_at=lt.${encodeURIComponent(at)}` +
+      `&order=due_at.asc&limit=${String(OVERDUE_SWEEP_INVOICE_LIMIT)}`,
+    z.object({
+      id: z.string().uuid(),
+      company_id: z.string().uuid(),
+      status: z.enum(INVOICE_STATUSES),
+      due_at: z.string(),
+    }),
+  );
+
+  const marked: string[] = [];
+  let skipped = 0;
+
+  for (const candidate of candidates) {
+    // The code's checks, because the query is a fast path: a row that is not one the sweep reads, or that
+    // is not yet due as of the sweep's own instant, is not this sweep's row, and is left alone rather
+    // than counted as a miss.
+    if (!OVERDUE_SWEEP_SOURCE_STATUSES.includes(candidate.status)) {
+      continue;
+    }
+
+    const dueMs = Date.parse(candidate.due_at);
+
+    if (!Number.isFinite(dueMs) || dueMs >= nowMs) {
+      continue;
+    }
+
+    const row = await readStatusRow(dependencies, { companyId, invoiceId: candidate.id });
+
+    if (row.status !== candidate.status) {
+      skipped += 1;
+      continue;
+    }
+
+    try {
+      const result = await applyTransition(dependencies, {
+        row,
+        to: "overdue",
+        extra: {},
+        event: {
+          type: INVOICE_OVERDUE_EVENT,
+          detail: null,
+          actor: "system",
+          actorUserId: null,
+          sessionId: null,
+        },
+        audit: {
+          action: INVOICE_OVERDUE_AUDIT_ACTION,
+          payload: { due_at: row.due_at },
+        },
+      });
+
+      marked.push(result.invoiceId);
+    } catch (error) {
+      if (isAppError(error) && error.code === "CONFLICT") {
+        // The row moved between the list read and the move: a payment arrived, a void was recorded. The
+        // next run finds whatever is still due, and nothing this run can safely do.
+        skipped += 1;
+        continue;
+      }
+
+      throw error;
+    }
+  }
+
+  return { companyId, marked, skipped };
+}
+
+/**
+ * Recording a payment on an issued document: the move where money is what changes the state.
+ *
+ * ## Why the money and the state are one statement
+ *
+ * `0022`'s `invoices_status_money_check` leaves no state in which a sent or viewed document holds
+ * money: the open states hold zero, a partially paid one holds some, a paid one holds all. A
+ * payment that lands is therefore a move, not an annotation: the engine performs it with the
+ * guarded write, the re-read and the entries the other moves get, and the payment's own invariant
+ * joins the guard - the accumulated amount it read must still be there, or the payment it carries
+ * is not the payment of the row it read.
+ *
+ * ## Why the minimum is on the payment, and only while it leaves the document open
+ *
+ * Section 16 accepts partial payments with a minimum of 20 USD, and the platform's config carries
+ * the number (`money.minimumPartialPayment`). The rule sits on the payment, because the payment is
+ * the thing the merchant offers: a five-dollar partial is refused whatever the document already
+ * holds. It stops applying the moment the payment settles the document, because a payment that pays
+ * the last remainder is not a partial payment, and a remainder may sit below the minimum without
+ * the document ever becoming unpayable.
+ *
+ * The database's own floor (`invoices_partial_minimum_check`) sits beneath the rule rather than at
+ * it: at the platform's four-decimal scale its two thousand minor is a backstop, and the service is
+ * the authority on the twenty the feature names.
+ *
+ * ## The entries
+ *
+ * A partial payment writes `payment_received`, the payment that settles writes `paid` - the two
+ * words `0024` gives the moments - each carrying the amount it records in the one form the
+ * platform prints, and the audit entry carrying the money in minor units, where money belongs.
+ */
+
+/** The audit action of a recorded payment that leaves the document open. */
+export const INVOICE_PAYMENT_RECEIVED_AUDIT_ACTION = "invoice.payment_received";
+
+/** The audit action of the payment that settles a document. */
+export const INVOICE_PAID_AUDIT_ACTION = "invoice.paid";
+
+/** The words this move writes to the `0024` timeline, one per kind of payment. */
+const INVOICE_EVENT_PAYMENT_RECEIVED = "payment_received";
+const INVOICE_EVENT_PAID = "paid";
+
+/** The rule a payment answers with when it is a partial below the minimum the feature names. */
+export const INVOICE_PAYMENT_BELOW_MINIMUM_RULE = "below_minimum";
+
+/** The rule a payment answers with when it is more than the document still owes. */
+export const INVOICE_PAYMENT_EXCEEDS_REMAINING_RULE = "exceeds_remaining";
+
+/** The rule a payment answers with when the text is not an amount at all. */
+export const INVOICE_PAYMENT_INVALID_RULE = "invalid_format";
+
+/** The answer a recorded payment gives: the document, the move and the money it now holds. */
+export interface InvoicePaymentResult {
+  readonly invoiceId: string;
+  readonly companyId: string;
+  readonly from: InvoiceStatus;
+  /** The two states a payment can end in: open with money, or settled. */
+  readonly to: "partially_paid" | "paid";
+  readonly number: string | null;
+  /** The accumulated amount after the payment, in minor units. */
+  readonly paidMinor: bigint;
+  /** What the document still owes after the payment, in minor units. */
+  readonly remainingMinor: bigint;
+  readonly at: string;
+}
+
+export async function recordInvoicePayment(
+  input: { readonly actor: RequestActor; readonly invoiceId: unknown; readonly amount: unknown },
+  dependencies: InvoiceStatusDependencies,
+): Promise<InvoicePaymentResult> {
+  requireAnyRole(input.actor, INVOICE_MANAGE_ROLES);
+  const companyId = requireCompanyId(input.actor);
+
+  if (typeof input.invoiceId !== "string") {
+    throw new AppError("VALIDATION_FAILED", { details: [{ field: "id", rule: "invalid_format" }] });
+  }
+
+  // The amount in the one form the merchant types it, through the one parser the platform's money
+  // has: decimal string arithmetic into minor units, and no float beside it.
+  if (typeof input.amount !== "string") {
+    throw new AppError("VALIDATION_FAILED", { details: [{ field: "amount", rule: INVOICE_PAYMENT_INVALID_RULE }] });
+  }
+
+  const amountMinor = priceToMinor(input.amount);
+
+  if (amountMinor === null) {
+    throw new AppError("VALIDATION_FAILED", { details: [{ field: "amount", rule: INVOICE_PAYMENT_INVALID_RULE }] });
+  }
+
+  if (amountMinor <= 0n) {
+    throw new AppError("VALIDATION_FAILED", { details: [{ field: "amount", rule: "zero_amount" }] });
+  }
+
+  const row = await readStatusRow(dependencies, { companyId, invoiceId: input.invoiceId });
+
+  const totalMinor = BigInt(row.total_minor);
+  const paidMinor = BigInt(row.amount_paid_minor);
+  const remainingMinor = totalMinor - paidMinor;
+
+  // The document's remaining amount is the payment's ceiling: an overpayment is not a payment this
+  // service records, because a link that has been paid in full no longer accepts money, and a
+  // document does not owe more than it says on itself.
+  if (amountMinor > remainingMinor) {
+    throw new AppError("VALIDATION_FAILED", {
+      details: [{ field: "amount", rule: INVOICE_PAYMENT_EXCEEDS_REMAINING_RULE }],
+      cause: { rule: "invoice_payment", reason: `remaining:${remainingMinor}` },
+    });
+  }
+
+  const newPaidMinor = paidMinor + amountMinor;
+  const to = newPaidMinor === totalMinor ? ("paid" as const) : ("partially_paid" as const);
+
+  // The minimum the feature names, on the payments that leave the document open, and on the
+  // platform's currency: a partial below it is refused, the settling payment is never a partial,
+  // and a currency the platform does not price at all carries no floor, which `0022`'s own check
+  // agrees with.
+  if (to === "partially_paid" && row.currency === appConfig.money.currencyCode) {
+    const minimumMinor = priceToMinor(appConfig.money.minimumPartialPayment);
+
+    if (minimumMinor !== null && amountMinor < minimumMinor) {
+      throw new AppError("VALIDATION_FAILED", {
+        details: [{ field: "amount", rule: INVOICE_PAYMENT_BELOW_MINIMUM_RULE }],
+        cause: { rule: "invoice_payment", reason: `minimum:${minimumMinor}` },
+      });
+    }
+  }
+
+  const at = new Date(dependencies.now?.() ?? Date.now()).toISOString();
+
+  const result = await applyTransition(dependencies, {
+    row,
+    to,
+    extra:
+      to === "paid"
+        ? { amount_paid_minor: newPaidMinor.toString(), paid_at: at }
+        : { amount_paid_minor: newPaidMinor.toString() },
+    guard: { amount_paid_minor: paidMinor.toString() },
+    event: {
+      type: to === "paid" ? INVOICE_EVENT_PAID : INVOICE_EVENT_PAYMENT_RECEIVED,
+      detail: `${priceFromMinor(amountMinor)} ${row.currency}`,
+      actor: "merchant",
+      actorUserId: input.actor.userId,
+      sessionId: input.actor.sessionId ?? null,
+    },
+    audit: {
+      action: to === "paid" ? INVOICE_PAID_AUDIT_ACTION : INVOICE_PAYMENT_RECEIVED_AUDIT_ACTION,
+      payload: {
+        amount_minor: amountMinor.toString(),
+        paid_minor: newPaidMinor.toString(),
+        remaining_minor: (totalMinor - newPaidMinor).toString(),
+      },
+    },
+  });
+
+  return {
+    invoiceId: result.invoiceId,
+    companyId: result.companyId,
+    from: result.from,
+    to,
+    number: result.number,
+    paidMinor: newPaidMinor,
+    remainingMinor: totalMinor - newPaidMinor,
+    at: result.at,
+  };
+}

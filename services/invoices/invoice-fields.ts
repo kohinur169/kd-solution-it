@@ -32,6 +32,33 @@ export type InvoiceStatus = (typeof INVOICE_STATUSES)[number];
  */
 export const INVOICE_CREATED_STATUS: InvoiceStatus = "draft";
 
+/** The screen's wording for each status, so the page and the action bar hold one copy of the map. */
+export function invoiceStatusLabelKey(status: InvoiceStatus):
+  | "invoices.statusDraft"
+  | "invoices.statusSent"
+  | "invoices.statusViewed"
+  | "invoices.statusPartiallyPaid"
+  | "invoices.statusPaid"
+  | "invoices.statusOverdue"
+  | "invoices.statusVoid" {
+  switch (status) {
+    case "draft":
+      return "invoices.statusDraft";
+    case "sent":
+      return "invoices.statusSent";
+    case "viewed":
+      return "invoices.statusViewed";
+    case "partially_paid":
+      return "invoices.statusPartiallyPaid";
+    case "paid":
+      return "invoices.statusPaid";
+    case "overdue":
+      return "invoices.statusOverdue";
+    case "void":
+      return "invoices.statusVoid";
+  }
+}
+
 /** The currencies a merchant may bill in. Rule 2 and section 16: all prices are displayed in USD. */
 export const INVOICE_CURRENCIES = ["USD"] as const;
 

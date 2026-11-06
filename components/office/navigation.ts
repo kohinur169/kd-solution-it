@@ -4,6 +4,7 @@ import { TWO_FACTOR_RESET_OFFICE_ROLES } from "../../lib/auth/two-factor-reset.t
 import { PLATFORM_ROLES, type PlatformRole, type RequestActor } from "../../lib/auth/types.ts";
 import { ANNOUNCEMENT_SCREEN_ROLES } from "../../lib/announcements/registry.ts";
 import { ACCOUNT_UNLOCK_OFFICE_ROLES } from "../../lib/auth/account-unlock.ts";
+import { PROVISIONING_ALERT_OFFICE_ROLES } from "../../services/submerchant/provisioning-queue-fields.ts";
 import { AUDIT_LOG_SCREEN_ROLES } from "../../lib/audit-log/registry.ts";
 import { APPROVAL_QUEUE_ROLES } from "../../lib/approvals/registry.ts";
 import { COUNTRY_SWITCH_ROLES } from "../../lib/countries/registry.ts";
@@ -95,7 +96,8 @@ export type OfficeSectionKey =
   | "settings"
   | "announcements"
   | "auditLog"
-  | "accountUnlocks";
+  | "accountUnlocks"
+  | "provisioningQueue";
 
 /**
  * Every office screen that exists today, in the order the sidebar shows them.
@@ -193,6 +195,13 @@ export const OFFICE_NAVIGATION: readonly OfficeSection[] = deepFreeze([
     labelKey: "office.sectionAccountUnlocks",
     descriptionKey: "office.sectionAccountUnlocksDescription",
     roles: ACCOUNT_UNLOCK_OFFICE_ROLES,
+  },
+  {
+    key: "provisioningQueue",
+    href: "/provisioning-alerts",
+    labelKey: "office.sectionProvisioningQueue",
+    descriptionKey: "office.sectionProvisioningQueueDescription",
+    roles: PROVISIONING_ALERT_OFFICE_ROLES,
   },
 ]);
 

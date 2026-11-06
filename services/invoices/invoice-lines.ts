@@ -13,6 +13,7 @@ import {
   type InvoiceUnit,
 } from "./invoice-fields.ts";
 import { grossLineMinor, invoiceTotalsOf, thousandthsToQuantity, type InvoiceTotals } from "./invoice-totals.ts";
+import { INVOICE_PAID_LOCKED_RULE } from "./invoice-status.ts";
 import {
   assertDiscountFits,
   basisPointsToColumn,
@@ -255,6 +256,13 @@ async function requireDraftParent(
 
   if (parent === undefined) {
     throw new AppError("RESOURCE_NOT_FOUND", { cause: { rule: "invoice", reason: "not_found" } });
+  }
+
+  if (parent.status === "paid") {
+    // Section 16: a paid invoice is locked and cannot be edited. `invoices_guard_paid` would raise on
+    // the write anyway; answering first turns the database's exception into the sentence the section
+    // actually says, and leaves the trigger as the authority behind it.
+    throw new AppError("CONFLICT", { details: [{ field: "status", rule: INVOICE_PAID_LOCKED_RULE }] });
   }
 
   if (parent.status !== INVOICE_CREATED_STATUS) {

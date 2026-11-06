@@ -1027,7 +1027,14 @@ async function checkMigrationSet(): Promise<void> {
   expectEqual(numbers.includes("0109"), true, "STEP 097's is too");
   expectEqual(numbers.includes("0110"), true, "STEP 098's is too");
   expectEqual(numbers.includes("0111"), true, "STEP 099's is too");
-  expectEqual(Math.max(...numbers.map((number) => Number.parseInt(number, 10))), 111, "the set ends at 0111");
+  // The highest number in the set is not this gate's to pin: every migration a later STEP adds moves it,
+  // and `migrations/verify.ts` already proves the set is whole, ordered and default-deny. What KYC owns is
+  // that none of the migrations it depends on has gone missing, so this is a floor rather than a number
+  // that turns a neighbour's legitimate work into this gate's failure.
+  expect(
+    Math.max(...numbers.map((number) => Number.parseInt(number, 10))) >= 111,
+    "the set still reaches 0111, so no migration KYC depends on has gone missing",
+  );
 }
 
 /* -------------------------------------------------------------------------------------------------
