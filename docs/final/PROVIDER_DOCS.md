@@ -220,6 +220,47 @@ its published markdown form.
 - Delivery is retried for approximately 28 hours (immediately, 5 s, 5 min, 30 min, 2 h, 5 h, 10 h, 10 h); any 2XX inside 15 seconds acknowledges; an exhausted attempt is reported as `message.attempt.exhausted`; an endpoint failing for 5 consecutive days is disabled.
 - Webhooks are at-least-once and can be replayed from the portal, so a consumer is idempotent on the resource id and `event_type`.
 
+### Verified for STEP 158: credential shape and the connection test (2026-11-06)
+
+- The credential set this platform stores is the **API key** plus the environment. It is sealed with the
+  platform's single encryption module (`lib/security/encryption.ts`) under the scope
+  `gateway:<companyId>:rainforest:api_key`, so a sealed value cannot be opened for another company or
+  another provider.
+- The documented key prefix is checked against the named environment **before** anything is sealed: a
+  production key (`apikey_`) in a sandbox configuration, or a sandbox key (`sbx_apikey_`) in a production
+  one, is refused. The prefix is the documentation's only way to tell the two apart, and a mismatched pair
+  would send the wrong key to the wrong base URL and report a rejection that says nothing about the key the
+  admin meant to configure.
+- The masked view shows the documented prefix and only the last four characters of the key, with the stars
+  capped at twelve; a stored key's view is built by opening and immediately masking, so the screen never
+  receives a full credential.
+- The connection test performs the documented authenticated read
+  `GET https://api.sandbox.rainforestpay.com/v1/api_keys` (production: `https://api.rainforestpay.com`) with
+  `Authorization: Bearer <api_key>`, `Accept: application/json` and the **`Rainforest-Api-Version: 2024-10-16`
+  header sent explicitly**, because the platform's minimum version is a portal setting the docs do not
+  expose. Redirects are refused, the timeout is 15 seconds and an answer over 64 KiB is refused.
+- What each answer means: a `2XX` with a parseable body is **connected** — the key authenticated against that
+  environment, and because sandbox and production keys and data are separate, the environment is proven too;
+  only the **number** of keys the read listed is reported, never a key. `401` and `403` are **rejected** with
+  the documented `errors` message sanitised. A `400` is **failed**, not rejected: the documented cause is a
+  request the API refused (an API version below the platform minimum), so the key was not judged. Redirects,
+  `404`, `409`, `415` and `422` are **failed**; `408`, `425`, `429` and every `5xx` are **unreachable**; a
+  thrown transport is **unreachable** and never repeats the thrown text; a `2XX` with an empty or unparseable
+  body proves nothing and is **failed**.
+- The outcome is recorded on the key as `lastTest { outcome, testedAtEpochMs, environment }` with a
+  version-guarded write, and **activation refuses unless that record says `connected` for the key's own
+  environment** — which is how "a provider cannot be enabled when its connection test fails" becomes a
+  property of the code. The reference store enforces the same rule, so a caller that bypasses the service
+  cannot activate an unproven key either.
+- Rotation runs in the documented order: add the replacement key while the old one serves traffic → run its
+  connection test → activate it (the old key becomes `superseded` and stays readable through the window) →
+  retire the old key. Every step writes an audit entry (`provider_key.configured`, `provider_key.tested`,
+  `provider_key.activated`, `provider_key.rotated`, `provider_key.retired`), and none of them carries a key.
+- **The connection test was not run against Rainforest**: no sandbox account or API key exists in this
+  environment, so the request shape and the outcome table were exercised against a recording transport only.
+  It does not prove payments or merchants — that is STEP 159 and STEP 160, and they may only run once a key
+  is active.
+
 ### Open Questions (recorded, not assumed)
 
 - **The webhook signature scheme is not yet read.** The Webhooks page points to a "Verify webhooks" recipe, and that recipe answers *not found* at both `/recipes/verify-webhooks-1` and `/recipes/verify-webhooks` in this environment. The header names, the signed content, the digest algorithm and the replay tolerance must be read from it before STEP 160 implements verification, and until then no Rainforest signature may be trusted.
@@ -236,6 +277,13 @@ its published markdown form.
 | Create a payin config | `POST /v1/payin_configs` | Not run | No Rainforest sandbox account or API key exists in this environment. |
 | Process a card payin to `SUCCEEDED` | `POST /v1/payins` | Not run | No Rainforest sandbox account or API key exists in this environment. |
 | Receive and verify a signed webhook | `POST /webhooks/rainforest` | Not run | No endpoint is registered and the signing recipe is not readable (see open questions). |
+
+Added by STEP 158 (same reason: no Rainforest sandbox account or API key exists here):
+
+| Step | Call | Result | Details |
+|---|---|---|---|
+| Test a sealed key against the API | `GET /v1/api_keys` | Not run | Implemented as `testRainforestConnection`; exercised against a recording transport only. No key was sent to Rainforest. |
+| Activate a key after a passing test | none (a state transition) | Not run | Implemented as `activateRainforestConfig`; no configuration is active in any real environment. |
 
 The record these notes produce is `partial`, never `verified`: `calculateRainforestStatus` requires the
 whole five step cycle to be present and passed before a record can read as verified.
