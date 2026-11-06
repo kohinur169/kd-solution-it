@@ -451,3 +451,134 @@ whole five step cycle to be present and passed before a record can read as verif
 - Charges: Yes (card and ACH payins)
 - Payouts: No (deposits to merchants are Rainforest's, not this platform's payouts)
 - Connected accounts: Yes (Rainforest onboards and underwrites the merchant; a sub-merchant is `merchant_application` + `merchant`)
+
+---
+
+## Stripe Connect (STEP 161)
+
+Stripe is the fourth provider in the adapter set, and the first whose documentation publishes the webhook
+signature scheme in full. Section 6 asks it for connected sub-merchant account creation, charges and
+payouts. STEP 161 records the documentation and the sandbox notes; key configuration and the connection
+test are STEP 162, onboarding and charges 163-166, and the sandbox cycle and capability matrix 167-169.
+
+### Documentation Sources (read in the STEP 161 session, 2026-11-06)
+
+| Topic | URL | Status |
+|---|---|---|
+| How Connect works | https://docs.stripe.com/connect/how-connect-works | Reviewed |
+| Accounts v2 (recommended account surface) | https://docs.stripe.com/connect/accounts-v2 | Reviewed |
+| Connected account types (legacy, deprecated) | https://docs.stripe.com/connect/accounts | Reviewed |
+| Account capabilities | https://docs.stripe.com/connect/account-capabilities | Reviewed |
+| Charge types | https://docs.stripe.com/connect/charges | Reviewed |
+| API keys and sandbox versus live mode | https://docs.stripe.com/keys | Reviewed |
+| Webhook endpoints and delivery behaviour | https://docs.stripe.com/webhooks | Reviewed |
+| Webhook signature verification (manual) | https://docs.stripe.com/webhooks#verify-manually | Reviewed |
+| Account updates, requirements and future requirements | https://docs.stripe.com/connect/handle-verification-updates | Reviewed |
+| Testing Connect | https://docs.stripe.com/connect/testing | Reviewed |
+| Accounts v1 and v2 request shapes | https://docs.stripe.com/api/accounts/create | Reviewed |
+
+Nothing in this section was read from anywhere else: the pages above are `docs.stripe.com` only, and
+`STRIPE_DOCUMENTATION_HOSTS` holds that one host so a record naming any other host is refused.
+
+### Recorded Rules
+
+- **New connected accounts use Accounts v2** (`POST /v2/core/accounts`) with configurations — `merchant`
+  (which carries `card_payments` and `stripe_balance.payouts`), `customer`, and `recipient` (which carries
+  `stripe_balance.stripe_transfers`) — or Accounts v1 with **controller properties**. Standard, Express and
+  Custom are the legacy type model; the page tells new platforms not to start there, and an account's type
+  cannot be changed after creation. This is recorded as `STRIPE_RECORDED_RULES` entry 1 rather than a
+  footnote, because it changes what every later Stripe STEP calls.
+- **`card_payments` must be `active`** before the connected account may accept payments, and `card_payments`
+  is requested together with `transfers`. Sandboxes do not always enforce capabilities, so a sandbox payment
+  succeeding is not proof that the gate works in live mode.
+- **The charge type decides the money's path**: a direct charge lands in the connected account's balance and
+  makes it merchant of record; a destination charge lands in the platform's balance, transfers a portion on,
+  and puts refunds and chargebacks on the platform; separate charges and transfers allow one payment to fund
+  several connected accounts. The platform's model — a merchant accepts, the platform pays out under STEPs
+  133-141 — must pick one of these explicitly in the adapter STEP.
+- **Sandbox and live are separate modes**: separate keys (`sk_test_`/`sk_live_`, `rk_test_`/`rk_live_`,
+  `pk_test_`/`pk_live_`, plus `sk_org_`), separate objects, no cross-reading. Only a publishable key may
+  reach a browser; only a server key may call the API.
+- **Webhook signing secrets are not API keys**: each endpoint has its own `whsec_` secret, it differs between
+  sandbox and live, and it can be rolled with the previous secret valid for up to 24 hours — during which one
+  signature is generated per secret.
+- **The signature scheme is published and implemented**: `Stripe-Signature: t=<unix seconds>,v1=<hex
+  HMAC-SHA256>` (Stripe adds a `v0` signature for test events, which must be ignored), signed content
+  `<t>.<raw body>`, key = the endpoint's `whsec_` secret, constant-time comparison, default tolerance five
+  minutes, and `0` disables the recency check so it is refused. Unlike Rainforest's unread recipe, nothing
+  here is an assumption.
+- **Delivery is at-least-once and unordered**: up to 16 event destinations per account, live retries for
+  three days, sandbox retries three times, order not guaranteed, duplicates tracked by event id, `2xx`
+  returned quickly, redirects and `4xx`/`5xx` treated as failures, TLS 1.2 or higher required, and manual
+  resend available for 15 days in the Dashboard and 30 with the CLI.
+- **Requirements are read, not guessed**: `requirements` and `future_requirements` carry `currently_due`,
+  `eventually_due`, `past_due`, `pending_verification`, `disabled_reason`, `current_deadline` and an `errors`
+  array of `{code, requirement, reason}`; `account.updated` reports changes; `controller.requirement_collection`
+  decides whether Stripe (`stripe`) or the platform (`application`) collects them.
+- **No raw card data reaches this platform**, exactly as for NMI and Rainforest: card data stays inside
+  Stripe's own interfaces, and this platform handles ids, amounts and statuses.
+
+### Verified for STEP 161: the account model, the vocabularies and the published signature (2026-11-06)
+
+Delivered by this STEP, with no network call and no credential:
+
+- `lib/payments/adapters/stripe.ts` — the record module in the STEP 157 shape: `STRIPE_PROVIDER_KEY`
+  ("stripe"), the eleven documentation sources above, `STRIPE_RECORDED_RULES` (15 rules) and
+  `STRIPE_OPEN_QUESTIONS` (5), the documented key shapes and their `sandbox`/`live` environment, the
+  capability vocabulary (`active|inactive|pending|unrequested`, where only `active` allows the action and an
+  unrecorded value is `null`), the requirement fields and `stripeOnboardingStateOf` (`ready`/`waiting`/
+  `blocked`), the three charge types with their merchant-of-record and losses facts, the recorded event types
+  and `parseStripeEventType`, the five-step sandbox cycle, `sanitizeStripeText`, and the record, store,
+  validation, `calculateStripeStatus` and `recordStripeVerification` machinery with an audit entry.
+- **The signature verifier is real, not a placeholder.** `verifyStripeWebhookSignature(rawBody, header,
+  { secret, toleranceSeconds, nowSeconds })` parses `t` and every `v1` entry, drops `v0` and unknown schemes,
+  rebuilds `<t>.<rawBody>`, MACs it with HMAC-SHA256, compares in constant time, then applies the tolerance
+  (refusing `0`). It refuses a wrong secret, a one-byte body change, a stale or future timestamp, a missing
+  header, an empty body, a missing secret, an oversized body, and a `v0`-only delivery; it accepts two `v1`
+  signatures during a secret rollout. A refusal never repeats the secret.
+- **`calculateStripeStatus` cannot be talked into `verified`**: pages verified but no sandbox step run is
+  `partial`; four of five steps is `partial`; steps without any page read is `partial`; nothing at all is
+  `not_verified`. `verified` requires every page verified **and** all five cycle steps passed.
+- **The sandbox cycle is recorded, step by step**: `key_auth` (`GET /v1/accounts`), `connected_account_create`
+  (`POST /v2/core/accounts`), `hosted_onboarding` (`POST /v1/account_links`), `test_payment`
+  (`POST /v1/payment_intents`), `signed_webhook` (`POST /webhooks/stripe`).
+- **None of it ran against Stripe.** No Stripe account, sandbox key or `whsec_` secret exists in this
+  environment, so every cycle step is `not_tested` with the reason recorded, `STRIPE_SESSION_STATUS` is
+  `partial` by construction, and the gate asserts that the session record cannot read as `verified`.
+
+### Open Questions (recorded, not assumed)
+
+- **Which account surface the code will use is STEP 162's decision.** The pages recommend Accounts v2 for new
+  platforms and keep Accounts v1 with controller properties for features v2 does not cover; this record names
+  both, and the adapter must record which one it calls and why.
+- **The API version to pin is not chosen here.** The v2 examples carried a dated preview value
+  (`2026-10-28.preview`), and the account default is not visible from the documentation, so `Stripe-Version`
+  must be sent explicitly and the choice recorded in STEP 162.
+- **The event subscription set is decided with the receiver**, because the documentation recommends
+  subscribing only to the events the integration needs. `account.updated` is the recorded one for account and
+  requirement changes; the payment events are recorded but not yet subscribed.
+- **The webhook source addresses were not read.** Stripe publishes them on `docs.stripe.com/ips`, a page this
+  session did not read, so IP allowlisting is recorded as available and unverified. Signature verification
+  stands on its own meanwhile.
+- **No sandbox exists here**, so no account was created, no test payment taken, no delivery signed by Stripe.
+
+### Sandbox Notes
+
+| Step | Call | Result | Details |
+|---|---|---|---|
+| Authenticate a sandbox key | `GET /v1/accounts` | Not run | No Stripe account or sandbox key exists in this environment. |
+| Create a connected account | `POST /v2/core/accounts` | Not run | No Stripe account or sandbox key exists in this environment. |
+| Onboard the merchant through a hosted link | `POST /v1/account_links` | Not run | No connected account exists to link, and no sandbox key was available. |
+| Take a test payment | `POST /v1/payment_intents` | Not run | No sandbox key exists; the documented test cards and tokens are recorded but unused. |
+| Receive and verify a signed delivery | `POST /webhooks/stripe` | Not run | No endpoint is registered and no `whsec_` secret exists; the verifier was exercised with self-computed signatures only. |
+
+The record these notes produce is `partial`, never `verified`: `calculateStripeStatus` requires all five
+step ids to be present and passed before a record can read as verified, and the gate asserts it.
+
+### Capability Matrix
+
+- Charges: Yes (direct, destination, or separate charges and transfers — one to be chosen in STEP 163)
+- Payouts: Yes (the platform's own payout path stays STEPs 133-141; Connect payouts are the connected account's)
+- Connected accounts: Yes (Accounts v2 configurations, or Accounts v1 with controller properties)
+- Refunds and disputes: Yes, on the balance the charge type names
+- Tokenised card capture: Yes (`pk_` publishable key with Stripe.js or Elements; no raw card number here)
