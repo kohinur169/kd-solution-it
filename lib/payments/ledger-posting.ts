@@ -114,8 +114,11 @@ export interface LedgerEntryStore {
   findByReversalOf(entryId: string): LedgerEntry | null;
   /** The ids of every group the store holds. */
   listGroupIds(): string[];
-  /** Store a posted entry. */
-  insert(entry: LedgerEntry): void;
+  /** Atomically insert a complete new group, or return false without writing any entries.
+   * The store must serialize competing group IDs and reversal IDs. A database implementation must
+   * perform these checks and the insert in one transaction, not as separate HTTP requests.
+   */
+  insertGroup(entries: readonly LedgerEntry[]): boolean;
 }
 
 /** The result of posting a group: the entries that were written, or the reason it was refused. */
@@ -148,11 +151,40 @@ export class InMemoryLedgerEntryStore implements LedgerEntryStore {
     return [...this.groups.keys()];
   }
 
-  insert(entry: LedgerEntry): void {
-    this.entries.set(entry.id, entry);
-    const ids = this.groups.get(entry.entryGroupId) ?? [];
-    ids.push(entry.id);
-    this.groups.set(entry.entryGroupId, ids);
+  insertGroup(entries: readonly LedgerEntry[]): boolean {
+    // Materialize and freeze the complete batch before touching either index.
+    const snapshots = entries.map((entry) => Object.freeze({ ...entry }));
+    const first = snapshots[0];
+    if (first === undefined || this.groups.has(first.entryGroupId)) return false;
+
+    const ids = new Set<string>();
+    const reversalIds = new Set<string>();
+    let debits = 0n;
+    let credits = 0n;
+    for (const entry of snapshots) {
+      if (entry.entryGroupId !== first.entryGroupId || entry.companyId !== first.companyId ||
+          entry.currency !== first.currency || entry.amountMinor <= 0n || ids.has(entry.id) || this.entries.has(entry.id)) return false;
+      if (entry.entrySide === "debit") debits += entry.amountMinor;
+      else if (entry.entrySide === "credit") credits += entry.amountMinor;
+      else return false;
+      ids.add(entry.id);
+      if (entry.reversalOfId !== null) {
+        const original = this.entries.get(entry.reversalOfId);
+        if (reversalIds.has(entry.reversalOfId) || this.findByReversalOf(entry.reversalOfId) !== null ||
+            original === undefined || original.entryGroupId === entry.entryGroupId ||
+            original.entrySide === entry.entrySide || original.accountId !== entry.accountId ||
+            original.amountMinor !== entry.amountMinor || original.currency !== entry.currency ||
+            original.companyId !== entry.companyId) return false;
+        reversalIds.add(entry.reversalOfId);
+      }
+    }
+    if (debits === 0n || debits !== credits) return false;
+
+    // Validate the entire batch before mutating either index. The synchronous in-memory operation
+    // cannot interleave with another insertion. This is not a database implementation.
+    for (const entry of snapshots) this.entries.set(entry.id, entry);
+    this.groups.set(first.entryGroupId, snapshots.map((entry) => entry.id));
+    return true;
   }
 }
 
@@ -239,8 +271,8 @@ export function postLedgerEntries(
     postedAt: now,
   }));
 
-  for (const entry of entries) {
-    options.store.insert(entry);
+  if (!options.store.insertGroup(entries)) {
+    return { status: "rejected", reason: "the ledger group or an entry already exists" };
   }
 
   return { status: "posted", entries };

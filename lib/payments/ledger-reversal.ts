@@ -115,8 +115,8 @@ export function reverseLedgerGroup(
   }
 
   // 6. Write the reversal entries. The originals are untouched.
-  for (const entry of entries) {
-    options.store.insert(entry);
+  if (!options.store.insertGroup(entries)) {
+    return { status: "rejected", reason: "the reversal conflicts with an existing ledger entry" };
   }
 
   return { status: "reversed", entries };

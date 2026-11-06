@@ -5,6 +5,7 @@ import {
   LEDGER_SOURCE_TYPES,
   InMemoryLedgerEntryStore,
   postLedgerEntries,
+  type LedgerEntry,
   type LedgerPostingGroup,
   type LedgerSourceType,
 } from "./ledger-posting.ts";
@@ -234,6 +235,44 @@ expect(storedEntries.length === (storeResult.status === "posted" ? 2 : 0), "the 
 
 expect(postLedgerEntries(balancedGroup, { store: balancedStore }).status === "rejected", "a repeated group is rejected");
 expect(balancedStore.findByGroup(balancedGroup.entryGroupId).length === 2, "a repeated group does not add entries");
+
+/* ---- atomic batch contract and rejection paths ---- */
+
+class ConflictStore extends InMemoryLedgerEntryStore {
+  calls = 0;
+  override insertGroup(_entries: readonly LedgerEntry[]): boolean { this.calls += 1; return false; }
+}
+const conflictingStore = new ConflictStore();
+const conflictGroup = makeGroup("payment");
+expect(postLedgerEntries(conflictGroup, { store: conflictingStore }).status === "rejected", "a store-level group conflict is reported as rejected");
+expect(conflictingStore.calls === 1, "a group is sent to the store in one atomic operation");
+expect(conflictingStore.findByGroup(conflictGroup.entryGroupId).length === 0, "a rejected batch leaves no partial group");
+
+if (balancedResult.status === "posted") {
+  const debit = balancedResult.entries[0];
+  const credit = balancedResult.entries[1];
+  if (debit !== undefined && credit !== undefined) {
+    const newGroupId = randomUUID();
+    const newDebit = { ...debit, id: randomUUID(), entryGroupId: newGroupId };
+    const duplicateIdCredit = { ...credit, id: debit.id, entryGroupId: newGroupId };
+    expect(!balancedStore.insertGroup([newDebit, duplicateIdCredit]), "a duplicate entry id rejects the entire batch");
+    expect(balancedStore.findByGroup(newGroupId).length === 0, "a duplicate entry id leaves no partial group");
+    expect(!balancedStore.insertGroup([newDebit]), "an unbalanced batch is rejected");
+    expect(balancedStore.findByGroup(newGroupId).length === 0, "an unbalanced batch leaves no partial group");
+    const crossTenantCredit = { ...credit, id: randomUUID(), entryGroupId: newGroupId, companyId: "other-company" };
+    expect(!balancedStore.insertGroup([newDebit, crossTenantCredit]), "a cross-tenant batch is rejected");
+    expect(balancedStore.findByGroup(newGroupId).length === 0, "a cross-tenant batch leaves no partial group");
+    expect(Object.isFrozen(balancedStore.findByGroup(balancedGroup.entryGroupId)[0]), "stored entries cannot be mutated through a read");
+    const copyFailureGroupId = randomUUID();
+    const copyFailureDebit = { ...debit, id: randomUUID(), entryGroupId: copyFailureGroupId };
+    const copyFailureCredit: LedgerEntry = { ...credit, id: randomUUID(), entryGroupId: copyFailureGroupId, get description(): string | null { throw new Error("copy failed"); } };
+    let copyFailed = false;
+    try { balancedStore.insertGroup([copyFailureDebit, copyFailureCredit]); } catch { copyFailed = true; }
+    expect(copyFailed, "a batch preparation failure is propagated");
+    expect(balancedStore.findByGroup(copyFailureGroupId).length === 0, "a batch preparation failure cannot leave entries behind");
+
+  }
+}
 
 /* ---- the verdict ---- */
 

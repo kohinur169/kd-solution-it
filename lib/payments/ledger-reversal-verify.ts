@@ -165,6 +165,26 @@ expect(
   "every reversal entry carries the same payment id as the original",
 );
 
+/* The store protects the one-reversal rule even when the service read was stale. */
+const replayReversalId = randomUUID();
+const replayEntries = reversalEntries.map((entry) => ({ ...entry, id: randomUUID(), entryGroupId: replayReversalId }));
+expect(!store.insertGroup(replayEntries), "the store rejects a duplicate reversal batch");
+expect(store.findByGroup(replayReversalId).length === 0, "a rejected reversal batch leaves no entries");
+
+/* A concurrent store conflict cannot leave a partial reversal. */
+class ReversalConflictStore extends InMemoryLedgerEntryStore {
+  refuse = false;
+  override insertGroup(entries: readonly LedgerEntry[]): boolean {
+    return this.refuse ? false : super.insertGroup(entries);
+  }
+}
+const conflictStore = new ReversalConflictStore();
+const conflictOriginal = makeGroup();
+expect(postLedgerEntries(conflictOriginal, { store: conflictStore }).status === "posted", "the conflict fixture posts the original");
+conflictStore.refuse = true;
+expect(reverseLedgerGroup(conflictOriginal.entryGroupId, { store: conflictStore }).status === "rejected", "a store-level reversal conflict is rejected");
+expect(conflictStore.listGroupIds().length === 1, "a rejected reversal does not add a partial group");
+
 /* ---- the verdict ---- */
 
 if (failures.length > 0) {

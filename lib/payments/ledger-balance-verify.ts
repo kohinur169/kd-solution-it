@@ -41,8 +41,16 @@ function makeGroup(): LedgerPostingGroup {
   };
 }
 
-/** Build an unbalanced entry pair and insert it directly into the store. */
-function insertUnbalancedGroup(store: InMemoryLedgerEntryStore, groupId: string): void {
+/** A read-only corruption fixture for testing alerts without bypassing the ledger writer. */
+class CorruptedLedgerStore extends InMemoryLedgerEntryStore {
+  private readonly corrupted = new Map<string, LedgerEntry[]>();
+  addCorruption(groupId: string, entries: LedgerEntry[]): void { this.corrupted.set(groupId, entries); }
+  override findByGroup(groupId: string): LedgerEntry[] { return this.corrupted.get(groupId) ?? super.findByGroup(groupId); }
+  override listGroupIds(): string[] { return [...super.listGroupIds(), ...this.corrupted.keys()]; }
+}
+
+/** Simulate reading pre-existing unbalanced entries from storage. */
+function insertUnbalancedGroup(store: CorruptedLedgerStore, groupId: string): void {
   const now = new Date().toISOString();
   const debit: LedgerEntry = {
     id: randomUUID(),
@@ -80,8 +88,7 @@ function insertUnbalancedGroup(store: InMemoryLedgerEntryStore, groupId: string)
     reversalOfId: null,
     postedAt: now,
   };
-  store.insert(debit);
-  store.insert(credit);
+  store.addCorruption(groupId, [debit, credit]);
 }
 
 /* ---- scenario 1: a balanced group is reported as balanced ---- */
@@ -104,7 +111,7 @@ expect(report.alerts.length === 0, "no alert is created for a balanced group");
 
 /* ---- scenario 2: an unbalanced group is reported as unbalanced ---- */
 
-const unbalancedStore = new InMemoryLedgerEntryStore();
+const unbalancedStore = new CorruptedLedgerStore();
 const unbalancedGroupId = randomUUID();
 insertUnbalancedGroup(unbalancedStore, unbalancedGroupId);
 
@@ -131,7 +138,7 @@ expect(alert?.detectedAt !== undefined, "the alert carries a detection time");
 
 /* ---- scenario 4: a mixed store produces correct counts ---- */
 
-const mixedStore = new InMemoryLedgerEntryStore();
+const mixedStore = new CorruptedLedgerStore();
 postLedgerEntries(makeGroup(), { store: mixedStore });
 postLedgerEntries(makeGroup(), { store: mixedStore });
 insertUnbalancedGroup(mixedStore, randomUUID());
