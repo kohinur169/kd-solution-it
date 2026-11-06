@@ -171,3 +171,77 @@ step cycle to be present and passed before a record can read as verified.
 - Payouts: Yes
 - Connected accounts: No (Payoneer pays registered payees; it does not create sub-merchants)
 
+## Rainforest (STEP 157)
+
+Rainforest is an acceptance and sub-merchant provider for this platform: it processes card and ACH
+payins for the platform's merchants, onboards those merchants and runs the KYC/KYB underwriting, and it
+is not used for this platform's payouts. The provider matrix in `lib/gateways/registry.ts` records it as
+`acceptance: true, payouts: false, submerchant: true`. The service that records a verification is
+`lib/payments/adapters/rainforest.ts`.
+
+### Documentation Sources (read in the STEP 157 session, 2026-11-06)
+
+All pages are on Rainforest's own documentation host, `docs.rainforestpay.com`. The index at
+`https://docs.rainforestpay.com/llms.txt` is how the pages were found, and each page below was read in
+its published markdown form.
+
+| Topic | URL | What it established |
+|---|---|---|
+| Rainforest overview | https://docs.rainforestpay.com/docs/overview.md | The platform/merchant/user model, that Rainforest performs KYC/KYB and answers approved, declined or manual review, and the payin/refund/deposit vocabulary. |
+| API keys | https://docs.rainforestpay.com/docs/api-keys.md | That an API key is a long-lived server credential that must never reach the browser, and the permission model: `resource:action`, Rainforest groups and constrained statements. |
+| Authentication | https://docs.rainforestpay.com/reference/authentication.md | Bearer authentication, the `apikey_` production and `sbx_apikey_` sandbox key prefixes, and the documented sandbox call URL `https://api.sandbox.rainforestpay.com/v1/`. |
+| Moving to production | https://docs.rainforestpay.com/docs/moving-to-production.md | The sandbox and production base URLs, separate data/keys/ids per environment, and the `sbx_` sandbox id prefix. |
+| API version upgrades | https://docs.rainforestpay.com/docs/api-version-upgrades.md | The `Rainforest-Api-Version` header, the current version `2024-10-16`, the older versions, and that a request below the platform minimum fails with 400. |
+| Process payins via API | https://docs.rainforestpay.com/docs/process-payins-via-api.md | The two-call payin flow (payin config, then `POST /v1/payins`), `method_type` `CARD`/`ACH`, the method field requirements, and the Rainforest approval the direct API integration needs. |
+| Onboarding merchants via API | https://docs.rainforestpay.com/docs/onboarding-merchants-via-api.md | The API onboarding sequence (deposit method config, deposit method, merchant with `deposit_routes`, application update, submit), the required fields per merchant type, and `validation_errors`. |
+| Understanding payins | https://docs.rainforestpay.com/docs/understanding-payins.md | The payin status table, real-time card authorisation, ACH settlement without one, T+1 and T+4 deposit timing, and `SUCCEEDED` as funds available to deposit. |
+| Payin webhooks | https://docs.rainforestpay.com/docs/payin-webhooks.md | The `payin.{status}` event names, the `{data, event_type}` payload, and the payin fields including `idempotency_key`, minor-unit amounts and USD-only `currency_code`. |
+| Merchant webhooks | https://docs.rainforestpay.com/docs/merchant-webhooks.md | The `merchant.{status}` event names, the merchant status vocabulary, and `merchant.active` as the ready-to-process notification. |
+| Merchant application webhooks | https://docs.rainforestpay.com/docs/merchant-application-webhooks.md | The `merchant_application.{status}` event names and the application status vocabulary, including `COMPLETED` and `DECLINED`. |
+| Webhooks | https://docs.rainforestpay.com/docs/webhooks-and-notifications.md | Per-endpoint signing keys, the four source addresses, the ~28 hour retry schedule, `message.attempt.exhausted`, and portal replay. |
+| On-premises webhook integration | https://docs.rainforestpay.com/docs/on-premises-webhook-integration.md | That webhooks are at-least-once, that the resource id plus `event_type` is the idempotency key, and that the signature must be validated at the final destination. |
+| Test accounts and cards | https://docs.rainforestpay.com/docs/test-accounts-and-cards.md | The sandbox test cards and ACH accounts: an approved card leaves the payin `PROCESSING`, an unlisted card is `FAILED`, and any valid sandbox account is approved. |
+| Going live | https://docs.rainforestpay.com/docs/going-live.md | The three launch phases, and that production access, a production merchant, a default billing profile and a residuals account are Rainforest-side prerequisites. |
+
+### Recorded Rules
+
+- The API is bearer authenticated: `Authorization: Bearer <api_key>`, production keys prefixed `apikey_`, sandbox keys prefixed `sbx_apikey_`. A key is a server credential and must never reach the browser, a log line, a record or a handoff file.
+- Bases are `https://api.sandbox.rainforestpay.com` and `https://api.rainforestpay.com` under `/v1`. Sandbox and production hold separate data, keys and ids, and sandbox ids carry the `sbx_` prefix.
+- Every request may select the API version with `Rainforest-Api-Version`; the current version is `2024-10-16` (older: `2023-12-01`, `2023-01-01`), webhook payload shapes follow the platform's minimum version, and a request below that minimum fails with 400.
+- API key permissions are statements of `resource:action` permissions or a Rainforest group such as `group#all` or `group#payment_component`, optionally constrained by resource fields such as `merchant_id`; multiple statements are OR'd.
+- A payin is two calls: `POST /v1/payin_configs` (merchant, idempotency key, amount, currency) and `POST /v1/payins` against that config with `method_type` `CARD` or `ACH`. Both require the merchant to be `ACTIVE`; `amount` is in minor units and `currency_code` is documented as USD only.
+- Sending raw card or bank account data through the API is a direct-to-API integration that requires Rainforest approval, and an ACH `account_number` is sent encrypted with RSA-OAEP-SHA256. The components exist so sensitive data never reaches the platform's servers, so this platform never accepts, logs or stores a raw card number.
+- A card payin is authorised in real time and then sits in `PROCESSING` until it becomes `SUCCEEDED` (funds available to deposit; T+1 standard for card, T+4 for ACH). An ACH payin has no real-time authorisation and can be returned after processing, so a processing ACH payin is not settled money.
+- Payin statuses: `CREATED`, `PRESENTING`, `AUTHORIZED`, `PROCESSING`, `SUCCEEDED`, `FAILED`, `RETURNED`, `CANCELED`, `IN_REVIEW`, with events named `payin.{status}` in lower case.
+- Merchant statuses: `PENDING`, `ONBOARDING`, `ACTIVE`, `SUSPENDED`, `DEACTIVATED`, `CANCELED`. Application statuses: `CREATED`, `IN_PROGRESS`, `PROCESSING`, `NEEDS_INFORMATION`, `IN_REVIEW`, `COMPLETED`, `DECLINED`, with `merchant_application.{status}` events.
+- API onboarding runs: deposit method config, ACH deposit method with `account_holder_type` `BUSINESS`, merchant with `deposit_routes` naming that deposit method, application update, then submit. Required for every merchant type: `name`, `dba_name`, `legal_name`, `merchant_type`, `mcc`, `email`, `website`, `phone_number`, `average_ticket`, `high_ticket`, `average_monthly_volume`, the address block, `owner_1` and (except for an individual) `tax_id`.
+- Every webhook delivery is `{ data, event_type }` where `event_type` is `{resource}.{status}` and `data` carries the same fields the resource's GET endpoint returns.
+- Each endpoint has its own signing key, shown beside the endpoint in the platform portal. Webhooks come from `44.228.126.217`, `50.112.21.217`, `52.24.126.164` and `54.148.139.208`.
+- Delivery is retried for approximately 28 hours (immediately, 5 s, 5 min, 30 min, 2 h, 5 h, 10 h, 10 h); any 2XX inside 15 seconds acknowledges; an exhausted attempt is reported as `message.attempt.exhausted`; an endpoint failing for 5 consecutive days is disabled.
+- Webhooks are at-least-once and can be replayed from the portal, so a consumer is idempotent on the resource id and `event_type`.
+
+### Open Questions (recorded, not assumed)
+
+- **The webhook signature scheme is not yet read.** The Webhooks page points to a "Verify webhooks" recipe, and that recipe answers *not found* at both `/recipes/verify-webhooks-1` and `/recipes/verify-webhooks` in this environment. The header names, the signed content, the digest algorithm and the replay tolerance must be read from it before STEP 160 implements verification, and until then no Rainforest signature may be trusted.
+- **The direct-to-API approval is not public.** Both the payin guide and the onboarding guide say the feature requires Rainforest approval. STEPs 159 and 160 must not assume it, and the PCI rule holds either way: no raw card number and no raw bank account number reaches this platform's servers or database.
+- **The platform's minimum API version is a portal setting** the documentation does not expose, so STEP 158 must send the `Rainforest-Api-Version` header explicitly rather than relying on a default.
+- **No sandbox account exists here.** Sandbox keys are created in the Sandbox Platform Portal, so no sandbox call was executed, no webhook endpoint was registered and nothing below is claimed as passed.
+
+### Sandbox Notes
+
+| Step | Call | Result | Details |
+|---|---|---|---|
+| Authenticate a sandbox key | `GET /v1/api_keys` | Not run | No Rainforest sandbox account or API key exists in this environment. |
+| Onboard a merchant to `ACTIVE` | `POST /v1/merchants` | Not run | No Rainforest sandbox account or API key exists in this environment. |
+| Create a payin config | `POST /v1/payin_configs` | Not run | No Rainforest sandbox account or API key exists in this environment. |
+| Process a card payin to `SUCCEEDED` | `POST /v1/payins` | Not run | No Rainforest sandbox account or API key exists in this environment. |
+| Receive and verify a signed webhook | `POST /webhooks/rainforest` | Not run | No endpoint is registered and the signing recipe is not readable (see open questions). |
+
+The record these notes produce is `partial`, never `verified`: `calculateRainforestStatus` requires the
+whole five step cycle to be present and passed before a record can read as verified.
+
+### Capability Matrix
+
+- Charges: Yes (card and ACH payins)
+- Payouts: No (deposits to merchants are Rainforest's, not this platform's payouts)
+- Connected accounts: Yes (Rainforest onboards and underwrites the merchant; a sub-merchant is `merchant_application` + `merchant`)
