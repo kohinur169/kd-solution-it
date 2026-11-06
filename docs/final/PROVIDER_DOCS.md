@@ -806,3 +806,160 @@ step ids to be present and passed before a record can read as verified, and the 
 - Connected accounts: Yes (Accounts v2 configurations, or Accounts v1 with controller properties)
 - Refunds and disputes: Yes, on the balance the charge type names
 - Tokenised card capture: Yes (`pk_` publishable key with Stripe.js or Elements; no raw card number here)
+
+---
+
+## Airwallex (STEP 165)
+
+### Documentation Sources (read in the STEP 165 session, 2026-11-06)
+
+| Topic | URL | Status |
+|---|---|---|
+| API reference and the two API hosts | https://www.airwallex.com/docs/api/introduction | Reviewed |
+| API access token and how it is obtained | https://www.airwallex.com/docs/api/authentication/api_access_token | Reviewed |
+| Sandbox environment, and what it does not cover | https://www.airwallex.com/docs/developer-tools/sandbox-environment | Reviewed |
+| Webhook delivery, headers and signature scheme | https://www.airwallex.com/docs/developer-tools/webhooks/listen-for-webhook-events | Reviewed |
+| Connected accounts overview | https://www.airwallex.com/docs/connected-accounts/overview | Reviewed |
+| Native API onboarding and the account lifecycle | https://www.airwallex.com/docs/connected-accounts/onboarding/kyc-and-onboarding/native-api | Reviewed |
+| PaymentIntents guide: create, client secret, idempotency | https://www.airwallex.com/docs/payments/get-started/using-payments-intent-api | Reviewed |
+| Payment statuses and the webhook each emits | https://www.airwallex.com/docs/payments/reference/payment-statuses | Reviewed |
+| Transfer statuses and `PAID`'s late failure | https://www.airwallex.com/docs/payouts/transfers/create-a-transfer/transfer-statuses | Reviewed |
+| Sandbox test cards and the required test cases | https://www.airwallex.com/docs/payments/test-and-go-live/test-card-numbers | Reviewed |
+| Versioning, from the machine-readable specification | https://github.com/airwallex/airwallex-openapi | Reviewed |
+
+Two hosts are recorded and no others: `www.airwallex.com` for the documentation and `github.com` for the
+published specification. `docs.airwallex.com` — a host people type, on which no page lives — and
+`api-demo.airwallex.com` — a host a community specification names and no page does — are **refused by name**
+in `AIRWALLEX_REFUSED_HOSTS`, so a source or a base URL naming either is rejected rather than accepted as
+close enough.
+
+### Recorded Rules
+
+The sixteen rules `AIRWALLEX_RECORDED_RULES` carries, each with the page that produced it. The five that
+change how the adapter must be written:
+
+- **The token is short-lived and reused.** `POST /api/v1/authentication/login` with `x-client-id` and
+  `x-api-key` headers answers `201` with `token` and `expires_at`; the token "is valid for 30 minutes and can
+  be reused until it expires. Do not call the authentication endpoint before each request." A receiver of
+  this record therefore refreshes one minute early (`AIRWALLEX_TOKEN_REFRESH_SKEW_SECONDS = 60`) and never
+  logs in per call.
+- **Amounts are major units.** The Payments guide: "`amount`: The amount to charge specified in major units as
+  defined by ISO 4217. For example, $9.99 is represented as `9.99`." This platform stores ten-thousandths, so
+  `airwallexAmountFromPlatformMinor` divides by `10 ** MONEY_SCALE` and renders an exact decimal, and the gate
+  asserts `99_900n → 9.99` and `1_000_000n → 100.00` in both directions. A cents-style value would be wrong by
+  a factor of a hundred here, in the opposite direction from Stripe's.
+- **The idempotency key is `request_id`, in the body.** "Your unique idempotency key (v4 UUID) used to prevent
+  duplicate transactions by ensuring that retried API calls with the same ID are only processed once." The
+  transfers changelog adds a documented `409 Conflict` while a duplicate is being processed. STEP 168 must send
+  the field, not a header.
+- **The client secret lives 60 minutes and is never logged.** "Never log the `client_secret` in plain text
+  server logs." It cannot be refreshed or extended, so an expired checkout creates a new PaymentIntent.
+- **A payout's `PAID` is not final.** A paid transfer "may subsequently fail if it is rejected by the local
+  clearing system or the recipient bank", moving to `FAILED`. `airwallexTransferOutcomeOf` reports `PAID` as
+  `paid` **and** `provisional: true`, and `airwallexTransferCanStillFail` is what STEP 169 must ask before it
+  lets a payout ledger call a payment final.
+
+Two more worth naming: `acct_` is **the same prefix Stripe uses**, so an account id alone is never proof of a
+provider (`airwallexAccountIdCollidesWithStripe`), and a failed PaymentIntent has **no failure status** — it
+returns to `REQUIRES_PAYMENT_METHOD`, so `payment_intent.payment_failed` and the last payment attempt are the
+only failure signals.
+
+### Verified for STEP 165: documentation and sandbox notes (2026-11-06)
+
+Delivered by this STEP in `lib/payments/adapters/airwallex.ts`, with no network call and no credential:
+
+- **The two hosts, and a lookalike refused.** `AIRWALLEX_PRODUCTION_BASE`, `AIRWALLEX_SANDBOX_BASE`,
+  `airwallexEnvironmentOfBase` and `isAirwallexApiBase`; the file host is recorded separately because the
+  documentation uploads files to `files.sandbox.airwallex.com`, not to the API host.
+- **Credentials are validated by bounds, because no prefix is documented.** `validateAirwallexCredentials`
+  checks a client id (8-128), an API key (16-256), the base URL and a date version;
+  `carriesAirwallexKeyShapedText` refuses a JWT access token, a pasted `x-api-key` header or a `Bearer` value in
+  a field meant for a stored credential. The consequence is recorded, not hidden: **the mode cannot be inferred
+  from a key**, so STEP 166 must store the mode beside the sealed credential and take it from the base URL.
+- **Versioning is date-based and pinned.** `x-api-version`, `AIRWALLEX_API_VERSION_PATTERN`,
+  `AIRWALLEX_OBSERVED_API_VERSIONS` (`2024-02-22`, `2024-09-27`, `2025-06-30`, `2026-05-29`, `2026-08-21`) and a
+  default of `2026-05-29` — the reference FAQ's stated latest — with the `2026-08-21` example recorded beside it
+  as an open question for STEP 166's connection test.
+- **Every documented status is mapped.** The six PaymentIntent statuses plus `CANCELLED` (seven values),
+  `airwallexPaymentOutcomeOf` with `SUCCEEDED` as the only `paid`, the four documented attempt statuses, and
+  `airwallexIntentHasFailureStatus` which records that `FAILED` is not an Intent status at all.
+- **Transfers are mapped with their finality.** `AIRWALLEX_TRANSFER_STATUSES` (eleven values, approvals
+  included), `airwallexTransferOutcomeOf`, `airwallexTransferCanStillFail` and the terminal list holding
+  `CANCELLED` only — deliberately not `PAID`.
+- **Connected accounts are recorded from the native-API page.** `AIRWALLEX_ACCOUNT_ID_PATTERN` for the
+  documented `acct_…` id, the five statuses `CREATED`/`SUBMITTED`/`ACTIVE`/`ACTION_REQUIRED`/`SUSPENDED`,
+  `airwallexOnboardingStateOf` (`ready`/`waiting`/`blocked`), `validateAirwallexAccountRequest` which requires
+  both agreement flags, and `buildAirwallexConnectedAccountBody` for the two documented shapes: an individual
+  body carrying `legal_entity_type: INDIVIDUAL` (observed), and a business body carrying **no**
+  `legal_entity_type` because the business enum was not observed and the documented business example omits it.
+- **The PaymentIntent body and its idempotency key.** `buildAirwallexPaymentIntentBody` in the page's shape
+  (`amount` in major units, upper-case `currency`, `merchant_order_id`, `request_id`, optional `return_url`,
+  `descriptor`, `metadata`) with no card field and no secret anywhere, and `airwallexRequestIdFor` deriving a
+  deterministic 43-character `kd-…` id that fits inside the documented 64.
+- **The documented webhook scheme, implemented.** `verifyAirwallexWebhookSignature` computes
+  HMAC-SHA256 over `x-timestamp` **as received** concatenated with the raw body, compares in constant time,
+  then applies a tolerance — 300 seconds, which is **this platform's choice** because the page names none. It
+  refuses a tampered body, another secret, a stale timestamp, a malformed timestamp, an upper-case or truncated
+  hex digest, an empty body, an empty secret, a zero tolerance and an oversized delivery, and no refusal carries
+  the secret, the signature or the body.
+- **Events are read, and no name is invented.** `parseAirwallexEvent` reads the page's envelope
+  (`id`/`name`/`account_id`/`org_id`/`data.object`/`created_at`/`version`), `AIRWALLEX_EVENT_NAMES` records the
+  ten payment intent, three payment attempt and eleven transfer events, and the **account** group is left empty
+  because the account-status webhook page was not read — recorded as an open question rather than guessed.
+- **The sandbox gap is stated, not papered over.** `AIRWALLEX_SANDBOX_LIMITS` records that the sandbox covers
+  "all products … except Connected Account APIs", that those need Airwallex Sales or the Simulation APIs, that
+  `x-on-behalf-of` is how a platform calls for a connected account, that sandbox entity names must be
+  "New Business Sandbox" or "Sandbox Business", and that sandbox files are deleted after 90 days.
+- **None of it ran against Airwallex.** No sandbox account, client id, API key or webhook secret exists in this
+  environment, so no token was obtained, no account created, no payment taken, no transfer sent and no delivery
+  signed by Airwallex. `AIRWALLEX_SESSION_STATUS` is `partial` and `calculateAirwallexStatus` cannot say
+  otherwise: it needs all five documented steps verified, with evidence, and none is.
+
+### Open Questions (recorded, not assumed)
+
+- **The credential shape is unknown beyond its bounds.** No page documents a prefix or a checksum for a client id
+  or an API key, so the mode cannot be derived from the key; STEP 166 stores the mode beside the sealed
+  credential and takes it from the base URL.
+- **Which version to pin is unsettled.** The reference FAQ says the latest version is `2026-05-29`; the
+  published OpenAPI repository demonstrates `2026-08-21`. The default is `2026-05-29` and STEP 166's connection
+  test must confirm what the account accepts before a pin is stored.
+- **The business `legal_entity_type` enum was not observed.** The business create example carries none, so this
+  record sends none; STEP 167 revisits it only with a page that lists the values.
+- **The transfer `request_id` bound is uncertain.** The PaymentIntent page caps `request_id` at 64; a community
+  note claims 10-50 for transfers with a `request_id_duplicate` rejection. Only the documented `409` is recorded
+  as fact, and the derived id is 43 characters, inside both.
+- **The webhook timestamp tolerance is this platform's choice**, not Airwallex's: `300` seconds, matching the
+  Stripe receiver, recorded so nobody later mistakes it for a provider number.
+- **The account-status webhook names were not read**, so no account event name is recorded and STEPs 167-169
+  must read that page before subscribing.
+- **The connected-account sandbox gap stands.** Until Airwallex Sales grants connected-account access or a
+  Simulation API run is recorded as its own evidence, STEP 169's account steps are `partial` by definition.
+- **The platform's own fee on a connected account's payment was not read.** The pages read here describe payment
+  intents and transfers separately; STEP 168 must read the payments-for-platforms pages before deciding how the
+  platform's fee is collected.
+
+### Sandbox Notes
+
+| Step | Call | Result | Details |
+|---|---|---|---|
+| Obtain and reuse an access token | `POST /api/v1/authentication/login` | Not run | No Airwallex sandbox account, client id or API key exists in this environment. The documented 201 shape, the 30-minute lifetime and the expiry skew are recorded and gated, not exercised. |
+| Create one connected account after approval | `POST /api/v1/accounts/create` | Not run | The sandbox does not offer the Connected Account APIs without Airwallex Sales, and no credential exists anyway. The documented body, `acct_` id and five statuses are recorded. |
+| Submit the account for verification | `POST /api/v1/accounts/{id}/submit` | Not run | No account exists to submit; `SUBMITTED`, `ACTION_REQUIRED` and `SUSPENDED` are recorded with their RFI meaning. |
+| Take a payment with a documented test card | `POST /api/v1/pa/payment_intents/create` | Not run | No credential exists. The required test cases and cards (`4035501000000008` succeeds, `4012000300000013` fails 3DS, `5307837360544518` with `80.51` is insufficient funds) are recorded and unused. |
+| Pay out to a beneficiary | `POST /api/v1/transfers/create` | Not run | No balance, beneficiary or credential exists; the eleven statuses and `PAID`'s late failure are recorded. |
+| Verify and deduplicate a delivery | the endpoint's raw body plus `x-timestamp`/`x-signature` | Not run | No webhook subscription exists; the verifier was exercised only with self-computed signatures in the gate. |
+
+The record these notes produce is `partial`, never `verified`: `calculateAirwallexStatus` requires all five step
+ids to be recorded as `verified` **with evidence**, and the gate asserts that a record claiming more than its
+steps prove is refused.
+
+### Capability Matrix
+
+- Connected accounts: Yes (native API create, update, submit and read; embedded component and hosted flow also documented)
+- Payments: Yes (PaymentIntents with the client secret handed to Airwallex's own component; no raw card data here)
+- Payouts: Yes (Transfers to a beneficiary; `PAID` is provisional until its late-failure window closes)
+- Refunds: Yes (documented refund create and the `refund.accepted` event)
+- Webhooks: Yes (`x-timestamp` + `x-signature`, per-URL secret, 200 required or the delivery is retried)
+- Hosted components: Yes (hosted payment page, drop-in element, embedded elements, embedded KYC)
+- Sandbox for connected accounts: **No** without Airwallex Sales or the Simulation APIs — recorded as this
+  provider's one matrix gap
