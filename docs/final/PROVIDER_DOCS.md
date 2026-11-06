@@ -875,11 +875,12 @@ Delivered by this STEP in `lib/payments/adapters/airwallex.ts`, with no network 
   checks a client id (8-128), an API key (16-256), the base URL and a date version;
   `carriesAirwallexKeyShapedText` refuses a JWT access token, a pasted `x-api-key` header or a `Bearer` value in
   a field meant for a stored credential. The consequence is recorded, not hidden: **the mode cannot be inferred
-  from a key**, so STEP 166 must store the mode beside the sealed credential and take it from the base URL.
+  from a key**, and STEP 166 therefore stores the mode beside the sealed credential and takes it from the base
+  URL, exactly as that note asked.
 - **Versioning is date-based and pinned.** `x-api-version`, `AIRWALLEX_API_VERSION_PATTERN`,
   `AIRWALLEX_OBSERVED_API_VERSIONS` (`2024-02-22`, `2024-09-27`, `2025-06-30`, `2026-05-29`, `2026-08-21`) and a
   default of `2026-05-29` — the reference FAQ's stated latest — with the `2026-08-21` example recorded beside it
-  as an open question for STEP 166's connection test.
+  as an open question STEP 166's bounded probe is built to answer on evidence.
 - **Every documented status is mapped.** The six PaymentIntent statuses plus `CANCELLED` (seven values),
   `airwallexPaymentOutcomeOf` with `SUCCEEDED` as the only `paid`, the four documented attempt statuses, and
   `airwallexIntentHasFailureStatus` which records that `FAILED` is not an Intent status at all.
@@ -914,15 +915,28 @@ Delivered by this STEP in `lib/payments/adapters/airwallex.ts`, with no network 
   environment, so no token was obtained, no account created, no payment taken, no transfer sent and no delivery
   signed by Airwallex. `AIRWALLEX_SESSION_STATUS` is `partial` and `calculateAirwallexStatus` cannot say
   otherwise: it needs all five documented steps verified, with evidence, and none is.
+- **STEP 166 stores the credentials sealed and proves them with the two documented calls.**
+  `lib/payments/adapters/airwallex-client.ts` seals the client id, the API key and (when given) the webhook
+  signing secret under per-company AES-256-GCM scopes, shows only the last four characters afterwards, and calls
+  `POST /api/v1/authentication/login` for a token then `GET /api/v1/balances/current` with it before it says
+  `connected`. Because no prefix is documented, the mode is taken from the documented host, and the recorded test
+  names the host and the version it proved, so activation can refuse a test made anywhere else. The token lives
+  in an in-memory cache only — never in the record, the view or an audit entry. The gate
+  (`airwallex-client-verify.ts`) runs 323 checks against recorded answers; no call reached Airwallex.
+- **The version question is answered by evidence, not by guessing.** `probeAirwallexApiVersions` tries the pin
+  and every recorded version **newer** than it — `2026-05-29` then `2026-08-21` — reports which one the account
+  accepted, and **never rewrites the stored pin**, so whichever answer the account gives, the change is an
+  operator's decision recorded against a real answer.
 
 ### Open Questions (recorded, not assumed)
 
 - **The credential shape is unknown beyond its bounds.** No page documents a prefix or a checksum for a client id
   or an API key, so the mode cannot be derived from the key; STEP 166 stores the mode beside the sealed
   credential and takes it from the base URL.
-- **Which version to pin is unsettled.** The reference FAQ says the latest version is `2026-05-29`; the
-  published OpenAPI repository demonstrates `2026-08-21`. The default is `2026-05-29` and STEP 166's connection
-  test must confirm what the account accepts before a pin is stored.
+- **Which version to pin is still unsettled in the documentation, though no longer unanswerable.** The
+  reference FAQ says the latest version is `2026-05-29`; the published OpenAPI repository demonstrates
+  `2026-08-21`. The pin stays `2026-05-29` and STEP 166's bounded probe reports what the account accepts, but the
+  probe has never run against Airwallex, so the account's answer is still unknown here.
 - **The business `legal_entity_type` enum was not observed.** The business create example carries none, so this
   record sends none; STEP 167 revisits it only with a page that lists the values.
 - **The transfer `request_id` bound is uncertain.** The PaymentIntent page caps `request_id` at 64; a community
@@ -942,7 +956,8 @@ Delivered by this STEP in `lib/payments/adapters/airwallex.ts`, with no network 
 
 | Step | Call | Result | Details |
 |---|---|---|---|
-| Obtain and reuse an access token | `POST /api/v1/authentication/login` | Not run | No Airwallex sandbox account, client id or API key exists in this environment. The documented 201 shape, the 30-minute lifetime and the expiry skew are recorded and gated, not exercised. |
+| Obtain and reuse an access token | `POST /api/v1/authentication/login` | Not run | No Airwallex sandbox account, client id or API key exists in this environment. The documented 201 shape, the 30-minute lifetime and the expiry skew are recorded and gated, not exercised. STEP 166 implements the call and its token cache, and gates them against recorded answers only. |
+| Prove a configuration with an authenticated read | `GET /api/v1/balances/current` | Not run | No credential exists, so the read that turns a token into a proof never reached Airwallex. STEP 166 requires both calls before it reports `connected`, and only the balance **count** is kept. |
 | Create one connected account after approval | `POST /api/v1/accounts/create` | Not run | The sandbox does not offer the Connected Account APIs without Airwallex Sales, and no credential exists anyway. The documented body, `acct_` id and five statuses are recorded. |
 | Submit the account for verification | `POST /api/v1/accounts/{id}/submit` | Not run | No account exists to submit; `SUBMITTED`, `ACTION_REQUIRED` and `SUSPENDED` are recorded with their RFI meaning. |
 | Take a payment with a documented test card | `POST /api/v1/pa/payment_intents/create` | Not run | No credential exists. The required test cases and cards (`4035501000000008` succeeds, `4012000300000013` fails 3DS, `5307837360544518` with `80.51` is insufficient funds) are recorded and unused. |
