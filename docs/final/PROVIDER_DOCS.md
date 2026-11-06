@@ -127,6 +127,16 @@ sub-merchants). The service that records a verification is `lib/payments/adapter
 - The request encoding and the answer field used here are the standard client-credentials grant (`application/x-www-form-urlencoded` with `grant_type=client_credentials`, `client_id`, `client_secret`; the token read from `access_token`, with `token` accepted as an alias). Payoneer's token-management section is present in the reference but its text is script-rendered and was not readable in this session, so this standard shape is recorded as **to be confirmed** on the first sandbox token call rather than claimed as provider-specific documentation.
 - The credentials are sealed with the platform's single encryption module (`lib/security/encryption.ts`) under the scope `gateway:<companyId>:payoneer:<client_id|client_secret>`, so a sealed value cannot be opened for another company, another provider or the other credential.
 
+### Verified for STEP 156: bank linking, payouts and status handling (2026-11-06)
+
+- Automatic bank linking is **Register Payee with token**: `POST https://api.sandbox.payoneer.com/v4/programs/{program_id}/payees/register-payee-with-token` (production: `https://api.payoneer.com`). The published body is `payee_id`, `payee { type, company { name, url, legal_type, incorporated_address_1, incorporated_address_2, incorporated_city, incorporated_state, incorporated_zipcode, incorporated_country } }` and `payout_method { type: "BANKTRANSFER", bank_account_type, country, currency }`; the answer carries the payee reference and a registration token or link the payee continues with. The adapter's provider bank reference is the Payoneer **payee id**, which is what every payout names.
+- Payout submission is `POST /v4/programs/{program_id}/masspayouts` with a `Payments` array of at most **500** instructions. Each instruction carries `client_reference_id`, `payee_id`, `amount`, `currency`, `description` and, when the platform sends the bank details with the payment (the published "One Step Payments" shape), `payout_method_details { payee, payout_method { bank_account_type, currency, country, details { bank_name, account_name, account_number, account_type, routing_number } } }`.
+- The published validation answer "lists the specific `client_reference_id` values that failed", so an instruction is only refused when the answer names it; the listed entry's message is what the merchant's failure notice says.
+- Payout status is `GET /v4/programs/{program_id}/payouts/{client_reference_id}/status`, answered with `result.status` and `result.load_date`. **`Transferred` is the only status value the pages read publish**, and it is the only one the adapter maps to success. `load_date` must be present beside it; `Transferred` without it is treated as unknown rather than assumed.
+- Payout notifications are the documented names: `Request received`, `Request accepted`, `Account/card loaded`, `Sent to bank`, `Failed bank transfer`, `Payout canceled`, `Account funded`. The adapter maps loaded to success, failed bank transfer and canceled to failed, and the three request/acknowledgement states to pending; `Sent to bank` stays pending because the funds can still be returned. Any other name is unknown.
+- The notification signing scheme is still **unverified** (see STEP 154's open questions), so the adapter refuses every notification that is not passed through a caller-supplied verifier; until the scheme is read, payouts are followed by the status query, which needs no signature.
+- The documented account type of the published payout example is `C` for a US routing-number account; the adapter sends it only in that shape and sends no account type for a SWIFT account, because no SWIFT example is published.
+
 ### Open Questions (recorded, not assumed)
 
 - **Webhook signing is not yet read.** The API reference lists a Webhooks Security section, but its text is rendered by script and was not readable in this session. The exact header and digest must be read from that section before STEP 157 implements verification, and until then no Payoneer signature may be trusted. (A third-party SDK describes an `Authorization: hmacauth <AppName>:<Signature>:<Nonce>:<Timestamp>` header with HMAC-SHA256 over app name, method, URL, timestamp, nonce and body digest; that is **not** first-party and is recorded here only so nobody mistakes it for verified documentation.)
@@ -142,6 +152,15 @@ sub-merchants). The service that records a verification is `lib/payments/adapter
 | Submit a single payout | `POST /v4/programs/{program_id}/masspayouts` | Not run | No Payoneer sandbox credentials exist in this environment. |
 | Read the payout status to `Transferred` | `GET /v4/programs/{program_id}/payouts/{client_reference_id}/status` | Not run | No Payoneer sandbox credentials exist in this environment. |
 | Receive and verify a signed IPCN | `POST /ipcn/{notification}` | Not run | No endpoint is registered and the signing scheme is not yet read (see open questions). |
+
+Added by STEP 156 (same reason: no Payoneer sandbox credential exists here):
+
+| Step | Call | Result | Details |
+|---|---|---|---|
+| Register the merchant as a payee (automatic bank link) | `POST /v4/programs/{program_id}/payees/register-payee-with-token` | Not run | Implemented as `registerPayoneerPayee`; exercised against recorded answers only. No payee was created at Payoneer. |
+| Submit one payout instruction | `POST /v4/programs/{program_id}/masspayouts` | Not run | Implemented as `submitPayoneerPayout` with a client-reference idempotency store; no money was instructed. |
+| Read the payout status to `Transferred` | `GET /v4/programs/{program_id}/payouts/{client_reference_id}/status` | Not run | Implemented as `readPayoneerPayoutStatus`; only a recorded `Transferred` answer with `load_date` maps to success. |
+| Apply a payout notification through a verifier | `POST /ipcn/{notification}` | Not run | Implemented as `applyPayoneerPayoutNotification`, which refuses every delivery while no verifier exists. |
 
 The record these notes produce is `partial`, never `verified`: `calculatePayoneerStatus` requires the whole five
 step cycle to be present and passed before a record can read as verified.
