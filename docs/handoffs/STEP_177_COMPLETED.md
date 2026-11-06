@@ -25,7 +25,7 @@ Owned and used: `lib/tax/` only, per `docs/final/STEP_PLAN_250.md:119` ("TaxClou
 
 - `lib/tax/taxcloud-connect.ts` — new, 1343 lines. The permission, the two sealing scopes, the row and its invariants, the insert columns, the store port with an in-memory reference implementation and a PostgREST implementation, the transport port with the production transport, the audit vocabulary, the masked views, and the three operations: connect, verify, disconnect.
 - `lib/tax/taxcloud-connect-runtime.ts` — new, 43 lines. The one place the four dependencies are wired: the platform's REST client, the AES-256-GCM sealer reading `ENCRYPTION_MASTER_KEY` from the environment, the audit trail, and the transport.
-- `lib/tax/taxcloud-connect-verify.ts` — new, 1351 lines, the gate, **344 checks**.
+- `lib/tax/taxcloud-connect-verify.ts` — new, 1353 lines, the gate, **346 checks** (two checks were added by STEP 179, which needs the `Retry-After` header the transport answer now carries beside its status and body).
 - `docs/handoffs/STEP_177_COMPLETED.md` — this file.
 
 Untouched, deliberately: `package.json` (the gate runs by path, as every STEP since 170 does), `config/structure.json`, `migrations/` (STEP 023 already created every column this STEP needs and this block was granted no migration exception), `app/` (a connect screen and its route belong to STEP 178, which owns the tax settings surfaces and the switch the screen shows), `lib/security/` (the cipher is STEP 064's and is used, not changed), `lib/auth/` and `docs/final/PROVIDER_DOCS.md` (created by STEP 147 and extended only by adapter STEPs 147-169).
@@ -93,8 +93,8 @@ None. `package.json` is unchanged: the module uses `node:crypto` for row ids, `z
 
 - `npm run typecheck` — clean.
 - `npx eslint lib/tax/` — clean, no warnings.
-- `node lib/tax/taxcloud-connect-verify.ts` — `taxcloud connect gate passed: 344 checks`.
-- `node --experimental-strip-types lib/tax/taxcloud-connect-verify.ts` — the same 344 checks.
+- `node lib/tax/taxcloud-connect-verify.ts` — `taxcloud connect gate passed: 346 checks`.
+- `node --experimental-strip-types lib/tax/taxcloud-connect-verify.ts` — the same 346 checks.
 - `npm run check:structure` — 17 directories, 14 root files, **588** source files.
 - `npm run build` — clean, every route compiled.
 - `npm run verify` — **exit 0**: audit **3295** checks, structure 588 source files, lint **77** checks.

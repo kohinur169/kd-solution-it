@@ -689,10 +689,18 @@ export interface TaxCloudTransportCall {
   readonly body: string | null;
 }
 
-/** One answer: the status and the text, unparsed. */
+/**
+ * One answer: the status, the text, and the response headers that a caller may need.
+ *
+ * The headers were added by STEP 179, which has to honour the documented `Retry-After` on a `429` or a
+ * `503`. They stay optional so a transport that has none - a gate's function, a future adapter - still
+ * satisfies this type, and they are lower cased by the production transport so a reader does not have
+ * to guess the casing a server used.
+ */
 export interface TaxCloudTransportAnswer {
   readonly status: number;
   readonly body: string;
+  readonly headers?: Readonly<Record<string, string>>;
 }
 
 /** The transport port. Production is `taxCloudFetchTransport`; the gate supplies a function. */
@@ -756,7 +764,13 @@ export const taxCloudFetchTransport: TaxCloudTransport = async (call) => {
 
   if (text.length > TAXCLOUD_ANSWER_MAXIMUM_BYTES) throw new Error("the TaxCloud answer is larger than this platform reads");
 
-  return { status: response.status, body: text };
+  const answeredHeaders: Record<string, string> = {};
+
+  response.headers.forEach((value, name) => {
+    answeredHeaders[name.toLowerCase()] = value;
+  });
+
+  return { status: response.status, body: text, headers: answeredHeaders };
 };
 
 /* -------------------------------------------------------------------------------------------------

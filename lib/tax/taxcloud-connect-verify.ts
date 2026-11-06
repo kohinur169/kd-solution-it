@@ -1307,6 +1307,8 @@ async function checkTransportAndSource(): Promise<void> {
 
   expectEqual(source.split('"Authorization"').length - 1, 0, "the source never writes the refused header as a literal");
   expectEqual(source.includes("TAXCLOUD_REFUSED_AUTH_HEADER"), true, "the refused header is named through its constant");
+  expectEqual(source.includes("response.headers.forEach"), true, "the transport answers the response headers");
+  expectEqual(source.includes("headers: answeredHeaders"), true, "and answers them lower cased, for STEP 179's Retry-After");
   expectEqual(source.includes("sk_live_"), false, "no live key shape appears");
   expectEqual(source.includes("sandbox"), false, "the word the documentation refuses appears nowhere");
   expectEqual(source.split("options.audit.append(").length - 1, 5, "each of the five mutations audits once");
