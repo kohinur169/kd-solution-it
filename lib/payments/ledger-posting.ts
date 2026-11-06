@@ -110,6 +110,8 @@ export interface LedgerEntry {
 export interface LedgerEntryStore {
   /** The entries a group already holds, or an empty list when the group is new. */
   findByGroup(entryGroupId: string): LedgerEntry[];
+  /** The reversal that undoes this entry, or null when the entry is not reversed. */
+  findByReversalOf(entryId: string): LedgerEntry | null;
   /** Store a posted entry. */
   insert(entry: LedgerEntry): void;
 }
@@ -129,6 +131,15 @@ export class InMemoryLedgerEntryStore implements LedgerEntryStore {
     return ids
       .map((id) => this.entries.get(id))
       .filter((entry): entry is LedgerEntry => entry !== undefined);
+  }
+
+  findByReversalOf(entryId: string): LedgerEntry | null {
+    for (const entry of this.entries.values()) {
+      if (entry.reversalOfId === entryId) {
+        return entry;
+      }
+    }
+    return null;
   }
 
   insert(entry: LedgerEntry): void {
