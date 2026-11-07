@@ -2,9 +2,11 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import type { ReactNode } from "react";
+import { DisputeDeadlineExtensionForm } from "./deadline-extension-form";
 import { AppError } from "@/lib/errors/app-error";
 import { getMessage } from "@/lib/i18n/messages";
 import { listDisputeQueue, type DisputeView } from "@/services/disputes/dispute";
+import { DISPUTE_DEFAULT_WINDOW_HOURS } from "@/services/disputes/dispute-fields";
 import { getDisputeRuntime } from "@/services/disputes/dispute-runtime";
 import { readOfficeActor } from "../../office-actor";
 
@@ -22,9 +24,16 @@ export const dynamic = "force-dynamic";
  * ## What an officer needs, in the order they need it
  *
  * Every dispute still waiting for an answer, nearest deadline first - a queue, not a report - with the
- * merchant, the amount, the processor's reason and the instant the window closes. The row carries no form:
- * assembling the evidence pack and sending it is STEP 198's, and the merchant's own response is STEP 195's,
- * so a button here would promise an act this build cannot perform.
+ * merchant, the amount, the processor's reason and the instant the window closes.
+ *
+ * ## The one act a row carries
+ *
+ * Section 19 lets a super administrator widen a window to 48 hours "when needed", so a row at 24 hours that is
+ * still open carries that button and nothing else. Assembling the evidence pack and sending it is STEP 198's,
+ * and the merchant's own response is theirs to write - a queue that offered those would promise acts this
+ * build cannot perform. The button is rendered for every officer and *decided* for one: the role, the second
+ * factor and the device proof are the route's, so an account that presses it reads a refusal rather than
+ * discovering the rule after the window moved.
  *
  * ## Why the page refuses before it renders
  *
@@ -217,7 +226,14 @@ export default async function DisputeQueuePage(): Promise<ReactNode> {
 
                   {dispute.dueState === "overdue" ? (
                     <p className={bodyClasses}>{getMessage("disputes.overdueNote")}</p>
-                  ) : null}
+                  ) : dispute.responseWindowHours === DISPUTE_DEFAULT_WINDOW_HOURS ? (
+                    <DisputeDeadlineExtensionForm
+                      currentWindowHours={dispute.responseWindowHours}
+                      disputeId={dispute.id}
+                    />
+                  ) : (
+                    <p className={bodyClasses}>{getMessage("disputes.deadlineExtensionRoleNote")}</p>
+                  )}
                 </li>
               ))}
             </ul>

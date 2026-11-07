@@ -1213,8 +1213,9 @@ async function main(): Promise<void> {
   );
   const numbers = migrationNames.map((name) => Number.parseInt(name.slice(0, 4), 10));
 
-  expectEqual(Math.max(...numbers), 123, "0123 is the newest migration in the chain");
-  expectEqual(numbers.length, 123, "and the chain is one longer than STEP 192 left it");
+  // 0123 is this STEP's own migration and 0124 is STEP 195's; the chain is contiguous to 124.
+  expectEqual(Math.max(...numbers), 124, "0124 is the newest migration in the chain");
+  expectEqual(numbers.length, 124, "and the chain is one longer than STEP 192 left it");
 
   // The service writes no payment, and reuses the refund module's guarded write.
   expect(

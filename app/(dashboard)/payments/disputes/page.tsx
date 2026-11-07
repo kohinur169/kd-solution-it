@@ -21,11 +21,15 @@ export const dynamic = "force-dynamic";
  *
  * ## Why this screen renders on the server
  *
- * It has nothing to *do*. STEP 194 lists a dispute and tracks the status a processor gives it; writing the
- * merchant's side of the answer is STEP 195's form, and the evidence pack is STEP 198's. A screen with no
- * form needs no client component, no fetch, no token and no loading state, so the service is called once
- * inside the request and the answer is the page. `listCompanyDisputes` is the same function the JSON route
- * calls, so a merchant reading this page and a client reading `/api/payments/disputes` cannot disagree.
+ * It has nothing to *do* itself. The list reads what a processor reported; the writing happens on
+ * `/payments/disputes/[id]` (STEP 195), whose form posts to the response route. So this screen needs no client
+ * component, no token and no loading state: the service is called once inside the request and the answer is
+ * the page. `listCompanyDisputes` is the same function the JSON route calls, so a merchant reading this page
+ * and a client reading `/api/payments/disputes` cannot disagree.
+ *
+ * Each row links to that form while the dispute is still answerable - undecided and unsent - and says so with a
+ * badge once a response is saved. A row past its deadline keeps the link, because the page explains the closed
+ * window better than a truncated row can, and the form there refuses the save rather than hiding the fact.
  *
  * ## Why a refusal is a sentence and not an empty list
  *
@@ -214,6 +218,18 @@ export default async function DisputesPage(): Promise<ReactNode> {
                       {dispute.processorDisputeId ?? "-"}
                     </dd>
                   </dl>
+
+                  <div className="flex flex-wrap items-center gap-3">
+                    {dispute.responseSavedAt === null ? null : (
+                      <span className={dueBadgeClasses}>{getMessage("disputes.responseSavedBadge")}</span>
+                    )}
+                    <Link
+                      className={linkClasses}
+                      href={`/payments/disputes/${encodeURIComponent(dispute.id)}`}
+                    >
+                      {getMessage("disputes.answerLink")}
+                    </Link>
+                  </div>
 
                   {dispute.resolvedAt === null ? null : (
                     <div className="flex flex-col gap-1">

@@ -3474,6 +3474,73 @@ const catalog = {
     roleRefusedBody: "Only the account owner can read the disputes of a merchant.",
     officeRoleRefusedBody: "Only the compliance desk, the finance desk and the leadership read the dispute queue.",
     failed: "That did not work. Try again.",
+
+    /**
+     * STEP 195: the merchant's answer, and the deadline it is written against. Every sentence here is read by
+     * a merchant whose money is held, so the deadline is printed twice - in their own zone and in UTC - and the
+     * words say which one decides.
+     */
+    answerLink: "Answer",
+    answerTitle: "Answer this dispute",
+    answerDescription:
+      "Your processor has asked for your side of this payment. Write what happened, and the compliance desk sends it with the evidence pack before the window closes.",
+    answerEyebrow: "Dispute response",
+    backToList: "Back to disputes",
+    responseSavedBadge: "Response saved",
+    summaryTitle: "This dispute",
+    deadlineCardTitle: "The window",
+    deadlineLocalLabel: "Deadline in your time zone",
+    deadlineUtcLabel: "Deadline (UTC)",
+    deadlineZoneLabel: "Your time zone",
+    deadlineHelpBoth:
+      "Both lines are the same instant. The one in your time zone is the one to work to; the UTC one is what the processor records.",
+    deadlineShiftedNote:
+      "Your time zone changed its clock inside this window, so the dial reads {localHours} hours across it while the window itself is {absoluteHours} hours. The deadline has not moved.",
+    deadlineNoZoneNote:
+      "This screen could not read your browser's time zone, so the deadline is shown in UTC.",
+    deadlineRemainingOpen: "{hours} h {minutes} min left",
+    deadlineRemainingDueSoon: "Due soon: {hours} h {minutes} min left",
+    deadlineRemainingDue: "{minutes} min left",
+    deadlineRemainingOverdue: "The window has closed",
+    deadlineClosedNote:
+      "The window on this dispute has closed, so a response can no longer be saved. Nothing is retried from here: the processor decides on what it already has.",
+    responseLabel: "What happened",
+    responseHelp:
+      "Describe the order, what you delivered and any conversation with the payer. Plain text, up to 20,000 characters. You can edit it until the deadline.",
+    responsePlaceholder: "The order, the delivery, and what the payer told you.",
+    responseCharacterCount: "{used} of {limit} characters",
+    responseSave: "Save response",
+    responseSaving: "Saving",
+    responseSavedDone: "Response saved.",
+    responseSavedAt: "Saved {instant}. You can edit it until the deadline.",
+    responseSubmittedNote:
+      "The compliance desk has sent this dispute to the processor, so the response is fixed.",
+    responseResolvedNote: "This dispute is decided, so the response is history.",
+    responseEmptyError: "Write your side of the dispute before saving.",
+    responseTooLongError: "Your response is longer than 20,000 characters.",
+    responseInvalidError: "Use plain text: no control characters, and something other than spaces.",
+    responseDeadlineError: "The window closed before this response arrived, so nothing was saved.",
+    responseMovedError: "Somebody saved this dispute while your page was open. Reload and check.",
+    responseNotFoundError: "This dispute is not on your account.",
+    documentsNote:
+      "Documents are collected by the compliance desk when the evidence pack is assembled. This form takes your words only.",
+    deadlineExtensionTitle: "The merchant's window",
+    deadlineExtensionHelp:
+      "A super administrator may set the window to 48 hours when the merchant needs it. The deadline moves with the window, and both stop mattering once the pack is sent.",
+    deadlineExtensionButton: "Extend to 48 hours",
+    deadlineExtensionBusy: "Extending",
+    deadlineExtensionDone: "The window is now 48 hours.",
+    deadlineExtensionClosedNote: "The window has already closed, so it cannot be extended.",
+    deadlineExtensionRoleNote: "Only a super administrator with a verified device can extend a deadline.",
+    deadlineExtensionDeviceNote: "This browser signs the request with the account's enrolled device key.",
+    windowLabel: "Window",
+    windowHoursText: "{hours} hours",
+    deadlinePassedRefusal: "The window closed before this request, so nothing changed.",
+    submittedRefusal: "The pack has been sent, so the response can no longer change.",
+    resolvedRefusal: "This dispute is decided and cannot be reopened from here.",
+    windowInvalidRefusal: "The window is set to 24 or 48 hours, and it only ever widens.",
+    deadlineNotExtendableRefusal: "A decided dispute has no deadline left to move.",
+    deviceRequiredRefusal: "This browser is not enrolled as a trusted device for this account.",
   },
   email: {
     lockAlert: {

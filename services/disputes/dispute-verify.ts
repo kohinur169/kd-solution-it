@@ -81,7 +81,8 @@ import {
  *     requires, and the fee column untouched: section 18's chargeback fee is a later STEP's number.
  *   - **No migration is needed.** `0039` already carries the table, the deadline arithmetic, the evidence
  *     rule, the resolution pair, the unique processor key and the triggers. The gate reads that file and
- *     asserts each of them, and asserts the highest migration is still 123.
+ *     asserts each of them, and asserts the highest migration is 124 - STEP 195's `0124_dispute_response`, which
+ *     this STEP did not write.
  *   - **Nothing here writes money.** No `payments` write, no ledger call, no chargeback fee.
  */
 
@@ -436,6 +437,7 @@ function createFixture(payments: readonly Row[]): Fixture {
                 fee_minor: "0",
                 evidence_ready: false,
                 response_text: null,
+                response_saved_at: null,
                 submitted_at: null,
                 resolved_at: null,
                 outcome_note: null,
@@ -1102,6 +1104,8 @@ async function main(): Promise<void> {
       response_window_hours: 24,
       response_due_at: "2026-11-08T09:00:00.000Z",
       evidence_ready: false,
+      response_text: null,
+      response_saved_at: null,
       submitted_at: null,
       resolved_at: null,
       outcome_note: null,
@@ -1219,9 +1223,11 @@ async function main(): Promise<void> {
     .map((name) => Number.parseInt(name.slice(0, 4), 10))
     .sort((left, right) => left - right);
 
+  // 124 is STEP 195's `0124_dispute_response`, the instant the merchant answered and the trigger that
+  // freezes it. This STEP (194) itself owns no migration: `0039` carries the dispute and `0032` the delivery.
   expectEqual(
     migrations[migrations.length - 1] ?? 0,
-    123,
+    124,
     "this STEP adds no migration: `0039` already carries the dispute and `0032` the delivery",
   );
   expectEqual(harness.fixture.disputes.length, 1, "and the fixture closed with one row, as the deliveries said");

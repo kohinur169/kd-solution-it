@@ -4,8 +4,9 @@ import { deepFreeze } from "../../lib/utils/freeze.ts";
 
 /**
  * The vocabulary of section 19's dispute: the six states `0039_disputes.sql` allows, the order they move
- * in, the two roles that may read them, the numbers the schema enforces, the words a refusal names and the
- * events a provider may use to move a row.
+ * in, the roles that may read them, the numbers the schema enforces, the words a refusal names, the events a
+ * provider may use to move a row, and - STEP 195 - the response the merchant writes and the window it has to
+ * write it in.
  *
  * ## Why this is a separate module from the service
  *
@@ -105,11 +106,42 @@ export const DISPUTE_QUEUE_LIMIT = 100;
 export const DISPUTE_DEFAULT_WINDOW_HOURS = 24;
 export const DISPUTE_WINDOW_HOURS = deepFreeze([24, 48] as const);
 
+/**
+ * How close to its deadline a window has to be before a screen says so.
+ *
+ * One number for every screen: the list's badge (STEP 194), the countdown on the response form and the
+ * office queue's ordering all read it here, so "due soon" can never mean four hours on one screen and six on
+ * another. It is a display rule, never an enforcement rule - only the closed window refuses a save.
+ */
+export const DISPUTE_DUE_SOON_HOURS = 4;
+
 /** `disputes_reason_check`: 1 to 64 characters, trimmed. */
 export const DISPUTE_REASON_MAXIMUM_LENGTH = 64;
 
 /** `disputes_outcome_check`: 1 to 500 characters, trimmed. */
 export const DISPUTE_OUTCOME_NOTE_MAXIMUM_LENGTH = 500;
+
+/** `disputes_response_check`: 1 to 20000 characters, the merchant's own words. */
+export const DISPUTE_RESPONSE_MINIMUM_LENGTH = 1;
+export const DISPUTE_RESPONSE_MAXIMUM_LENGTH = 20_000;
+
+/**
+ * The largest body the response route reads.
+ *
+ * Twenty thousand characters of prose can arrive escaped - a newline is `\n`, a quote is `\"`, an emoji is
+ * six bytes - so the ceiling is the text's own bound with room for the escaping, not the bound itself.
+ */
+export const DISPUTE_RESPONSE_MAXIMUM_BODY_BYTES = 32_768;
+
+/**
+ * The extension section 19 allows, and the one role that may make it.
+ *
+ * "super_admin can set the deadline to 48 hours when needed" - one direction only, because a deadline that
+ * could shrink would be a deadline that could take back time a merchant was already using. The service
+ * therefore refuses a body naming 24 on a dispute that is already at 48.
+ */
+export const DISPUTE_EXTENDED_WINDOW_HOURS = 48;
+export const DISPUTE_DEADLINE_ROLES: readonly PlatformRole[] = deepFreeze(["super_admin"] as const);
 
 /** The largest provider body a dispute webhook reads. Stripe's own ceiling for an event is far smaller. */
 export const DISPUTE_WEBHOOK_MAXIMUM_BODY_BYTES = 1_048_576;
@@ -170,6 +202,16 @@ export const DISPUTE_RULES = deepFreeze({
   eventIdInvalid: "webhook_event_id_invalid",
   /** The event says neither `live` nor `test` where the platform needs one. */
   modeInvalid: "webhook_mode_invalid",
+  /** The response is empty, too long, not trimmed, or carries a control character the column should not hold. */
+  responseInvalid: "dispute_response_invalid",
+  /** The merchant is writing after the window section 19 gave them has closed. */
+  deadlinePassed: "dispute_deadline_passed",
+  /** The pack was already sent to the processor, so the words are fixed. */
+  submitted: "dispute_submitted",
+  /** The window is not one of the two the schema allows, or the extension goes the wrong way. */
+  windowInvalid: "dispute_window_invalid",
+  /** The dispute is decided or already sent, so its deadline is history. */
+  deadlineNotExtendable: "dispute_deadline_not_extendable",
 } as const);
 
 /**
@@ -186,6 +228,8 @@ export const DISPUTE_AUDIT = deepFreeze({
   ignored: "dispute.webhook_ignored",
   refused: "dispute.webhook_rejected",
   listed: "dispute.listed",
+  responseSaved: "dispute.response_saved",
+  deadlineExtended: "dispute.deadline_extended",
 } as const);
 
 /** True when a value is one of `0039`'s six statuses. */
@@ -229,6 +273,24 @@ export function disputeStatusMayMove(from: string, to: DisputeStatus): boolean {
 /** The deadline of a dispute opened at one instant, for one window: `opened_at + window hours`. */
 export function disputeDueAt(openedAtEpochMs: number, windowHours: number): number {
   return openedAtEpochMs + windowHours * 3_600_000;
+}
+
+/**
+ * Whether an extension may be made, and to what.
+ *
+ * Only the wider window is available, only from the narrower one: 24 to 48 is section 19's sentence, 48 to
+ * 24 is taking back time, and 24 to 24 is a save that changes nothing.
+ */
+export function disputeExtensionTarget(currentWindowHours: number, requestedWindowHours: number): number | null {
+  if (!(DISPUTE_WINDOW_HOURS as readonly number[]).includes(requestedWindowHours)) {
+    return null;
+  }
+
+  if (requestedWindowHours === DISPUTE_EXTENDED_WINDOW_HOURS && currentWindowHours === DISPUTE_DEFAULT_WINDOW_HOURS) {
+    return DISPUTE_EXTENDED_WINDOW_HOURS;
+  }
+
+  return null;
 }
 
 /**

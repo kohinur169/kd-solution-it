@@ -9,6 +9,7 @@ import { appendTolerated } from "../payments/refund.ts";
 import type { DisputeEvent } from "./dispute-events.ts";
 import {
   DISPUTE_AUDIT,
+  DISPUTE_DUE_SOON_HOURS,
   DISPUTE_AUDIT_ENTITY,
   DISPUTE_DEFAULT_WINDOW_HOURS,
   DISPUTE_LIST_LIMIT,
@@ -95,6 +96,10 @@ export interface DisputeView {
   readonly responseDueAt: string;
   readonly dueState: DisputeDueState;
   readonly evidenceReady: boolean;
+  /** What the merchant wrote (STEP 195), or null before they have written anything. */
+  readonly responseText: string | null;
+  /** When the merchant last saved it, inside the window. */
+  readonly responseSavedAt: string | null;
   readonly responseSubmittedAt: string | null;
   readonly resolvedAt: string | null;
   readonly outcomeNote: string | null;
@@ -106,8 +111,8 @@ export interface DisputeView {
 /** The columns every read names, one by one. Never `select=*`. */
 export const DISPUTE_ROW_COLUMNS =
   "select=id,company_id,payment_id,processor_dispute_id,status,reason_code,amount_minor,currency,fee_minor" +
-  ",opened_at,response_window_hours,response_due_at,evidence_ready,submitted_at,resolved_at,outcome_note" +
-  ",created_at,updated_at,version";
+  ",opened_at,response_window_hours,response_due_at,evidence_ready,response_text,response_saved_at" +
+  ",submitted_at,resolved_at,outcome_note,created_at,updated_at,version";
 
 export const disputeRowSchema = z.object({
   id: z.string().uuid(),
@@ -123,6 +128,8 @@ export const disputeRowSchema = z.object({
   response_window_hours: z.number(),
   response_due_at: z.string(),
   evidence_ready: z.boolean(),
+  response_text: z.string().nullable(),
+  response_saved_at: z.string().nullable(),
   submitted_at: z.string().nullable(),
   resolved_at: z.string().nullable(),
   outcome_note: z.string().nullable(),
@@ -158,9 +165,6 @@ const providerRowSchema = z.object({
 });
 
 export type DisputeProviderRow = z.infer<typeof providerRowSchema>;
-
-/** The four hours of a 24-hour window that count as "due soon". */
-export const DISPUTE_DUE_SOON_HOURS = 4;
 
 /** How close one row is to the deadline section 19 gave it. */
 export function dueStateOf(resolvedAt: string | null, responseDueAt: string, nowMs: number): DisputeDueState {
@@ -200,6 +204,8 @@ export function disputeViewOf(row: DisputeRow, nowMs: number): DisputeView {
     responseDueAt: row.response_due_at,
     dueState: dueStateOf(row.resolved_at, row.response_due_at, nowMs),
     evidenceReady: row.evidence_ready,
+    responseText: row.response_text,
+    responseSavedAt: row.response_saved_at,
     responseSubmittedAt: row.submitted_at,
     resolvedAt: row.resolved_at,
     outcomeNote: row.outcome_note,

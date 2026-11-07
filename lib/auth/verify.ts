@@ -12814,11 +12814,17 @@ async function checkCsrfProtection(): Promise<void> {
   //
   // STEP 193 adds one file and two calls: the section 18 fee screen's form, which answers the platform fee
   // question on a refund and runs the pass that applies the answer to the refunds still unanswered.
-  expectEqual(browserMutations.length, 52, "fifty two browser files send a mutation");
+  //
+  // STEP 194 adds none: both of its screens read, and a screen that only reads holds no token.
+  //
+  // STEP 195 adds two files and two calls, one each: the merchant's response form - the words section 19 gives
+  // them inside the window - and the office's deadline extension, which a super administrator's enrolled device
+  // signs before the route will move another merchant's deadline.
+  expectEqual(browserMutations.length, 54, "fifty four browser files send a mutation");
   expectEqual(
     browserMutations.reduce((total, path) => total + mutationCalls(appSourceOf(appSources, path)), 0),
-    72,
-    "across seventy two call sites",
+    74,
+    "across seventy four call sites",
   );
   const postCalls = mutationCalls;
   const tokenSpreads = (source: string): number =>

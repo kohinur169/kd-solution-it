@@ -1103,7 +1103,8 @@ async function main(): Promise<void> {
 
   // 123 is STEP 193's `0123_refund_fee_rule`; this STEP adds none, because `0038` already carries the
   // statuses, the instant and the provider identifier an execution writes.
-  expectEqual(migrations[migrations.length - 1] ?? 0, 123, "this STEP adds no migration either");
+  // The chain's head moved to 124 with STEP 195's `0124_dispute_response`; this STEP adds none of its own.
+  expectEqual(migrations[migrations.length - 1] ?? 0, 124, "this STEP adds no migration either");
 
   if (failures.length > 0) {
     process.stdout.write(`refund execution gate failed with ${String(failures.length)} problem(s):\n`);

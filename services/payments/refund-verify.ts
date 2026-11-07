@@ -61,7 +61,7 @@ import {
  *     `payments.refunded_minor`, which `0037`'s trigger reserves for the refund sync.
  *   - **No migration is needed**: `0038` already carries the table, the six statuses, the approval and
  *     processing constraints, the cap trigger and the payment sync. The gate reads that file and asserts
- *     every one of them, and asserts the next free migration number is still 123.
+ *     every one of them, and asserts the newest migration is whatever the chain's head is (124, after STEP 195).
  */
 
 const failures: string[] = [];
@@ -1358,11 +1358,11 @@ async function main(): Promise<void> {
     .map((name) => Number.parseInt(name.slice(0, 4), 10))
     .sort((left, right) => left - right);
 
-  // 123 is STEP 193's `0123_refund_fee_rule`, the section 18 switch and the instant the fee rule was applied.
-  // This STEP still owns no migration: `0038` carries the whole refund lifecycle, as the file says.
+  // 124 is STEP 195's `0124_dispute_response`, the merchant's answer and the instant it was saved; 123 was this
+  // STEP's own `0123_refund_fee_rule`. This STEP still owns no migration: `0038` carries the whole lifecycle.
   expectEqual(
     migrations[migrations.length - 1] ?? 0,
-    123,
+    124,
     "this STEP adds no migration, because `0038` already carries the whole lifecycle",
   );
 
