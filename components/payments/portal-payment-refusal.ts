@@ -39,6 +39,12 @@ export function portalPaymentRuleTextOf(rule: string): string | null {
       return getMessage("portal.paymentRuleOutcomeUnknown");
     case "amount_unrepresentable":
       return getMessage("portal.paymentRuleAmountUnrepresentable");
+    case "velocity_card_limited":
+      return getMessage("portal.ruleVelocityCardLimited");
+    case "velocity_ip_limited":
+      return getMessage("portal.ruleVelocityAddressLimited");
+    case "velocity_unavailable":
+      return getMessage("portal.ruleVelocityUnavailable");
     case "card_blacklisted":
       return getMessage("portal.ruleCardBlacklisted");
     case "card_blacklist_unavailable":
@@ -91,6 +97,9 @@ export function portalPaymentRuleSentences(): Readonly<Record<string, string>> {
     "risk_suspicious",
     "card_blacklisted",
     "card_blacklist_unavailable",
+    "velocity_card_limited",
+    "velocity_ip_limited",
+    "velocity_unavailable",
   ];
 
   const sentences: Record<string, string> = {};

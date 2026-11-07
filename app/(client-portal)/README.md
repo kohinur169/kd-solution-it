@@ -6,7 +6,7 @@ Owner: STEP 181-190 (client portal, payment pages and payment links).
 STEP 181 built the invoice link, STEP 182 the estimate link, STEP 183 the card payment page, STEP 184 the
 3D Secure step in front of it, STEP 185 the billing match that decides what a payment without a bank may do,
 STEP 186 the handling of the provider's fraud signal, STEP 187 the card blacklist the platform checks before it
-charges anything.
+charges anything, STEP 188 the card and IP velocity limits that stop an attempt before a record exists.
 The links are read-only without a token, and each STEP writes only what its own section asks for.
 
 Reserved for tokenized client surfaces opened without a login: invoice links under
@@ -204,6 +204,32 @@ decision.
 STEP 187 adds no migration: `0055` (STEP 030) already carries the table, the fingerprint alphabet, the two
 sources, the six reasons, the unique active-block index and the release guard. The gate reads that migration and
 asserts each of them, and asserts 0123 is still the next free number.
+
+## What STEP 188 built
+
+- `portal-velocity-fields.ts` - the vocabulary of section 18's velocity sentence: the two subjects, the defaults
+  read out of `config/app.ts`, the three rules a refusal names (`velocity_card_limited`, `velocity_ip_limited`,
+  `velocity_unavailable`), the audit action, the policy schema bounded by `0056`'s own checks, and the refusal
+  payload.
+- `portal-velocity.ts` - the counting: `consumePortalPaymentVelocity` hits STEP 067's `consume_velocity` once for
+  the card and once for the address, breaches are written through STEP 067's own `velocityAuditEntry`, and
+  `createPortalVelocityLookup` is the same counter in the shape STEP 066's fraud evaluation asks for.
+- `portal-velocity-processor.ts` - the check the payment operation runs, with the operator's policy validated once
+  at build time and STEP 067's defaults when there is none.
+- `portal-velocity-verify.ts` - the gate, 204 checks. Run it with
+  `node "app/(client-portal)/portal-velocity-verify.ts"`.
+
+The three pre-charge checks now run in one documented order: **the list** is read first (STEP 187), then **the
+counters** are hit (STEP 188), and only then is **a payment record opened** and the gateway asked. An unreadable
+list or an unreadable counter refuses the attempt; a breach of either velocity limit refuses it with `429`,
+`retry-after` and the rule that says which limit it was. A velocity refusal writes **no** payment record, because
+a limit is about traffic and not about money - the counter holds the count and the chain holds the refusal
+(`portal.payment_velocity_limited`) and STEP 067's own breach (`security.velocity_limited`, once per window).
+
+STEP 188 adds no migration: `0056` (STEP 067) already carries `velocity_counters` with the subject, window, limit
+and breach constraints and its two unique keys, and `0093` already carries `consume_velocity`, which counts a hit
+up inside one statement and freezes the limit in the row. The gate reads both and asserts the six arguments and
+the answer columns this page depends on, and asserts 0123 is still the next free number.
 
 STEP 182 adds no migration. `0025` already carries `void_reason`, `voided_at` and `accepted_at`; `0027`
 already carries the eight pieces of evidence and the unique index that makes one signature per estimate;

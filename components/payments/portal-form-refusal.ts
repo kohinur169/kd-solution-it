@@ -98,10 +98,6 @@ export async function portalRefusalOf(
     return { status: response.status, rule: null, text: getMessage("portal.merchantForbidden") };
   }
 
-  if (response.status === 429) {
-    return { status: response.status, rule: null, text: getMessage("portal.confirmationRateLimited") };
-  }
-
   let rule: string | null = null;
 
   try {
@@ -121,6 +117,19 @@ export async function portalRefusalOf(
     }
   } catch {
     rule = null;
+  }
+
+  if (response.status === 429) {
+    // A rate limit usually carries no rule: it is the surface's own ceiling, and the sentence for it is the
+    // confirmation one. STEP 188's velocity limits do carry one, because a payer can act on which limit they
+    // reached - so an override wins when it is named, and the generic sentence stands when it is not.
+    const override = rule === null ? undefined : overrides?.[rule];
+
+    return {
+      status: response.status,
+      rule,
+      text: override ?? getMessage("portal.confirmationRateLimited"),
+    };
   }
 
   if (rule === null) {

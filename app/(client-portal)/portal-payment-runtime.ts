@@ -7,6 +7,7 @@ import {
 } from "../../lib/payments/adapters/nmi-client.ts";
 import type { PortalPaymentDependencies } from "./portal-payment.ts";
 import { createPortalCardBlacklistQueue, createPortalCardBlockCheck } from "./portal-blacklist-processor.ts";
+import { createPortalVelocityCheck } from "./portal-velocity-processor.ts";
 import {
   createInMemoryPortalPaymentRecorder,
   createPortalPaymentProcessor,
@@ -70,6 +71,9 @@ export function getPortalPaymentRuntime(): PortalPaymentRuntime {
       encryptionKeyHex,
       // STEP 187: the list is asked before the gateway is, on every attempt.
       blacklist: createPortalCardBlockCheck({ rest: auth.rest, audit: auth.audit }),
+      // STEP 188: and so are the card and address counters, under STEP 067's defaults until an operator sets
+      // a policy. The value travels as this argument, which is where the settings screen will hand it over.
+      velocity: createPortalVelocityCheck({ rest: auth.rest, audit: auth.audit }),
     }),
     /**
      * STEP 186's referral, now wired to STEP 187's table.

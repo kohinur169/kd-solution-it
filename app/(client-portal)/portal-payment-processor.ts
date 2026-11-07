@@ -16,6 +16,7 @@ import {
 } from "./portal-fraud-fields.ts";
 import { PORTAL_BLACKLIST_SETTLED_CODE } from "./portal-blacklist-fields.ts";
 import type { PortalBlacklistCheck } from "./portal-blacklist.ts";
+import type { PortalVelocityCheck } from "./portal-velocity.ts";
 import type {
   PortalChargeOutcome,
   PortalChargeRequest,
@@ -117,6 +118,11 @@ export interface PortalPaymentProcessorOptions {
    * always wires the real one - but a gate that is about something else can leave it out.
    */
   readonly blacklist?: PortalBlacklistCheck | null;
+  /**
+   * STEP 188's counters, asked after the list and before a record is opened: an attempt that breaches a card or
+   * address limit is traffic the page turns away, not a payment that failed.
+   */
+  readonly velocity?: PortalVelocityCheck | null;
   /** The routing rules a charge is decided by. The platform's starting set unless a caller says otherwise. */
   readonly routingRules?: readonly RoutingRule[];
 }
@@ -142,6 +148,26 @@ export function createPortalPaymentProcessor(
 
       if (blocked !== null && blocked.status === "unavailable") {
         return { status: "unavailable", reason: "blacklist" };
+      }
+
+      // STEP 188, second: one attempt is one hit on the card and one on the address, and a breach ends the
+      // attempt here - before a payment record exists, because a limit is about traffic and not about money.
+      const velocity = options.velocity ?? null;
+      const counted =
+        velocity === null
+          ? null
+          : await velocity.check({
+              token: request.token,
+              clientAddress: request.clientAddress,
+              userAgent: request.userAgent,
+            });
+
+      if (counted !== null && counted.status === "unavailable") {
+        return { status: "unavailable", reason: "velocity" };
+      }
+
+      if (counted !== null && counted.status === "limited") {
+        return { status: "refused_by_velocity", limited: counted.limited };
       }
 
       const opened = options.recorder.open({

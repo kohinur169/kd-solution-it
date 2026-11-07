@@ -3140,6 +3140,13 @@ const catalog = {
     paymentBillingPostalLabel: "Billing postal code",
     paymentBillingPostalHint:
       "The postal code on the card's billing address. Your bank uses it, with the country of this connection, to check the payment.",
+    /** STEP 188: this card or this address reached a velocity limit, or the counters could not be read. */
+    ruleVelocityCardLimited:
+      "This card has been used for too many payment attempts in a short time. Nothing was charged. Please wait a little and try again, or use another card.",
+    ruleVelocityAddressLimited:
+      "There have been too many payment attempts from this network in a short time. Nothing was charged. Please wait a little and try again.",
+    ruleVelocityUnavailable:
+      "Payment attempts cannot be counted right now, so the payment was not attempted and nothing was charged. Please try again in a few minutes.",
     /** STEP 187: the card is on the platform's own list, or the list could not be read. */
     ruleCardBlacklisted:
       "This card cannot be used for payments on this platform. Nothing was charged. If you believe this is wrong, contact the business you are paying.",

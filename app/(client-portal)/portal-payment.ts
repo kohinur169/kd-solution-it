@@ -14,6 +14,15 @@ import {
   PORTAL_BLACKLIST_UNAVAILABLE_AUDIT_ACTION,
 } from "./portal-blacklist-fields.ts";
 import { portalCardFingerprintOf, type PortalCardBlockSummary } from "./portal-blacklist.ts";
+import {
+  PORTAL_VELOCITY_AUDIT_ACTION,
+  PORTAL_VELOCITY_REFUSAL_FIELD,
+  PORTAL_VELOCITY_RULES,
+  portalVelocityPayloadOf,
+  portalVelocityRuleOf,
+  type PortalVelocityLimited,
+} from "./portal-velocity-fields.ts";
+import { portalVelocityCardFingerprint } from "./portal-velocity.ts";
 import type { PortalTokenKeys } from "../../lib/security/portal-token.ts";
 import { openPortalInvoice, type PortalInvoiceView } from "./portal-invoice.ts";
 import { portalMoneyTextOf } from "./portal-invoice-money.ts";
@@ -107,6 +116,12 @@ export interface PortalChargeRequest {
   readonly token: string;
   readonly idempotencyKey: string;
   readonly occurredAtEpochMs: number;
+  /**
+   * Where the attempt came from, which STEP 188's address counter needs and which a browser cannot set: the
+   * service reads it from the request's own address, the same value the rate limiter counts.
+   */
+  readonly clientAddress: string;
+  readonly userAgent: string | null;
 }
 
 /** What the payment operation answers. */
@@ -130,6 +145,11 @@ export type PortalChargeOutcome =
       readonly replayed: boolean;
     }
   /**
+   * STEP 188: this card or this address reached a velocity limit, so the attempt ended before a payment record
+   * existed and before the gateway was asked. The counters hold the count; the chain holds the refusal.
+   */
+  | { readonly status: "refused_by_velocity"; readonly limited: PortalVelocityLimited }
+  /**
    * STEP 187: the card is on the platform's blacklist, so the attempt ended before the gateway was asked.
    * `block` is the entry that refused it, or null when this is the replay of an attempt that already has one.
    */
@@ -142,8 +162,11 @@ export type PortalChargeOutcome =
   | { readonly status: "unknown"; readonly paymentId: string | null; readonly reason: string }
   | {
       readonly status: "unavailable";
-      /** `blacklist` is STEP 187's: the list could not be consulted, so nothing was charged. */
-      readonly reason: PortalPaymentUnavailable | "blacklist";
+      /**
+       * `blacklist` is STEP 187's: the list could not be consulted, so nothing was charged. `velocity` is STEP
+       * 188's: the counters could not be read, and a limiter that opens when the database is down is not one.
+       */
+      readonly reason: PortalPaymentUnavailable | "blacklist" | "velocity";
     };
 
 /** The platform's payment operation, as this page sees it. */
@@ -531,9 +554,19 @@ export async function chargePortalPayment(
     token: parsed.token,
     idempotencyKey: parsed.idempotencyKey,
     occurredAtEpochMs: nowMs,
+    // The address and the agent the request actually came from: STEP 188's counters are about traffic, and a
+    // browser that could name its own address would spend someone else's window.
+    clientAddress: input.clientAddress,
+    userAgent: input.userAgent,
   });
 
   if (outcome.status === "unavailable") {
+    if (outcome.reason === "velocity") {
+      // STEP 188: the counters could not be read, so the attempt was not made. A limiter that opens when the
+      // database is down is not a limiter, and this is a temporary failure rather than a verdict on the card.
+      throw refused("SERVICE_UNAVAILABLE", PORTAL_VELOCITY_REFUSAL_FIELD, PORTAL_VELOCITY_RULES.unavailable);
+    }
+
     if (outcome.reason === "blacklist") {
       // STEP 187: the list could not be read, and a list that cannot be read must not clear a card. Nothing was
       // sent to the gateway, so the payer is told to try again rather than that their card was refused.
@@ -615,6 +648,36 @@ export async function chargePortalPayment(
     });
 
     throw refused("VALIDATION_FAILED", "collectjs_token", "card_declined");
+  }
+
+  if (outcome.status === "refused_by_velocity") {
+    // STEP 188. A limit is a wait, not a verdict: the refusal is `429` with the time the counter computed, and
+    // the rule says which of the two limits was reached so the page can say which.
+    const rule = portalVelocityRuleOf(outcome.limited.subject);
+
+    await appendTolerated(dependencies.audit, {
+      action: PORTAL_VELOCITY_AUDIT_ACTION,
+      actorUserId: null,
+      entityType: PORTAL_PAYMENT_AUDIT_ENTITY,
+      entityId: view.invoiceId,
+      payload: portalVelocityPayloadOf({
+        invoiceId: view.invoiceId,
+        number: view.number,
+        amountMinor: view.payment.amountMinor,
+        limited: outcome.limited,
+        cardFingerprint: portalVelocityCardFingerprint(parsed.token),
+        rule,
+      }),
+      companyId: view.companyId,
+      sessionId: null,
+      ipAddress: input.clientAddress,
+      userAgent: input.userAgent,
+    });
+
+    throw new AppError("RATE_LIMITED", {
+      retryAfterSeconds: outcome.limited.retryAfterSeconds,
+      details: [{ field: PORTAL_VELOCITY_REFUSAL_FIELD, rule }],
+    });
   }
 
   if (outcome.status === "refused_by_blacklist") {

@@ -65,6 +65,15 @@ interface PaymentResponseBody {
  * `card_blacklist_unavailable` when the list cannot be read, because a list that cannot be read must not clear a
  * card. Neither answer reaches the provider, and neither moves money.
  *
+ * ## The answer a card that has been tried too often gets
+ *
+ * STEP 188. After the list and before a payment record is opened, the service counts the attempt against the
+ * card's own velocity limit and the address it came from. An attempt that reaches either limit is refused with
+ * `429`, the rule `velocity_card_limited` or `velocity_ip_limited`, and the `retry-after` header this route's
+ * error writer fills from the same field - a wait, not a verdict, so nothing was charged and nothing was sent.
+ * A counter that cannot answer is `503` with `velocity_unavailable`, because a limiter that opens when the
+ * database is down is not a limiter.
+ *
  * ## The answer a flagged card gets
  *
  * STEP 186. A payment the gateway answers with one of its four fraud codes is never a `201`: the service
