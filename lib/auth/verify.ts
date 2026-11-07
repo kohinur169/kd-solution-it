@@ -12830,6 +12830,9 @@ async function checkCsrfProtection(): Promise<void> {
   // which is what keeps one spread per mutation. So the files arrive at fifty six and the call sites at
   // eighty two.
   //
+  // STEP 200 adds one file and one call: the merchant's API credential form, which makes a credential and is
+  // answered with a mask. Fifty nine files, eighty eight call sites.
+  //
   // STEP 199 adds one file and three calls: the office's chargeback panel, whose three acts are the thresholds,
   // the step a merchant's numbers earn and the clearing of one. They arrive at fifty eight files and eighty
   // seven call sites.
@@ -12837,11 +12840,11 @@ async function checkCsrfProtection(): Promise<void> {
   // STEP 198 adds one file and two calls: the office review panel, whose two acts are a decision on a frozen
   // pack and the submission that follows it. Both are signed with the enrolled device as well as the token, and
   // both go through one `send`, so the files arrive at fifty seven and the call sites at eighty four.
-  expectEqual(browserMutations.length, 58, "fifty eight browser files send a mutation");
+  expectEqual(browserMutations.length, 59, "fifty nine browser files send a mutation");
   expectEqual(
     browserMutations.reduce((total, path) => total + mutationCalls(appSourceOf(appSources, path)), 0),
-    87,
-    "across eighty seven call sites",
+    88,
+    "across eighty eight call sites",
   );
   const postCalls = mutationCalls;
   const tokenSpreads = (source: string): number =>
