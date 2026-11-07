@@ -970,8 +970,10 @@ for (const forbidden of ["revealKey", "showKey", "copyKey", "navigator.clipboard
 }
 
 expectSourceContains(panelSource, "type MutationVerb = \"POST\"", "the panel sends one verb");
-expectEqual(panelSource.split('method: "POST"').length - 1, 1, "and sends one mutation");
-expectEqual(panelSource.split("...(await csrfHeaders())").length - 1, 1, "with one token spread");
+// STEP 201 adds the revoke and the regenerate to the same file, each with its own token spread; this gate keeps
+// counting so the number below cannot drift without somebody reading it.
+expectEqual(panelSource.split('method: "POST"').length - 1, 3, "and sends three mutations");
+expectEqual(panelSource.split("...(await csrfHeaders())").length - 1, 3, "with one token spread each");
 
 // ---------------------------------------------------------------------------------------------
 // 11. Every message the two files name exists

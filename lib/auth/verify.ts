@@ -12830,6 +12830,9 @@ async function checkCsrfProtection(): Promise<void> {
   // which is what keeps one spread per mutation. So the files arrive at fifty six and the call sites at
   // eighty two.
   //
+  // STEP 201 adds two calls to STEP 200's credential panel - the revoke and the regenerate - with a token
+  // spread each, so the call sites move from eighty eight to ninety while the file count stands still.
+  //
   // STEP 200 adds one file and one call: the merchant's API credential form, which makes a credential and is
   // answered with a mask. Fifty nine files, eighty eight call sites.
   //
@@ -12843,8 +12846,8 @@ async function checkCsrfProtection(): Promise<void> {
   expectEqual(browserMutations.length, 59, "fifty nine browser files send a mutation");
   expectEqual(
     browserMutations.reduce((total, path) => total + mutationCalls(appSourceOf(appSources, path)), 0),
-    88,
-    "across eighty eight call sites",
+    90,
+    "across ninety call sites",
   );
   const postCalls = mutationCalls;
   const tokenSpreads = (source: string): number =>

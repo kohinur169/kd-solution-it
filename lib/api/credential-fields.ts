@@ -79,8 +79,24 @@ export const CREDENTIAL_ACTIVE_LIMIT = 10;
 /** How many rows the screen reads, newest first. */
 export const CREDENTIAL_HISTORY_LIMIT = 50;
 
-/** The body ceiling of the one route this STEP writes. */
+/** The body ceiling of the routes this STEP writes. */
 export const CREDENTIAL_MAXIMUM_BODY_BYTES = 1_024;
+
+/** The longest reason a revocation may carry, which `0034` also checks. */
+export const CREDENTIAL_REASON_MAXIMUM_LENGTH = 280;
+
+/**
+ * The name a rotated credential keeps once its successor takes the original.
+ *
+ * `0034` forbids two live credentials of one merchant sharing a label, and a rotation must leave the merchant's
+ * new credential under the name they know. So the predecessor is renamed, and the suffix carries four characters
+ * of its own id: a second rotation of the successor therefore cannot collide with the first predecessor's name,
+ * which a plain `(superseded)` would.
+ */
+export const CREDENTIAL_SUPERSEDED_SUFFIX = "superseded";
+
+/** The reason the platform writes on a credential it rotated away. */
+export const CREDENTIAL_ROTATED_REASON = "Regenerated: replaced by a newer credential.";
 
 /**
  * The associated data the signing secret is sealed under.
@@ -117,11 +133,25 @@ export const CREDENTIAL_RULES = Object.freeze({
   limitReached: "credential_limit_reached",
   /** The row the database handed back is not a credential this build wrote. */
   unreadable: "credential_unreadable",
+  /** A revocation with no sentence, or one longer than 280 characters. */
+  reasonInvalid: "reason_invalid",
+  /** The credential is already revoked, so there is nothing to revoke and nothing to rotate. */
+  alreadyRevoked: "credential_already_revoked",
+  /** Regeneration rotates a credential that is still in use; a revoked one is replaced, not rotated. */
+  notActive: "credential_not_active",
+  /** This credential has already been rotated once; `0034` allows one successor. */
+  alreadyRotated: "credential_already_rotated",
+  /** The successor was written but the predecessor could not be retired, so two keys are live. */
+  rotationIncomplete: "rotation_incomplete",
+  /** The guarded update matched no row, so the credential is not in the state the caller was told it was. */
+  writeNotApplied: "credential_write_not_applied",
 } as const);
 
 /** The audit actions of section 20. Creation is this STEP's; revoking and regeneration are STEP 201's. */
 export const CREDENTIAL_AUDIT = Object.freeze({
   created: "api.credential_created",
+  revoked: "api.credential_revoked",
+  regenerated: "api.credential_regenerated",
 } as const);
 
 /**
@@ -168,6 +198,21 @@ export function maskedKeyOf(input: {
   readonly keyLastFour: string;
 }): string {
   return `${CREDENTIAL_KEY_PREFIX}_${input.mode}_${input.keyPrefix}_${CREDENTIAL_MASK.repeat(CREDENTIAL_MASK_WIDTH)}${input.keyLastFour}`;
+}
+
+/**
+ * The name a predecessor takes when its successor owns the original.
+ *
+ * Bounded to the same eighty characters the table checks, trimmed, and made unique by four characters of the
+ * row's own id - so two rotations of one name cannot produce two identical labels.
+ */
+export function supersededLabelOf(label: string, credentialId: string): string {
+  const tail = credentialId.replace(/[^0-9a-z]/gu, "").slice(-4).padStart(4, "0");
+  const suffix = ` (${CREDENTIAL_SUPERSEDED_SUFFIX} ${tail})`;
+  const room = CREDENTIAL_LABEL_MAXIMUM_LENGTH - suffix.length;
+  const base = label.trim().slice(0, room).trimEnd();
+
+  return `${base.length === 0 ? CREDENTIAL_SUPERSEDED_SUFFIX : base}${suffix}`;
 }
 
 /** The signing secret's display, which is four characters and the mask that stands before them. */

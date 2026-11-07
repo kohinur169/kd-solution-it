@@ -157,6 +157,8 @@ export const CSRF_PROTECTED_PATHS: readonly string[] = Object.freeze([
   "/api/office/disputes/[id]/review",
   "/api/office/disputes/[id]/submit",
   "/api/developers/api-credentials",
+  "/api/developers/api-credentials/[id]/regenerate",
+  "/api/developers/api-credentials/[id]/revoke",
   "/api/office/disputes/chargeback/apply",
   "/api/office/disputes/chargeback/clear",
   "/api/office/disputes/chargeback/policy",

@@ -6,6 +6,7 @@ import { useState, type ReactNode } from "react";
 import { getMessage } from "@/lib/i18n/messages";
 import {
   CREDENTIAL_LABEL_MAXIMUM_LENGTH,
+  CREDENTIAL_REASON_MAXIMUM_LENGTH,
   CREDENTIAL_MODES,
   CREDENTIAL_RULES,
   type CredentialMode,
@@ -42,6 +43,14 @@ const fieldClasses =
 
 const gridClasses = "grid grid-cols-1 gap-3 sm:grid-cols-2";
 
+const actionsClasses = "flex flex-wrap items-center gap-2";
+
+const buttonClasses =
+  "inline-flex items-center justify-center rounded-lg border border-border bg-background px-3 py-1.5 text-sm font-semibold text-foreground transition-colors hover:bg-muted/60 disabled:opacity-60";
+
+const dangerButtonClasses =
+  "inline-flex items-center justify-center rounded-lg border border-destructive/60 bg-background px-3 py-1.5 text-sm font-semibold text-destructive transition-colors hover:bg-destructive/10 disabled:opacity-60";
+
 const primaryButtonClasses =
   "inline-flex items-center justify-center rounded-lg bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground transition-opacity hover:opacity-90 disabled:opacity-60";
 
@@ -70,6 +79,10 @@ function sentenceForRule(rule: string | null, status: number): string {
     return getMessage("api.forbidden");
   }
 
+  if (status === 404) {
+    return getMessage("api.ruleNotFound");
+  }
+
   if (status === 429) {
     return getMessage("api.rateLimited");
   }
@@ -84,6 +97,16 @@ function sentenceForRule(rule: string | null, status: number): string {
       return getMessage("api.ruleLabelTaken");
     case CREDENTIAL_RULES.limitReached:
       return getMessage("api.ruleLimitReached");
+    case CREDENTIAL_RULES.reasonInvalid:
+      return getMessage("api.ruleReasonInvalid");
+    case CREDENTIAL_RULES.alreadyRevoked:
+      return getMessage("api.ruleAlreadyRevoked");
+    case CREDENTIAL_RULES.notActive:
+      return getMessage("api.ruleNotActive");
+    case CREDENTIAL_RULES.alreadyRotated:
+      return getMessage("api.ruleAlreadyRotated");
+    case CREDENTIAL_RULES.rotationIncomplete:
+      return getMessage("api.ruleRotationIncomplete");
     case "csrf_token_invalid":
       return getMessage("api.ruleCsrf");
     default:
@@ -114,8 +137,30 @@ function ruleOf(body: unknown): string | null {
   return typeof first.rule === "string" ? first.rule : null;
 }
 
-/** One credential, as a card: the mask, the mode, the state and when it was made. */
-function CredentialCard({ credential }: { readonly credential: CredentialView }): ReactNode {
+/** One credential, as a card: the mask, the mode, the state, when it was made and the two acts left to it. */
+function CredentialCard({
+  credential,
+  busy,
+  revoking,
+  reason,
+  onReason,
+  onStartRevoke,
+  onCancelRevoke,
+  onRevoke,
+  onRegenerate,
+  onActivate,
+}: {
+  readonly credential: CredentialView;
+  readonly busy: boolean;
+  readonly revoking: boolean;
+  readonly reason: string;
+  readonly onReason: (value: string) => void;
+  readonly onStartRevoke: () => void;
+  readonly onCancelRevoke: () => void;
+  readonly onRevoke: () => void;
+  readonly onRegenerate: () => void;
+  readonly onActivate: () => void;
+}): ReactNode {
   const status =
     credential.status === "active" ? getMessage("api.statusActive") : getMessage("api.statusRevoked");
 
@@ -144,7 +189,61 @@ function CredentialCard({ credential }: { readonly credential: CredentialView })
             ? getMessage("api.lastUsedNever")
             : credential.lastUsedAt.slice(0, 10)}
         </span>
+        {credential.revokedAt === null ? null : (
+          <span>
+            {getMessage("api.revokedLabel")} {credential.revokedAt.slice(0, 10)}
+          </span>
+        )}
       </div>
+
+      {credential.revokeReason === null ? null : (
+        <p className={helpClasses}>
+          {getMessage("api.revokeReasonLabel")} {credential.revokeReason}
+        </p>
+      )}
+
+      {credential.status === "active" ? (
+        revoking ? (
+          <div className={formClasses}>
+            <label className="flex flex-col gap-1">
+              <span className={labelClasses}>{getMessage("api.revokeReasonPrompt")}</span>
+              <input
+                className={fieldClasses}
+                maxLength={CREDENTIAL_REASON_MAXIMUM_LENGTH}
+                onChange={(event) => onReason(event.target.value)}
+                placeholder={getMessage("api.revokeReasonPlaceholder")}
+                type="text"
+                value={reason}
+              />
+            </label>
+            <div className={actionsClasses}>
+              <button className={dangerButtonClasses} disabled={busy || reason.trim().length === 0} onClick={onRevoke} type="button">
+                {busy ? getMessage("api.revoking") : getMessage("api.revokeConfirm")}
+              </button>
+              <button className={buttonClasses} disabled={busy} onClick={onCancelRevoke} type="button">
+                {getMessage("api.cancel")}
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div className={actionsClasses}>
+            <button className={buttonClasses} disabled={busy} onClick={onRegenerate} type="button">
+              {getMessage("api.regenerate")}
+            </button>
+            <button
+              className={buttonClasses}
+              disabled={busy}
+              onClick={() => {
+                onActivate();
+                onStartRevoke();
+              }}
+              type="button"
+            >
+              {getMessage("api.revoke")}
+            </button>
+          </div>
+        )
+      ) : null}
     </li>
   );
 }
@@ -154,11 +253,19 @@ export function CredentialPanel({ view }: { readonly view: CredentialPanelView }
   const [label, setLabel] = useState<string>("");
   const [mode, setMode] = useState<CredentialMode>("test");
   const [busy, setBusy] = useState<boolean>(false);
+  /** The card whose reason field is open, so only one revocation is ever being written. */
+  const [revokingId, setRevokingId] = useState<string | null>(null);
+  const [reason, setReason] = useState<string>("");
   const [message, setMessage] = useState<string | null>(null);
   const [isError, setIsError] = useState<boolean>(false);
   const [created, setCreated] = useState<CredentialView | null>(null);
 
   const trimmed = label.trim();
+  /** Close whichever reason field is open, because after an act the list is the server's answer again. */
+  const closeRevoking = (): void => {
+    setRevokingId(null);
+    setReason("");
+  };
   const ready = trimmed.length > 0 && trimmed.length <= CREDENTIAL_LABEL_MAXIMUM_LENGTH;
 
   /** The one act: make a credential, then re-read the page so the list is the server's answer. */
@@ -206,6 +313,94 @@ export function CredentialPanel({ view }: { readonly view: CredentialPanelView }
     } catch {
       setBusy(false);
       setMessage(getMessage("api.createFailed"));
+      setIsError(true);
+    }
+  }
+
+  /** Section 20's revocation: one sentence, one credential, and the key is dead when it answers. */
+  async function revoke(credentialId: string): Promise<void> {
+    setBusy(true);
+    setMessage(null);
+    setIsError(false);
+
+    const path = `/api/developers/api-credentials/${encodeURIComponent(credentialId)}/revoke`;
+
+    try {
+      const response = await fetch(path, {
+        method: "POST" satisfies MutationVerb,
+        headers: { "content-type": "application/json", ...(await csrfHeaders()) },
+        body: JSON.stringify({ reason: reason.trim() }),
+        credentials: "same-origin",
+        cache: "no-store",
+      });
+
+      setBusy(false);
+      closeRevoking();
+
+      if (!response.ok) {
+        const refusal: unknown = await response.json().catch(() => null);
+
+        setMessage(sentenceForRule(ruleOf(refusal), response.status));
+        setIsError(true);
+
+        return;
+      }
+
+      setMessage(getMessage("api.revoked"));
+      setIsError(false);
+      setCreated(null);
+      router.refresh();
+    } catch {
+      setBusy(false);
+      setMessage(getMessage("api.revokeFailed"));
+      setIsError(true);
+    }
+  }
+
+  /** Section 20's regeneration: a successor under the same name, and the predecessor retired. */
+  async function regenerate(credentialId: string): Promise<void> {
+    setBusy(true);
+    setMessage(null);
+    setIsError(false);
+    setCreated(null);
+
+    const path = `/api/developers/api-credentials/${encodeURIComponent(credentialId)}/regenerate`;
+
+    try {
+      const response = await fetch(path, {
+        method: "POST" satisfies MutationVerb,
+        headers: { "content-type": "application/json", ...(await csrfHeaders()) },
+        body: JSON.stringify({}),
+        credentials: "same-origin",
+        cache: "no-store",
+      });
+
+      setBusy(false);
+
+      if (!response.ok) {
+        const refusal: unknown = await response.json().catch(() => null);
+
+        setMessage(sentenceForRule(ruleOf(refusal), response.status));
+        setIsError(true);
+
+        return;
+      }
+
+      const body = (await response.json().catch(() => null)) as
+        | { readonly credential?: CredentialView }
+        | null;
+
+      setMessage(getMessage("api.regenerated"));
+      setIsError(false);
+
+      if (body !== null && body.credential !== undefined) {
+        setCreated(body.credential);
+      }
+
+      router.refresh();
+    } catch {
+      setBusy(false);
+      setMessage(getMessage("api.regenerateFailed"));
       setIsError(true);
     }
   }
@@ -289,7 +484,29 @@ export function CredentialPanel({ view }: { readonly view: CredentialPanelView }
         ) : (
           <ul className={listClasses}>
             {view.credentials.map((credential) => (
-              <CredentialCard credential={credential} key={credential.id} />
+              <CredentialCard
+                busy={busy}
+                credential={credential}
+                key={credential.id}
+                onActivate={() => {
+                  setMessage(null);
+                  setIsError(false);
+                }}
+                onCancelRevoke={closeRevoking}
+                onReason={setReason}
+                onRegenerate={() => {
+                  void regenerate(credential.id);
+                }}
+                onRevoke={() => {
+                  void revoke(credential.id);
+                }}
+                onStartRevoke={() => {
+                  setRevokingId(credential.id);
+                  setReason("");
+                }}
+                reason={revokingId === credential.id ? reason : ""}
+                revoking={revokingId === credential.id}
+              />
             ))}
           </ul>
         )}
