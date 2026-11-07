@@ -21,7 +21,7 @@ import "./globals.css";
  *   - the pre-paint script reads the stored theme in `<head>`, so a dark preference never paints
  *     a light page first;
  *   - the skip link is the first focusable element, and it targets the focusable wrapper around
- *     `children` (`app/page.tsx` already renders the one `<main>` of the page);
+ *     `children` (`app/(public)/page.tsx` renders the one `<main>` of the home page);
  *   - the header holds the brand link and the theme switcher, and nothing else: navigation to
  *     routes that do not exist yet would be a broken promise;
  *   - `AppProviders` is the single client boundary, mounted once around the tree.

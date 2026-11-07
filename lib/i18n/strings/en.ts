@@ -56,6 +56,31 @@ const catalog = {
     themeLight: "Light",
     themeDark: "Dark",
   },
+  /**
+   * The public website's shell (STEP 231-238). Every label here is read by
+   * `components/public/`, and the three footer headings name columns that appear only once a
+   * public page belongs to them.
+   */
+  publicSite: {
+    /** Accessible name of the primary navigation in the site header. */
+    navLabel: "Primary",
+    /** The home page's navigation label. */
+    navHome: "Home",
+    signIn: "Sign in",
+    createAccount: "Create account",
+    /**
+     * FEATURE_LIST section 25 fixes how partners are named on public and merchant surfaces.
+     * The wording is reviewable copy, so it lives here rather than in a component.
+     */
+    partnerNaming: "Global Payout Partners and Local Payment Methods via Licensed Partners.",
+    copyright: "Copyright {year} KD Solution IT. All rights reserved.",
+    legalNote: "All amounts are shown in US dollars.",
+    footer: {
+      product: "Product",
+      company: "Company",
+      resources: "Resources",
+    },
+  },
   errors: {
     /** Every message states what the client can do next. None describes what the server saw. */
     validationFailed:
