@@ -102,6 +102,7 @@ export const PRIVATE_URL_PREFIXES: readonly string[] = deepFreeze([
   "/onboarding",
   "/p",
   "/payments",
+  "/plans",
   "/products",
   "/provisioning-alerts",
   "/reauth",
