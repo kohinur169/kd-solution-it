@@ -64,7 +64,13 @@ export interface PortalPaymentRecorder {
   /** Open a record for one attempt, or answer the one the key already produced. */
   open(input: {
     readonly companyId: string;
-    readonly invoiceId: string;
+    /**
+     * The document the payment is for, or null when the payment is for a general payment link.
+     *
+     * `0037` leaves `payments.invoice_id` nullable for exactly this reason: a hosted checkout sells a payment,
+     * not an invoice, and STEP 190's link charge has no document to name. A recorder writes the null.
+     */
+    readonly invoiceId: string | null;
     readonly amountMinor: string;
     readonly chargeAmount: string;
     readonly idempotencyKey: string;
@@ -264,7 +270,8 @@ export function createPortalPaymentProcessor(
           amount: request.chargeAmount,
           token: request.token,
           customerId: null,
-          reference: request.number ?? request.invoiceId,
+          // STEP 190: a payment on a general link has neither a number nor an invoice, so it names itself.
+          reference: request.number ?? request.invoiceId ?? `link_${request.companyId}`,
           originalTransactionId: null,
           capture: false,
         },

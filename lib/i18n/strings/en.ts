@@ -3195,6 +3195,97 @@ const catalog = {
       "Nothing has been taken. The payment is being reviewed by our compliance team, who will contact you if anything else is needed.",
     ruleThreeDsResultInvalid:
       "Your bank's answer could not be read, so nothing was charged. Start again from the invoice.",
+    /** STEP 190: the hosted checkout a general payment link opens. */
+    linkPageEyebrow: "Payment link",
+    linkPageMetaDescription:
+      "Pay this business through its payment link. The amount is the one the business set, not one this page can change.",
+    linkDescriptionLabel: "For",
+    linkReferenceLabel: "Reference",
+    linkAmountTitle: "Amount",
+    linkAmountBody: "This link takes {amount}, the amount the business set for it.",
+    linkExpiresOn: "The link stops working on {date}.",
+    linkCardSection: "Pay by card",
+    linkPrivacyNote:
+      "Only the amount and the business's note are stored here. Your card details go straight to the payment provider.",
+    linkPaidTitle: "This link is paid",
+    linkPaidBody:
+      "The business has already been paid through this link, so it takes no further payment. Keep the confirmation you were given as your record.",
+    linkRevokedTitle: "This link was cancelled",
+    linkRevokedBody:
+      "The business cancelled this link, so it does not take payment. Ask them for a new one if you still need to pay.",
+    linkExpiredTitle: "This link has expired",
+    linkExpiredBody:
+      "The link was made for a limited time and that time has passed. Nothing has been charged. Ask the business for a new link.",
+    linkUnavailableTitle: "Card payment is not available",
+    linkUnavailableProviderBody:
+      "This business has not connected its card gateway yet, so this link cannot take a card. Nothing has been charged.",
+    linkUnavailableRecorderBody:
+      "This platform cannot record this payment durably yet, so the link does not take a card. Nothing has been charged.",
+    ruleLinkNotFound:
+      "This link cannot be opened. It is not valid, has expired, or has been cancelled. Ask the business that sent it for a new one.",
+    ruleLinkExpired:
+      "This link has expired, so it does not take payment. Nothing has been charged. Ask the business for a new link.",
+    ruleLinkRevoked:
+      "The business cancelled this link, so it does not take payment. Nothing has been charged.",
+    ruleLinkPaid:
+      "This link has already been paid, so it takes no further payment. Nothing more was charged.",
+    ruleLinkNotActive:
+      "This link has moved on: it was cancelled, reissued or already paid. Nothing has been charged.",
+    ruleLinkStoreUnavailable:
+      "Payment links cannot be kept reliably in this deployment, so none was created and nothing was charged.",
+    rulePaymentLinksNotInPlan:
+      "Payment links are not part of this account's plan, so a link could not be made.",
+    /** STEP 190: the merchant console's own refusals, worded for the person typing the link. */
+    ruleAmountTooSmall: "That amount is below the smallest a payment link can take.",
+    ruleAmountTooLarge: "That amount is above the largest a payment link can take.",
+    ruleDescriptionInvalid: "Add a short note of up to 200 characters saying what the payment is for.",
+    ruleReferenceInvalid: "That reference is too long. Keep it to 64 characters or fewer.",
+    ruleLifetimeInvalid: "A link works for at least one hour and at most thirty days.",
+  },
+  paymentLinks: {
+    /** STEP 190: the merchant console at /payments/links. */
+    title: "Payment links",
+    description:
+      "Ask for a fixed amount without an invoice: make a link, share it anywhere, and cancel it when you are done.",
+    createTitle: "New payment link",
+    amountLabel: "Amount",
+    amountPlaceholder: "25.00",
+    descriptionLabel: "What it is for",
+    descriptionPlaceholder: "Design retainer, March",
+    referenceLabel: "Reference (optional)",
+    referenceHelp: "Up to 64 characters, printed on the payer's page and kept with your records.",
+    lifetimeLabel: "Works for (days)",
+    lifetimeHelp: "At least one hour and at most thirty days. A link closes on its own when the time is up.",
+    submit: "Create link",
+    submitting: "Creating...",
+    createdTitle: "Link ready",
+    createdBody:
+      "Copy this URL and share it. It is shown once: if you lose it, reissue the link for a new one.",
+    copy: "Copy",
+    copied: "Copied",
+    listTitle: "Your links",
+    listEmpty: "No payment link yet.",
+    stateActive: "Live",
+    statePaid: "Paid",
+    stateRevoked: "Cancelled",
+    stateExpired: "Expired",
+    revoke: "Cancel link",
+    revokeConfirm: "Cancel this link? Its URL stops working immediately.",
+    dismiss: "Keep it",
+    reissue: "Reissue",
+    reissueHelp: "Reissuing keeps the same payment request and gives it a fresh URL. The old one stops working.",
+    reissuedTitle: "New URL ready",
+    reissuedBody: "The old URL no longer works. Share this one instead.",
+    expiresLabel: "Closes",
+    paidLabel: "Paid",
+    loading: "Loading your links...",
+    errorGeneric: "That did not work. Try again.",
+    notEntitledTitle: "Your plan does not include payment links",
+    notEntitledBody: "Ask the account owner to upgrade the plan, or send an invoice link instead.",
+    unavailableTitle: "Payment links are not available yet",
+    unavailableBody:
+      "This deployment cannot keep payment links durably, so it does not create them. Nothing was charged.",
+    roleRefusedBody: "Only the account owner can create and manage payment links.",
   },
   email: {
     lockAlert: {

@@ -262,6 +262,58 @@ STEP 189 adds no migration: `0022` already carries `amount_paid_minor`, the mone
 `invoices_partial_minimum_check`, `0037` already carries `payments.amount_minor`, and the twenty dollar floor is
 configuration rather than a column. The gate asserts 0123 is still the next free number.
 
+## What STEP 190 built
+
+- `portal-payment-link-fields.ts` - the vocabulary of a general link: the path (`/p`), the claim's kind
+  (`payment_link`) and capability (`pay`), the plan service key (`payment_links`), the amount's two bounds
+  (10,000 to 1,000,000,000 platform minor units, and the provider's 100 minor units per unit), the description's
+  1-200 characters, the reference's 64, the lifetime (an hour to thirty days, a week by default), the four
+  states a page prints and the three a row is stored with, fifteen rules, seven audit actions and the body
+  ceiling. Browser safe, because the console and the refusal vocabulary read it.
+- `portal-payment-link-store.ts` - the link's row as a **port**, with an in-memory implementation that says
+  `durable: false` about itself. The header carries the `portal_payment_links` column list the STEP that owns the
+  table must satisfy, so the table is written by a STEP that owns migrations rather than by this one.
+- `portal-payment-link.ts` - `createPortalPaymentLink`, `openPortalPaymentLink`, `revokePortalPaymentLink`,
+  `reissuePortalPaymentLink`, `revokePortalPaymentLinkById`, `reissuePortalPaymentLinkById`,
+  `listPortalPaymentLinks`, and the amount, state and URL helpers the pages use.
+- `portal-payment-link-checkout.ts` - `chargePortalPaymentLink` and `preparePortalPaymentLinkCheckout`: one card
+  on a link, through STEP 183's processor, with `invoiceId: null` and no invoice or ledger path touched.
+- `portal-payment-link-runtime.ts` - the production wiring: the **plan entitlement is real** (a `subscriptions`
+  read for the company's live plan, then a `plan_entitlements` read for `payment_links`), the link store is the
+  in-memory port, and the payment operation is the payment page's own.
+- `p/[token]/page.tsx` - the hosted checkout, and `p/[token]/charge/route.ts` - the endpoint its form posts to.
+- `../api/payment-links/route.ts` (make and list), `../api/payment-links/[id]/revoke/route.ts` and
+  `../api/payment-links/[id]/reissue/route.ts` - the merchant's three endpoints, CSRF-checked and `no-store`.
+- `../(dashboard)/payments/links/` - the console: make a link, copy its URL once it exists, cancel it, reissue it.
+- `portal-payment-link-verify.ts` - the gate, 254 checks. Run it with
+  `node "app/(client-portal)/portal-payment-link-verify.ts"`.
+
+A merchant makes a link for **an amount and a sentence** rather than for a document, and the token carries the
+link's own row, the `payment_link` kind and the `pay` capability - never an invoice's. The row keeps the token's
+**digest and id**, never the token, so the response is the one moment the URL can be read; a merchant who loses it
+**reissues**, which rotates the token id and leaves the old URL resolving to nothing at all. A revoked link answers
+the same "cannot be opened" sentence as a forged one, because an answer that says which of the merchant's actions
+closed a link is a probe for which links exist.
+
+The feature is an **entitlement**: a creation with no way to answer the plan question is `503`, and a plan without
+`payment_links` is `403`, both with `payment_links_not_in_plan`. A link takes **one payment**: the row's status is
+the guard, `markPaid` returns `conflict` to the loser and the capture entry records
+`duplicate_link_payment: true` rather than hiding a second charge. A failed, declined or flagged attempt leaves the
+link `active`, because the merchant has not been paid.
+
+A link payment has **no invoice**, so `payments.invoice_id` stays null and no invoice balance or ledger posting is
+touched; the gateway's reference is the link's own id. The three pre-charge checks of STEPs 186-188 run unchanged,
+because the checkout calls the same processor, and a link payment must be **authenticated**: `0037`'s
+`payments_three_ds_capture_check` accepts a capture without 3D Secure only when a postal code and an IP country
+were matched against a client, and a general link has no client to match. The hosted page and the charge route
+therefore both render and refuse on the same readiness fact, and the link's own 3D Secure step is named in the
+handoff as the next STEP's work rather than papered over.
+
+STEP 190 adds **no migration**, and the proof is written in three places: the store's header (the table sketch),
+the gate (the highest migration is still 122 and no file in `migrations/` names `portal_payment_links`), and this
+paragraph. A link's row is a port exactly as STEP 183's recorder and STEP 186's queue are, so `0123` stays free for
+the STEP that writes the table.
+
 STEP 182 adds no migration. `0025` already carries `void_reason`, `voided_at` and `accepted_at`; `0027`
 already carries the eight pieces of evidence and the unique index that makes one signature per estimate;
 `0118` already freezes a decided quote. The gate asserts all three instead of assuming them.

@@ -63,6 +63,31 @@ export function portalPaymentRuleTextOf(rule: string): string | null {
       return getMessage("portal.ruleRiskSuspicious");
     case "stale_document":
       return getMessage("portal.paymentRuleStaleDocument");
+    // STEP 190: a general payment link's dead states, and the two facts a merchant meets while making one.
+    case "link_not_found":
+      return getMessage("portal.ruleLinkNotFound");
+    case "link_expired":
+      return getMessage("portal.ruleLinkExpired");
+    case "link_revoked":
+      return getMessage("portal.ruleLinkRevoked");
+    case "link_paid":
+      return getMessage("portal.ruleLinkPaid");
+    case "link_not_active":
+      return getMessage("portal.ruleLinkNotActive");
+    case "payment_link_store_unavailable":
+      return getMessage("portal.ruleLinkStoreUnavailable");
+    case "payment_links_not_in_plan":
+      return getMessage("portal.rulePaymentLinksNotInPlan");
+    case "amount_too_small":
+      return getMessage("portal.ruleAmountTooSmall");
+    case "amount_too_large":
+      return getMessage("portal.ruleAmountTooLarge");
+    case "description_invalid":
+      return getMessage("portal.ruleDescriptionInvalid");
+    case "reference_invalid":
+      return getMessage("portal.ruleReferenceInvalid");
+    case "lifetime_invalid":
+      return getMessage("portal.ruleLifetimeInvalid");
     default:
       return null;
   }
@@ -112,6 +137,18 @@ export function portalPaymentRuleSentences(): Readonly<Record<string, string>> {
     "velocity_card_limited",
     "velocity_ip_limited",
     "velocity_unavailable",
+    "link_not_found",
+    "link_expired",
+    "link_revoked",
+    "link_paid",
+    "link_not_active",
+    "payment_link_store_unavailable",
+    "payment_links_not_in_plan",
+    "amount_too_small",
+    "amount_too_large",
+    "description_invalid",
+    "reference_invalid",
+    "lifetime_invalid",
   ];
 
   const sentences: Record<string, string> = {};

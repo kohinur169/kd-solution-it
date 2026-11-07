@@ -121,7 +121,8 @@ export interface PortalPaymentView {
 /** What a charge asks the payment operation for. No card data, no amount chosen by the browser. */
 export interface PortalChargeRequest {
   readonly companyId: string;
-  readonly invoiceId: string;
+  /** The document the payment is for, or null for a general payment link (STEP 190). */
+  readonly invoiceId: string | null;
   readonly number: string | null;
   readonly amountMinor: string;
   readonly chargeAmount: string;
