@@ -1,0 +1,292 @@
+// path: app/(client-portal)/portal-payment-processor.ts
+import { randomUUID } from "node:crypto";
+import { processNmiPayment, type NmiHttpTransport } from "../../lib/payments/adapters/nmi-payment.ts";
+import type { NmiKeyStore } from "../../lib/payments/adapters/nmi-client.ts";
+import { DEFAULT_ROUTING_RULES, routePayment, type RoutingRule } from "../../lib/payments/routing.ts";
+import {
+  PORTAL_PAYMENT_CAPABILITY,
+  PORTAL_PAYMENT_METHOD,
+  PORTAL_PAYMENT_PROVIDER,
+} from "./portal-payment-fields.ts";
+import type {
+  PortalChargeOutcome,
+  PortalChargeRequest,
+  PortalPaymentProcessor,
+} from "./portal-payment.ts";
+
+/**
+ * The composition this page charges through: routing to a provider, a durable record, and the provider's
+ * own execution.
+ *
+ * ## The three parts, and whose they are
+ *
+ *   1. **Routing** is STEP 129's `routePayment`, a pure function: it answers which provider a charge goes to,
+ *      or that no rule matches it. A page that chose a provider itself would be a second routing engine.
+ *   2. **The record** is the recorder below - the port this page needs and the one piece the platform does
+ *      not yet have a durable implementation of. It writes the payment the charge produces, and it is the
+ *      thing that makes a repeated attempt one payment instead of two.
+ *   3. **The execution** is STEP 151's `processNmiPayment`: it exchanges the Collect.js token for a sale
+ *      through NMI's Classic API, exactly as the provider's documentation describes, and it is the only
+ *      code in the platform that talks to the gateway about a card.
+ *
+ * ## Why the record comes before the charge
+ *
+ * A payment that is charged and not recorded is money the platform cannot account for. So the record is
+ * opened first and settled afterwards, and a process that dies between the two leaves a record that says
+ * "opened, outcome unknown" - which is the truth, and which the reconciliation STEP reads. The reverse
+ * order - charge, then hope a write lands - has no honest answer when the write fails.
+ *
+ * ## What this file never holds
+ *
+ * A card number, an expiry, a CVV or a keystroke. It holds a token, an amount, a key and the provider's
+ * answer, which is the whole of what section 18 allows a platform to see.
+ */
+
+/** A payment record this page can open and settle. The durable implementation is the platform's, not this file's. */
+export interface PortalPaymentRecorder {
+  /**
+   * True when a record this recorder writes survives the request.
+   *
+   * The in-memory recorder a gate uses is `false`; a database-backed one is `true`. The page refuses to
+   * charge through a recorder that answers `false`, because a charge it cannot account for is worse than a
+   * payment it did not take.
+   */
+  readonly durable: boolean;
+  /** Open a record for one attempt, or answer the one the key already produced. */
+  open(input: {
+    readonly companyId: string;
+    readonly invoiceId: string;
+    readonly amountMinor: string;
+    readonly chargeAmount: string;
+    readonly idempotencyKey: string;
+    readonly occurredAtEpochMs: number;
+  }): PortalRecorderOpen;
+  /** Settle an opened record with the outcome the provider gave. */
+  settle(input: {
+    readonly paymentId: string;
+    readonly outcome: "captured" | "declined" | "unknown";
+    readonly transactionId: string | null;
+    readonly code: string | null;
+    readonly occurredAtEpochMs: number;
+  }): void;
+}
+
+/** What opening a record answered. */
+export type PortalRecorderOpen =
+  /** A fresh record: the charge may be sent. */
+  | { readonly status: "opened"; readonly paymentId: string }
+  /** The key already produced this record; nothing is charged again. */
+  | {
+      readonly status: "duplicate";
+      readonly paymentId: string;
+      readonly settled: "captured" | "declined" | "unknown" | null;
+      readonly transactionId: string | null;
+      readonly code: string | null;
+    }
+  /** The recorder could not open a record, so nothing may be charged. */
+  | { readonly status: "refused"; readonly reason: string };
+
+/** What the composition needs to exist at all. */
+export interface PortalPaymentProcessorOptions {
+  readonly recorder: PortalPaymentRecorder;
+  /** The provider's encrypted keys, by company: STEP 149/151's own store interface. */
+  readonly keyStore: NmiKeyStore;
+  /** The master key in the hex form `decryptKey` takes. */
+  readonly encryptionKeyHex: string;
+  /** The transport, when a caller overrides it. The provider's own `fetch` transport is the default. */
+  readonly transport?: NmiHttpTransport;
+  /** The routing rules a charge is decided by. The platform's starting set unless a caller says otherwise. */
+  readonly routingRules?: readonly RoutingRule[];
+}
+
+/**
+ * Build the payment operation this page charges through.
+ *
+ * The durable flag is the recorder's: an operation built on a recorder that cannot keep its records reports
+ * itself as not durable, and `chargePortalPayment` refuses instead of charging.
+ */
+export function createPortalPaymentProcessor(
+  options: PortalPaymentProcessorOptions,
+): PortalPaymentProcessor {
+  const routingRules = options.routingRules ?? DEFAULT_ROUTING_RULES;
+
+  return {
+    durable: options.recorder.durable,
+    async charge(request: PortalChargeRequest): Promise<PortalChargeOutcome> {
+      const opened = options.recorder.open({
+        companyId: request.companyId,
+        invoiceId: request.invoiceId,
+        amountMinor: request.amountMinor,
+        chargeAmount: request.chargeAmount,
+        idempotencyKey: request.idempotencyKey,
+        occurredAtEpochMs: request.occurredAtEpochMs,
+      });
+
+      if (opened.status === "refused") {
+        return { status: "unavailable", reason: "recorder" };
+      }
+
+      if (opened.status === "duplicate") {
+        if (opened.settled === "captured" && opened.transactionId !== null) {
+          // The answer the first attempt was given, given again: a reload is not a second charge.
+          return { status: "captured", paymentId: opened.paymentId, transactionId: opened.transactionId };
+        }
+
+        if (opened.settled === "declined") {
+          return { status: "declined", paymentId: opened.paymentId, code: opened.code ?? "declined" };
+        }
+
+        // Opened and never settled: the previous attempt's answer was lost. Charging again could take the
+        // money twice, so the honest answer is that the outcome is unknown and must be reconciled.
+        return { status: "unknown", paymentId: opened.paymentId, reason: "duplicate_unsettled" };
+      }
+
+      const routing = routePayment(
+        { capability: PORTAL_PAYMENT_CAPABILITY, method: PORTAL_PAYMENT_METHOD },
+        routingRules,
+      );
+
+      if (!routing.matched || routing.providerKey !== PORTAL_PAYMENT_PROVIDER) {
+        // No rule, or a rule pointing at a provider without hosted fields: this page has no way to charge.
+        options.recorder.settle({
+          paymentId: opened.paymentId,
+          outcome: "unknown",
+          transactionId: null,
+          code: "no_provider",
+          occurredAtEpochMs: request.occurredAtEpochMs,
+        });
+
+        return { status: "unavailable", reason: "provider" };
+      }
+
+      const executed = await processNmiPayment(
+        {
+          companyId: request.companyId,
+          type: "sale",
+          amount: request.chargeAmount,
+          token: request.token,
+          customerId: null,
+          reference: request.number ?? request.invoiceId,
+          originalTransactionId: null,
+          capture: false,
+        },
+        {
+          store: options.keyStore,
+          encryptionKey: options.encryptionKeyHex,
+          ...(options.transport === undefined ? {} : { transport: options.transport }),
+          occurredAtEpochMs: request.occurredAtEpochMs,
+        },
+      );
+
+      if (executed.status === "success") {
+        options.recorder.settle({
+          paymentId: opened.paymentId,
+          outcome: "captured",
+          transactionId: executed.transactionId,
+          code: null,
+          occurredAtEpochMs: request.occurredAtEpochMs,
+        });
+
+        return { status: "captured", paymentId: opened.paymentId, transactionId: executed.transactionId };
+      }
+
+      if (executed.status === "failed") {
+        options.recorder.settle({
+          paymentId: opened.paymentId,
+          outcome: "declined",
+          transactionId: null,
+          code: executed.responseCode,
+          occurredAtEpochMs: request.occurredAtEpochMs,
+        });
+
+        return { status: "declined", paymentId: opened.paymentId, code: executed.responseCode };
+      }
+
+      if (executed.status === "rejected") {
+        // Refused before it reached the gateway: no key configured, or a request the adapter will not build.
+        // Nothing was charged, so the record is settled as unknown rather than as a decline - a decline would
+        // tell the payer their card was refused.
+        options.recorder.settle({
+          paymentId: opened.paymentId,
+          outcome: "unknown",
+          transactionId: null,
+          code: "rejected",
+          occurredAtEpochMs: request.occurredAtEpochMs,
+        });
+
+        return { status: "unavailable", reason: "provider" };
+      }
+
+      // A transport that lost its answer may have taken the money. This is not a failure to retry; it is a
+      // fact to reconcile, and the record says so.
+      options.recorder.settle({
+        paymentId: opened.paymentId,
+        outcome: "unknown",
+        transactionId: null,
+        code: "transport_error",
+        occurredAtEpochMs: request.occurredAtEpochMs,
+      });
+
+      return { status: "unknown", paymentId: opened.paymentId, reason: executed.message };
+    },
+  };
+}
+
+/**
+ * The recorder a gate uses: correct about idempotency, honest about persistence.
+ *
+ * It exists so the whole flow can be proven without a database, and so the production wiring has something
+ * that says `durable: false` rather than pretending. It is not a production store: the record lives in this
+ * process only, which is exactly why the page refuses to charge through it.
+ */
+export function createInMemoryPortalPaymentRecorder(): PortalPaymentRecorder {
+  interface Record {
+    readonly paymentId: string;
+    settled: "captured" | "declined" | "unknown" | null;
+    transactionId: string | null;
+    code: string | null;
+  }
+
+  const byKey = new Map<string, Record>();
+  const byPayment = new Map<string, Record>();
+
+  return {
+    durable: false,
+    open(input) {
+      const existing = byKey.get(input.idempotencyKey);
+
+      if (existing !== undefined) {
+        return {
+          status: "duplicate",
+          paymentId: existing.paymentId,
+          settled: existing.settled,
+          transactionId: existing.transactionId,
+          code: existing.code,
+        };
+      }
+
+      const record: Record = {
+        paymentId: randomUUID(),
+        settled: null,
+        transactionId: null,
+        code: null,
+      };
+
+      byKey.set(input.idempotencyKey, record);
+      byPayment.set(record.paymentId, record);
+
+      return { status: "opened", paymentId: record.paymentId };
+    },
+    settle(input) {
+      const record = byPayment.get(input.paymentId);
+
+      if (record === undefined) {
+        return;
+      }
+
+      record.settled = input.outcome;
+      record.transactionId = input.transactionId;
+      record.code = input.code;
+    },
+  };
+}

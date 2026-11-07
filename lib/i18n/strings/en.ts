@@ -3058,6 +3058,56 @@ const catalog = {
     ruleEstimateSelfDecision:
       "A decision has to come from your client. This browser is signed in to the account that sent the estimate.",
     ruleEstimateEvidenceMissing: "The offer this decision would point at is not there any more.",
+
+    /** Section 18: the card payment page opened under i/[token]/pay with the provider's hosted fields. */
+    paymentEyebrow: "Payment",
+    paymentMetaDescription:
+      "Pay this invoice by card. The card number, the expiry and the security code are entered in fields hosted by the payment provider; this site never sees them.",
+    paymentSection: "Pay by card",
+    paymentAmountTitle: "Amount to pay",
+    paymentAmountBody: "This link takes {amount} and no more: the exact amount this invoice still owes.",
+    paymentCardNumberLabel: "Card number",
+    paymentExpiryLabel: "Expiry",
+    paymentSecurityCodeLabel: "Security code",
+    paymentSecureFieldsNote:
+      "These three fields are drawn by the payment provider inside this page. The card details go straight to the provider and never reach this site.",
+    paymentSubmit: "Pay {amount}",
+    paymentSubmitting: "Paying...",
+    paymentFailed: "The payment was not taken. Check the card and try again.",
+    paymentFieldsUnavailable:
+      "The secure card fields could not be loaded. Check your connection and reload the page.",
+    paymentFieldsInvalid: "The card details are not complete yet.",
+    paymentCapturedTitle: "Payment received",
+    paymentCapturedBody:
+      "Paid {amount} on {date} (UTC). This invoice shows the payment as soon as its receipt is posted.",
+    paymentPrivacyNote: "Keep this link to yourself. Anyone who has it can open this invoice.",
+    paymentBackToInvoice: "Back to the invoice",
+    paymentStart: "Pay by card",
+    paymentNotPayableTitle: "This invoice cannot be paid here",
+    paymentUnavailableTitle: "Card payment is not available yet",
+    paymentUnavailableProviderBody:
+      "This business has not finished connecting its card gateway, so this page cannot take a card. The invoice stays open, and the business has been told.",
+    paymentUnavailableRecorderBody:
+      "Card payment is switched off while the platform finishes its payment records, so this page cannot take a card. The invoice stays open, and nothing has been charged.",
+    paymentRuleNotPayable: "This invoice has nothing left to pay, so the link takes no card.",
+    paymentRuleInvoiceVoid: "This invoice was cancelled, so it cannot be paid.",
+    paymentRuleNotIssued: "This invoice has not been issued yet.",
+    paymentRuleSelfPayment:
+      "A payment has to come from your client. This browser is signed in to the account that sent the invoice.",
+    paymentRuleCardDataRefused:
+      "Card details are only ever entered in the payment provider's own fields. Nothing was charged: reload the page and enter the card there.",
+    paymentRuleInvalidToken: "The card details could not be read. Reload the page and enter the card again.",
+    paymentRuleCardDeclined: "The card was declined by the bank. Try another card, or contact the business.",
+    paymentRuleProviderUnavailable:
+      "The payment provider is not reachable right now, so nothing was charged. Try again in a moment.",
+    paymentRuleRecorderUnavailable:
+      "Card payment is switched off while the platform finishes its payment records. Nothing was charged.",
+    paymentRuleOutcomeUnknown:
+      "The provider has not confirmed this payment yet. Do not try again: the payment is being checked, and the invoice will show the result.",
+    paymentRuleAmountUnrepresentable:
+      "This invoice's total cannot be charged as dollars and cents, so this link takes no card. Ask the business to correct the invoice.",
+    paymentRuleStaleDocument:
+      "This invoice changed while the page was open, so nothing was charged. Reload the page to see it as it is now.",
   },
   email: {
     lockAlert: {

@@ -3,8 +3,8 @@
 
 Owner: STEP 181-190 (client portal, payment pages and payment links).
 
-STEP 181 built the invoice link, STEP 182 the estimate link. Both are read-only without a link, and both
-write only the evidence section 16 asks for.
+STEP 181 built the invoice link, STEP 182 the estimate link, STEP 183 the card payment page. The links are
+read-only without a token, and each STEP writes only what its own section asks for.
 
 Reserved for tokenized client surfaces opened without a login: invoice links under
 i/[token] and estimate links under e/[token]. A fully paid invoice link shows the receipt
@@ -48,9 +48,36 @@ and refuses further payment, and a partly paid invoice link accepts only the rem
 - `portal-estimate-verify.ts` - the gate, 232 checks. It is not on the `verify` chain for the same reason
   as the invoice gate; run it with `node "app/(client-portal)/portal-estimate-verify.ts"`.
 
+## What STEP 183 built
+
+- `i/[token]/pay/page.tsx` - the payment page of section 18: the amount the link still takes, and the
+  provider's hosted fields. The page holds no card input of its own and hands three empty containers to NMI's
+  Collect.js script. `force-dynamic` and `noindex`.
+- `i/[token]/pay/charge/route.ts` - the charge: CSRF, byte ceiling, address, rate limit, body, then the
+  service. The body carries a Collect.js token and an idempotency key, and nothing else.
+- `portal-payment-fields.ts` - the vocabulary: the two body fields, the card keys that must never appear in
+  one, the token shapes, the `portal_payment` policy (5 attempts per address per ten minutes), the rules, the
+  audit actions and the dollars-and-cents conversion.
+- `portal-payment.ts` - the service: what the page shows (`preparePortalPayment`) and the one charge
+  (`chargePortalPayment`), which refuses card data, spends nothing until the link and the amount are right,
+  and never retries an unknown outcome.
+- `portal-payment-processor.ts` - the composition a charge runs through: STEP 129's routing, a durable record
+  (the recorder port), and STEP 151's provider execution. It also ships the in-memory recorder, which says
+  `durable: false`.
+- `portal-payment-runtime.ts` - the production wiring, which states plainly that the key store and the
+  recorder are in memory in this build, so the page explains that card payment is not available yet instead
+  of taking a card it cannot account for.
+- `portal-payment-verify.ts` - the gate, 194 checks. Run it with
+  `node "app/(client-portal)/portal-payment-verify.ts"`.
+
+STEP 183 adds no migration: `0037` already carries the payment, its idempotency key, its status, its provider
+transaction and the two card facts section 18 allows, and `0030` already carries the platform-scoped gateway
+keys.
+
 STEP 182 adds no migration. `0025` already carries `void_reason`, `voided_at` and `accepted_at`; `0027`
 already carries the eight pieces of evidence and the unique index that makes one signature per estimate;
 `0118` already freezes a decided quote. The gate asserts all three instead of assuming them.
 
 Payment components live in `components/payments/` (invoice receipt, confirmation card and form,
-delivery card and form, the estimate decision card and form, and the refusal vocabulary the forms share).
+delivery card and form, the estimate decision card and form, the card payment form, and the refusal
+vocabularies the forms share).

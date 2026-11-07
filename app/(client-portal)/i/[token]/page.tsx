@@ -1,6 +1,7 @@
 // path: app/(client-portal)/i/[token]/page.tsx
 import type { Metadata } from "next";
 import { cookies } from "next/headers";
+import Link from "next/link";
 import type { ReactNode } from "react";
 import { InvoiceAcceptanceCard } from "../../../../components/payments/invoice-acceptance-card.tsx";
 import { InvoiceFulfilmentCard } from "../../../../components/payments/invoice-fulfilment-card.tsx";
@@ -285,8 +286,20 @@ function InvoiceDocument({ view }: { readonly view: PortalInvoiceView }): ReactN
   );
 }
 
-/** What the link would take, when it takes anything at all. */
-function PaymentBlock({ view }: { readonly view: PortalInvoiceView }): ReactNode {
+/**
+ * What the link would take, when it takes anything at all, and the way to take it.
+ *
+ * The amount is the invoice's own remaining due, and the link beside it is STEP 183's payment page - a page
+ * of its own because a card number must never be typed into the page that shows the document. A settled or
+ * cancelled invoice renders neither: there is nothing to pay and no form to offer.
+ */
+function PaymentBlock({
+  view,
+  token,
+}: {
+  readonly view: PortalInvoiceView;
+  readonly token: string;
+}): ReactNode {
   if (!view.payment.open || view.payment.amountMinor === null) {
     return <p className={bodyClasses}>{getMessage("portal.settledSentence")}</p>;
   }
@@ -317,6 +330,12 @@ function PaymentBlock({ view }: { readonly view: PortalInvoiceView }): ReactNode
           })}
         </p>
       ) : null}
+      <Link
+        href={`/i/${encodeURIComponent(token)}/pay`}
+        className="inline-flex w-fit items-center justify-center rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground outline-none focus-visible:ring-2 focus-visible:ring-primary"
+      >
+        {getMessage("portal.paymentStart")}
+      </Link>
     </div>
   );
 }
@@ -420,7 +439,7 @@ export default async function PortalInvoicePage({
 
       <InvoiceDocument view={view} />
 
-      {view.state === "void" ? null : <PaymentBlock view={view} />}
+      {view.state === "void" ? null : <PaymentBlock view={view} token={decoded} />}
 
       <InvoicePaidState view={view} />
 
