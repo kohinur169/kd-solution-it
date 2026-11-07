@@ -1,9 +1,23 @@
 # STEP 197 — Structured evidence pack builder: invoice, delivery proof, communications
 
-Status: **complete**. One commit, `STEP 197: Structured evidence pack builder: invoice, delivery proof,
-communications`, on `arena/ca936761-kd-solution-it`, branched from STEP 196's `2bd2eec`. Typecheck, lint and build
-are clean, and the STEP's own gate is `services/disputes/dispute-evidence-verify.ts` at **356 checks**,
-mutation-checked with twenty mutations, all red.
+Status: **complete**. Commit `STEP 197: Structured evidence pack builder: invoice, delivery proof,
+communications` (`21b819a`), then `STEP 197: a frozen pack offers no action, and a refusal is announced`
+(the follow-up that finished the UI slice, described below), then this handoff, on
+`arena/ca936761-kd-solution-it`, branched from
+STEP 196's `2bd2eec`. Typecheck, lint and build are clean, and the STEP's own gate is
+`services/disputes/dispute-evidence-verify.ts` at **359 checks**, mutation-checked with fifteen mutations in the
+final run (twenty in the first), all red.
+
+## Resumed after a re-initialised sandbox
+
+The workspace's `.git` had fallen back to the branch's base commit while the files themselves were intact, so
+the first act of the resumed session was to prove the tree was still STEP 197's: the local branch was moved to
+the real head `74cc2ce` with `git reset --soft` followed by `git reset` (no file was written or removed), and
+`git status` came back clean - every file on disk already matched the pushed head byte for byte. The preflight
+inventory then re-ran every gate and walked the eight sub-steps; slices 1-5 and 7-8 were found complete, and
+slice 6 (the UI) was found to have one wart left: on a **frozen** pack the panel still offered the
+assemble/refresh button, an action the service is built to refuse. That is what the follow-up commit fixes,
+together with two smaller things found in the same read.
 
 ## STEP
 
@@ -106,8 +120,10 @@ bodies, so a service that skipped its own check would still fail:
 13. **The four routes** - CSRF before the session, the identity read named in each route file, the body ceiling,
     one service call, the version read from the body on the freeze and left out when absent, and the two-verb
     routes checking the token on both verbs.
-14. **The panel** - seven acts, each a `MutationVerb` with its own token spread, and the freeze button disabled
-    until the pack is complete.
+14. **The panel** - seven acts, each a `MutationVerb` with its own token spread, the freeze button disabled until
+    the pack is complete, **no action offered on a frozen pack** (the service would refuse every one of them),
+    a refusal announced with `role="alert"` rather than printed quietly, and a captioned document still saying
+    how many bytes it is.
 15. **Every message exists** - a path scan, so a screen cannot ask for a string that was never added.
 16. **The browser boundary** - the fields file pulls no hash into the bundle, and the panel imports nothing from
     `node:`.
@@ -134,7 +150,7 @@ bodies, so a service that skipped its own check would still fail:
 
 | Gate | Result at this commit |
 | --- | --- |
-| `services/disputes/dispute-evidence-verify.ts` | **passed, 356 checks** (twenty mutations, all red) |
+| `services/disputes/dispute-evidence-verify.ts` | **passed, 359 checks** (fifteen mutations re-run in the resumed sandbox, all red; twenty in the first run) |
 | `services/disputes/dispute-verify.ts` | passed, 271 checks |
 | `services/disputes/dispute-response-verify.ts` | passed, 398 checks |
 | `services/disputes/dispute-warnings-verify.ts` | passed, 268 checks |
@@ -149,13 +165,15 @@ bodies, so a service that skipped its own check would still fail:
 | `npm run verify` (whole chain, ending in `tsc`, `eslint .`, `next build`) | passed, compiled in 12.3 s |
 | **Pre-existing red (unchanged, unchanged reasons)** | `lib/auth/verify.ts` 1 (a fourth module dials), `lib/security/verify.ts` 3 (a probe's own literals, `nmi-client.ts` naming the algorithm), `components/office/verify.ts` 13 (`provisioningQueue` unaccounted for) |
 
-The twenty mutations, each of which the gate catches by name: the freeze accepting a pack missing a part; the
+The mutations, each of which the gate catches by name: the freeze accepting a pack missing a part; the
 freeze accepting a pack with no document; the flag raised without a pack; a frozen pack updatable; the service
 freezing an incomplete pack; the digest ignoring labels; the digest depending on row order; a note landing under
 the wrong part; a quarantined file attached anyway; the same bytes attaching twice; the storage key unchecked; the
 flag never raised; a removal not checking that it removed; a decided dispute packed; the correspondence not
 capped; the delivery record losing its reference; the document never verified; the panel freezing an incomplete
-pack; a route dropping its token; the freeze route forgetting the version.
+pack; a route dropping its token; the freeze route forgetting the version; and, added when slice 6 was finished,
+the panel offering a refresh on a frozen pack, printing a refusal quietly as a status line, and dropping a
+captioned document's size.
 
 Two exact-count assertions moved because this STEP legitimately adds what they count: `lib/auth/verify.ts`
 55→56 browser files and 75→82 mutation call sites (the panel's seven acts), with the reason written beside them.
