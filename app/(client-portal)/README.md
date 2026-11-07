@@ -6,7 +6,8 @@ Owner: STEP 181-190 (client portal, payment pages and payment links).
 STEP 181 built the invoice link, STEP 182 the estimate link, STEP 183 the card payment page, STEP 184 the
 3D Secure step in front of it, STEP 185 the billing match that decides what a payment without a bank may do,
 STEP 186 the handling of the provider's fraud signal, STEP 187 the card blacklist the platform checks before it
-charges anything, STEP 188 the card and IP velocity limits that stop an attempt before a record exists.
+charges anything, STEP 188 the card and IP velocity limits that stop an attempt before a record exists, STEP 189
+the part payment a payer may choose on the link.
 The links are read-only without a token, and each STEP writes only what its own section asks for.
 
 Reserved for tokenized client surfaces opened without a login: invoice links under
@@ -230,6 +231,36 @@ STEP 188 adds no migration: `0056` (STEP 067) already carries `velocity_counters
 and breach constraints and its two unique keys, and `0093` already carries `consume_velocity`, which counts a hit
 up inside one statement and freezes the limit in the row. The gate reads both and asserts the six arguments and
 the answer columns this page depends on, and asserts 0123 is still the next free number.
+
+## What STEP 189 built
+
+- `portal-part-payment-fields.ts` - the vocabulary of part payment: the one body field (`amount`), the four rules
+  a chosen amount is refused with, the printed forms, and the shape the page hands the form. It is browser safe,
+  because the card form reads it.
+- `portal-part-payment.ts` - the rules: `portalPartPaymentLimitsOf` (the ceiling, the floor of a partial, whether
+  a choice exists), `splitPortalPartPaymentAmountField` (the field out of the body, before STEP 183's strict
+  parser), `portalPartPaymentAmountOf` (the one resolution every charge path uses) and
+  `portalPartPaymentMovedOf` (STEP 184's question, asked about a part).
+- `portal-part-payment-verify.ts` - the gate, 175 checks. Run it with
+  `node "app/(client-portal)/portal-part-payment-verify.ts"`.
+
+A payer may now pay **less than the remainder**, and never more: the remaining due is the ceiling and it is read
+from the invoice in the request that charges, not from anything the browser sent. A payment that leaves the
+document open is a **partial payment** and meets section 16's twenty dollar floor (`money.minimumPartialPayment`,
+through the same folding `portalMinimumPartialMinor` gives the invoice page); the payment that settles the
+document is not a partial and is taken at whatever the remainder is, which is what keeps a nine dollar remainder
+payable at all. `below_minimum` and `exceeds_remaining` are **STEP 124's rule strings**, asserted equal by the
+gate, so the link and the merchant's own record-a-payment screen refuse the same number with the same word.
+
+An absent `amount` is the whole remainder - the request STEP 183 always sent - so nothing about the earlier STEPs
+changed for a caller that sends none. The amount travels through the 3D Secure step in the sealed handle and
+comes back in the completion's charge, so the challenge and the capture are for one number. A partial leaves the
+invoice's balance to STEP 130's operation and STEP 132's ledger: this page writes `payments`, never
+`invoices.amount_paid_minor`, and a failed or pending attempt therefore never reduces the balance.
+
+STEP 189 adds no migration: `0022` already carries `amount_paid_minor`, the money checks and
+`invoices_partial_minimum_check`, `0037` already carries `payments.amount_minor`, and the twenty dollar floor is
+configuration rather than a column. The gate asserts 0123 is still the next free number.
 
 STEP 182 adds no migration. `0025` already carries `void_reason`, `voided_at` and `accepted_at`; `0027`
 already carries the eight pieces of evidence and the unique index that makes one signature per estimate;

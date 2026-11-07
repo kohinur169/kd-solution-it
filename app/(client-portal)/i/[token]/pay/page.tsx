@@ -245,6 +245,7 @@ export default async function PortalPaymentPage({
           endpoint={endpoint}
           askForPostalCode={threeDsReady}
           amountText={view.amountText}
+          partPayment={view.partPayment}
           idempotencyKey={view.idempotencyKey}
           secureFields={view.secureFields}
         />

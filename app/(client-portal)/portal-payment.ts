@@ -25,6 +25,12 @@ import {
 import { portalVelocityCardFingerprint } from "./portal-velocity.ts";
 import type { PortalTokenKeys } from "../../lib/security/portal-token.ts";
 import { openPortalInvoice, type PortalInvoiceView } from "./portal-invoice.ts";
+import {
+  portalPartPaymentAmountOf,
+  portalPartPaymentLimitsOf,
+  splitPortalPartPaymentAmountField,
+} from "./portal-part-payment.ts";
+import type { PortalPartPaymentLimits } from "./portal-part-payment-fields.ts";
 import { portalMoneyTextOf } from "./portal-invoice-money.ts";
 import {
   PORTAL_PAYMENT_AUDIT_ENTITY,
@@ -98,6 +104,12 @@ export interface PortalPaymentView {
   readonly amountText: string;
   /** The amount in the provider's own spelling, `100.00`, which is what the charge will send. */
   readonly chargeAmount: string;
+  /**
+   * STEP 189: what this link will take in parts - the ceiling, the floor of a partial, and whether a choice
+   * exists at all. The form renders an amount field from it and nothing else; the numbers themselves are read
+   * from the invoice again when the charge arrives.
+   */
+  readonly partPayment: PortalPartPaymentLimits;
   /** The key this page's attempt carries, so a double submit is one payment and not two. */
   readonly idempotencyKey: string;
   /** The hosted fields, or null when the platform cannot take a card right now. */
@@ -413,6 +425,9 @@ export async function preparePortalPayment(
     throw refused("CONFLICT", "payment", PORTAL_PAYMENT_RULES.amountUnrepresentable);
   }
 
+  // STEP 189: the same read answers what a part payment may be, so the form's floor and the charge's floor
+  // are one number rather than two that agree today.
+  const partPayment = portalPartPaymentLimitsOf(view);
   const tokenization = dependencies.tokenizationKeyFor(view.companyId);
   const secureFields: PortalSecureFields | null =
     tokenization === null
@@ -435,6 +450,7 @@ export async function preparePortalPayment(
     amountMinor: view.payment.amountMinor,
     amountText: portalMoneyTextOf(view.currency, view.payment.amountMinor),
     chargeAmount,
+    partPayment,
     // A fresh key per render. The form sends it back, so a double submit is one payment: the second request
     // finds the record the first one made rather than charging the card again.
     idempotencyKey: randomUUID(),
@@ -504,9 +520,16 @@ export async function chargePortalPayment(
   }
 
   let parsed: ParsedPortalPaymentBody;
+  let requestedAmount: string | null;
 
   try {
-    parsed = parsePortalPaymentBody(input.body);
+    // STEP 189's field is taken out first, exactly as STEP 185 takes the postal code out: STEP 183's parser
+    // still sees the body it has always seen, and the card-field scan still runs over everything else. A
+    // card number typed into the amount box is refused here, by the rule that refuses one anywhere.
+    const split = splitPortalPartPaymentAmountField(input.body);
+
+    requestedAmount = split.amount;
+    parsed = parsePortalPaymentBody(split.rest);
   } catch (error) {
     if (
       error instanceof AppError &&
@@ -529,11 +552,11 @@ export async function chargePortalPayment(
     throw error;
   }
 
-  const chargeAmount = portalPaymentChargeAmountOf(view.payment.amountMinor);
-
-  if (chargeAmount === null) {
-    throw refused("CONFLICT", "payment", PORTAL_PAYMENT_RULES.amountUnrepresentable);
-  }
+  // STEP 189: one resolution for the whole charge - the ceiling, the floor, the parser and the provider's
+  // cents, in that order. An absent amount is the whole remainder, which is what every caller before this
+  // STEP sent.
+  const amount = portalPartPaymentAmountOf({ requested: requestedAmount, view });
+  const chargeAmount = amount.chargeAmount;
 
   const processor = dependencies.processor;
 
@@ -549,7 +572,7 @@ export async function chargePortalPayment(
     companyId: view.companyId,
     invoiceId: view.invoiceId,
     number: view.number,
-    amountMinor: view.payment.amountMinor,
+    amountMinor: amount.amountMinor,
     chargeAmount,
     token: parsed.token,
     idempotencyKey: parsed.idempotencyKey,
@@ -595,7 +618,8 @@ export async function chargePortalPayment(
   }
 
   const common = {
-    amount_minor: view.payment.amountMinor,
+    amount_minor: amount.amountMinor,
+    part_payment: amount.partial,
     charge_amount: chargeAmount,
     idempotency_key_hash: keyHashOf(parsed.idempotencyKey),
   };
@@ -624,8 +648,8 @@ export async function chargePortalPayment(
       status: "captured",
       invoiceId: view.invoiceId,
       companyId: view.companyId,
-      amountMinor: view.payment.amountMinor,
-      amountText: portalMoneyTextOf(view.currency, view.payment.amountMinor),
+      amountMinor: amount.amountMinor,
+      amountText: amount.amountText,
       chargeAmount,
       paymentId: outcome.paymentId,
       transactionId: outcome.transactionId,
@@ -663,7 +687,7 @@ export async function chargePortalPayment(
       payload: portalVelocityPayloadOf({
         invoiceId: view.invoiceId,
         number: view.number,
-        amountMinor: view.payment.amountMinor,
+        amountMinor: amount.amountMinor,
         limited: outcome.limited,
         cardFingerprint: portalVelocityCardFingerprint(parsed.token),
         rule,
@@ -722,7 +746,7 @@ export async function chargePortalPayment(
           token: parsed.token,
           signal: outcome.signal,
           responseCode: outcome.code,
-          amountMinor: view.payment.amountMinor,
+          amountMinor: amount.amountMinor,
           ipAddress: input.clientAddress,
           userAgent: input.userAgent,
         },

@@ -3,11 +3,18 @@
 
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
-import { getMessage } from "../../lib/i18n/messages.ts";
+import { formatMessage, getMessage } from "../../lib/i18n/messages.ts";
 import { csrfHeaders } from "../../lib/security/csrf-client.ts";
 import { portalRefusalOf } from "./portal-form-refusal.ts";
 import { portalPaymentRefusalIsFinal, portalPaymentRuleSentences } from "./portal-payment-refusal.ts";
 import { portalThreeDsRuleSentences } from "./portal-three-ds-refusal.ts";
+import {
+  PORTAL_PART_PAYMENT_FIELD,
+  PORTAL_PART_PAYMENT_INPUT_ID,
+  PORTAL_PART_PAYMENT_INPUT_MAXIMUM_LENGTH,
+  portalPartPaymentTextOf,
+  type PortalPartPaymentLimits,
+} from "../../app/(client-portal)/portal-part-payment-fields.ts";
 import { ThreeDsChallenge } from "./three-ds-challenge.tsx";
 
 /**
@@ -118,6 +125,14 @@ export interface CardPaymentFormProps {
    */
   readonly askForPostalCode: boolean;
   readonly amountText: string;
+  /**
+   * STEP 189: what this link will take in parts.
+   *
+   * The form shows an amount field only when a legal choice exists below the whole remainder, and it prints the
+   * ceiling and the floor beside it. Both numbers come from the page's own read of the invoice, never from a
+   * query parameter, and the server resolves the amount again when the form is posted.
+   */
+  readonly partPayment: PortalPartPaymentLimits;
   readonly idempotencyKey: string;
   readonly secureFields: {
     readonly scriptUrl: string;
@@ -130,6 +145,7 @@ export function CardPaymentForm({
   endpoint,
   askForPostalCode,
   amountText,
+  partPayment,
   idempotencyKey,
   secureFields,
 }: CardPaymentFormProps): ReactNode {
@@ -151,6 +167,15 @@ export function CardPaymentForm({
   } | null>(null);
   const submitted = useRef(false);
   const [postalCode, setPostalCode] = useState("");
+  /**
+   * STEP 189: the amount the payer is choosing, as the text they typed.
+   *
+   * It starts at the whole remainder, so a payer who ignores the field pays the invoice as it stands - the same
+   * request STEP 183 sent. The value is text end to end: the platform parses it on the server with the one
+   * parser its money has, and this component never converts it to a number.
+   */
+  const [amount, setAmount] = useState(() => portalPartPaymentTextOf(partPayment.remainingMinor));
+  const amountChosen = partPayment.allowPartial;
 
   const send = useCallback(
     async (paymentToken: string): Promise<void> => {
@@ -174,6 +199,9 @@ export function CardPaymentForm({
             ...(askForPostalCode && postalCode.trim().length > 0
               ? { billing_postal_code: postalCode.trim() }
               : {}),
+            // STEP 189: only when the payer had a choice. An absent amount means the whole remainder, which is
+            // what this form sent before the field existed.
+            ...(amountChosen && amount.trim().length > 0 ? { [PORTAL_PART_PAYMENT_FIELD]: amount.trim() } : {}),
           }),
         });
 
@@ -243,7 +271,7 @@ export function CardPaymentForm({
         setBusy(false);
       }
     },
-    [amountText, askForPostalCode, endpoint, idempotencyKey, postalCode, router],
+    [amount, amountChosen, amountText, askForPostalCode, endpoint, idempotencyKey, postalCode, router],
   );
 
   const configure = useCallback((): void => {
@@ -375,6 +403,35 @@ export function CardPaymentForm({
 
       <p className={hintClasses}>{getMessage("portal.paymentSecureFieldsNote")}</p>
 
+      {amountChosen ? (
+        <div className={fieldClasses}>
+          <label className={labelClasses} htmlFor={PORTAL_PART_PAYMENT_INPUT_ID}>
+            {getMessage("portal.partPaymentLabel")}
+          </label>
+          <input
+            id={PORTAL_PART_PAYMENT_INPUT_ID}
+            name={PORTAL_PART_PAYMENT_FIELD}
+            type="text"
+            inputMode="decimal"
+            autoComplete="off"
+            maxLength={PORTAL_PART_PAYMENT_INPUT_MAXIMUM_LENGTH}
+            value={amount}
+            onChange={(event): void => {
+              setAmount(event.target.value);
+            }}
+            className={hostClasses}
+          />
+          <p className={hintClasses}>
+            {formatMessage("portal.partPaymentHint", {
+              remaining: partPayment.remainingText,
+              minimum: partPayment.minimumText ?? partPayment.remainingText,
+            })}
+          </p>
+        </div>
+      ) : partPayment.minimumMinor === null ? null : (
+        <p className={hintClasses}>{getMessage("portal.partPaymentNoChoice")}</p>
+      )}
+
       {askForPostalCode ? (
         <div className={fieldClasses}>
           <label className={labelClasses} htmlFor={BILLING_POSTAL_FIELD_ID}>
@@ -406,12 +463,18 @@ export function CardPaymentForm({
       <button
         id={SUBMIT_BUTTON_ID}
         type="submit"
-        disabled={!ready || busy || (askForPostalCode && postalCode.trim().length < 2)}
+        disabled={
+          !ready || busy || (askForPostalCode && postalCode.trim().length < 2) || (amountChosen && amount.trim().length === 0)
+        }
         className={submitClasses}
       >
         {busy
           ? getMessage("portal.paymentSubmitting")
-          : getMessage("portal.paymentSubmit").replace("{amount}", amountText)}
+          : amountChosen
+            ? // The amount is above, in the field the payer is choosing it in. Printing the whole remainder on
+              // the button would be a second, larger number beside their own.
+              getMessage("portal.paymentSubmitGeneric")
+            : getMessage("portal.paymentSubmit").replace("{amount}", amountText)}
       </button>
     </form>
   );

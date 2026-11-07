@@ -18,7 +18,13 @@ import {
   type PortalPaidPayment,
   type PortalPaymentDependencies,
 } from "./portal-payment.ts";
-import { PORTAL_PAYMENT_RULES, portalPaymentChargeAmountOf } from "./portal-payment-fields.ts";
+import { PORTAL_PAYMENT_RULES } from "./portal-payment-fields.ts";
+import {
+  portalPartPaymentAmountOf,
+  portalPartPaymentMovedOf,
+  portalPartPaymentRequestBodyOf,
+  splitPortalPartPaymentAmountField,
+} from "./portal-part-payment.ts";
 import {
   PORTAL_THREE_DS_AUDIT_ENTITY,
   PORTAL_THREE_DS_AUTHENTICATED_AUDIT_ACTION,
@@ -542,14 +548,18 @@ export async function startPortalThreeDs(
   // card-field scan still runs over everything the payer sent. See `splitPortalBillingPostalField`.
   const billing = splitPortalBillingPostalField(input.body);
 
+  // STEP 189's amount is taken out the same way and beside it, so the parser below still sees STEP 183's body.
+  const part = splitPortalPartPaymentAmountField(billing.rest);
+
   // STEP 183's parser, deliberately: a body carrying card data is refused by the same rule here, and the
   // token is held to the same shape, so there is one answer to "what may a payment body contain".
-  const parsed = parsePortalPaymentBody(billing.rest);
-  const chargeAmount = portalPaymentChargeAmountOf(view.payment.amountMinor);
+  const parsed = parsePortalPaymentBody(part.rest);
 
-  if (chargeAmount === null) {
-    throw refused("CONFLICT", "payment", PORTAL_PAYMENT_RULES.amountUnrepresentable);
-  }
+  // STEP 189: the chosen amount, resolved once against the document as this request read it. Everything below
+  // - the provider's request, the sealed handle, the record and the audits - carries this one number, so the
+  // amount the payer chose cannot differ from the amount the challenge is for.
+  const amount = portalPartPaymentAmountOf({ requested: part.amount, view });
+  const chargeAmount = amount.chargeAmount;
 
   const port = dependencies.port;
 
@@ -584,7 +594,7 @@ export async function startPortalThreeDs(
     invoiceId: view.invoiceId,
     number: view.number,
     amountText: chargeAmount,
-    amountMinor: view.payment.amountMinor,
+    amountMinor: amount.amountMinor,
     token: parsed.token,
     returnUrl: termUrl,
     browser: {
@@ -637,7 +647,12 @@ export async function startPortalThreeDs(
     const payment = await chargePortalPayment(
       {
         token: input.token,
-        body: { collectjs_token: parsed.token, idempotency_key: parsed.idempotencyKey },
+        body: {
+          collectjs_token: parsed.token,
+          idempotency_key: parsed.idempotencyKey,
+          // STEP 189: the amount the payer chose, re-posted as the text it resolves back from.
+          amount: portalPartPaymentRequestBodyOf(amount.amountMinor),
+        },
         clientAddress: input.clientAddress,
         userAgent: input.userAgent,
         actorCompanyId: input.actorCompanyId,
@@ -653,7 +668,8 @@ export async function startPortalThreeDs(
       payload: threeDsPayloadOf({
         invoice_id: view.invoiceId,
         number: view.number,
-        amount_minor: view.payment.amountMinor,
+        amount_minor: amount.amountMinor,
+        part_payment: amount.partial,
         three_ds_outcome: "authenticated",
         basis: "frictionless",
         idempotency_key_hash: keyHashOf(parsed.idempotencyKey),
@@ -690,7 +706,7 @@ export async function startPortalThreeDs(
     providerChallengeId,
     companyId: view.companyId,
     invoiceId: view.invoiceId,
-    amountMinor: view.payment.amountMinor,
+    amountMinor: amount.amountMinor,
     chargeAmount,
     token: parsed.token,
     idempotencyKey: parsed.idempotencyKey,
@@ -711,7 +727,7 @@ export async function startPortalThreeDs(
       challengeId,
       companyId: view.companyId,
       invoiceId: view.invoiceId,
-      amountMinor: view.payment.amountMinor,
+      amountMinor: amount.amountMinor,
       issuedAtEpochMs: nowMs,
       expiresAtEpochMs,
     },
@@ -726,7 +742,8 @@ export async function startPortalThreeDs(
     payload: threeDsPayloadOf({
       invoice_id: view.invoiceId,
       number: view.number,
-      amount_minor: view.payment.amountMinor,
+      amount_minor: amount.amountMinor,
+      part_payment: amount.partial,
       three_ds_outcome: "attempted",
       challenge_id: challengeId,
       postal_code_matched: billingMatch.postalCodeMatched,
@@ -746,8 +763,8 @@ export async function startPortalThreeDs(
     status: "challenge",
     invoiceId: view.invoiceId,
     companyId: view.companyId,
-    amountMinor: view.payment.amountMinor,
-    amountText: portalMoneyTextOf(view.currency, view.payment.amountMinor),
+    amountMinor: amount.amountMinor,
+    amountText: amount.amountText,
     acsUrl,
     paReq,
     md,
@@ -804,7 +821,9 @@ export async function completePortalThreeDs(
     throw notPayable(view);
   }
 
-  if (view.payment.amountMinor !== claim.amountMinor) {
+  if (portalPartPaymentMovedOf({ chosenMinor: claim.amountMinor, view })) {
+    // STEP 189: the handle carries the amount the payer chose, not the whole remainder, so the question here is
+    // whether that amount can still be taken - a document that took another payment meanwhile may still owe it.
     throw refused("CONFLICT", "payment", PORTAL_THREE_DS_RULES.staleDocument);
   }
 
@@ -968,7 +987,11 @@ export async function completePortalThreeDs(
     payment = await chargePortalPayment(
       {
         token: input.token,
-        body: { collectjs_token: record.token, idempotency_key: record.idempotencyKey },
+        body: {
+          collectjs_token: record.token,
+          idempotency_key: record.idempotencyKey,
+          amount: portalPartPaymentRequestBodyOf(record.amountMinor),
+        },
         clientAddress: record.ipAddress,
         userAgent: record.userAgent,
         actorCompanyId: null,

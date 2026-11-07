@@ -3140,6 +3140,19 @@ const catalog = {
     paymentBillingPostalLabel: "Billing postal code",
     paymentBillingPostalHint:
       "The postal code on the card's billing address. Your bank uses it, with the country of this connection, to check the payment.",
+    /** STEP 189: the amount a payer chose, and the two limits a part payment is held to. */
+    partPaymentLabel: "Amount to pay now",
+    partPaymentHint:
+      "This link accepts up to {remaining}. The smallest part payment is {minimum}.",
+    partPaymentNoChoice:
+      "The amount due is below the smallest part payment, so the whole amount is paid in one payment.",
+    paymentSubmitGeneric: "Pay now",
+    partPaymentInvalidAmount:
+      "That is not an amount this page can take. Type a number like 25.00, with a dot before the decimals.",
+    partPaymentBelowMinimum:
+      "A part payment must be at least the smallest amount this link accepts, which is shown beside the amount. Enter that or more, or pay the whole remaining amount.",
+    partPaymentExceedsRemaining:
+      "That is more than the invoice still owes. Enter the remaining amount or less, and nothing has been charged.",
     /** STEP 188: this card or this address reached a velocity limit, or the counters could not be read. */
     ruleVelocityCardLimited:
       "This card has been used for too many payment attempts in a short time. Nothing was charged. Please wait a little and try again, or use another card.",

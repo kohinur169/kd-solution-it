@@ -1146,9 +1146,16 @@ async function main(): Promise<void> {
     /<div[^>]*id=(\{?)?"?ccnumber/iu.test(formMarkup) || formMarkup.includes('id={CARD_NUMBER_FIELD_ID}'),
     "the card number container is a div the provider draws into",
   );
+  // STEP 189 added the second: the amount the payer chooses. Both are the payer's own text fields, so the
+  // claim this assertion has always meant is stated as that - the form's inputs are the portal's two facts,
+  // never a card's - rather than as a count that every later STEP would have to re-number.
+  const formInputs = formMarkup.match(/<input[^>]*>/gu) ?? [];
+
   expect(
-    (formMarkup.match(/<input/gu) ?? []).length === 1,
-    "and the only input in the form is the billing postal code STEP 185 asks for",
+    formInputs.length === 2 &&
+      formInputs.every((tag) => tag.includes('type="text"')) &&
+      formInputs.every((tag) => /name=(\{PORTAL_PART_PAYMENT_FIELD\}|"billing_postal_code")/u.test(tag)),
+    "the form's two inputs are the billing postal code STEP 185 asks for and the amount STEP 189 offers",
   );
   expect(form.includes('"data-tokenization-key"'), "it hands the provider the public tokenization key");
   expect(form.includes("document.createElement(\"script\")"), "and mounts the provider's script itself");

@@ -39,6 +39,14 @@ export function portalPaymentRuleTextOf(rule: string): string | null {
       return getMessage("portal.paymentRuleOutcomeUnknown");
     case "amount_unrepresentable":
       return getMessage("portal.paymentRuleAmountUnrepresentable");
+    case "amount_invalid":
+    case "amount_zero":
+      // STEP 189: one sentence for "this is not an amount", because a payer acts on both the same way.
+      return getMessage("portal.partPaymentInvalidAmount");
+    case "below_minimum":
+      return getMessage("portal.partPaymentBelowMinimum");
+    case "exceeds_remaining":
+      return getMessage("portal.partPaymentExceedsRemaining");
     case "velocity_card_limited":
       return getMessage("portal.ruleVelocityCardLimited");
     case "velocity_ip_limited":
@@ -92,6 +100,10 @@ export function portalPaymentRuleSentences(): Readonly<Record<string, string>> {
     "recorder_unavailable",
     "outcome_unknown",
     "amount_unrepresentable",
+    "amount_invalid",
+    "amount_zero",
+    "below_minimum",
+    "exceeds_remaining",
     "stale_document",
     "risk_rejected",
     "risk_suspicious",
