@@ -3,6 +3,13 @@ import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
 import type { AuditEntry, AuditTrail } from "../../lib/auth/audit.ts";
 import { AppError } from "../../lib/errors/app-error.ts";
+import {
+  evaluatePortalBillingMatch,
+  routePortalPaymentReview,
+  splitPortalBillingPostalField,
+  type PortalBillingMatchDependencies,
+} from "./portal-billing-match.ts";
+import type { PortalBillingMatch } from "./portal-billing-match-fields.ts";
 import { openPortalInvoice, type PortalInvoiceView } from "./portal-invoice.ts";
 import { portalMoneyTextOf } from "./portal-invoice-money.ts";
 import {
@@ -166,9 +173,14 @@ export interface PortalThreeDsRecord {
   readonly ipAddress: string;
   readonly userAgent: string | null;
   readonly expiresAtEpochMs: number;
-  /** Section 18's billing facts. STEP 185 fills them; this STEP only reads them. */
-  readonly postalCodeMatched: boolean;
-  readonly ipCountryMatched: boolean;
+  /**
+   * Section 18's billing match, decided by STEP 185 when the challenge was opened.
+   *
+   * The whole comparison and not two booleans, because a reviewer needs to know *which* fact failed and why -
+   * an absent postal code and a wrong one are different answers to a support question - and the capture rule
+   * only ever reads the two booleans out of it.
+   */
+  readonly billingMatch: PortalBillingMatch;
 }
 
 /** The challenge records this flow keeps. */
@@ -221,6 +233,13 @@ export interface PortalThreeDsDependencies {
   readonly port: PortalThreeDsPort | null;
   readonly recorder: PortalThreeDsRecorder | null;
   readonly secrets: PortalThreeDsSecrets | null;
+  /**
+   * STEP 185's billing match and review routing.
+   *
+   * Required rather than optional: a flow that could be built without it would be a flow that captured money
+   * without ever asking whether section 18's second condition held.
+   */
+  readonly billing: PortalBillingMatchDependencies;
   readonly now?: () => number;
 }
 
@@ -519,9 +538,13 @@ export async function startPortalThreeDs(
     throw refused("CONFLICT", "payment", PORTAL_PAYMENT_RULES.selfPayment);
   }
 
+  // The payer's postal code is taken out first, so STEP 183's strict parser still sees a two-field body and the
+  // card-field scan still runs over everything the payer sent. See `splitPortalBillingPostalField`.
+  const billing = splitPortalBillingPostalField(input.body);
+
   // STEP 183's parser, deliberately: a body carrying card data is refused by the same rule here, and the
   // token is held to the same shape, so there is one answer to "what may a payment body contain".
-  const parsed = parsePortalPaymentBody(input.body);
+  const parsed = parsePortalPaymentBody(billing.rest);
   const chargeAmount = portalPaymentChargeAmountOf(view.payment.amountMinor);
 
   if (chargeAmount === null) {
@@ -541,6 +564,19 @@ export async function startPortalThreeDs(
   if (dependencies.secrets === null) {
     throw refused("SERVICE_UNAVAILABLE", "payment", PORTAL_THREE_DS_RULES.unavailable);
   }
+
+  // Section 18's two facts, decided once per attempt and carried with the challenge: the postal code the payer
+  // typed against the client record's, and the country of the payer's address against the client's. Both fail
+  // closed, so a deployment with no resolver reviews every unverified payment rather than capturing it.
+  const billingMatch = await evaluatePortalBillingMatch(
+    {
+      companyId: view.companyId,
+      clientId: view.clientId,
+      payerPostalCode: billing.postalCode,
+      payerIpAddress: input.clientAddress,
+    },
+    dependencies.billing,
+  );
 
   const termUrl = portalThreeDsTermUrlOf(input.origin, input.token);
   const answer = await port.request({
@@ -661,10 +697,7 @@ export async function startPortalThreeDs(
     ipAddress: input.clientAddress,
     userAgent: input.userAgent,
     expiresAtEpochMs,
-    // STEP 185's two facts. This STEP reads them and never guesses them, so until STEP 185 evaluates them a
-    // payment that was not authenticated is reviewed rather than captured.
-    postalCodeMatched: false,
-    ipCountryMatched: false,
+    billingMatch,
   };
 
   const opened = dependencies.recorder.open(record);
@@ -696,6 +729,10 @@ export async function startPortalThreeDs(
       amount_minor: view.payment.amountMinor,
       three_ds_outcome: "attempted",
       challenge_id: challengeId,
+      postal_code_matched: billingMatch.postalCodeMatched,
+      ip_country_matched: billingMatch.ipCountryMatched,
+      postal_code_reason: billingMatch.postalCodeReason,
+      country_reason: billingMatch.countryReason,
       idempotency_key_hash: keyHashOf(parsed.idempotencyKey),
       expires_at: new Date(expiresAtEpochMs).toISOString(),
     }),
@@ -861,8 +898,8 @@ export async function completePortalThreeDs(
   const outcome = portalThreeDsOutcomeOf(answer.status === "authenticated" ? "authenticated" : "abandoned");
   const decision = portalThreeDsCaptureDecisionOf({
     outcome,
-    postalCodeMatched: record.postalCodeMatched,
-    ipCountryMatched: record.ipCountryMatched,
+    postalCodeMatched: record.billingMatch.postalCodeMatched,
+    ipCountryMatched: record.billingMatch.ipCountryMatched,
   });
 
   if (decision === "review") {
@@ -877,6 +914,21 @@ export async function completePortalThreeDs(
       occurredAtEpochMs: nowMs,
     });
 
+    // Section 18's second sentence: nothing is captured, and the payment goes to the desk that reads it.
+    const routed = await routePortalPaymentReview(
+      {
+        companyId: record.companyId,
+        invoiceId: record.invoiceId,
+        paymentId: null,
+        challengeId: record.challengeId,
+        amountMinor: record.amountMinor,
+        match: record.billingMatch,
+        ipAddress: input.clientAddress,
+        userAgent: input.userAgent,
+      },
+      dependencies.billing,
+    );
+
     await appendTolerated(dependencies.payment.audit, {
       action: PORTAL_THREE_DS_REVIEW_AUDIT_ACTION,
       actorUserId: null,
@@ -888,8 +940,9 @@ export async function completePortalThreeDs(
         three_ds_outcome: outcome,
         decision,
         review_owner: PORTAL_THREE_DS_REVIEW_OWNER,
-        postal_code_matched: record.postalCodeMatched,
-        ip_country_matched: record.ipCountryMatched,
+        postal_code_matched: record.billingMatch.postalCodeMatched,
+        ip_country_matched: record.billingMatch.ipCountryMatched,
+        review_routed: routed.status === "routed",
         captured: false,
       }),
       companyId: record.companyId,

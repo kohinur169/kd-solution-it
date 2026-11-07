@@ -579,6 +579,17 @@ function challengeRecorderOf(durable = true): GateRecorder {
   };
 }
 
+/** STEP 185's dependencies: a fixture with no client record, and no country resolver. */
+function billingDependenciesOf(fixture: Fixture, audit: InMemoryAuditTrail) {
+  return {
+    rest: createRest(fixture),
+    audit,
+    resolver: null,
+    queue: null,
+    now: () => nowMs,
+  } as const;
+}
+
 /** The real cipher, keyed by a test master key: a handle that was edited actually fails to open. */
 function secretsOf(key = masterKey): PortalThreeDsSecrets {
   return {
@@ -641,6 +652,7 @@ function flowOf(options: {
       port: options.port ?? port,
       recorder: options.recorder === undefined ? recorder : options.recorder,
       secrets: options.secrets === undefined ? secretsOf() : options.secrets,
+      billing: billingDependenciesOf(fixture, audit),
       now: () => nowMs,
     },
   };
@@ -1004,8 +1016,12 @@ async function main(): Promise<void> {
       "6f1c5c1e-6f6f-4f6f-8f6f-6f6f6f6f6f6f",
       "and the payer's own key, so the charge after the bank is the same payment",
     );
-    expectEqual(record?.postalCodeMatched, false, "the billing facts default to false, because STEP 185 fills them");
-    expectEqual(record?.ipCountryMatched, false, "and neither is guessed here");
+    expectEqual(
+      record?.billingMatch.postalCodeMatched,
+      false,
+      "the billing facts default to false when the payer typed no postal code",
+    );
+    expectEqual(record?.billingMatch.ipCountryMatched, false, "and the country fails closed while no resolver exists");
     expectEqual(flow.audit.entries.length, 1, "one audit entry was written");
     expectEqual(flow.audit.entries[0]?.action, PORTAL_THREE_DS_CHALLENGED_AUDIT_ACTION, "under the challenge action");
     expectEqual(flow.audit.entries[0]?.entityType, PORTAL_THREE_DS_AUDIT_ENTITY, "about a payment");
@@ -1275,8 +1291,7 @@ async function main(): Promise<void> {
     if (record !== undefined) {
       flow.recorder.records.set(challenge.challengeId, {
         ...record,
-        postalCodeMatched: true,
-        ipCountryMatched: true,
+        billingMatch: { ...record.billingMatch, postalCodeMatched: true, ipCountryMatched: true },
       });
     }
 

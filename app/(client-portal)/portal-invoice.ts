@@ -253,6 +253,14 @@ export interface PortalInvoiceView {
   readonly invoiceId: string;
   readonly companyId: string;
   readonly tokenId: string;
+  /**
+   * The client the invoice was issued to.
+   *
+   * Read for one reason: STEP 185 compares the payer's billing postal code and IP country with the billing
+   * details on this client, and section 18's fallback capture rule is a comparison of the two. It is an id, not
+   * a name, so the page that prints the document still prints only what section 16 allows.
+   */
+  readonly clientId: string;
   readonly number: string | null;
   readonly state: PortalInvoiceState;
   readonly currency: string;
@@ -593,6 +601,7 @@ export async function openPortalInvoice(
     invoiceId: invoice.id,
     companyId: invoice.company_id,
     tokenId: claim.tokenId,
+    clientId: invoice.client_id,
     number: invoice.number,
     state,
     currency: invoice.currency,

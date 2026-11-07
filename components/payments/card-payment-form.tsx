@@ -64,6 +64,16 @@ const EXPIRY_FIELD_ID = "ccexp";
 const SECURITY_CODE_FIELD_ID = "cvv";
 const SUBMIT_BUTTON_ID = "portal-pay-submit";
 
+/**
+ * The payer's billing postal code, which section 18 needs and the card fields cannot give.
+ *
+ * It is not card data - it appears on every invoice, a receipt and a delivery note - so it is an ordinary
+ * labelled input the platform reads itself, unlike the number, the expiry and the security code, which exist
+ * only inside the provider's frames. It carries `autoComplete="postal-code"` so a browser can fill it, and a
+ * ceiling of sixteen so the field cannot hold a document.
+ */
+const BILLING_POSTAL_FIELD_ID = "portal-pay-postal-code";
+
 const containerClasses = "flex flex-col gap-4";
 
 const fieldClasses = "flex flex-col gap-1";
@@ -99,6 +109,14 @@ export interface CardPaymentFormProps {
    * the same amount either way.
    */
   readonly endpoint: string;
+  /**
+   * Whether to ask for the billing postal code.
+   *
+   * True when the payment goes through the bank's step, because section 18's fallback needs the postal code to
+   * compare against the invoice; false on the plain charge path, which takes a token and a key and refuses
+   * anything else. The page decides, because the page is the one surface that knows which path this is.
+   */
+  readonly askForPostalCode: boolean;
   readonly amountText: string;
   readonly idempotencyKey: string;
   readonly secureFields: {
@@ -110,6 +128,7 @@ export interface CardPaymentFormProps {
 
 export function CardPaymentForm({
   endpoint,
+  askForPostalCode,
   amountText,
   idempotencyKey,
   secureFields,
@@ -126,6 +145,7 @@ export function CardPaymentForm({
     readonly termUrl: string;
   } | null>(null);
   const submitted = useRef(false);
+  const [postalCode, setPostalCode] = useState("");
 
   const send = useCallback(
     async (paymentToken: string): Promise<void> => {
@@ -144,6 +164,11 @@ export function CardPaymentForm({
           body: JSON.stringify({
             collectjs_token: paymentToken,
             idempotency_key: idempotencyKey,
+            // Only on the path that compares it. An empty value is not sent at all, because "not given" and
+            // "given as nothing" are different answers to section 18's first condition.
+            ...(askForPostalCode && postalCode.trim().length > 0
+              ? { billing_postal_code: postalCode.trim() }
+              : {}),
           }),
         });
 
@@ -209,7 +234,7 @@ export function CardPaymentForm({
         setBusy(false);
       }
     },
-    [amountText, endpoint, idempotencyKey, router],
+    [amountText, askForPostalCode, endpoint, idempotencyKey, postalCode, router],
   );
 
   const configure = useCallback((): void => {
@@ -331,6 +356,28 @@ export function CardPaymentForm({
 
       <p className={hintClasses}>{getMessage("portal.paymentSecureFieldsNote")}</p>
 
+      {askForPostalCode ? (
+        <div className={fieldClasses}>
+          <label className={labelClasses} htmlFor={BILLING_POSTAL_FIELD_ID}>
+            {getMessage("portal.paymentBillingPostalLabel")}
+          </label>
+          <input
+            id={BILLING_POSTAL_FIELD_ID}
+            name="billing_postal_code"
+            type="text"
+            inputMode="text"
+            autoComplete="postal-code"
+            maxLength={16}
+            value={postalCode}
+            onChange={(event): void => {
+              setPostalCode(event.target.value);
+            }}
+            className={hostClasses}
+          />
+          <p className={hintClasses}>{getMessage("portal.paymentBillingPostalHint")}</p>
+        </div>
+      ) : null}
+
       {message === null ? null : (
         <p role="alert" className={errorClasses}>
           {message}
@@ -340,7 +387,7 @@ export function CardPaymentForm({
       <button
         id={SUBMIT_BUTTON_ID}
         type="submit"
-        disabled={!ready || busy}
+        disabled={!ready || busy || (askForPostalCode && postalCode.trim().length < 2)}
         className={submitClasses}
       >
         {busy

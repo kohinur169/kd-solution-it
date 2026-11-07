@@ -1,6 +1,7 @@
 // path: app/(client-portal)/portal-three-ds-runtime.ts
 import { getAuthRuntime } from "../../lib/auth/runtime.ts";
 import { openSecret, packSecretBox, sealSecret, unpackSecretBox } from "../../lib/auth/secrets.ts";
+import { getPortalBillingMatchRuntime } from "./portal-billing-match-runtime.ts";
 import { getPortalPaymentRuntime } from "./portal-payment-runtime.ts";
 import type { PortalThreeDsDependencies, PortalThreeDsSecrets } from "./portal-three-ds.ts";
 import {
@@ -68,12 +69,15 @@ export function getPortalThreeDsRuntime(): PortalThreeDsRuntime {
     },
   };
 
-  runtime = {
+  const built: PortalThreeDsRuntime = {
     payment: getPortalPaymentRuntime(),
     port: noPortalThreeDsPort,
     recorder: createInMemoryPortalThreeDsRecorder(),
     secrets,
+    billing: getPortalBillingMatchRuntime(),
   };
+
+  runtime = built;
 
   return runtime;
 }

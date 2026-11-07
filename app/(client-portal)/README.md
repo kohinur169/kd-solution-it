@@ -4,8 +4,8 @@
 Owner: STEP 181-190 (client portal, payment pages and payment links).
 
 STEP 181 built the invoice link, STEP 182 the estimate link, STEP 183 the card payment page, STEP 184 the
-3D Secure step in front of it. The links are read-only without a token, and each STEP writes only what its own
-section asks for.
+3D Secure step in front of it, STEP 185 the billing match that decides what a payment without a bank may do.
+The links are read-only without a token, and each STEP writes only what its own section asks for.
 
 Reserved for tokenized client surfaces opened without a login: invoice links under
 i/[token] and estimate links under e/[token]. A fully paid invoice link shows the receipt
@@ -114,6 +114,37 @@ unavailable panel - "the bank confirmation step is not switched on yet" - when i
 STEP 184 adds no migration: `0037` already carries `three_ds_outcome` with its four values, the capture check
 that names section 18's rule, `postal_code_matched`, `ip_country_matched` and the `under_review` status. The
 gate asserts all five and asserts the next free migration number is untouched.
+
+## What STEP 185 built
+
+- `portal-billing-match-fields.ts` - the vocabulary: the body field the payer's postal code travels in, the
+  alphabet `clients_postal_code_check` allows, the ISO country shape, one rule for the two facts, the review
+  owner, the status and risk decision `0037` already accepts, and the audit actions.
+- `portal-billing-match.ts` - the rule and the routing: `portalBillingMatchOf` (normalise, compare, both must
+  match), `readPortalBillingFacts` (one tenant-scoped read of the client the invoice was issued to),
+  `evaluatePortalBillingMatch` (the resolver's answer, failing closed), `routePortalPaymentReview` (the queue
+  plus two chain entries), and `splitPortalBillingPostalField`, which takes the postal code out of the body so
+  STEP 183's strict parser and card scan still see everything else.
+- `portal-billing-match-processor.ts` - the in-memory review queue (`durable: false`) and
+  `noPortalCountryResolver`, the honest absence of geolocation data in this build.
+- `portal-billing-match-runtime.ts` - the production wiring: the platform's rows, its audit chain, no resolver
+  and an in-memory queue.
+- `portal-billing-match-verify.ts` - the gate, 148 checks. Run it with
+  `node "app/(client-portal)/portal-billing-match-verify.ts"`.
+
+The card form asks for one ordinary input - the payer's billing postal code, labelled, `autoComplete="postal-code"`,
+bounded to sixteen characters - and sends it only on the path that compares it. STEP 184's flow reads the two
+facts when it opens a challenge (`billingMatch` on the challenge record, replacing the two booleans it left
+false), and its review path now routes the payment as well as audit it.
+
+The payoff is section 18's second sentence, working: a payment the bank did not authenticate is **captured**
+when the postal code and the country both match the invoice, and is otherwise **not captured** and queued for
+`compliance_kyc`. Because this deployment has no country resolver, `ipCountryMatched` is false and every
+unverified payment is reviewed - which is the honest reading of "where possible", not a silent pass.
+
+STEP 185 adds no migration: `0037` already carries `postal_code_matched`, `ip_country_matched`,
+`status = 'under_review'`, `risk_decision = 'review'` and the index on the status, and `0019` already carries
+`clients.postal_code` and `clients.country`. The gate asserts each of those and the postal alphabet they share.
 
 STEP 182 adds no migration. `0025` already carries `void_reason`, `voided_at` and `accepted_at`; `0027`
 already carries the eight pieces of evidence and the unique index that makes one signature per estimate;

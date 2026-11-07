@@ -3136,6 +3136,12 @@ const catalog = {
     paymentThreeDsExpiredTitle: "The verification step was not completed",
     paymentThreeDsExpiredBody:
       "Your bank's verification page expired, or the step was not finished in time. Nothing has been taken. Start again from the invoice.",
+    /** STEP 185: the billing postal code section 18 compares, and what a payer reads about it. */
+    paymentBillingPostalLabel: "Billing postal code",
+    paymentBillingPostalHint:
+      "The postal code on the card's billing address. Your bank uses it, with the country of this connection, to check the payment.",
+    ruleBillingPostalInvalid:
+      "That postal code could not be read. Check it and try again: letters, digits, spaces and hyphens only.",
     paymentThreeDsAmountTitle: "Amount",
     paymentThreeDsAmountNote: "{amount}",
     paymentThreeDsUnavailableTitle: "Card payment is not available yet",

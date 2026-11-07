@@ -1135,9 +1135,20 @@ async function main(): Promise<void> {
 
   const formMarkup = form.replace(/\/\*[\s\S]*?\*\//gu, "");
 
+  // STEP 185 added one input to this form - the payer's billing postal code, which is not card data - so the
+  // claim is stated as what it always meant: no *card* field is an input, and the three card containers are
+  // still the provider's to fill.
   expect(
-    /<input[\s/>]/u.test(formMarkup) === false,
-    "the card form's markup holds no input element at all, only the containers the provider fills",
+    /<input[^>]*(ccnumber|ccexp|cvv|cardnumber|card_number|pan)/iu.test(formMarkup) === false,
+    "no card field in the form is an input element, only the three containers the provider fills",
+  );
+  expect(
+    /<div[^>]*id=(\{?)?"?ccnumber/iu.test(formMarkup) || formMarkup.includes('id={CARD_NUMBER_FIELD_ID}'),
+    "the card number container is a div the provider draws into",
+  );
+  expect(
+    (formMarkup.match(/<input/gu) ?? []).length === 1,
+    "and the only input in the form is the billing postal code STEP 185 asks for",
   );
   expect(form.includes('"data-tokenization-key"'), "it hands the provider the public tokenization key");
   expect(form.includes("document.createElement(\"script\")"), "and mounts the provider's script itself");

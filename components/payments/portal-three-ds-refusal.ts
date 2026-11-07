@@ -17,6 +17,8 @@ import { getMessage } from "../../lib/i18n/messages.ts";
 /** The sentence for one 3DS rule, or null when this module does not know it. */
 export function portalThreeDsRuleTextOf(rule: string): string | null {
   switch (rule) {
+    case "billing_postal_code_invalid":
+      return getMessage("portal.ruleBillingPostalInvalid");
     case "three_ds_unavailable":
       return getMessage("portal.ruleThreeDsUnavailable");
     case "three_ds_recorder_unavailable":
@@ -48,6 +50,7 @@ export function portalThreeDsRuleTextOf(rule: string): string | null {
  */
 export function portalThreeDsRuleSentences(): Readonly<Record<string, string>> {
   const rules = [
+    "billing_postal_code_invalid",
     "three_ds_unavailable",
     "three_ds_recorder_unavailable",
     "three_ds_authentication_failed",
