@@ -222,6 +222,10 @@ const CSRF_EXEMPT = Object.freeze([
   "app/api/jobs/health/route.ts",
   // The provider's own callbacks, authenticated by a signature or a shared secret in the request.
   "app/api/webhooks/",
+  // The public API: a store presents a bearer key, never a cookie, so there is no ambient credential for a
+  // cross-site request to borrow. The token is the credential *and* the proof that the caller meant it,
+  // which is what the CSRF token exists to establish for a surface that carries the session.
+  "app/api/public/v1/",
 ]);
 
 /**
@@ -245,6 +249,10 @@ const IDENTITY_PRIMITIVES = Object.freeze([
   // read. A route naming this name without calling it would still have to answer a body it could not
   // verify, which is why the exemption is worth no more to an attacker than the check it replaces.
   "receiveDisputeWebhook",
+  // STEP 202/203: a public API call has no actor either. It has a bearer key, and the function named here
+  // opens it, compares its hash against the live credential and refuses with `401` before the route's
+  // handler is called at all - a route cannot reach its body without having passed through it.
+  "handlePublicApiCall",
 ]);
 
 /**
