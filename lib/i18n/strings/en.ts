@@ -3108,6 +3108,57 @@ const catalog = {
       "This invoice's total cannot be charged as dollars and cents, so this link takes no card. Ask the business to correct the invoice.",
     paymentRuleStaleDocument:
       "This invoice changed while the page was open, so nothing was charged. Reload the page to see it as it is now.",
+
+    /** STEP 184: the 3D Secure step in front of a card payment, and what a payer reads afterwards. */
+    paymentThreeDsEyebrow: "Card verification",
+    paymentThreeDsResultMetaDescription:
+      "What happened to this card payment, and what it means for the invoice.",
+    paymentThreeDsChallengeTitle: "Confirm this payment with your bank",
+    paymentThreeDsChallengeBody:
+      "Banks in most countries ask for one more step before a card payment completes. You will be taken to your bank's own page now, and brought back here when it is done.",
+    paymentThreeDsContinue: "Continue to your bank",
+    paymentThreeDsChallengeNote:
+      "This step happens on your bank's page. This site does not see your card details, and it does not see what you type there either.",
+    paymentThreeDsCapturedBody:
+      "Your bank confirmed the payment and it has been taken. This invoice shows the payment as soon as its receipt is posted.",
+    paymentThreeDsCapturedAmountNote:
+      "The figure below is what this invoice still shows as due. It falls when the payment's receipt is posted.",
+    paymentThreeDsRemainingAmountNote: "What this invoice still shows as due.",
+    paymentThreeDsReviewTitle: "This payment is being checked",
+    paymentThreeDsReviewBody:
+      "Your bank did not finish the extra verification step, so nothing has been taken. The payment has gone to our compliance team for review, and you will be contacted if anything else is needed.",
+    paymentThreeDsDeclinedTitle: "Your bank did not approve this payment",
+    paymentThreeDsDeclinedBody:
+      "Nothing has been taken. You can start again from the invoice with the same card or a different one.",
+    paymentThreeDsUnknownTitle: "This payment could not be confirmed",
+    paymentThreeDsUnknownBody:
+      "We could not confirm whether your bank approved the payment. Do not try again yet: the payment is being checked, and you will not be charged twice.",
+    paymentThreeDsExpiredTitle: "The verification step was not completed",
+    paymentThreeDsExpiredBody:
+      "Your bank's verification page expired, or the step was not finished in time. Nothing has been taken. Start again from the invoice.",
+    paymentThreeDsAmountTitle: "Amount",
+    paymentThreeDsAmountNote: "{amount}",
+    paymentThreeDsUnavailableTitle: "Card payment is not available yet",
+    paymentThreeDsUnavailableBody:
+      "This platform asks every card's bank to confirm the payment before it is taken, and that step is not switched on yet. Nothing has been charged. The invoice stays open, and the business has been told.",
+    ruleThreeDsUnavailable:
+      "Card payments need a bank confirmation step that is not switched on yet, so nothing was charged.",
+    ruleThreeDsRecorderUnavailable:
+      "Card payment is switched off while the platform finishes its payment records. Nothing was charged.",
+    ruleThreeDsAuthenticationFailed:
+      "Your bank did not confirm this payment, so nothing was charged. You can try again with the same card or another one.",
+    ruleThreeDsChallengeExpired:
+      "The bank's verification page expired before the payment was confirmed. Nothing was charged. Start again from the invoice.",
+    ruleThreeDsChallengeReplayed:
+      "This verification has already been used. Nothing was charged twice. Start again from the invoice if the payment is still due.",
+    ruleThreeDsChallengeInvalid:
+      "This verification could not be matched to the payment it came from, so nothing was charged. Start again from the invoice.",
+    ruleThreeDsChallengeUnknown:
+      "This verification was not found, so nothing was charged. Start again from the invoice.",
+    ruleThreeDsUnderReview:
+      "Nothing has been taken. The payment is being reviewed by our compliance team, who will contact you if anything else is needed.",
+    ruleThreeDsResultInvalid:
+      "Your bank's answer could not be read, so nothing was charged. Start again from the invoice.",
   },
   email: {
     lockAlert: {

@@ -7,6 +7,8 @@ import { getMessage } from "../../lib/i18n/messages.ts";
 import { csrfHeaders } from "../../lib/security/csrf-client.ts";
 import { portalFailureTextOf } from "./portal-form-refusal.ts";
 import { portalPaymentRuleSentences } from "./portal-payment-refusal.ts";
+import { portalThreeDsRuleSentences } from "./portal-three-ds-refusal.ts";
+import { ThreeDsChallenge } from "./three-ds-challenge.tsx";
 
 /**
  * The card form: three iframes the provider owns, and nothing else.
@@ -88,7 +90,15 @@ function instantOf(iso: string): string {
 }
 
 export interface CardPaymentFormProps {
-  readonly token: string;
+  /**
+   * Where this form posts, which is the one question STEP 184 adds to STEP 183's form.
+   *
+   * When the deployment can authenticate a card, the form posts to the 3D Secure step, which charges through
+   * the same service once the issuer is satisfied; when it cannot, it posts straight to the charge. The page
+   * decides, because the page is the one place that knows what this deployment can do - and the button says
+   * the same amount either way.
+   */
+  readonly endpoint: string;
   readonly amountText: string;
   readonly idempotencyKey: string;
   readonly secureFields: {
@@ -99,7 +109,7 @@ export interface CardPaymentFormProps {
 }
 
 export function CardPaymentForm({
-  token,
+  endpoint,
   amountText,
   idempotencyKey,
   secureFields,
@@ -109,6 +119,12 @@ export function CardPaymentForm({
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [captured, setCaptured] = useState<{ readonly amount: string; readonly at: string } | null>(null);
+  const [challenge, setChallenge] = useState<{
+    readonly acsUrl: string;
+    readonly paReq: string;
+    readonly md: string;
+    readonly termUrl: string;
+  } | null>(null);
   const submitted = useRef(false);
 
   const send = useCallback(
@@ -122,7 +138,7 @@ export function CardPaymentForm({
       setMessage(null);
 
       try {
-        const response = await fetch(`/i/${encodeURIComponent(token)}/pay/charge`, {
+        const response = await fetch(endpoint, {
           method: "POST",
           headers: { "content-type": "application/json", ...(await csrfHeaders()) },
           body: JSON.stringify({
@@ -136,7 +152,8 @@ export function CardPaymentForm({
             await portalFailureTextOf(
               response,
               getMessage("portal.paymentFailed"),
-              portalPaymentRuleSentences(),
+              // Both vocabularies, because one form can meet both: a charge's own refusals and the bank's.
+              { ...portalPaymentRuleSentences(), ...portalThreeDsRuleSentences() },
             ),
           );
           // The token was spent by the attempt, so the fields are cleared and the card is asked for again.
@@ -145,7 +162,39 @@ export function CardPaymentForm({
         }
 
         const body: unknown = await response.json();
-        const parsed = body as { readonly amountText?: unknown; readonly capturedAt?: unknown };
+        const parsed = body as {
+          readonly status?: unknown;
+          readonly amountText?: unknown;
+          readonly capturedAt?: unknown;
+          readonly acsUrl?: unknown;
+          readonly paReq?: unknown;
+          readonly md?: unknown;
+          readonly termUrl?: unknown;
+        };
+
+        // The issuer wants the cardholder. The token is spent, so the fields are cleared and the payer is
+        // handed to their bank - and nothing has been charged yet.
+        if (parsed.status === "challenge") {
+          if (
+            typeof parsed.acsUrl === "string" &&
+            typeof parsed.paReq === "string" &&
+            typeof parsed.md === "string" &&
+            typeof parsed.termUrl === "string"
+          ) {
+            window.CollectJS?.clearInputs?.();
+            setChallenge({
+              acsUrl: parsed.acsUrl,
+              paReq: parsed.paReq,
+              md: parsed.md,
+              termUrl: parsed.termUrl,
+            });
+
+            return;
+          }
+
+          setMessage(getMessage("portal.paymentFailed"));
+          return;
+        }
 
         setCaptured({
           amount: typeof parsed.amountText === "string" ? parsed.amountText : amountText,
@@ -160,7 +209,7 @@ export function CardPaymentForm({
         setBusy(false);
       }
     },
-    [amountText, idempotencyKey, router, token],
+    [amountText, endpoint, idempotencyKey, router],
   );
 
   const configure = useCallback((): void => {
@@ -222,6 +271,17 @@ export function CardPaymentForm({
     // The script is mounted once per render of this page: the key it carries does not change under it.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  if (challenge !== null) {
+    return (
+      <ThreeDsChallenge
+        acsUrl={challenge.acsUrl}
+        paReq={challenge.paReq}
+        md={challenge.md}
+        termUrl={challenge.termUrl}
+      />
+    );
+  }
 
   if (captured !== null) {
     return (

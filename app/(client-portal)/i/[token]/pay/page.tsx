@@ -8,6 +8,7 @@ import { isAppError } from "../../../../../lib/errors/app-error.ts";
 import { formatMessage, getMessage } from "../../../../../lib/i18n/messages.ts";
 import { preparePortalPayment, type PortalPaymentView } from "../../../portal-payment.ts";
 import { getPortalPaymentRuntime } from "../../../portal-payment-runtime.ts";
+import { getPortalThreeDsRuntime } from "../../../portal-three-ds-runtime.ts";
 
 /**
  * The payment page of section 18, opened from a tokenized invoice link.
@@ -121,8 +122,30 @@ function refusalNotice(error: unknown): ReactNode {
   );
 }
 
-/** The panel a business without a connected gateway gets, which says why and who will fix it. */
-function Unavailable({ view }: { readonly view: PortalPaymentView }): ReactNode {
+/**
+ * The panel a business without a connected gateway gets, which says why and who will fix it.
+ *
+ * STEP 184 adds a third reason: a platform that cannot ask a card's bank to confirm the payment does not take
+ * the card either, because section 18 asks for 3D Secure on every payment where possible and `0037`'s
+ * `payments_three_ds_capture_check` refuses to record a capture without it. "Where possible" is a fact about
+ * the deployment, so the page states it rather than charging and hoping.
+ */
+function Unavailable({
+  view,
+  threeDsReady,
+}: {
+  readonly view: PortalPaymentView;
+  readonly threeDsReady: boolean;
+}): ReactNode {
+  if (view.unavailable === null && !threeDsReady) {
+    return (
+      <NoticeBody
+        title={getMessage("portal.paymentThreeDsUnavailableTitle")}
+        body={getMessage("portal.paymentThreeDsUnavailableBody")}
+      />
+    );
+  }
+
   return (
     <NoticeBody
       title={getMessage("portal.paymentUnavailableTitle")}
@@ -172,10 +195,19 @@ export default async function PortalPaymentPage({
     return refusalNotice(error);
   }
 
-  if (view.unavailable !== null || view.secureFields === null) {
+  // What this deployment can do about a card: a charge it can record, and a bank it can ask. The endpoint the
+  // form posts to follows from the second, and the third reason for a page with no form follows from both.
+  const threeDs = getPortalThreeDsRuntime();
+  const threeDsReady =
+    threeDs.port !== null && threeDs.port.available && threeDs.recorder !== null && threeDs.recorder.durable;
+  const endpoint = threeDsReady
+    ? `/i/${encodeURIComponent(decoded)}/pay/3ds`
+    : `/i/${encodeURIComponent(decoded)}/pay/charge`;
+
+  if (view.unavailable !== null || view.secureFields === null || !threeDsReady) {
     return (
       <main className={pageClasses}>
-        <Unavailable view={view} />
+        <Unavailable view={view} threeDsReady={threeDsReady} />
         <p className={noteClasses}>
           <Link href={`/i/${encodeURIComponent(decoded)}`} className={linkClasses}>
             {getMessage("portal.paymentBackToInvoice")}
@@ -210,7 +242,7 @@ export default async function PortalPaymentPage({
           {getMessage("portal.paymentSection")}
         </h2>
         <CardPaymentForm
-          token={decoded}
+          endpoint={endpoint}
           amountText={view.amountText}
           idempotencyKey={view.idempotencyKey}
           secureFields={view.secureFields}
