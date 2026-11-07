@@ -1,0 +1,14 @@
+{
+  "name": "kd-payments-app",
+  "version": "1.0.0",
+  "private": true,
+  "description": "KD Solution IT's Shopify app: the install, the token exchange and the credential login that activates a store connection.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "start": "node src/server.mjs"
+  },
+  "dependencies": {}
+}
