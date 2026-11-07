@@ -1,0 +1,11 @@
+{
+  "platformBaseUrl": "https://app.kdsolution.example",
+  "appUrl": "https://shopify.kdsolution.example",
+  "shopifyApiKey": "REPLACE_WITH_THE_APPS_CLIENT_ID",
+  "shopifyApiSecret": "REPLACE_WITH_THE_APPS_CLIENT_SECRET",
+  "scopes": ["read_orders", "write_orders", "read_products"],
+  "sessionSecret": "REPLACE_WITH_32_OR_MORE_RANDOM_BASE64_CHARACTERS",
+  "sessionTtlSeconds": 900,
+  "port": 8080,
+  "listenHost": "0.0.0.0"
+}

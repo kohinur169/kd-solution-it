@@ -13,6 +13,8 @@ import { PERMISSION_DELEGATION_ROLES } from "../../lib/permissions/registry.ts";
 import { PLATFORM_SETTINGS_SCREEN_ROLES } from "../../lib/settings/registry.ts";
 import type { MessagePath } from "../../lib/i18n/messages.ts";
 import { deepFreeze } from "../../lib/utils/freeze.ts";
+import { ENTITLEMENT_READ_ROLES } from "../../services/billing/entitlements.ts";
+import { BILLING_PLAN_ROLES } from "../../services/billing/plans-registry.ts";
 
 /**
  * The office workspace: which roles exist, which screens each one opens, and who may enter.
@@ -97,7 +99,9 @@ export type OfficeSectionKey =
   | "announcements"
   | "auditLog"
   | "accountUnlocks"
-  | "provisioningQueue";
+  | "provisioningQueue"
+  | "plans"
+  | "entitlements";
 
 /**
  * Every office screen that exists today, in the order the sidebar shows them.
@@ -167,6 +171,20 @@ export const OFFICE_NAVIGATION: readonly OfficeSection[] = deepFreeze([
     labelKey: "office.sectionTwoFactorResets",
     descriptionKey: "office.sectionTwoFactorResetsDescription",
     roles: TWO_FACTOR_RESET_OFFICE_ROLES,
+  },
+  {
+    key: "entitlements",
+    href: "/entitlements",
+    labelKey: "office.sectionEntitlements",
+    descriptionKey: "office.sectionEntitlementsDescription",
+    roles: ENTITLEMENT_READ_ROLES,
+  },
+  {
+    key: "plans",
+    href: "/plans",
+    labelKey: "office.sectionPlans",
+    descriptionKey: "office.sectionPlansDescription",
+    roles: BILLING_PLAN_ROLES,
   },
   {
     key: "settings",
