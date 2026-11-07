@@ -14,6 +14,8 @@ import {
   portalFraudDecisionOf,
   portalProviderFraudSignalOf,
 } from "./portal-fraud-fields.ts";
+import { PORTAL_BLACKLIST_SETTLED_CODE } from "./portal-blacklist-fields.ts";
+import type { PortalBlacklistCheck } from "./portal-blacklist.ts";
 import type {
   PortalChargeOutcome,
   PortalChargeRequest,
@@ -107,6 +109,14 @@ export interface PortalPaymentProcessorOptions {
   readonly encryptionKeyHex: string;
   /** The transport, when a caller overrides it. The provider's own `fetch` transport is the default. */
   readonly transport?: NmiHttpTransport;
+  /**
+   * STEP 187's list, asked before the gateway is: a card the platform already knows is refused without a
+   * request leaving the server.
+   *
+   * Optional, because a page can be built without a list. Absent is not "clear" in production - the runtime
+   * always wires the real one - but a gate that is about something else can leave it out.
+   */
+  readonly blacklist?: PortalBlacklistCheck | null;
   /** The routing rules a charge is decided by. The platform's starting set unless a caller says otherwise. */
   readonly routingRules?: readonly RoutingRule[];
 }
@@ -125,6 +135,15 @@ export function createPortalPaymentProcessor(
   return {
     durable: options.recorder.durable,
     async charge(request: PortalChargeRequest): Promise<PortalChargeOutcome> {
+      // STEP 187, before a record is opened or a request is built: the list is asked what it knows about this
+      // card, and a list that cannot answer is a refusal rather than a pass.
+      const blacklist = options.blacklist ?? null;
+      const blocked = blacklist === null ? null : await blacklist.check({ token: request.token });
+
+      if (blocked !== null && blocked.status === "unavailable") {
+        return { status: "unavailable", reason: "blacklist" };
+      }
+
       const opened = options.recorder.open({
         companyId: request.companyId,
         invoiceId: request.invoiceId,
@@ -148,6 +167,13 @@ export function createPortalPaymentProcessor(
           return { status: "declined", paymentId: opened.paymentId, code: opened.code ?? "declined" };
         }
 
+        if (opened.settled === "failed" && opened.code === PORTAL_BLACKLIST_SETTLED_CODE) {
+          // STEP 187: the first attempt was refused by the list, so the replay is refused by the same rule.
+          // The block itself is not carried: the record keeps the code, and re-reading the list to decorate a
+          // refusal would be a second query for nothing.
+          return { status: "refused_by_blacklist", paymentId: opened.paymentId, replayed: true, block: null };
+        }
+
         if (opened.settled === "failed" || opened.settled === "under_review") {
           // STEP 186: the risk answer the first attempt was given, given again. `replayed` is what keeps the
           // page from writing a second chain entry and a second referral for one flag: the first attempt
@@ -165,6 +191,26 @@ export function createPortalPaymentProcessor(
         // Opened and never settled: the previous attempt's answer was lost. Charging again could take the
         // money twice, so the honest answer is that the outcome is unknown and must be reconciled.
         return { status: "unknown", paymentId: opened.paymentId, reason: "duplicate_unsettled" };
+      }
+
+      if (blocked !== null && blocked.status === "blocked") {
+        // Nothing is routed and nothing is sent: a card on the list is refused here, and the record says so
+        // with `failed` and the list's own code, which `payments_risk_reject_check` puts with `risk_decision`
+        // `reject`.
+        options.recorder.settle({
+          paymentId: opened.paymentId,
+          outcome: "failed",
+          transactionId: null,
+          code: PORTAL_BLACKLIST_SETTLED_CODE,
+          occurredAtEpochMs: request.occurredAtEpochMs,
+        });
+
+        return {
+          status: "refused_by_blacklist",
+          paymentId: opened.paymentId,
+          replayed: false,
+          block: blocked.block,
+        };
       }
 
       const routing = routePayment(

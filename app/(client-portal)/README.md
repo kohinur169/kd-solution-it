@@ -5,7 +5,8 @@ Owner: STEP 181-190 (client portal, payment pages and payment links).
 
 STEP 181 built the invoice link, STEP 182 the estimate link, STEP 183 the card payment page, STEP 184 the
 3D Secure step in front of it, STEP 185 the billing match that decides what a payment without a bank may do,
-STEP 186 the handling of the provider's fraud signal.
+STEP 186 the handling of the provider's fraud signal, STEP 187 the card blacklist the platform checks before it
+charges anything.
 The links are read-only without a token, and each STEP writes only what its own section asks for.
 
 Reserved for tokenized client surfaces opened without a login: invoice links under
@@ -174,6 +175,35 @@ reaches the gateway a second time.
 STEP 186 adds no migration: `0037` already carries `payments_risk_reject_check` (`risk_decision <> 'reject' or
 status = 'failed'`), the three risk decisions, the `under_review` status and its index. The gate asserts each of
 those rather than assuming them.
+
+## What STEP 187 built
+
+- `portal-blacklist-fields.ts` - the vocabulary of section 18's last clause, read out of `0055`: the two
+  identifiers (`card_token`, `provider_fingerprint`), the six reasons, the two states, the sixty four character
+  fingerprint `0055` stores, the note bounds, the rules a refusal names, and the Zod schemas a block and a
+  release are validated with.
+- `portal-blacklist.ts` - the list itself: `portalCardFingerprintOf` (SHA-256, one function for both sources),
+  `readPortalCardBlock` (one platform-wide query, three answers - clear, blocked, unavailable),
+  `checkPortalCardBlacklist`, `blockPortalCard` (a person, a reason, a life), `releasePortalCard` (the version it
+  read, read back afterwards) and `createPortalCardBlockLookup`, which is the same list in the shape STEP 066's
+  fraud evaluation asks for.
+- `portal-blacklist-processor.ts` - the check the payment operation runs before the gateway, and the durable
+  referral queue STEP 186 described.
+- `portal-blacklist-verify.ts` - the gate, 208 checks. Run it with
+  `node "app/(client-portal)/portal-blacklist-verify.ts"`.
+
+A listed card is refused **before** a request is built: the record is settled `failed` with the code
+`card_blacklisted` (the `risk_decision` that goes with it is `reject`, which `payments_risk_reject_check` allows
+only on a failed payment), the chain gets `portal.card_blacklisted_refused` with the fingerprint, and the payer
+gets the "this card cannot be used" sentence. A list that cannot be read refuses the same way rather than
+charging a card nobody checked. STEP 186's referral is now wired to this table: with a compliance officer
+configured it writes the block, and without one it writes `portal.card_block_requested` and answers
+`actor_required`, because `card_blacklist.blacklisted_by` references `public.users` and a block is a person's
+decision.
+
+STEP 187 adds no migration: `0055` (STEP 030) already carries the table, the fingerprint alphabet, the two
+sources, the six reasons, the unique active-block index and the release guard. The gate reads that migration and
+asserts each of them, and asserts 0123 is still the next free number.
 
 STEP 182 adds no migration. `0025` already carries `void_reason`, `voided_at` and `accepted_at`; `0027`
 already carries the eight pieces of evidence and the unique index that makes one signature per estimate;

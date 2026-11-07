@@ -39,6 +39,10 @@ export function portalPaymentRuleTextOf(rule: string): string | null {
       return getMessage("portal.paymentRuleOutcomeUnknown");
     case "amount_unrepresentable":
       return getMessage("portal.paymentRuleAmountUnrepresentable");
+    case "card_blacklisted":
+      return getMessage("portal.ruleCardBlacklisted");
+    case "card_blacklist_unavailable":
+      return getMessage("portal.ruleCardBlacklistUnavailable");
     case "risk_rejected":
       return getMessage("portal.ruleRiskRejected");
     case "risk_suspicious":
@@ -53,12 +57,14 @@ export function portalPaymentRuleTextOf(rule: string): string | null {
 /**
  * Whether a refusal ends the page rather than marking a field to fix.
  *
- * One rule does: `risk_rejected`, which is `PORTAL_FRAUD_RULES.rejected` in the portal's fraud vocabulary
- * (STEP 186). It is spelled here rather than imported because this module is a client component's and the
- * fraud vocabulary reaches the gateway adapter's table; the gate checks the two spellings still agree.
+ * Two rules do: `risk_rejected` (STEP 186's, `PORTAL_FRAUD_RULES.rejected`) and `card_blacklisted` (STEP 187's,
+ * `PORTAL_BLACKLIST_RULES.blocked`). They are spelled here rather than imported because this module is a client
+ * component's and both vocabularies reach the gateway adapter's table; each gate checks its own spelling.
  */
 export function portalPaymentRefusalIsFinal(rule: string | null): boolean {
-  return rule === "risk_rejected";
+  // `risk_rejected` is STEP 186's (the gateway named the card) and `card_blacklisted` is STEP 187's (the
+  // platform already knew). Both end the page: re-offering the fields would invite the same card again.
+  return rule === "risk_rejected" || rule === "card_blacklisted";
 }
 
 /**
@@ -83,6 +89,8 @@ export function portalPaymentRuleSentences(): Readonly<Record<string, string>> {
     "stale_document",
     "risk_rejected",
     "risk_suspicious",
+    "card_blacklisted",
+    "card_blacklist_unavailable",
   ];
 
   const sentences: Record<string, string> = {};

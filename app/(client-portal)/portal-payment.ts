@@ -8,6 +8,12 @@ import type { FraudProviderSignal } from "../../lib/security/fraud.ts";
 import { validateCollectJsToken } from "../../lib/payments/adapters/nmi-collectjs.ts";
 import { handlePortalProviderSignal, type PortalCardReferralQueue } from "./portal-fraud.ts";
 import { PORTAL_FRAUD_RULES } from "./portal-fraud-fields.ts";
+import {
+  PORTAL_BLACKLIST_REFUSED_AUDIT_ACTION,
+  PORTAL_BLACKLIST_RULES,
+  PORTAL_BLACKLIST_UNAVAILABLE_AUDIT_ACTION,
+} from "./portal-blacklist-fields.ts";
+import { portalCardFingerprintOf, type PortalCardBlockSummary } from "./portal-blacklist.ts";
 import type { PortalTokenKeys } from "../../lib/security/portal-token.ts";
 import { openPortalInvoice, type PortalInvoiceView } from "./portal-invoice.ts";
 import { portalMoneyTextOf } from "./portal-invoice-money.ts";
@@ -123,8 +129,22 @@ export type PortalChargeOutcome =
        */
       readonly replayed: boolean;
     }
+  /**
+   * STEP 187: the card is on the platform's blacklist, so the attempt ended before the gateway was asked.
+   * `block` is the entry that refused it, or null when this is the replay of an attempt that already has one.
+   */
+  | {
+      readonly status: "refused_by_blacklist";
+      readonly paymentId: string | null;
+      readonly replayed: boolean;
+      readonly block: PortalCardBlockSummary | null;
+    }
   | { readonly status: "unknown"; readonly paymentId: string | null; readonly reason: string }
-  | { readonly status: "unavailable"; readonly reason: PortalPaymentUnavailable };
+  | {
+      readonly status: "unavailable";
+      /** `blacklist` is STEP 187's: the list could not be consulted, so nothing was charged. */
+      readonly reason: PortalPaymentUnavailable | "blacklist";
+    };
 
 /** The platform's payment operation, as this page sees it. */
 export interface PortalPaymentProcessor {
@@ -514,6 +534,24 @@ export async function chargePortalPayment(
   });
 
   if (outcome.status === "unavailable") {
+    if (outcome.reason === "blacklist") {
+      // STEP 187: the list could not be read, and a list that cannot be read must not clear a card. Nothing was
+      // sent to the gateway, so the payer is told to try again rather than that their card was refused.
+      await appendTolerated(dependencies.audit, {
+        action: PORTAL_BLACKLIST_UNAVAILABLE_AUDIT_ACTION,
+        actorUserId: null,
+        entityType: PORTAL_PAYMENT_AUDIT_ENTITY,
+        entityId: view.invoiceId,
+        payload: paymentPayloadOf(view, { rule: PORTAL_BLACKLIST_RULES.unavailable }),
+        companyId: view.companyId,
+        sessionId: null,
+        ipAddress: input.clientAddress,
+        userAgent: input.userAgent,
+      });
+
+      throw refused("SERVICE_UNAVAILABLE", "payment", PORTAL_BLACKLIST_RULES.unavailable);
+    }
+
     throw refused(
       "SERVICE_UNAVAILABLE",
       "payment",
@@ -577,6 +615,35 @@ export async function chargePortalPayment(
     });
 
     throw refused("VALIDATION_FAILED", "collectjs_token", "card_declined");
+  }
+
+  if (outcome.status === "refused_by_blacklist") {
+    // STEP 187. The fingerprint is what the chain records: a hash that cannot be charged, and the one value an
+    // investigation can ask the list about later. No token, no card, and no amount.
+    await appendTolerated(dependencies.audit, {
+      action: PORTAL_BLACKLIST_REFUSED_AUDIT_ACTION,
+      actorUserId: null,
+      entityType: PORTAL_PAYMENT_AUDIT_ENTITY,
+      entityId: outcome.paymentId ?? view.invoiceId,
+      payload: paymentPayloadOf(view, {
+        ...common,
+        rule: PORTAL_BLACKLIST_RULES.blocked,
+        card_fingerprint: portalCardFingerprintOf(parsed.token.trim()),
+        fingerprint_source: "card_token",
+        block_reason: outcome.block?.reason ?? null,
+        block_source: outcome.block?.source ?? null,
+        blocked_at: outcome.block?.blacklistedAt ?? null,
+        block_expires_at: outcome.block?.expiresAt ?? null,
+        replayed: outcome.replayed,
+        retry_permitted: false,
+      }),
+      companyId: view.companyId,
+      sessionId: null,
+      ipAddress: input.clientAddress,
+      userAgent: input.userAgent,
+    });
+
+    throw refused("VALIDATION_FAILED", "payment", PORTAL_BLACKLIST_RULES.blocked);
   }
 
   if (outcome.status === "refused_by_risk") {

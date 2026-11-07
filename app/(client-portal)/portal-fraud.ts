@@ -47,7 +47,15 @@ export interface PortalCardReferral {
 /** What referring answered. */
 export type PortalCardReferred =
   | { readonly status: "referred"; readonly referralId: string }
-  | { readonly status: "refused"; readonly reason: "queue_unavailable" | "queue_not_durable" };
+  | {
+      readonly status: "refused";
+      /**
+       * Why the card is not on the list. `actor_required` is STEP 187's: `card_blacklist.blacklisted_by`
+       * references `public.users`, so an automatic referral can propose a block but a person has to confirm it.
+       * `write_failed` is a list that refused the write.
+       */
+      readonly reason: "queue_unavailable" | "queue_not_durable" | "actor_required" | "write_failed";
+    };
 
 /** The list a flagged card goes on, as this page sees it. */
 export interface PortalCardReferralQueue {

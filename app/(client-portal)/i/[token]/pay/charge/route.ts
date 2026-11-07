@@ -58,6 +58,13 @@ interface PaymentResponseBody {
  * is none to carry: the only card facts this platform could hold are the provider's own brand and last four,
  * and they belong to the record, not to a response.
  *
+ * ## The answer a blacklisted card gets
+ *
+ * STEP 187. Before the gateway is asked at all, the service checks the card's fingerprint against the platform's
+ * `card_blacklist`, and a card on it is refused with `422` and the rule `card_blacklisted` - or `503` with
+ * `card_blacklist_unavailable` when the list cannot be read, because a list that cannot be read must not clear a
+ * card. Neither answer reaches the provider, and neither moves money.
+ *
  * ## The answer a flagged card gets
  *
  * STEP 186. A payment the gateway answers with one of its four fraud codes is never a `201`: the service

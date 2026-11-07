@@ -6,7 +6,7 @@ import {
   type NmiKeyStore,
 } from "../../lib/payments/adapters/nmi-client.ts";
 import type { PortalPaymentDependencies } from "./portal-payment.ts";
-import { createInMemoryCardReferralQueue } from "./portal-fraud-processor.ts";
+import { createPortalCardBlacklistQueue, createPortalCardBlockCheck } from "./portal-blacklist-processor.ts";
 import {
   createInMemoryPortalPaymentRecorder,
   createPortalPaymentProcessor,
@@ -68,10 +68,18 @@ export function getPortalPaymentRuntime(): PortalPaymentRuntime {
       recorder: createInMemoryPortalPaymentRecorder(),
       keyStore,
       encryptionKeyHex,
+      // STEP 187: the list is asked before the gateway is, on every attempt.
+      blacklist: createPortalCardBlockCheck({ rest: auth.rest, audit: auth.audit }),
     }),
-    // STEP 186: the list a flagged card is referred to. In memory here, and reported as refused; the durable
-    // list is STEP 187's table.
-    referral: createInMemoryCardReferralQueue(),
+    /**
+     * STEP 186's referral, now wired to STEP 187's table.
+     *
+     * The actor is null, and that is the honest state of this deployment rather than a placeholder: no
+     * compliance officer is configured for the payment page, and `card_blacklist.blacklisted_by` references
+     * `public.users`, so a referral writes a block proposal into the chain and answers `actor_required`. The
+     * moment a desk identity is supplied here, the same line writes the block itself.
+     */
+    referral: createPortalCardBlacklistQueue({ rest: auth.rest, audit: auth.audit, actor: null }),
     tokenizationKeyFor: (companyId) => {
       const config = keyStore.findActiveByCompany(companyId);
 

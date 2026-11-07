@@ -939,12 +939,16 @@ async function main(): Promise<void> {
     paymentService.includes("!outcome.replayed"),
     "a replayed answer is refused without writing its consequences twice",
   );
+  // Restated by STEP 187: the page now writes `retry_permitted: false` when it refuses for risk, so the claim is
+  // the one it always meant - no answer of this page ever permits a retry.
   expect(
-    paymentService.includes("retry_permitted") === false,
-    "the page itself never promises a retry it does not make",
+    /retry_permitted: true/u.test(paymentService) === false,
+    "the page never promises a retry it does not make",
   );
+  // Restated by STEP 187: the runtime now wires the durable queue over the blacklist table, which is the list
+  // this gate's referrals were always going to reach.
   expect(
-    runtime.includes("createInMemoryCardReferralQueue"),
+    runtime.includes("createPortalCardBlacklistQueue"),
     "the runtime wires the referral queue this build has",
   );
   expect(
