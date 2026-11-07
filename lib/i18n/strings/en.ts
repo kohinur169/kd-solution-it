@@ -3375,6 +3375,56 @@ const catalog = {
     processedRowLabel: "Sent to provider",
     providerReferenceLabel: "Provider reference",
     failureRowLabel: "Provider answer",
+    /** STEP 193: the section 18 answer printed on a succeeded row, and the way to change it. */
+    feesLink: "Platform fee on refunds",
+    feeReturnedRowLabel: "Platform fee returned",
+    feeRetainedRowLabel: "The platform kept its fee on this refund.",
+  },
+  refundFees: {
+    /**
+     * STEP 193: the section 18 switch at /office/refunds/fees. One person answers whether the platform fee
+     * comes back with a refund, and this screen states the answer, what it does, and what is still unpaid.
+     */
+    screenTitle: "Platform fee on refunds",
+    screenDescription:
+      "When a refund sends the payer's money back, the platform's own fee on that money is a separate question. The super administrator answers it here, once, for every refund the platform processes.",
+    backToQueue: "Back to the refund queue",
+    ruleHeading: "The answer in force",
+    stateReturned: "The fee comes back",
+    stateRetained: "The platform keeps the fee",
+    stateHelp:
+      "When the fee comes back, each refund returns its share of the fee the payment carried, in the same proportion as the refund is of the payment. The refund that completes a payment returns the rest of the fee, so a payment refunded in full gives the whole fee back.",
+    updatedLabel: "Last answered",
+    updatedNever: "Never. This deployment is using the default.",
+    defaultNote:
+      "Nobody has answered this yet, so the platform is applying the default: it keeps its fee on a refund.",
+    readOnlyNote:
+      "Only the super administrator answers this. You can read the answer in force and run a pass below.",
+    prorationHelp:
+      "A part refund never returns more than its share of the fee, and no refund returns more than the fee the payment carried. A fee that was already returned in full by earlier refunds is not returned twice.",
+    passHeading: "Refunds waiting for an answer",
+    backlogLabel: "Succeeded refunds with no answer yet:",
+    backlogNone: "No succeeded refund is waiting for an answer.",
+    backlogCapped: "This counts the first hundred. Running a pass works through the rest over more than one press.",
+    passHelp:
+      "A pass applies the answer in force to the refunds that have not been answered yet, fifty at a time, oldest first. A refund the execution settled already has its answer.",
+    ledgerAbsentNote:
+      "The answer is recorded on the refund and in the audit chain. This deployment holds no ledger store yet, so the balanced ledger pair for a returned fee is not posted; the group is derived from the refund, so it can be posted later without posting twice.",
+    switchLabel: "On a refund, the platform fee is",
+    switchReturned: "returned with the refund",
+    switchRetained: "kept by the platform",
+    save: "Save this answer",
+    saving: "Saving...",
+    saved: "Saved. Refunds executed from now on are answered with this.",
+    saveHelp: "The change is recorded in the audit chain with the account that made it.",
+    runPass: "Run a pass now",
+    runningPass: "Running...",
+    runPassHelp: "Fifty refunds a press, and the counts come back to this page.",
+    passDone: "The pass finished. The counts are on the refunds it answered.",
+    passNothing: "There was nothing waiting. Every succeeded refund has an answer.",
+    reauthRequired: "This act needs a fresh second factor. Sign in again with your authenticator first.",
+    staleSave: "Somebody else answered this while the page was open. Reload to read their answer.",
+    failed: "That did not go through. Try again, and quote the reference if it keeps happening.",
   },
   email: {
     lockAlert: {

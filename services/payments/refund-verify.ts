@@ -1358,9 +1358,11 @@ async function main(): Promise<void> {
     .map((name) => Number.parseInt(name.slice(0, 4), 10))
     .sort((left, right) => left - right);
 
+  // 123 is STEP 193's `0123_refund_fee_rule`, the section 18 switch and the instant the fee rule was applied.
+  // This STEP still owns no migration: `0038` carries the whole refund lifecycle, as the file says.
   expectEqual(
     migrations[migrations.length - 1] ?? 0,
-    122,
+    123,
     "this STEP adds no migration, because `0038` already carries the whole lifecycle",
   );
 

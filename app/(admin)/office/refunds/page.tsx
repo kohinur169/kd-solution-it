@@ -1,8 +1,10 @@
 // path: app/(admin)/office/refunds/page.tsx
 import type { Metadata } from "next";
+import Link from "next/link";
 import type { ReactNode } from "react";
 import { AppError } from "@/lib/errors/app-error";
 import { getMessage } from "@/lib/i18n/messages";
+import { priceFromMinor } from "@/services/products/price";
 import { listRefundQueue } from "@/services/payments/refund";
 import { getRefundRuntime } from "@/services/payments/refund-runtime";
 import { readOfficeActor } from "../../office-actor";
@@ -40,11 +42,17 @@ export const dynamic = "force-dynamic";
  * without the role reads "only the finance desk decides refunds" rather than an empty queue that looks like
  * "nothing to do".
  *
+ * ## What a succeeded row says about the platform fee
+ *
+ * The fee the platform took on the payment is a separate question from the refund, answered once by the super
+ * administrator (STEP 193, `/office/refunds/fees`). A succeeded refund therefore prints the answer that was
+ * applied to it - the fee that came back with it, or that the platform kept - because a merchant asking "where
+ * is my fee" is asking about this row.
+ *
  * ## What is not here
  *
- * The platform fee on a refund, which is STEP 193's setting and leaves `platform_fee_returned` false and
- * `platform_fee_returned_minor` zero. Nor a retry of a call the provider never answered: that row stays
- * `processing` and belongs to the reconciliation the desk does by hand until a later STEP automates it.
+ * A retry of a call the provider never answered: that row stays `processing` and belongs to the reconciliation
+ * the desk does by hand until a later STEP automates it.
  */
 type QueueState =
   | { readonly kind: "signed-out" }
@@ -116,6 +124,8 @@ const reasonClasses =
 
 const alertClasses = "text-sm text-destructive";
 
+const linkClasses = "w-fit text-sm font-medium text-primary underline-offset-4 hover:underline";
+
 /** One instant, printed the way every office screen prints one: UTC, minute precision. */
 function formatInstant(iso: string | null): string {
   if (iso === null) {
@@ -156,6 +166,9 @@ export default async function RefundQueuePage(): Promise<ReactNode> {
         <p className={eyebrowClasses}>{getMessage("refunds.title")}</p>
         <h1 className={titleClasses}>{getMessage("refunds.queueTitle")}</h1>
         <p className={descriptionClasses}>{getMessage("refunds.queueDescription")}</p>
+        <Link className={linkClasses} href="/office/refunds/fees">
+          {getMessage("refunds.feesLink")}
+        </Link>
       </header>
 
       {state.kind === "signed-out" ? (
@@ -221,6 +234,16 @@ export default async function RefundQueuePage(): Promise<ReactNode> {
                       <p className={reasonClasses}>{refund.failureDetail}</p>
                     </div>
                   )}
+
+                  {refund.status === "succeeded" ? (
+                    <p className={bodyClasses}>
+                      {refund.platformFeeReturned
+                        ? `${getMessage("refunds.feeReturnedRowLabel")} ${priceFromMinor(
+                            BigInt(refund.platformFeeReturnedMinor),
+                          )} ${refund.currency}`
+                        : getMessage("refunds.feeRetainedRowLabel")}
+                    </p>
+                  ) : null}
 
                   {refund.status === "requested" ? <RefundDecisionForm refundId={refund.id} /> : null}
 

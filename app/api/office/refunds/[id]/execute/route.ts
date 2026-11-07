@@ -10,6 +10,8 @@ import { requireCsrfToken } from "@/lib/security/csrf";
 import { REFUND_EXECUTION_MAXIMUM_BODY_BYTES } from "@/services/payments/refund-execution-fields";
 import { executeRefund, type RefundExecutionView } from "@/services/payments/refund-execution";
 import { getRefundExecutionRuntime } from "@/services/payments/refund-execution-runtime";
+import { applyRefundFeeReturn } from "@/services/payments/refund-fee";
+import { getRefundFeeRuntime } from "@/services/payments/refund-fee-runtime";
 
 export const dynamic = "force-dynamic";
 
@@ -36,6 +38,15 @@ export const dynamic = "force-dynamic";
  * `"pending"` is the provider working on it; `"unanswered"` is a call this platform will not call failed;
  * `"declined"` is the provider's own refusal, recorded on the refund. A refusal *before* the call is a `4xx` or
  * `503` with the rule, and it leaves the refund exactly as it was - `approved` means promised and not sent.
+ *
+ * ## The one step after a success, and why it may not fail this route
+ *
+ * Section 18's platform fee rule (STEP 193) applies to a refund the moment the money went back, so a succeeded
+ * execution asks the fee service to apply it to this refund before this route answers. That call is tolerant on
+ * purpose: the refund has already left, the provider has already answered, and a fee that could not be recorded
+ * yet - a ledger that refused, a switch nobody has written - is the desk's next press on `/office/refunds/fees`
+ * rather than a `500` on a refund that succeeded. The fee rule never decides whether money moves; it only
+ * decides how much of the platform's fee comes back with it.
  */
 export const POST = withErrorResponse(
   async (
@@ -85,6 +96,15 @@ export const POST = withErrorResponse(
     }
 
     const execution = await executeRefund({ actor, refundId }, getRefundExecutionRuntime());
+
+    if (execution.outcome === "succeeded") {
+      try {
+        await applyRefundFeeReturn({ actor, refundId: execution.refund.id }, getRefundFeeRuntime());
+      } catch {
+        // Deliberate: the refund succeeded, the money went back, and the fee answer is recorded by the next pass
+        // of section 18's sweep. A fee that cannot be written must not turn a sent refund into an error.
+      }
+    }
 
     logger.info("refund executed", {
       refundId: execution.refund.id,

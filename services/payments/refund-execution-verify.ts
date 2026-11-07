@@ -1101,7 +1101,9 @@ async function main(): Promise<void> {
     .map((name) => Number.parseInt(name.slice(0, 4), 10))
     .sort((left, right) => left - right);
 
-  expectEqual(migrations[migrations.length - 1] ?? 0, 122, "this STEP adds no migration either");
+  // 123 is STEP 193's `0123_refund_fee_rule`; this STEP adds none, because `0038` already carries the
+  // statuses, the instant and the provider identifier an execution writes.
+  expectEqual(migrations[migrations.length - 1] ?? 0, 123, "this STEP adds no migration either");
 
   if (failures.length > 0) {
     process.stdout.write(`refund execution gate failed with ${String(failures.length)} problem(s):\n`);
