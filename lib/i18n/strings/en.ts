@@ -2980,6 +2980,84 @@ const catalog = {
     ruleSelfConfirmation:
       "A confirmation has to come from your client. This browser is signed in to the account that sent the invoice.",
     fieldInvalid: "This value was refused.",
+
+    /** Section 16: the tokenized estimate page opened under e/[token] without a login. */
+    estimateEyebrow: "Estimate",
+    estimateMetaDescription:
+      "Open this estimate, accept or decline it, and read the signature record. No account is needed: this link is the access.",
+    estimatePrivacyNote: "Keep this link to yourself. Anyone who has it can decide this estimate.",
+    estimateSection: "Estimate",
+    estimateOfferSection: "The offer",
+    estimateClientSection: "Prepared for",
+    estimateDecisionSection: "Your decision",
+    estimateIssuedOn: "Issued {date}",
+    estimateExpiresOn: "Valid until {date}",
+    estimateExpiresOpen: "This offer stays open until {date}.",
+    estimateStateOpen: "Open for your decision",
+    estimateStateAccepted: "Accepted",
+    estimateStateDeclined: "Declined",
+    estimateStateExpired: "Expired",
+    estimateStateWithdrawn: "Withdrawn",
+    estimateStateNotIssued: "Draft",
+    estimateNotIssuedTitle: "This estimate is not ready yet",
+    estimateNotIssuedBody:
+      "It is still a draft, so there is nothing to accept or decline. The business that sent it will let you know.",
+    estimateExpiredTitle: "This estimate has expired",
+    estimateExpiredBody:
+      "The offer ended on {date}, so it can no longer be accepted. Ask the business that sent it for a new one.",
+    estimateExpiredBodyUndated:
+      "The offer period has ended, so it can no longer be accepted. Ask the business that sent it for a new one.",
+    estimateWithdrawnTitle: "This estimate was withdrawn",
+    estimateWithdrawnBody:
+      "The business withdrew this offer, so it can no longer be accepted. Nothing is owed on it.",
+    estimateAcceptedTitle: "Accepted",
+    estimateAcceptedBody:
+      "Accepted by {name} on {date}. The signature below is kept with the offer and cannot be changed.",
+    estimateAcceptedBodyUndated:
+      "This offer has been accepted. The signature below is kept with the offer and cannot be changed.",
+    estimateDeclinedTitle: "Declined",
+    estimateDeclinedBody:
+      "Declined by {name} on {date}. The record below is kept with the offer and cannot be changed.",
+    estimateDeclinedBodyUndated:
+      "This offer was declined. The record below is kept with the offer and cannot be changed.",
+    estimateDecisionBody:
+      "Deciding records your name, your email address, the consent below, the time, the address of this connection and a digest of the offer as it stands. Accepting means you agree to the offer; declining ends it.",
+    estimateAcceptSubmit: "Accept this estimate",
+    estimateAcceptSubmitting: "Accepting...",
+    estimateDeclineSubmit: "Decline this estimate",
+    estimateDeclineSubmitting: "Declining...",
+    estimateDecisionFailed: "The decision was not recorded. Check the marked fields and try again.",
+    estimateDecisionConflict:
+      "This estimate changed, or it has already been decided. Reload the page to see it as it is now.",
+    estimateDecisionRateLimited: "Too many attempts from this connection. Try again in a moment.",
+    estimateSignerNameLabel: "Your name",
+    estimateSignerNameHint: "The person deciding, as the name should appear on the record.",
+    estimateSignerEmailLabel: "Your email address",
+    estimateSignerEmailHint: "Used only to record who decided and how to reach them.",
+    estimateSignatureSection: "Signature record",
+    estimateSignatureBody:
+      "What this decision recorded, kept as evidence. The record is append-only and cannot be edited.",
+    estimateSignatureSignedBy: "Signed by",
+    estimateSignatureSignedAt: "Signed at (UTC)",
+    estimateSignatureEmail: "Signer's email address",
+    estimateSignatureDecisionLabel: "Decision",
+    estimateSignatureIp: "IP address",
+    estimateSignatureGeo: "Location",
+    estimateSignatureFingerprint: "Device fingerprint",
+    estimateSignatureConsentShown: "Consent shown",
+    estimateSignatureDocumentHash: "Document digest",
+    estimateSignatureDocumentHashHint:
+      "A digest of the offer as it stood when the decision was made. It changes if any line, price, discount, tax or client detail changes.",
+    estimateSignatureTyped: "The typed name is the signature: no drawn signature is stored.",
+    signatureConsent:
+      "I agree to this decision being recorded as my signature on this estimate, together with my name, my email address, the time and the evidence described above, and I accept that the record is kept as evidence.",
+    ruleEstimateExpired: "This estimate expired before the decision could be recorded.",
+    ruleEstimateAlreadyAccepted: "This estimate has already been accepted.",
+    ruleEstimateAlreadyDeclined: "This estimate has already been declined.",
+    ruleEstimateWithdrawn: "The business withdrew this estimate.",
+    ruleEstimateSelfDecision:
+      "A decision has to come from your client. This browser is signed in to the account that sent the estimate.",
+    ruleEstimateEvidenceMissing: "The offer this decision would point at is not there any more.",
   },
   email: {
     lockAlert: {

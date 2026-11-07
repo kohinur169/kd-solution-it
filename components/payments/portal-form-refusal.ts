@@ -66,8 +66,17 @@ export function portalRuleTextOf(rule: string): string {
  * validation failure means "fix the marked field". `429` names the wait. `403` on this page can only mean
  * a merchant whose session does not own the invoice the link names. Everything else is the caller's own
  * fallback sentence, which is the one that says the write did not happen.
+ *
+ * `overrides` is how a second surface adds its own rules without a second parser: the entry form of an
+ * estimate passes the rules that only a quote can refuse with (`already_accepted`, `expired`, and so on),
+ * and every rule it does not name still becomes the sentence above. A rule answered here is a rule no
+ * surface has to describe twice.
  */
-export async function portalFailureTextOf(response: Response, fallback: string): Promise<string> {
+export async function portalFailureTextOf(
+  response: Response,
+  fallback: string,
+  overrides?: Readonly<Record<string, string>>,
+): Promise<string> {
   if (response.status === 401 || response.status === 403) {
     return getMessage("portal.merchantForbidden");
   }
@@ -97,5 +106,11 @@ export async function portalFailureTextOf(response: Response, fallback: string):
     rule = null;
   }
 
-  return rule === null ? fallback : portalRuleTextOf(rule);
+  if (rule === null) {
+    return fallback;
+  }
+
+  const override = overrides?.[rule];
+
+  return override ?? portalRuleTextOf(rule);
 }

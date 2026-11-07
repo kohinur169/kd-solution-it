@@ -4,13 +4,16 @@ import { readClientAddress, readUserAgent } from "../../../../../lib/auth/client
 import { getAuthRuntime } from "../../../../../lib/auth/runtime.ts";
 import { readRequestActorOptionally } from "../../../portal-invoice-runtime.ts";
 import { capturePortalInvoiceAcceptance } from "../../../portal-invoice-evidence.ts";
-import { enforcePortalAcceptanceRateLimit, portalRateLimitHeaders } from "../../../portal-invoice-rate-limit.ts";
+import { enforcePortalRateLimit, portalRateLimitHeaders } from "../../../portal-rate-limit.ts";
 import { getPortalInvoiceRuntime } from "../../../portal-invoice-runtime.ts";
 import { AppError } from "../../../../../lib/errors/app-error.ts";
 import { withErrorResponse } from "../../../../../lib/errors/respond.ts";
 import { logger } from "../../../../../lib/logger/logger.ts";
 import { requireCsrfToken } from "../../../../../lib/security/csrf.ts";
-import { PORTAL_EVIDENCE_MAXIMUM_BODY_BYTES } from "../../../portal-invoice-fields.ts";
+import {
+  PORTAL_ACCEPTANCE_RATE_LIMIT,
+  PORTAL_EVIDENCE_MAXIMUM_BODY_BYTES,
+} from "../../../portal-invoice-fields.ts";
 
 export const dynamic = "force-dynamic";
 
@@ -71,8 +74,9 @@ export const POST = withErrorResponse(
     }
 
     const userAgent = readUserAgent(request.headers);
-    const decision = await enforcePortalAcceptanceRateLimit(
-      { clientAddress, userAgent },
+    const decision = await enforcePortalRateLimit(
+      PORTAL_ACCEPTANCE_RATE_LIMIT,
+      { clientAddress, userAgent, route: "/i/[token]/acceptance" },
       { rest: runtime.rest, audit: runtime.audit },
     );
 
@@ -131,7 +135,7 @@ export const POST = withErrorResponse(
         statement: captured.statement,
         acceptedAt: captured.acceptedAt,
       } satisfies AcceptanceResponseBody,
-      { status: 201, headers: portalRateLimitHeaders(decision) },
+      { status: 201, headers: portalRateLimitHeaders(PORTAL_ACCEPTANCE_RATE_LIMIT, decision) },
     );
   },
 );

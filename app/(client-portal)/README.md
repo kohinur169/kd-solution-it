@@ -3,6 +3,9 @@
 
 Owner: STEP 181-190 (client portal, payment pages and payment links).
 
+STEP 181 built the invoice link, STEP 182 the estimate link. Both are read-only without a link, and both
+write only the evidence section 16 asks for.
+
 Reserved for tokenized client surfaces opened without a login: invoice links under
 i/[token] and estimate links under e/[token]. A fully paid invoice link shows the receipt
 and refuses further payment, and a partly paid invoice link accepts only the remainder.
@@ -23,10 +26,31 @@ and refuses further payment, and a partly paid invoice link accepts only the rem
 - `portal-invoice.ts` - the read model: token to view, five scoped reads, the payable state, the
   receipt, the release question and the document digest.
 - `portal-invoice-evidence.ts` - the two writes and their parsers.
-- `portal-invoice-rate-limit.ts` - the confirmation's own counter, on `rate_limit_windows`.
+- `portal-rate-limit.ts` (STEP 182) - the portal's one counter module, on `rate_limit_windows`,
+  with the confirmation's `portal_acceptance` policy and the signature's `portal_signature` policy. It
+  replaced `portal-invoice-rate-limit.ts`, which STEP 182 deleted rather than leave beside it.
 - `portal-invoice-runtime.ts` - the production wiring and the optional actor read.
 - `portal-invoice-verify.ts` - the gate. It is not on the `verify` chain because `package.json` is not
   this block's file; run it with `node "app/(client-portal)/portal-invoice-verify.ts"`.
 
+## What STEP 182 built
+
+- `e/[token]/page.tsx` - the estimate page: the offer, its lifetime, its six client-facing states and the
+  decision. Two writes happen as it is opened, both tolerant: an expired offer is voided with
+  `void_reason = 'expired'`, and a `sent` offer becomes `viewed`. `force-dynamic` and `noindex`.
+- `e/[token]/signature/route.ts` - the client's decision: accept with a typed signature, or decline. The
+  same check order as the invoice confirmation - CSRF, byte ceiling, address, rate limit, body.
+- `portal-estimate-fields.ts` - the vocabulary: six states, two decisions, three void reasons, the
+  borrowed signature limits, the rules, the audit actions, the `portal_signature` policy, the consent key.
+- `portal-estimate.ts` - the read model: token to view, three scoped reads, the state fold, the digest.
+- `portal-estimate-decision.ts` - the writes: the expiry void, the view, and the decision, which records
+  STEP 022's evidence and then applies the status it implies (`accepted`, or `void` + `declined`).
+- `portal-estimate-verify.ts` - the gate, 232 checks. It is not on the `verify` chain for the same reason
+  as the invoice gate; run it with `node "app/(client-portal)/portal-estimate-verify.ts"`.
+
+STEP 182 adds no migration. `0025` already carries `void_reason`, `voided_at` and `accepted_at`; `0027`
+already carries the eight pieces of evidence and the unique index that makes one signature per estimate;
+`0118` already freezes a decided quote. The gate asserts all three instead of assuming them.
+
 Payment components live in `components/payments/` (invoice receipt, confirmation card and form,
-delivery card and form, and the refusal vocabulary both forms share).
+delivery card and form, the estimate decision card and form, and the refusal vocabulary the forms share).

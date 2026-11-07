@@ -16,6 +16,7 @@ import {
   portalFulfilmentKindOf,
   portalStatementMatchesKind,
   PORTAL_ACCEPTANCE_CONSENT_KEY,
+  PORTAL_ACCEPTANCE_RATE_LIMIT,
   PORTAL_DOCUMENT_HASH_PATTERN,
   PORTAL_RELEASE_BLOCKERS,
 } from "./portal-invoice-fields.ts";
@@ -35,7 +36,7 @@ import {
   recordPortalInvoiceFulfilment,
   type PortalEvidenceDependencies,
 } from "./portal-invoice-evidence.ts";
-import { enforcePortalAcceptanceRateLimit } from "./portal-invoice-rate-limit.ts";
+import { enforcePortalRateLimit } from "./portal-rate-limit.ts";
 
 /**
  * The gate for STEP 181: the tokenized invoice page, its receipt and the two evidence writes.
@@ -1122,8 +1123,9 @@ async function main(): Promise<void> {
 
   // ---- the rate limit: allowed, refused, and refused with a wait
   const allowedFixture = createFixture();
-  const allowed = await enforcePortalAcceptanceRateLimit(
-    { clientAddress: "203.0.113.9" },
+  const allowed = await enforcePortalRateLimit(
+    PORTAL_ACCEPTANCE_RATE_LIMIT,
+    { clientAddress: "203.0.113.9", route: "/i/[token]/acceptance" },
     { rest: createRest(allowedFixture), audit: createInMemoryAuditTrail() },
   );
 
@@ -1140,8 +1142,9 @@ async function main(): Promise<void> {
 
   await expectRefusal(
     () =>
-      enforcePortalAcceptanceRateLimit(
-        { clientAddress: "203.0.113.9" },
+      enforcePortalRateLimit(
+        PORTAL_ACCEPTANCE_RATE_LIMIT,
+        { clientAddress: "203.0.113.9", route: "/i/[token]/acceptance" },
         { rest: createRest(refusedFixture), audit: refusalTrail },
       ),
     "RATE_LIMITED",
@@ -1163,8 +1166,9 @@ async function main(): Promise<void> {
   unreadableFixture.rateLimitAnswer = null;
   await expectRefusal(
     () =>
-      enforcePortalAcceptanceRateLimit(
-        { clientAddress: "203.0.113.9" },
+      enforcePortalRateLimit(
+        PORTAL_ACCEPTANCE_RATE_LIMIT,
+        { clientAddress: "203.0.113.9", route: "/i/[token]/acceptance" },
         { rest: createRest(unreadableFixture) },
       ),
     "DEPENDENCY_FAILED",
@@ -1187,11 +1191,11 @@ async function main(): Promise<void> {
 
   expect(acceptanceRoute.includes("requireCsrfToken("), "the confirmation route checks the CSRF token");
   expect(
-    acceptanceRoute.indexOf("requireCsrfToken(") < acceptanceRoute.indexOf("enforcePortalAcceptanceRateLimit("),
+    acceptanceRoute.indexOf("requireCsrfToken(") < acceptanceRoute.indexOf("enforcePortalRateLimit("),
     "and checks it before it spends a counter",
   );
   expect(
-    acceptanceRoute.indexOf("enforcePortalAcceptanceRateLimit(") < acceptanceRoute.indexOf("request.text()"),
+    acceptanceRoute.indexOf("enforcePortalRateLimit(") < acceptanceRoute.indexOf("request.text()"),
     "and spends the counter before it reads the body",
   );
   expect(
