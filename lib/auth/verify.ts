@@ -12729,10 +12729,17 @@ async function checkCsrfProtection(): Promise<void> {
   // neither check: a file with no POST never entered this list, so nothing asserted it carried the
   // token. The line editor is the first file that posts *and* deletes, which is what surfaced the gap.
   // Counting every mutating method closes it, and the two delete-only files are now covered.
+  //
+  // STEP 191 adds the one filter the scan was missing: a file that mutates is a file that runs in a browser,
+  // and a browser file is a client component. Without it `app/(client-portal)/portal-rate-limit.ts` - a server
+  // module whose prose contains the words `method: "POST"` - was counted as a fifth door nobody could see, and
+  // the two assertions below had answered red since the portal block landed. A gate that cannot tell a comment
+  // from a call teaches its reader to skip it.
   const MUTATION_METHODS = ['method: "POST"', 'method: "DELETE"'] as const;
   const mutationCalls = (source: string): number =>
     MUTATION_METHODS.reduce((total, marker) => total + source.split(marker).length - 1, 0);
   const browserMutations = appSources
+    .filter((file) => file.source.includes('"use client"'))
     .filter((file) => mutationCalls(file.source) > 0)
     .map((file) => file.path)
     .sort();
@@ -12760,11 +12767,19 @@ async function checkCsrfProtection(): Promise<void> {
   // STEP 124 adds one more call to that same file: the payment form, which records one amount on the
   // document it sits under, on its own route with its own token.
   // So the files stay at forty seven and the call sites arrive at sixty three.
-  expectEqual(browserMutations.length, 47, "forty seven browser files send a mutation");
+  //
+  // STEP 190 adds one more file and three more calls: the payment link console, which creates a link,
+  // revokes one and reissues one - three facts, three routes and three tokens from one screen.
+  //
+  // STEP 191 adds two more files and three more calls: the merchant refund desk, which asks for a refund and
+  // withdraws a request, and the finance desk's decision form, which approves or rejects on one route.
+  // With the client-component filter above in place, the files arrive at fifty and the call sites at sixty
+  // nine.
+  expectEqual(browserMutations.length, 50, "fifty browser files send a mutation");
   expectEqual(
     browserMutations.reduce((total, path) => total + mutationCalls(appSourceOf(appSources, path)), 0),
-    63,
-    "across sixty three call sites",
+    69,
+    "across sixty nine call sites",
   );
   const postCalls = mutationCalls;
   const tokenSpreads = (source: string): number =>
