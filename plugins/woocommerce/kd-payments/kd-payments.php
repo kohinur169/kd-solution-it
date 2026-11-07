@@ -48,7 +48,9 @@ function kd_payments_api_base(): string {
  * Boot the plugin once WooCommerce is known to be present.
  *
  * Without WooCommerce there is nothing to connect, and saying so in the admin notice is better than a fatal error on
- * activation.
+ * activation. The two files that extend WooCommerce's own classes are loaded **here** rather than at the top of this
+ * file: a `WC_Payment_Gateway` subclass cannot be declared before WooCommerce has declared its parent, and a plugin that
+ * fatals on a site without WooCommerce cannot even be deactivated from the admin.
  */
 function kd_payments_boot(): void {
 	if ( ! class_exists( 'WooCommerce' ) ) {
@@ -57,12 +59,31 @@ function kd_payments_boot(): void {
 		return;
 	}
 
+	require_once KD_PAYMENTS_PLUGIN_DIR . 'includes/class-kd-payment-gateway.php';
+	require_once KD_PAYMENTS_PLUGIN_DIR . 'includes/class-kd-callback.php';
+
 	$connection = new KD_Connection();
 	$settings   = new KD_Settings( $connection );
+	$callback   = new KD_Callback();
 
 	$settings->register();
+	$callback->register();
+
+	add_filter( 'woocommerce_payment_gateways', 'kd_payments_register_gateways' );
 }
 add_action( 'plugins_loaded', 'kd_payments_boot' );
+
+/**
+ * The gateway WooCommerce offers at checkout.
+ *
+ * @param array<int, string> $gateways The registered gateways.
+ * @return array<int, string>
+ */
+function kd_payments_register_gateways( array $gateways ): array {
+	$gateways[] = 'KD_Payment_Gateway';
+
+	return $gateways;
+}
 
 /** The notice a site without WooCommerce sees instead of a broken plugin. */
 function kd_payments_woocommerce_missing_notice(): void {

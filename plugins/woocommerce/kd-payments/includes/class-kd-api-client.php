@@ -11,7 +11,7 @@
 
 defined( 'ABSPATH' ) || exit;
 
-/** One call to the platform's connection resource. */
+/** One call to the platform: the connection handshake, a payment, and a payment's status. */
 class KD_Api_Client {
 
 	/**
@@ -33,9 +33,19 @@ class KD_Api_Client {
 		$this->api_base = untrailingslashit( $api_base );
 	}
 
-	/** The URL of the one resource this plugin uses. */
+	/** The URL of the connection resource. */
 	public function connection_url(): string {
 		return $this->api_base . '/api/public/v1/stores/woocommerce/connection';
+	}
+
+	/** The URL a payment is created on. */
+	public function payments_url(): string {
+		return $this->api_base . '/api/public/v1/payments';
+	}
+
+	/** The URL of one payment. */
+	public function payment_url( string $payment_id ): string {
+		return $this->payments_url() . '/' . rawurlencode( $payment_id );
 	}
 
 	/**
@@ -83,28 +93,80 @@ class KD_Api_Client {
 	}
 
 	/**
+	 * Create a payment for one order.
+	 *
+	 * The idempotency key is the shop's own derivation over the order, so a checkout the customer submits twice - or a
+	 * shop whose request times out and retries - is one payment on the platform rather than two charges.
+	 *
+	 * @param int    $amount_minor    The order total in minor units.
+	 * @param string $currency        The currency, which the platform accepts as USD only.
+	 * @param string $method          How the payer will pay.
+	 * @param string $idempotency_key The shop's stable key for this order.
+	 * @return array{ok: bool, status: int, body: array<string, mixed>, error: string, replayed: bool}
+	 */
+	public function create_payment(
+		int $amount_minor,
+		string $currency,
+		string $method,
+		string $idempotency_key
+	): array {
+		return $this->request(
+			'POST',
+			$this->payments_url(),
+			array(
+				'amount_minor' => $amount_minor,
+				'currency'     => $currency,
+				'method'       => $method,
+			),
+			array( 'idempotency-key' => $idempotency_key )
+		);
+	}
+
+	/**
+	 * Read one payment's status, server to server.
+	 *
+	 * This is the call that makes a callback safe: the shop is told what changed, and then it asks - with its own key -
+	 * before it touches an order.
+	 *
+	 * @param string $payment_id The payment's id.
+	 * @return array{ok: bool, status: int, body: array<string, mixed>, error: string, replayed: bool}
+	 */
+	public function payment_status( string $payment_id ): array {
+		return $this->request( 'GET', $this->payment_url( $payment_id ) );
+	}
+
+	/**
 	 * One authenticated request, and the platform's answer reduced to what a screen needs.
 	 *
 	 * No redirects are followed, the platform's TLS certificate is verified, and the response body is parsed only when
 	 * the status says there is one - a plugin that trusts whatever comes back over the network is a plugin that shows a
 	 * merchant an attacker's text.
 	 *
-	 * @param string               $method HTTP method.
-	 * @param string               $url    Absolute URL, built here rather than from a request.
-	 * @param array<string, mixed> $body   JSON body, or an empty array.
-	 * @return array{ok: bool, status: int, body: array<string, mixed>, error: string}
+	 * @param string                $method        HTTP method.
+	 * @param string                $url           Absolute URL, built here rather than from a request.
+	 * @param array<string, mixed>  $body          JSON body, or an empty array.
+	 * @param array<string, string> $extra_headers Headers this call adds, such as the idempotency key.
+	 * @return array{ok: bool, status: int, body: array<string, mixed>, error: string, replayed: bool}
 	 */
-	private function request( string $method, string $url, array $body = array() ): array {
+	private function request(
+		string $method,
+		string $url,
+		array $body = array(),
+		array $extra_headers = array()
+	): array {
 		$args = array(
 			'method'      => $method,
 			'timeout'     => self::TIMEOUT_SECONDS,
 			'sslverify'   => true,
 			'redirection' => 0,
-			'headers'     => array(
-				'Authorization' => 'Bearer ' . $this->api_key,
-				'Accept'        => 'application/json',
-				'Content-Type'  => 'application/json',
-				'User-Agent'    => 'kd-payments-woocommerce/' . KD_PAYMENTS_VERSION,
+			'headers'     => array_merge(
+				array(
+					'Authorization' => 'Bearer ' . $this->api_key,
+					'Accept'        => 'application/json',
+					'Content-Type'  => 'application/json',
+					'User-Agent'    => 'kd-payments-woocommerce/' . KD_PAYMENTS_VERSION,
+				),
+				$extra_headers
 			),
 		);
 
@@ -117,22 +179,25 @@ class KD_Api_Client {
 		if ( is_wp_error( $response ) ) {
 			// The transport's own message can carry a host name, so it is reduced to a code the screen translates.
 			return array(
-				'ok'     => false,
-				'status' => 0,
-				'body'   => array(),
-				'error'  => 'unreachable',
+				'ok'       => false,
+				'status'   => 0,
+				'body'     => array(),
+				'error'    => 'unreachable',
+				'replayed' => false,
 			);
 		}
 
 		$status = (int) wp_remote_retrieve_response_code( $response );
 		$raw    = (string) wp_remote_retrieve_body( $response );
 		$parsed = json_decode( $raw, true );
+		$ok     = $status >= 200 && $status < 300;
 
 		return array(
-			'ok'     => $status >= 200 && $status < 300,
-			'status' => $status,
-			'body'   => is_array( $parsed ) ? $parsed : array(),
-			'error'  => $status >= 200 && $status < 300 ? '' : $this->error_of( $status, $parsed ),
+			'ok'       => $ok,
+			'status'   => $status,
+			'body'     => is_array( $parsed ) ? $parsed : array(),
+			'error'    => $ok ? '' : $this->error_of( $status, $parsed ),
+			'replayed' => 'true' === wp_remote_retrieve_header( $response, 'idempotency-replayed' ),
 		);
 	}
 
