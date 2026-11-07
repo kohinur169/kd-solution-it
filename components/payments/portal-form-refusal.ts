@@ -72,17 +72,34 @@ export function portalRuleTextOf(rule: string): string {
  * and every rule it does not name still becomes the sentence above. A rule answered here is a rule no
  * surface has to describe twice.
  */
-export async function portalFailureTextOf(
+/** One refusal, read once: the sentence a person reads, and the rule a caller may act on. */
+export interface PortalRefusal {
+  /** The HTTP status the write was refused with. */
+  readonly status: number;
+  /** The first rule the envelope named, or null when the answer carried none this reader understands. */
+  readonly rule: string | null;
+  /** The sentence for that rule. */
+  readonly text: string;
+}
+
+/**
+ * The same answer, naming the rule as well as its sentence.
+ *
+ * A form usually only needs the sentence, which `portalFailureTextOf` gives it. A form that has to *stop*
+ * after one refusal - a card the provider has flagged is refused once and not offered again - needs the rule
+ * to recognise it, and reading the body twice is not possible: the response is a stream.
+ */
+export async function portalRefusalOf(
   response: Response,
   fallback: string,
   overrides?: Readonly<Record<string, string>>,
-): Promise<string> {
+): Promise<PortalRefusal> {
   if (response.status === 401 || response.status === 403) {
-    return getMessage("portal.merchantForbidden");
+    return { status: response.status, rule: null, text: getMessage("portal.merchantForbidden") };
   }
 
   if (response.status === 429) {
-    return getMessage("portal.confirmationRateLimited");
+    return { status: response.status, rule: null, text: getMessage("portal.confirmationRateLimited") };
   }
 
   let rule: string | null = null;
@@ -107,10 +124,17 @@ export async function portalFailureTextOf(
   }
 
   if (rule === null) {
-    return fallback;
+    return { status: response.status, rule: null, text: fallback };
   }
 
-  const override = overrides?.[rule];
+  return { status: response.status, rule, text: overrides?.[rule] ?? portalRuleTextOf(rule) };
+}
 
-  return override ?? portalRuleTextOf(rule);
+/** The sentence for a failed portal write, read from the envelope. */
+export async function portalFailureTextOf(
+  response: Response,
+  fallback: string,
+  overrides?: Readonly<Record<string, string>>,
+): Promise<string> {
+  return (await portalRefusalOf(response, fallback, overrides)).text;
 }

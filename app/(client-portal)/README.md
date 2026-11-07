@@ -4,7 +4,8 @@
 Owner: STEP 181-190 (client portal, payment pages and payment links).
 
 STEP 181 built the invoice link, STEP 182 the estimate link, STEP 183 the card payment page, STEP 184 the
-3D Secure step in front of it, STEP 185 the billing match that decides what a payment without a bank may do.
+3D Secure step in front of it, STEP 185 the billing match that decides what a payment without a bank may do,
+STEP 186 the handling of the provider's fraud signal.
 The links are read-only without a token, and each STEP writes only what its own section asks for.
 
 Reserved for tokenized client surfaces opened without a login: invoice links under
@@ -145,6 +146,34 @@ unverified payment is reviewed - which is the honest reading of "where possible"
 STEP 185 adds no migration: `0037` already carries `postal_code_matched`, `ip_country_matched`,
 `status = 'under_review'`, `risk_decision = 'review'` and the index on the status, and `0019` already carries
 `clients.postal_code` and `clients.country`. The gate asserts each of those and the postal alphabet they share.
+
+## What STEP 186 built
+
+- `portal-fraud-fields.ts` - the vocabulary of section 18's fraud sentence: the four documented codes that name
+  the card itself as the problem (`250` pick up, `251` lost, `252` stolen, `253` fraudulent), the four that ask
+  the merchant to stop (`240`, `260`, `261`, `262`), the gateway's own words for each, the mapping from a code
+  to `fraud`/`suspicious`/`clear`, the decision and the two values `0037` accepts (`failed` with
+  `risk_decision = 'reject'`, `under_review` with `'review'`), the audit actions and the payload they carry.
+- `portal-fraud.ts` - the consequences: `recordPortalProviderSignal`, `referPortalCard` and
+  `handlePortalProviderSignal`, plus the `PortalCardReferralQueue` port a flagged card is referred to.
+- `portal-fraud-processor.ts` - `createInMemoryCardReferralQueue`, the list this build has, saying
+  `durable: false`.
+- `portal-fraud-verify.ts` - the gate, 267 checks. Run it with
+  `node "app/(client-portal)/portal-fraud-verify.ts"`.
+
+The signal is read in `portal-payment-processor.ts`, where a charge's answer is parsed, and the outcome carries
+it out of the processor: `failed` on `failed`/`risk_rejected` for a fraud signal, `under_review` for a
+suspicious one. `chargePortalPayment` then refuses - `risk_rejected` for the first, `risk_suspicious` for the
+second - and the card form ends the page on the first rather than inviting the payer to try the same card again.
+
+The card's referral is a port because the blacklist is STEP 187's table: a referral that cannot be kept is
+recorded as `card_referral_unavailable` and the rejection stands, which is the honest reading of a rule that
+must not depend on a side effect. A retried attempt answers the same refusal, records nothing twice, and never
+reaches the gateway a second time.
+
+STEP 186 adds no migration: `0037` already carries `payments_risk_reject_check` (`risk_decision <> 'reject' or
+status = 'failed'`), the three risk decisions, the `under_review` status and its index. The gate asserts each of
+those rather than assuming them.
 
 STEP 182 adds no migration. `0025` already carries `void_reason`, `voided_at` and `accepted_at`; `0027`
 already carries the eight pieces of evidence and the unique index that makes one signature per estimate;

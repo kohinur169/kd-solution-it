@@ -8,6 +8,12 @@ import {
   PORTAL_PAYMENT_METHOD,
   PORTAL_PAYMENT_PROVIDER,
 } from "./portal-payment-fields.ts";
+import {
+  PORTAL_FRAUD_FAILURE_CODE,
+  PORTAL_FRAUD_RULES,
+  portalFraudDecisionOf,
+  portalProviderFraudSignalOf,
+} from "./portal-fraud-fields.ts";
 import type {
   PortalChargeOutcome,
   PortalChargeRequest,
@@ -64,7 +70,13 @@ export interface PortalPaymentRecorder {
   /** Settle an opened record with the outcome the provider gave. */
   settle(input: {
     readonly paymentId: string;
-    readonly outcome: "captured" | "declined" | "unknown";
+    /**
+     * What happened to the payment. `failed` and `under_review` are STEP 186's additions: a payment the gateway
+     * called fraudulent is a failed payment carrying `risk_rejected`, and one it asked the merchant to stop on
+     * is held for review. Neither is a decline, and settling one as a decline would hide a risk decision behind
+     * an ordinary refusal.
+     */
+    readonly outcome: "captured" | "declined" | "unknown" | "failed" | "under_review";
     readonly transactionId: string | null;
     readonly code: string | null;
     readonly occurredAtEpochMs: number;
@@ -79,7 +91,7 @@ export type PortalRecorderOpen =
   | {
       readonly status: "duplicate";
       readonly paymentId: string;
-      readonly settled: "captured" | "declined" | "unknown" | null;
+      readonly settled: "captured" | "declined" | "unknown" | "failed" | "under_review" | null;
       readonly transactionId: string | null;
       readonly code: string | null;
     }
@@ -134,6 +146,20 @@ export function createPortalPaymentProcessor(
 
         if (opened.settled === "declined") {
           return { status: "declined", paymentId: opened.paymentId, code: opened.code ?? "declined" };
+        }
+
+        if (opened.settled === "failed" || opened.settled === "under_review") {
+          // STEP 186: the risk answer the first attempt was given, given again. `replayed` is what keeps the
+          // page from writing a second chain entry and a second referral for one flag: the first attempt
+          // already recorded both.
+          return {
+            status: "refused_by_risk",
+            paymentId: opened.paymentId,
+            decision: opened.settled === "failed" ? "reject" : "review",
+            signal: opened.settled === "failed" ? "fraud" : "suspicious",
+            code: opened.code,
+            replayed: true,
+          };
         }
 
         // Opened and never settled: the previous attempt's answer was lost. Charging again could take the
@@ -191,6 +217,30 @@ export function createPortalPaymentProcessor(
       }
 
       if (executed.status === "failed") {
+        // STEP 186, before the decline is written: the documented codes that name the card itself as the
+        // problem are section 18's fraud signal, and a payment they answer is not an ordinary decline.
+        const signal = portalProviderFraudSignalOf({ responseCode: executed.responseCode });
+        const decision = portalFraudDecisionOf(signal);
+
+        if (decision !== null) {
+          options.recorder.settle({
+            paymentId: opened.paymentId,
+            outcome: decision === "reject" ? "failed" : "under_review",
+            transactionId: null,
+            code: decision === "reject" ? PORTAL_FRAUD_FAILURE_CODE : PORTAL_FRAUD_RULES.suspicious,
+            occurredAtEpochMs: request.occurredAtEpochMs,
+          });
+
+          return {
+            status: "refused_by_risk",
+            paymentId: opened.paymentId,
+            decision,
+            signal,
+            code: executed.responseCode,
+            replayed: false,
+          };
+        }
+
         options.recorder.settle({
           paymentId: opened.paymentId,
           outcome: "declined",
@@ -242,7 +292,7 @@ export function createPortalPaymentProcessor(
 export function createInMemoryPortalPaymentRecorder(): PortalPaymentRecorder {
   interface Record {
     readonly paymentId: string;
-    settled: "captured" | "declined" | "unknown" | null;
+    settled: "captured" | "declined" | "unknown" | "failed" | "under_review" | null;
     transactionId: string | null;
     code: string | null;
   }

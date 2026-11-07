@@ -3140,6 +3140,11 @@ const catalog = {
     paymentBillingPostalLabel: "Billing postal code",
     paymentBillingPostalHint:
       "The postal code on the card's billing address. Your bank uses it, with the country of this connection, to check the payment.",
+    /** STEP 186: a payment the gateway flagged, refused at once or held for review. */
+    ruleRiskRejected:
+      "This payment was refused by the card's bank or by the payment provider before any money moved. Nothing was charged. Do not try this card again: contact the business if you believe this is wrong.",
+    ruleRiskSuspicious:
+      "The payment provider asked us to check this payment before it goes through. Nothing has been charged yet: the payment is under review and you will be contacted if anything else is needed.",
     ruleBillingPostalInvalid:
       "That postal code could not be read. Check it and try again: letters, digits, spaces and hyphens only.",
     paymentThreeDsAmountTitle: "Amount",

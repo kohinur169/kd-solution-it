@@ -6,6 +6,7 @@ import {
   type NmiKeyStore,
 } from "../../lib/payments/adapters/nmi-client.ts";
 import type { PortalPaymentDependencies } from "./portal-payment.ts";
+import { createInMemoryCardReferralQueue } from "./portal-fraud-processor.ts";
 import {
   createInMemoryPortalPaymentRecorder,
   createPortalPaymentProcessor,
@@ -68,6 +69,9 @@ export function getPortalPaymentRuntime(): PortalPaymentRuntime {
       keyStore,
       encryptionKeyHex,
     }),
+    // STEP 186: the list a flagged card is referred to. In memory here, and reported as refused; the durable
+    // list is STEP 187's table.
+    referral: createInMemoryCardReferralQueue(),
     tokenizationKeyFor: (companyId) => {
       const config = keyStore.findActiveByCompany(companyId);
 

@@ -4,7 +4,10 @@ import { z } from "zod";
 import type { AuditEntry, AuditTrail } from "../../lib/auth/audit.ts";
 import type { RestClient } from "../../lib/auth/rest.ts";
 import { AppError, type ErrorDetail } from "../../lib/errors/app-error.ts";
+import type { FraudProviderSignal } from "../../lib/security/fraud.ts";
 import { validateCollectJsToken } from "../../lib/payments/adapters/nmi-collectjs.ts";
+import { handlePortalProviderSignal, type PortalCardReferralQueue } from "./portal-fraud.ts";
+import { PORTAL_FRAUD_RULES } from "./portal-fraud-fields.ts";
 import type { PortalTokenKeys } from "../../lib/security/portal-token.ts";
 import { openPortalInvoice, type PortalInvoiceView } from "./portal-invoice.ts";
 import { portalMoneyTextOf } from "./portal-invoice-money.ts";
@@ -104,6 +107,22 @@ export interface PortalChargeRequest {
 export type PortalChargeOutcome =
   | { readonly status: "captured"; readonly paymentId: string; readonly transactionId: string }
   | { readonly status: "declined"; readonly paymentId: string | null; readonly code: string }
+  /**
+   * STEP 186: the gateway flagged the payment. `decision` is what section 18 does about it - a fraud signal
+   * rejects the payment at once, a suspicious one holds it for review - and neither settles money.
+   */
+  | {
+      readonly status: "refused_by_risk";
+      readonly paymentId: string | null;
+      readonly decision: "reject" | "review";
+      readonly signal: FraudProviderSignal;
+      readonly code: string | null;
+      /**
+       * True when this answer is the one a previous attempt was already given, under the same idempotency
+       * key. The refusal is the same; the consequences were written once, by the attempt that earned them.
+       */
+      readonly replayed: boolean;
+    }
   | { readonly status: "unknown"; readonly paymentId: string | null; readonly reason: string }
   | { readonly status: "unavailable"; readonly reason: PortalPaymentUnavailable };
 
@@ -136,6 +155,13 @@ export interface PortalPaymentDependencies {
   readonly tokenizationKeyFor: (
     companyId: string,
   ) => { readonly apiKey: string; readonly environment: "sandbox" | "production" } | null;
+  /**
+   * Where a card the gateway flagged is referred (STEP 186).
+   *
+   * Optional because a page can be built without one: a referral that cannot be made is reported in the chain,
+   * and the refusal that caused it stands either way.
+   */
+  readonly referral?: PortalCardReferralQueue | null;
   readonly now?: () => number;
 }
 
@@ -551,6 +577,36 @@ export async function chargePortalPayment(
     });
 
     throw refused("VALIDATION_FAILED", "collectjs_token", "card_declined");
+  }
+
+  if (outcome.status === "refused_by_risk") {
+    // STEP 186. The chain entry and, for a fraud signal, the card's referral are written by the fraud module;
+    // what this service does is refuse, in the rule the page prints, and never retry. A replayed answer has
+    // both already, so it is refused again without writing them twice.
+    if (!outcome.replayed) {
+        await handlePortalProviderSignal(
+        {
+          companyId: view.companyId,
+          invoiceId: view.invoiceId,
+          paymentId: outcome.paymentId,
+          token: parsed.token,
+          signal: outcome.signal,
+          responseCode: outcome.code,
+          amountMinor: view.payment.amountMinor,
+          ipAddress: input.clientAddress,
+          userAgent: input.userAgent,
+        },
+        {
+          audit: dependencies.audit,
+          referral: dependencies.referral ?? null,
+          now: () => nowMs,
+        },
+      );
+    }
+
+    throw outcome.decision === "reject"
+      ? refused("VALIDATION_FAILED", "payment", PORTAL_FRAUD_RULES.rejected)
+      : refused("CONFLICT", "payment", PORTAL_FRAUD_RULES.suspicious);
   }
 
   await appendTolerated(dependencies.audit, {

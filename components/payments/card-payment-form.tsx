@@ -5,8 +5,8 @@ import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { getMessage } from "../../lib/i18n/messages.ts";
 import { csrfHeaders } from "../../lib/security/csrf-client.ts";
-import { portalFailureTextOf } from "./portal-form-refusal.ts";
-import { portalPaymentRuleSentences } from "./portal-payment-refusal.ts";
+import { portalRefusalOf } from "./portal-form-refusal.ts";
+import { portalPaymentRefusalIsFinal, portalPaymentRuleSentences } from "./portal-payment-refusal.ts";
 import { portalThreeDsRuleSentences } from "./portal-three-ds-refusal.ts";
 import { ThreeDsChallenge } from "./three-ds-challenge.tsx";
 
@@ -137,6 +137,11 @@ export function CardPaymentForm({
   const [ready, setReady] = useState(false);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
+  /**
+   * STEP 186: the provider flagged this card, so the page is finished. Re-offering the fields would invite the
+   * payer to try the same card again, which section 18 exists to refuse.
+   */
+  const [refusedByRisk, setRefusedByRisk] = useState(false);
   const [captured, setCaptured] = useState<{ readonly amount: string; readonly at: string } | null>(null);
   const [challenge, setChallenge] = useState<{
     readonly acsUrl: string;
@@ -173,16 +178,20 @@ export function CardPaymentForm({
         });
 
         if (!response.ok) {
-          setMessage(
-            await portalFailureTextOf(
-              response,
-              getMessage("portal.paymentFailed"),
-              // Both vocabularies, because one form can meet both: a charge's own refusals and the bank's.
-              { ...portalPaymentRuleSentences(), ...portalThreeDsRuleSentences() },
-            ),
+          const refusal = await portalRefusalOf(
+            response,
+            getMessage("portal.paymentFailed"),
+            // Both vocabularies, because one form can meet both: a charge's own refusals and the bank's.
+            { ...portalPaymentRuleSentences(), ...portalThreeDsRuleSentences() },
           );
-          // The token was spent by the attempt, so the fields are cleared and the card is asked for again.
+
+          setMessage(refusal.text);
+          setRefusedByRisk(portalPaymentRefusalIsFinal(refusal.rule));
+
+          // The token was spent by the attempt, so the fields are cleared and the card is asked for again -
+          // unless the gateway flagged the card, in which case the page does not ask again at all.
           window.CollectJS?.clearInputs?.();
+
           return;
         }
 
@@ -305,6 +314,16 @@ export function CardPaymentForm({
         md={challenge.md}
         termUrl={challenge.termUrl}
       />
+    );
+  }
+
+  if (refusedByRisk) {
+    return (
+      <div className={containerClasses}>
+        <p role="alert" className={errorClasses}>
+          {message ?? getMessage("portal.ruleRiskRejected")}
+        </p>
+      </div>
     );
   }
 

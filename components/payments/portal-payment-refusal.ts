@@ -39,11 +39,26 @@ export function portalPaymentRuleTextOf(rule: string): string | null {
       return getMessage("portal.paymentRuleOutcomeUnknown");
     case "amount_unrepresentable":
       return getMessage("portal.paymentRuleAmountUnrepresentable");
+    case "risk_rejected":
+      return getMessage("portal.ruleRiskRejected");
+    case "risk_suspicious":
+      return getMessage("portal.ruleRiskSuspicious");
     case "stale_document":
       return getMessage("portal.paymentRuleStaleDocument");
     default:
       return null;
   }
+}
+
+/**
+ * Whether a refusal ends the page rather than marking a field to fix.
+ *
+ * One rule does: `risk_rejected`, which is `PORTAL_FRAUD_RULES.rejected` in the portal's fraud vocabulary
+ * (STEP 186). It is spelled here rather than imported because this module is a client component's and the
+ * fraud vocabulary reaches the gateway adapter's table; the gate checks the two spellings still agree.
+ */
+export function portalPaymentRefusalIsFinal(rule: string | null): boolean {
+  return rule === "risk_rejected";
 }
 
 /**
@@ -66,6 +81,8 @@ export function portalPaymentRuleSentences(): Readonly<Record<string, string>> {
     "outcome_unknown",
     "amount_unrepresentable",
     "stale_document",
+    "risk_rejected",
+    "risk_suspicious",
   ];
 
   const sentences: Record<string, string> = {};

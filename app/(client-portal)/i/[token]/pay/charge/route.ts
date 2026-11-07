@@ -57,6 +57,14 @@ interface PaymentResponseBody {
  * The amount that was charged, the payment and the provider's transaction id. No card detail, because there
  * is none to carry: the only card facts this platform could hold are the provider's own brand and last four,
  * and they belong to the record, not to a response.
+ *
+ * ## The answer a flagged card gets
+ *
+ * STEP 186. A payment the gateway answers with one of its four fraud codes is never a `201`: the service
+ * refuses it, and this route lets the refusal through the platform's own envelope - `422` with the rule
+ * `risk_rejected`, or `409` with `risk_suspicious` when the issuer asked the merchant to stop instead. The
+ * card form reads the rule from `details[0]` and ends the page on the first of those, so a payer is told the
+ * truth once rather than invited to try the same card again.
  */
 export const POST = withErrorResponse(
   async (
