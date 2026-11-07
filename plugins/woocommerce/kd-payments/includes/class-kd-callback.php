@@ -10,8 +10,8 @@
  *      nothing else can stand in for it: no signature the shop cannot verify, no nonce the shop cannot issue, no
  *      session. `hash_equals` rather than `===` because a comparison that returns early on the first wrong byte tells
  *      an attacker how much of a guess was right.
- *   2. **A body ceiling, before the body is parsed.** This endpoint is on the public internet, so it must not be a way
- *      to spend a shop's memory.
+ *   2. **A body ceiling, before the body is read.** This endpoint is on the public internet, so it must not be a way to
+ *      spend a shop's memory: the declared length is refused first, and what is read is bounded by the ceiling.
  *   3. **The envelope's shape, field by field.** A JSON object with four known keys, a callback id of the platform's
  *      own shape, and a payment id - and anything else is refused rather than ignored, because an ignored field is a
  *      field somebody will one day rely on.
@@ -68,9 +68,9 @@ class KD_Callback {
 			return;
 		}
 
-		$raw = (string) file_get_contents( 'php://input' );
+		$raw = $this->read_body();
 
-		if ( strlen( $raw ) > self::MAXIMUM_BODY_BYTES ) {
+		if ( null === $raw ) {
 			$this->respond( 413, array( 'handled' => false, 'reason' => 'body_too_large' ) );
 
 			return;
@@ -118,6 +118,42 @@ class KD_Callback {
 	}
 
 	/**
+	 * The request body, read no further than the ceiling.
+	 *
+	 * The declared `Content-Length` is checked first, so an announced oversize body is answered without reading a byte,
+	 * and then at most `MAXIMUM_BODY_BYTES + 1` bytes are read - a request with no length, or with one that lies, still
+	 * cannot make this endpoint hold more of somebody else's text than the ceiling allows. Reading first and measuring
+	 * afterwards would have answered `413` only after the memory had already been spent, which is not a ceiling at all.
+	 *
+	 * @return string|null The body, or null when it is larger than the ceiling.
+	 */
+	private function read_body(): ?string {
+		$declared = isset( $_SERVER['CONTENT_LENGTH'] ) && is_string( $_SERVER['CONTENT_LENGTH'] )
+			? (int) $_SERVER['CONTENT_LENGTH']
+			: 0;
+
+		if ( $declared > self::MAXIMUM_BODY_BYTES ) {
+			return null;
+		}
+
+		$handle = fopen( 'php://input', 'rb' );
+
+		if ( false === $handle ) {
+			return '';
+		}
+
+		$raw = stream_get_contents( $handle, self::MAXIMUM_BODY_BYTES + 1 );
+
+		fclose( $handle );
+
+		if ( ! is_string( $raw ) || strlen( $raw ) > self::MAXIMUM_BODY_BYTES ) {
+			return null;
+		}
+
+		return $raw;
+	}
+
+	/**
 	 * Whether the caller presented this shop's own token.
 	 *
 	 * The header can arrive in three shapes depending on the server (Apache with `CGI`, FastCGI, or a proxy that
@@ -130,6 +166,15 @@ class KD_Callback {
 			$header = sanitize_text_field( wp_unslash( $_SERVER['HTTP_AUTHORIZATION'] ) );
 		} elseif ( isset( $_SERVER['REDIRECT_HTTP_AUTHORIZATION'] ) && is_string( $_SERVER['REDIRECT_HTTP_AUTHORIZATION'] ) ) {
 			$header = sanitize_text_field( wp_unslash( $_SERVER['REDIRECT_HTTP_AUTHORIZATION'] ) );
+		} elseif ( function_exists( 'getallheaders' ) ) {
+			// The third shape: a host that fills neither superglobal still hands the header to PHP's own accessor.
+			foreach ( getallheaders() as $name => $value ) {
+				if ( is_string( $name ) && is_string( $value ) && 0 === strcasecmp( $name, 'Authorization' ) ) {
+					$header = sanitize_text_field( $value );
+
+					break;
+				}
+			}
 		}
 
 		if ( 0 === stripos( $header, 'Bearer ' ) ) {
@@ -284,6 +329,14 @@ class KD_Callback {
 			return null;
 		}
 
+		// The answer must be about the payment this callback names. A read that came back with another id is a read
+		// this shop cannot use, and applying it would move an order on somebody else's status.
+		$answered_id = isset( $answer['body']['id'] ) && is_string( $answer['body']['id'] ) ? $answer['body']['id'] : '';
+
+		if ( $payment_id !== $answered_id ) {
+			return null;
+		}
+
 		$status = isset( $answer['body']['status'] ) && is_string( $answer['body']['status'] ) ? $answer['body']['status'] : '';
 
 		return '' === $status ? null : $status;
@@ -305,8 +358,15 @@ class KD_Callback {
 				$order->payment_complete( $payment_id );
 			}
 		} elseif ( in_array( $status, self::FAILED_STATUSES, true ) ) {
-			/* translators: %s: the platform's status word. */
-			$order->set_status( 'failed', sprintf( __( 'The platform reported the payment as %s.', 'kd-payments' ), $status ) );
+			if ( $order->is_paid() ) {
+				// The money is already taken. A later callback must not un-pay an order - only a refund moves a paid
+				// order, and it moves it forward - so this is recorded and the status is left alone.
+				/* translators: %s: the platform's status word. */
+				$order->add_order_note( sprintf( __( 'The platform reported the payment as %s, but this order is already paid. The order was left as it is.', 'kd-payments' ), $status ) );
+			} else {
+				/* translators: %s: the platform's status word. */
+				$order->set_status( 'failed', sprintf( __( 'The platform reported the payment as %s.', 'kd-payments' ), $status ) );
+			}
 		} elseif ( 'refunded' === $status ) {
 			$order->set_status( 'refunded', __( 'The platform reported the payment as refunded.', 'kd-payments' ) );
 		} else {

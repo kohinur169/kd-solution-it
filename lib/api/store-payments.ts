@@ -7,6 +7,7 @@ import { AppError, type ErrorDetail } from "../errors/app-error.ts";
 import { isProviderKey, PROVIDER_KEYS, type ProviderKey } from "../payments/registry.ts";
 import { routePayment, type RoutingRule } from "../payments/routing.ts";
 import {
+  API_IDEMPOTENCY_ABANDONED_SECONDS,
   API_IDEMPOTENCY_FIELD,
   API_IDEMPOTENCY_HEADER,
   API_IDEMPOTENCY_KEY_MAXIMUM_LENGTH,
@@ -257,6 +258,7 @@ const idempotencyRowSchema = z.object({
   id: z.string().uuid(),
   state: z.enum(["in_flight", "completed", "failed"]),
   request_hash: z.string(),
+  created_at: z.string(),
   response_status: z.number().int().nullable(),
   response_body: z.string().nullable(),
   version: z.number().int().positive(),
@@ -287,7 +289,7 @@ const paymentRowSchema = z.object({
 });
 
 const KEY_COLUMNS =
-  "select=id,state,request_hash,response_status,response_body,version&deleted_at=is.null&limit=1";
+  "select=id,state,request_hash,created_at,response_status,response_body,version&deleted_at=is.null&limit=1";
 const RULE_COLUMNS =
   "select=id,provider_id,payment_method,country_code,priority&status=eq.active&deleted_at=is.null&limit=100";
 
@@ -379,6 +381,83 @@ async function failKey(
   } catch {
     // A key that cannot be marked failed is not a reason to leave the caller without an answer.
   }
+}
+
+/** The payment already written under a key, when the attempt that claimed it got that far. */
+async function paymentUnderKey(
+  dependencies: StorePaymentDependencies,
+  keyId: string,
+): Promise<z.infer<typeof paymentRowSchema> | null> {
+  const rows = await dependencies.rest.select(
+    API_PAYMENT_TABLES.payments,
+    `select=id,status,created_at&idempotency_key_id=eq.${encodeURIComponent(keyId)}&deleted_at=is.null&limit=1`,
+    paymentRowSchema,
+  );
+
+  return rows[0] ?? null;
+}
+
+/** What an in-flight key turned out to be: still running, resumable, or already done. */
+type AbandonedAttempt =
+  | { readonly kind: "none" }
+  | { readonly kind: "resumed"; readonly row: IdempotencyRow }
+  | { readonly kind: "replayed"; readonly outcome: StorePaymentOutcome };
+
+/**
+ * Decide what an `in_flight` key means, when it has been in flight longer than a request can live.
+ *
+ * Three answers, and the difference between them is whether the abandoned attempt wrote its payment before it died:
+ *
+ *   - **not abandoned** - the row is decided, belongs to another body, or is young enough to still be running. The
+ *     caller answers from the key as it stands, which is the `409` a retry during a live attempt deserves.
+ *   - **resumed** - stale, and no payment carries this key. Nothing was charged, so the caller carries on with the
+ *     same row: no second row (the key is unique), no new key for the store to invent, and the completion write at the
+ *     end lands on a row that was in flight all along, which the schema allows.
+ *   - **replayed** - stale, and a payment does carry this key. The attempt did its work and died before recording the
+ *     answer, so the key is completed here from that payment and the caller receives it as the replay it is. A second
+ *     payment is never written.
+ */
+async function settleAbandonedAttempt(
+  dependencies: StorePaymentDependencies,
+  input: {
+    readonly row: IdempotencyRow;
+    readonly requestHash: string;
+    readonly request: ApiStorePaymentRequest;
+    readonly mode: ApiPrincipal["mode"];
+  },
+): Promise<AbandonedAttempt> {
+  const row = input.row;
+
+  if (row.state !== "in_flight" || row.request_hash !== input.requestHash) {
+    return { kind: "none" };
+  }
+
+  const claimedAt = Date.parse(row.created_at);
+
+  if (!Number.isFinite(claimedAt) || dependencies.now() - claimedAt < API_IDEMPOTENCY_ABANDONED_SECONDS * 1_000) {
+    return { kind: "none" };
+  }
+
+  const written = await paymentUnderKey(dependencies, row.id);
+
+  if (written === null) {
+    return { kind: "resumed", row };
+  }
+
+  const view: ApiStorePaymentView = {
+    id: written.id,
+    object: API_PAYMENT_OBJECT,
+    status: API_PAYMENT_STATUS,
+    amount_minor: input.request.amountMinor,
+    currency: API_PAYMENT_CURRENCY,
+    mode: input.mode === "live" ? "live" : "test",
+    payment_method: input.request.method,
+    created_at: written.created_at,
+  };
+
+  await completeKey(dependencies, row, view);
+
+  return { kind: "replayed", outcome: { status: 201, body: view, replayed: true } };
 }
 
 /** The answer a decided key gives, whatever decided it. */
@@ -551,12 +630,28 @@ export async function createStorePayment(
   }
 
   const existing = await findKeyRow(dependencies, companyId, keyHash);
+  let carried: IdempotencyRow | null = null;
 
   if (existing !== null) {
-    return outcomeOfExisting(existing, requestHash);
+    const settled = await settleAbandonedAttempt(dependencies, {
+      row: existing,
+      requestHash,
+      request: input.request,
+      mode,
+    });
+
+    if (settled.kind === "replayed") {
+      return settled.outcome;
+    }
+
+    if (settled.kind === "resumed") {
+      carried = settled.row;
+    } else {
+      return outcomeOfExisting(existing, requestHash);
+    }
   }
 
-  const claimed = await claimKey(dependencies, { companyId, keyHash, requestHash });
+  const claimed = carried ?? (await claimKey(dependencies, { companyId, keyHash, requestHash }));
 
   if (claimed === null) {
     const raced = await findKeyRow(dependencies, companyId, keyHash);

@@ -1044,6 +1044,112 @@ expectEqual(inFlight.status, 409, "with a 409");
 expectEqual(inFlight.rule, API_PAYMENT_RULES.idempotencyInFlight, "and says the first attempt is running");
 expectEqual(inFlightFixture.state.payments.length, 0, "no payment is written behind a key in flight");
 
+// An attempt that was abandoned by the process, not by a decision: killed between claiming its key and recording the
+// answer. `idempotency_keys` has no expiry of its own and its unique index covers deleted rows too, so without the
+// staleness window below the key is stuck for ever and this checkout can never be paid again. The repair is one of two
+// things, and which one is decided by whether the dead attempt had already written its payment.
+
+const abandonedResumeFixture = createFixture();
+const abandonedResumeFirst = await createStorePayment(
+  createInput({ key: "checkout-abandoned-1" }),
+  dependenciesOf(abandonedResumeFixture),
+);
+
+// Rewind the fixture to the moment after the key was claimed and before the payment was written.
+abandonedResumeFixture.state.payments.length = 0;
+const resumedRow = abandonedResumeFixture.state.idempotency_keys[0];
+
+if (resumedRow !== undefined) {
+  resumedRow["state"] = "in_flight";
+  resumedRow["response_status"] = null;
+  resumedRow["response_body"] = null;
+  resumedRow["completed_at"] = null;
+  resumedRow["created_at"] = new Date(startedAt - 400_000).toISOString();
+}
+
+const resumed = await createStorePayment(
+  createInput({ key: "checkout-abandoned-1" }),
+  dependenciesOf(abandonedResumeFixture),
+);
+
+expectEqual(resumed.status, 201, "a stale in-flight key with no payment behind it is carried on rather than refused");
+expectEqual(resumed.replayed, false, "and it is a fresh attempt, not a replay");
+expectEqual(abandonedResumeFixture.state.payments.length, 1, "which writes exactly one payment");
+expectEqual(
+  abandonedResumeFixture.state.idempotency_keys.length,
+  1,
+  "on the row that was already there, because the key is unique and a second row is impossible",
+);
+expectEqual(
+  abandonedResumeFixture.state.idempotency_keys[0]?.["state"],
+  "completed",
+  "and the key is completed at the end, so the next retry replays",
+);
+expect(
+  resumed.body.id !== abandonedResumeFirst.body.id,
+  "the resumed attempt is a new payment, because the abandoned one never reached the table",
+);
+
+const abandonedHealedFixture = createFixture();
+const abandonedHealedFirst = await createStorePayment(
+  createInput({ key: "checkout-abandoned-2" }),
+  dependenciesOf(abandonedHealedFixture),
+);
+const healedRow = abandonedHealedFixture.state.idempotency_keys[0];
+
+if (healedRow !== undefined) {
+  healedRow["state"] = "in_flight";
+  healedRow["response_status"] = null;
+  healedRow["response_body"] = null;
+  healedRow["completed_at"] = null;
+  healedRow["created_at"] = new Date(startedAt - 400_000).toISOString();
+}
+
+const healed = await createStorePayment(
+  createInput({ key: "checkout-abandoned-2" }),
+  dependenciesOf(abandonedHealedFixture),
+);
+
+expectEqual(healed.status, 201, "a stale in-flight key whose payment was written is answered, not refused");
+expectEqual(healed.replayed, true, "as the replay it is");
+expectEqual(
+  JSON.stringify(healed.body),
+  JSON.stringify(abandonedHealedFirst.body),
+  "byte for byte the answer the first attempt would have given",
+);
+expectEqual(abandonedHealedFixture.state.payments.length, 1, "and no second payment is written, which is the whole point");
+expectEqual(abandonedHealedFixture.state.idempotency_keys[0]?.["state"], "completed", "the key is completed from that payment");
+expectEqual(
+  String(abandonedHealedFixture.state.payments[0]?.["id"]),
+  healed.body.id,
+  "and it names the payment that exists rather than a new one",
+);
+
+const abandonedConflictFixture = createFixture();
+const abandonedConflictFirst = await createStorePayment(
+  createInput({ key: "checkout-abandoned-3" }),
+  dependenciesOf(abandonedConflictFixture),
+);
+
+abandonedConflictFixture.state.payments.length = 0;
+const conflictRow = abandonedConflictFixture.state.idempotency_keys[0];
+
+if (conflictRow !== undefined) {
+  conflictRow["state"] = "in_flight";
+  conflictRow["response_status"] = null;
+  conflictRow["response_body"] = null;
+  conflictRow["completed_at"] = null;
+  conflictRow["created_at"] = new Date(startedAt - 400_000).toISOString();
+}
+
+const abandonedConflict = await refusalOf(async () =>
+  createStorePayment(createInput({ key: "checkout-abandoned-3", amountMinor: 99_00 }), dependenciesOf(abandonedConflictFixture)),
+);
+
+expectEqual(abandonedConflict.code, "IDEMPOTENCY_CONFLICT", "an abandoned key replayed with another body is still a conflict");
+expectEqual(abandonedConflictFixture.state.payments.length, 0, "and nothing is written for it");
+expectEqual(abandonedConflictFirst.body.amount_minor, 12_50, "the first body is what the key remembers");
+
 const spentFixture = createFixture();
 
 spentFixture.state.idempotency_keys.push({
@@ -1266,11 +1372,21 @@ expect(serviceSource.includes("state: \"in_flight\""), "the key is claimed befor
 expect(serviceSource.includes("state: \"completed\""), "and completed with the answer to replay");
 expect(serviceSource.includes("routePayment("), "routing goes through the payment core's engine");
 expect(serviceSource.includes("insertReturning("), "and the payment is written and read back");
+expect(
+  serviceSource.includes("select=id,state,request_hash,created_at"),
+  "the key read carries the moment it was claimed, which is what staleness is measured from",
+);
+expect(serviceSource.includes("settleAbandonedAttempt("), "an in-flight key is settled rather than refused blindly");
+expect(
+  serviceSource.includes("idempotency_key_id=eq.${encodeURIComponent(keyId)}"),
+  "and the decision asks the payments table whether the dead attempt wrote anything",
+);
 expect(!serviceSource.includes("console."), "the service prints nothing");
 
 const fieldsSource = await readFile(new URL("./payment-fields.ts", import.meta.url), "utf8");
 
 expect(!fieldsSource.includes("from \"node:"), "the vocabulary imports no Node builtin");
+expect(fieldsSource.includes("export const API_IDEMPOTENCY_ABANDONED_SECONDS = 300;"), "the staleness window is a named constant, pinned");
 expectEqual(API_PAYMENTS_PATH, `${PUBLIC_API_BASE}/payments`, "the endpoint lives under the public API's version root");
 expectEqual(API_PAYMENTS_PATH, "/api/public/v1/payments", "at the path a store is told to call");
 expectEqual(API_IDEMPOTENCY_HEADER, "idempotency-key", "the key travels in the header the contract names");

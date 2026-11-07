@@ -92,8 +92,9 @@ class KD_Payment_Gateway extends WC_Payment_Gateway {
 	/**
 	 * Whether the gateway may appear.
 	 *
-	 * Five facts, and every one of them would make a payment fail after the customer pressed the button: the setting,
-	 * a saved key, an active connection, the right currency and an order that is not already paid.
+	 * Four facts, and every one of them would make a payment fail after the customer pressed the button: the setting,
+	 * a saved key, an active connection and the right currency. Whether *this* order is already paid is not one of them -
+	 * availability is asked before an order exists - and `process_payment()` answers that one for itself.
 	 */
 	public function is_available(): bool {
 		if ( ! parent::is_available() ) {
@@ -131,9 +132,11 @@ class KD_Payment_Gateway extends WC_Payment_Gateway {
 			return array( 'result' => 'failure' );
 		}
 
-		if ( '' === KD_Connection::api_key() ) {
-			// The order-pay screen can reach this method without `is_available()` ever being asked: the key is checked
-			// here too, because a payment with no credential is a `401` a customer would read as a broken shop.
+		if ( '' === KD_Connection::api_key() || ! KD_Connection::is_active() ) {
+			// The order-pay screen can reach this method without `is_available()` ever being asked, so the two facts
+			// that make a payment possible are checked here as well: a missing key is a `401` a customer would read as
+			// a broken shop, and a revoked or half-finished connection creates a payment whose callback nothing will
+			// answer, leaving the order on hold with no way forward but the store's own order screen.
 			wc_add_notice( __( 'This shop is not connected to the platform yet. Please contact the store.', 'kd-payments' ), 'error' );
 
 			return array( 'result' => 'failure' );

@@ -1416,6 +1416,14 @@ expect(
   gatewayFile.includes("if ( is_string( $existing ) && '' !== $existing )"),
   "a second submit of the same order does not create a second payment",
 );
+// `is_available()` asks the same two questions, so the pin names the order-pay branch itself: a duplicate of the
+// availability check would satisfy a looser string without ever guarding the path that never consults it.
+expect(
+  gatewayFile.includes(
+    "if ( '' === KD_Connection::api_key() || ! KD_Connection::is_active() ) {\n\t\t\t// The order-pay screen",
+  ),
+  "the order-pay path refuses a shop whose connection is not active, so no payment is created for a callback nothing will answer",
+);
 
 expect(
   callbackFile.includes("add_action( 'woocommerce_api_' . self::ROUTE, array( $this, 'handle' ) )"),
@@ -1429,14 +1437,49 @@ expect(
 expect(callbackFile.includes("'Bearer '") && callbackFile.includes("substr( $header, 7 )"), "with the bearer prefix removed");
 expect(
   callbackFile.includes("if ( ! $this->is_authorised() ) {") &&
-    callbackFile.indexOf("is_authorised()") < callbackFile.indexOf("file_get_contents( 'php://input' )"),
+    callbackFile.indexOf("is_authorised()") < callbackFile.indexOf("$raw = $this->read_body();"),
   "and checked before a byte of the body is read",
 );
 expect(callbackFile.includes("const MAXIMUM_BODY_BYTES = 65536;"), "the body has a ceiling, pinned");
 expect(
-  callbackFile.indexOf("strlen( $raw ) > self::MAXIMUM_BODY_BYTES") <
-    callbackFile.indexOf("json_decode( $raw, true )"),
-  "which is checked before the body is parsed",
+  callbackFile.includes("$raw = $this->read_body();") &&
+    callbackFile.indexOf("$raw = $this->read_body();") < callbackFile.indexOf("json_decode( $raw, true )") &&
+    callbackFile.indexOf("if ( null === $raw )") < callbackFile.indexOf("json_decode( $raw, true )"),
+  "and the body is read through that ceiling, before it is parsed",
+);
+expect(
+  callbackFile.includes("$declared > self::MAXIMUM_BODY_BYTES"),
+  "the declared length is refused before a byte is read",
+);
+expect(
+  callbackFile.includes("stream_get_contents( $handle, self::MAXIMUM_BODY_BYTES + 1 )"),
+  "and what is read is bounded by the ceiling rather than measured after the fact",
+);
+expect(
+  callbackFile.indexOf("$declared > self::MAXIMUM_BODY_BYTES") <
+    callbackFile.indexOf("fopen( 'php://input', 'rb' )"),
+  "the declared length is checked first, not after the read it is meant to prevent",
+);
+expect(
+  callbackFile.includes("if ( ! is_string( $raw ) || strlen( $raw ) > self::MAXIMUM_BODY_BYTES ) {"),
+  "and a body that lied about its length is refused after the bounded read",
+);
+expect(
+  !callbackFile.includes("(string) file_get_contents( 'php://input' )"),
+  "nothing reads the whole body before measuring it",
+);
+
+// The three shapes a host may present the bearer token in. The first two are superglobals; the third is the only place
+// a host that fills neither of them leaves it, and a shop on such a host would otherwise refuse every callback.
+expect(
+  callbackFile.includes("isset( $_SERVER['HTTP_AUTHORIZATION'] )") &&
+    callbackFile.includes("isset( $_SERVER['REDIRECT_HTTP_AUTHORIZATION'] )") &&
+    callbackFile.includes("function_exists( 'getallheaders' )"),
+  "the token is read from all three places a server may leave it",
+);
+expect(
+  callbackFile.includes("0 === strcasecmp( $name, 'Authorization' )"),
+  "with the header name matched without case",
 );
 expect(
   callbackFile.includes("array( 'created', 'id', 'object', 'payment', 'store', 'type' )"),
@@ -1513,8 +1556,22 @@ expect(
   "and an order that is already paid is not paid twice",
 );
 expect(
+  callbackFile.includes("if ( $payment_id !== $answered_id ) {"),
+  "the platform's answer is only applied when it is about the payment this callback names",
+);
+expect(
   callbackFile.includes("$order->set_status( 'failed'"),
   "a failed payment fails the order",
+);
+expect(
+  callbackFile.includes("} elseif ( in_array( $status, self::FAILED_STATUSES, true ) ) {\n\t\t\tif ( $order->is_paid() ) {"),
+  "unless the order is already paid, in which case the failure is recorded and the status left alone",
+);
+expect(
+  callbackFile.includes(
+    "$order->add_order_note( sprintf( __( 'The platform reported the payment as %s, but this order is already paid.",
+  ),
+  "because money already taken is not undone by a later notification, only recorded",
 );
 expect(
   callbackFile.includes("$order->update_meta_data( KD_Payment_Gateway::CALLBACK_ID_META, $callback_id );"),

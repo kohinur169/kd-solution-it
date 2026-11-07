@@ -64,6 +64,22 @@ export const API_IDEMPOTENCY_KEY_MAXIMUM_LENGTH = 128;
 export const API_IDEMPOTENCY_TTL_SECONDS = 86_400;
 
 /**
+ * How long an `in_flight` key is trusted to still be running.
+ *
+ * `in_flight` is written by the attempt that is running, and the only thing that moves it is that attempt's own
+ * completion or failure write. A process killed between the two - a deploy, a serverless timeout, a lost connection -
+ * leaves the row exactly there, and `idempotency_keys` has no expiry of its own: nothing deletes an expired row
+ * before the cleanup job of section 27 runs, and that job deletes answers, not attempts. Without a staleness window
+ * the key is stuck for ever, and a store payment's key is derived from its order - so that one checkout could never
+ * be paid again.
+ *
+ * Five minutes: far longer than a request in this tree can live (its own ceiling is seconds), so a genuinely running
+ * attempt can never be mistaken for an abandoned one, and short enough that a merchant's retry succeeds rather than
+ * being told to wait for an operator.
+ */
+export const API_IDEMPOTENCY_ABANDONED_SECONDS = 300;
+
+/**
  * The largest body this endpoint reads.
  *
  * Three fields, so a kilobyte is generous and two is a ceiling a proxy will not silently raise. The route
