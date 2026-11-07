@@ -237,6 +237,14 @@ const IDENTITY_PRIMITIVES = Object.freeze([
   "requireActor",
   "requireAnyRole",
   "requireCompanyId",
+  // STEP 194: a provider's callback cannot name any of the four above, because there is no actor: the
+  // caller is a processor, it holds no cookie and no session, and it identifies itself with an HMAC
+  // signature over the exact bytes of the body. That verification *is* this route's identity check, so the
+  // receiver that performs it is named here instead - the function opens the endpoint's secret from the
+  // settings store, verifies the signature, and refuses with `401` before a single field of the body is
+  // read. A route naming this name without calling it would still have to answer a body it could not
+  // verify, which is why the exemption is worth no more to an attacker than the check it replaces.
+  "receiveDisputeWebhook",
 ]);
 
 /**

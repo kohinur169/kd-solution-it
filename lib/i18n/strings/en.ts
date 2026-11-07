@@ -3426,6 +3426,55 @@ const catalog = {
     staleSave: "Somebody else answered this while the page was open. Reload to read their answer.",
     failed: "That did not go through. Try again, and quote the reference if it keeps happening.",
   },
+  disputes: {
+    /**
+     * STEP 194: section 19's dispute list. The merchant reads what a processor reported against their money
+     * and how far the status has moved; the office reads the same rows as a queue, nearest deadline first.
+     * The response form and the evidence pack are later STEPs, so neither screen offers one.
+     */
+    title: "Disputes",
+    description:
+      "A dispute is money a payer asked their bank to take back. Follow each one here, from the report to the outcome.",
+    listTitle: "Your disputes",
+    listEmpty: "No dispute has been reported against your payments.",
+    queueTitle: "Dispute queue",
+    queueDescription:
+      "Every dispute still waiting for an answer, nearest deadline first. The deadline is the processor's window, not this screen's.",
+    queueEmpty: "No dispute is waiting for an answer.",
+    statusHelp:
+      "The status is the processor's, not this platform's. A dispute moves forward only, and a decided one stays decided.",
+    stateOpen: "Open",
+    stateUnderReview: "Under review",
+    stateEvidenceSubmitted: "Evidence sent",
+    stateWon: "Won",
+    stateLost: "Lost",
+    stateClosed: "Closed",
+    dueOpen: "In time",
+    dueSoon: "Due soon",
+    dueOverdue: "Past the deadline",
+    dueResolved: "Decided",
+    deadlineHelp:
+      "The response window is 24 hours from the moment the processor reported the dispute. The compliance desk sends the evidence pack before it closes.",
+    overdueNote:
+      "The window on this dispute has closed. Nothing is retried from here: the processor decides on what it already has.",
+    nextStepNote:
+      "Writing your side of the dispute and uploading the documents is the next step. This screen tracks the status until then.",
+    referenceRowLabel: "Processor reference",
+    reasonRowLabel: "Reason",
+    amountRowLabel: "Disputed amount",
+    openedRowLabel: "Reported",
+    dueRowLabel: "Deadline",
+    resolvedRowLabel: "Decided",
+    outcomeRowLabel: "Outcome",
+    companyRowLabel: "Merchant",
+    statusRowLabel: "Status",
+    refundQueueLink: "Refund queue",
+    refundDeskLink: "Refund desk",
+    signedOut: "Your session ended. Sign in again.",
+    roleRefusedBody: "Only the account owner can read the disputes of a merchant.",
+    officeRoleRefusedBody: "Only the compliance desk, the finance desk and the leadership read the dispute queue.",
+    failed: "That did not work. Try again.",
+  },
   email: {
     lockAlert: {
       /** Subject of the section 23 alert of section 22: the owner is told their account locked. */

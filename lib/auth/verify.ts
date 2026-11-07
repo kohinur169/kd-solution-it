@@ -12606,12 +12606,45 @@ async function checkCsrfProtection(): Promise<void> {
     .map((file) => file.path.replace("/", "/api/").replace("/api/api/", "/api/").replace(/\/route\.ts$/u, ""))
     .sort();
 
-  expectEqual(postRoutes.length, CSRF_PROTECTED_PATHS.length, "every route that answers a POST is on the protected list");
+  /**
+   * The one kind of mutation that cannot carry a token, and the half of the rule it is held to instead.
+   *
+   * A provider's callback is not a browser: there is no cookie, so there is no ambient credential to forge,
+   * and the caller identifies itself with an HMAC signature over the exact bytes of the body. A token in
+   * `CSRF_PROTECTED_PATHS` would be a token the provider cannot hold, and the route would have to refuse
+   * every real delivery to satisfy this gate - so the two half-rules below are what STEP 194 wrote: the
+   * callbacks are excluded from the equality, and each one is required to verify a signature instead, with
+   * the CSRF guard *absent* so nobody later "fixes" it by adding one. `scripts/verify-audit.mjs` names the
+   * same prefix for the same reason, and the two gates now agree about the same exception.
+   */
+  const WEBHOOK_ROUTE_PREFIX = "/api/webhooks/";
+  const webhookRoutes = postRoutes.filter((path) => path.startsWith(WEBHOOK_ROUTE_PREFIX));
+  const browserPostRoutes = postRoutes.filter((path) => !path.startsWith(WEBHOOK_ROUTE_PREFIX));
+
   expectEqual(
-    postRoutes.join(","),
+    browserPostRoutes.length,
+    CSRF_PROTECTED_PATHS.length,
+    "every route that answers a POST is on the protected list",
+  );
+  expectEqual(
+    browserPostRoutes.join(","),
     [...CSRF_PROTECTED_PATHS].sort().join(","),
     "and the list names exactly those routes",
   );
+
+  for (const path of webhookRoutes) {
+    const callback = appSourceOf(appSources, `${path}/route.ts`);
+
+    expect(callback.length > 0, `${path} exists on disk`);
+    expect(
+      !callback.includes("requireCsrfToken("),
+      `${path} does not ask for a token a provider cannot hold`,
+    );
+    expect(
+      callback.includes("receiveDisputeWebhook"),
+      `${path} verifies the provider's own signature before it reads the body`,
+    );
+  }
 
   /**
    * The source a protected route is judged by: its own file, plus any file it builds its handlers from.
