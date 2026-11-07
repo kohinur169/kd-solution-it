@@ -3355,6 +3355,26 @@ const catalog = {
     signedOut: "Your session ended. Sign in again.",
     deviceRequired: "This device is not verified for a decision. Enrol it and try again.",
     failed: "That did not work. Try again.",
+    /** STEP 192: sending an approved refund back through the provider that took the payment. */
+    execute: "Send to provider",
+    executing: "Sending...",
+    executeHelp:
+      "The money leaves through the provider that took the payment. Nothing else about this refund changes.",
+    executedDone: "Sent. The payment now records the refunded amount.",
+    executionPending: "The provider has it and will answer again. The refund stays in progress.",
+    executionUnanswered:
+      "The provider did not answer. The money may or may not have moved, so nothing is retried here: check the provider's own report.",
+    executionDeclined: "The provider refused the refund. Its reason is on the refund.",
+    executionNotSent: "The provider was not asked, so nothing moved. The refund is approved again.",
+    notExecutable: "Only an approved refund can be sent, and only once.",
+    providerUnsupported: "This payment was taken through a provider that cannot be refunded from here yet.",
+    referenceMissing: "The payment carries no provider transaction to refund against.",
+    amountUnrepresentable: "The provider cannot express this amount, so it was not sent.",
+    providerKeyMissing: "This deployment holds no usable key for that provider in the mode the payment was taken.",
+    providerRefused: "The provider refused the refund request before it was sent.",
+    processedRowLabel: "Sent to provider",
+    providerReferenceLabel: "Provider reference",
+    failureRowLabel: "Provider answer",
   },
   email: {
     lockAlert: {

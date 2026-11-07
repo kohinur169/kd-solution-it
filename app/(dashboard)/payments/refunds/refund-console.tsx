@@ -31,9 +31,11 @@ import { csrfHeaders } from "@/lib/security/csrf-client";
  *
  * ## Why the wallet is not promised here
  *
- * `processing`, `succeeded` and `providerRefundId` arrive from the module that executes the refund. This
- * screen prints them when they are there and never invents them; an approval is the money authorised, not
- * the money sent.
+ * `processing` and `succeeded` arrive from the module that executes the refund (STEP 192). This screen prints
+ * the status the platform recorded and never invents one: an approval is the money authorised, and `succeeded`
+ * is the only status that means the money has gone back. The provider's own reference for the refund stays on
+ * the desk's queue rather than here, because the merchant's question is "has it gone back", not "under which
+ * processor handle".
  */
 
 /** One refund as the list route answers it. The service's own view, mirrored so the browser imports no server code. */

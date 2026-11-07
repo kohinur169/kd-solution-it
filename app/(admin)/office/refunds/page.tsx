@@ -7,6 +7,7 @@ import { listRefundQueue } from "@/services/payments/refund";
 import { getRefundRuntime } from "@/services/payments/refund-runtime";
 import { readOfficeActor } from "../../office-actor";
 import { RefundDecisionForm } from "./refund-decision-form";
+import { RefundExecutionForm } from "./refund-execution-form";
 
 export const metadata: Metadata = {
   title: getMessage("refunds.queueTitle"),
@@ -17,7 +18,7 @@ export const metadata: Metadata = {
 export const dynamic = "force-dynamic";
 
 /**
- * The finance desk's refund queue, at `/office/refunds`.
+ * The finance desk's refund queue, at `/office/refunds`, and the two acts the desk performs on it.
  *
  * ## What an officer needs, in the order they need it
  *
@@ -29,6 +30,11 @@ export const dynamic = "force-dynamic";
  *
  * ## Why the page refuses before it renders
  *
+ * An `approved` row carries the button that sends it back through the provider that took the payment (STEP
+ * 192, `refund-execution-form.tsx`); a `requested` one carries the decision. The two forms are separate because
+ * the two acts are: approving promises the money, executing moves it, and only the second can be declined by a
+ * provider seconds later.
+ *
  * `listRefundQueue` requires `finance_ops` or `super_admin` and throws `PERMISSION_DENIED` for anybody else.
  * The page asks the same function and maps its refusal to a sentence, so an account that reaches this URL
  * without the role reads "only the finance desk decides refunds" rather than an empty queue that looks like
@@ -36,8 +42,9 @@ export const dynamic = "force-dynamic";
  *
  * ## What is not here
  *
- * Paying the money out. An approval authorises the refund; the provider call, the `processing` status and the
- * processor's answer are STEP 192's, and the platform-fee rule on a refund is STEP 193's.
+ * The platform fee on a refund, which is STEP 193's setting and leaves `platform_fee_returned` false and
+ * `platform_fee_returned_minor` zero. Nor a retry of a call the provider never answered: that row stays
+ * `processing` and belongs to the reconciliation the desk does by hand until a later STEP automates it.
  */
 type QueueState =
   | { readonly kind: "signed-out" }
@@ -193,7 +200,31 @@ export default async function RefundQueuePage(): Promise<ReactNode> {
                     <p className={reasonClasses}>{refund.reason}</p>
                   </div>
 
+                  {refund.processedAt === null ? null : (
+                    <p className={bodyClasses}>
+                      {`${getMessage("refunds.processedRowLabel")} ${formatInstant(refund.processedAt)}`}
+                    </p>
+                  )}
+
+                  {refund.providerRefundId === null ? null : (
+                    <p className={bodyClasses}>
+                      {`${getMessage("refunds.providerReferenceLabel")} `}
+                      <span className="tabular-nums text-foreground">{refund.providerRefundId}</span>
+                    </p>
+                  )}
+
+                  {refund.failureDetail === null ? null : (
+                    <div>
+                      <p className="text-sm font-medium text-foreground">
+                        {getMessage("refunds.failureRowLabel")}
+                      </p>
+                      <p className={reasonClasses}>{refund.failureDetail}</p>
+                    </div>
+                  )}
+
                   {refund.status === "requested" ? <RefundDecisionForm refundId={refund.id} /> : null}
+
+                  {refund.status === "approved" ? <RefundExecutionForm refundId={refund.id} /> : null}
                 </li>
               ))}
             </ul>

@@ -12775,11 +12775,14 @@ async function checkCsrfProtection(): Promise<void> {
   // withdraws a request, and the finance desk's decision form, which approves or rejects on one route.
   // With the client-component filter above in place, the files arrive at fifty and the call sites at sixty
   // nine.
-  expectEqual(browserMutations.length, 50, "fifty browser files send a mutation");
+  //
+  // STEP 192 adds one more file and one more call: the finance desk's execution form, which sends one approved
+  // refund back through the provider that took the payment - one button, one route, one token.
+  expectEqual(browserMutations.length, 51, "fifty one browser files send a mutation");
   expectEqual(
     browserMutations.reduce((total, path) => total + mutationCalls(appSourceOf(appSources, path)), 0),
-    69,
-    "across sixty nine call sites",
+    70,
+    "across seventy call sites",
   );
   const postCalls = mutationCalls;
   const tokenSpreads = (source: string): number =>

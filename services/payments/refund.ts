@@ -75,7 +75,13 @@ export interface RefundDependencies {
   readonly now?: () => number;
 }
 
-/** One refund, as a screen prints it. */
+/**
+ * One refund, as a screen prints it.
+ *
+ * STEP 192 reads and moves the same rows from `refund-execution.ts`, so the projection, the column list, the
+ * tenant-scoped read and the guarded write below are exported rather than copied: a second copy of the guard is
+ * how one caller ends up able to move a row another caller cannot.
+ */
 export interface RefundView {
   readonly id: string;
   readonly companyId: string;
@@ -120,7 +126,7 @@ export interface RefundablePaymentView {
  * `refunds_guard_amount` reads the payment's own amount and currency at the database, so this module never
  * needs a `*` anywhere: a refund view is these sixteen columns and nothing else.
  */
-const REFUND_ROW_COLUMNS =
+export const REFUND_ROW_COLUMNS =
   "select=id,company_id,payment_id,amount_minor,currency,status,reason,requested_by,approved_by,decided_at" +
   ",processed_at,provider_refund_id,platform_fee_returned,platform_fee_returned_minor,failure_detail" +
   ",created_at,updated_at,version";
@@ -128,7 +134,7 @@ const REFUND_ROW_COLUMNS =
 const PAYMENT_ROW_COLUMNS =
   "select=id,company_id,invoice_id,amount_minor,currency,refunded_minor,status,captured_at,settled_at,created_at";
 
-const refundRowSchema = z.object({
+export const refundRowSchema = z.object({
   id: z.string().uuid(),
   company_id: z.string().uuid(),
   payment_id: z.string().uuid(),
@@ -149,7 +155,7 @@ const refundRowSchema = z.object({
   version: z.number(),
 });
 
-type RefundRow = z.infer<typeof refundRowSchema>;
+export type RefundRow = z.infer<typeof refundRowSchema>;
 
 const paymentRowSchema = z.object({
   id: z.string().uuid(),
@@ -173,7 +179,7 @@ const heldRowSchema = z.object({
 });
 
 /** A refund row as a screen prints it. One function, so the service and the routes agree. */
-function viewOf(row: RefundRow): RefundView {
+export function viewOf(row: RefundRow): RefundView {
   return {
     id: row.id,
     companyId: row.company_id,
@@ -197,7 +203,7 @@ function viewOf(row: RefundRow): RefundView {
 }
 
 /** One audit entry, written or not: a chain that is down never fails the act it records. */
-async function appendTolerated(audit: AuditTrail, entry: AuditEntry): Promise<void> {
+export async function appendTolerated(audit: AuditTrail, entry: AuditEntry): Promise<void> {
   try {
     await audit.append(entry);
   } catch {
@@ -211,7 +217,7 @@ function listOf(statuses: readonly string[]): string {
 }
 
 /** Read one refund by id, optionally scoped to a merchant. */
-async function findRefund(
+export async function findRefund(
   dependencies: RefundDependencies,
   id: string,
   companyId: string | null,
@@ -396,7 +402,7 @@ export async function requestRefund(
  * won the race has already spent this version, so a caller whose update matched nothing is told the refund
  * moved rather than being handed a row somebody else decided.
  */
-async function moveRefund(
+export async function moveRefund(
   dependencies: RefundDependencies,
   row: RefundRow,
   values: Readonly<Record<string, unknown>>,
