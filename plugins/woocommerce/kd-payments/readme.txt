@@ -30,7 +30,9 @@ five things and nothing else:
    asks the platform for the payment's real status, and then moves the order. A redelivered callback changes nothing.
 
 The store's domain is read from the site itself rather than typed, so a merchant cannot connect a shop that is not this
-one. The gateway is available only when the store is connected, the key is saved and the shop trades in USD - the one
+one. The shop must live at the root of its domain: the platform derives the callback address from the domain alone, so a
+WordPress installed under a subdirectory answers at a different address and the handshake says so instead of connecting a
+shop no callback could reach. The gateway is available only when the store is connected, the key is saved and the shop trades in USD - the one
 currency the platform's public API accepts - because a silent conversion is a wrong amount on a real customer's card.
 
 == Installation ==
@@ -57,6 +59,10 @@ small JSON body naming the payment. This plugin:
 
 If the platform cannot be reached the endpoint answers `503`, which asks the platform to try again. If no order matches
 the payment it answers `200` with `handled: false`, so the platform does not retry a callback this shop can never use.
+
+**Send a test callback** on the plugin's screen asks the platform to call this shop about the newest payment it created,
+so a merchant can see the whole round trip - the request, the store token, the platform's own status read and the answer -
+without waiting for a real payment. It never marks an order paid.
 
 == Frequently Asked Questions ==
 

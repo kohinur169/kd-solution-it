@@ -1271,6 +1271,51 @@ expect(runtimeSource.includes("openSecret(masterKey, box, context)"), "the runti
 expect(serviceSource.includes("credentialSecretContext(credential.company_id)"), "and only under the tenant's own context");
 expect(!runtimeSource.includes("console."), "the runtime prints nothing");
 
+// The seam a later STEP calls. Nothing in this range can fire an event - no code moves a payment's state yet - so
+// these two functions are the whole wiring: the bootstrap registers the handler, and whatever transition arrives
+// schedules through the service. Pinned so a later edit cannot quietly drop the seam and leave the job unreachable.
+expect(
+  runtimeSource.includes("export function registerStoreWebhookJobOnPlatform(): boolean {") &&
+    runtimeSource.includes("return registerStoreWebhookJob(getJobRuntime().registry, getStoreWebhookRuntime());"),
+  "the platform registers this job through one named function",
+);
+expect(
+  runtimeSource.includes("export function getStoreWebhookScheduleRuntime(): StoreWebhookScheduleDependencies {") &&
+    runtimeSource.includes("queue: getJobRuntime().queue,"),
+  "and schedules through the process-wide queue, so a request cannot mint its own",
+);
+
+// A route that registered the job itself would register it once per request against a fresh registry; the seam is
+// the only place allowed to, which is what keeps the handler single.
+const appFiles = await listSourceFiles(new URL("../../app", import.meta.url).pathname);
+
+for (const file of appFiles) {
+  const source = await readFile(file, "utf8");
+
+  expect(
+    !source.includes("registerStoreWebhookJob("),
+    `${file.slice(file.indexOf("/app/") + 1)} registers no job of its own`,
+  );
+}
+
+/** Every `.ts`/`.tsx` file under a directory, without following a directory symlink. */
+async function listSourceFiles(root: string): Promise<string[]> {
+  const entries = await readdir(root, { withFileTypes: true });
+  const files: string[] = [];
+
+  for (const entry of entries) {
+    const path = `${root}/${entry.name}`;
+
+    if (entry.isDirectory()) {
+      files.push(...(await listSourceFiles(path)));
+    } else if (entry.isFile() && (entry.name.endsWith(".ts") || entry.name.endsWith(".tsx"))) {
+      files.push(path);
+    }
+  }
+
+  return files.sort();
+}
+
 function maximumOf(source: string): boolean {
   return source.includes("export const STORE_WEBHOOK_MAXIMUM_ATTEMPTS = 5;");
 }

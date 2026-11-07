@@ -1461,19 +1461,36 @@ expect(
 // ---------------------------------------------------------------------------------------------
 
 const pluginRoot = new URL("../../plugins/woocommerce/kd-payments/", import.meta.url);
-const phpFiles = [
+const ownFiles = [
   "kd-payments.php",
   "includes/class-kd-api-client.php",
   "includes/class-kd-connection.php",
   "includes/class-kd-settings.php",
 ];
+/**
+ * Every PHP file in the package, listed rather than typed out.
+ *
+ * The four files below are the ones this STEP wrote, and they are asserted to exist. The safety loop that follows,
+ * however, runs over **everything in the directory**: a later STEP adds files to this package (STEP 209 added two), and
+ * a gate that only checked a hardcoded list would quietly stop covering the plugin the moment somebody else touched it.
+ */
+const pluginFiles = await listPluginFiles(pluginRoot);
 const pluginSources = new Map<string, string>();
 
-for (const file of phpFiles) {
+for (const file of pluginFiles) {
   pluginSources.set(file, await readFile(new URL(file, pluginRoot), "utf8"));
 }
 
-expect(pluginSources.size === 4, "the plugin is four PHP files");
+for (const file of ownFiles) {
+  expect(pluginFiles.includes(file), `${file} is one of the four files this STEP wrote`);
+}
+
+expect(pluginFiles.length >= ownFiles.length, "and the package holds at least them");
+expect(
+  pluginFiles.every((file) => file.endsWith(".php")),
+  "the listing is PHP only, so the safety loop below checks exactly the executable surface",
+);
+expect(pluginFiles.includes("readme.txt") === false, "and does not try to parse the readme as code");
 
 const readme = await readFile(new URL("readme.txt", pluginRoot), "utf8");
 
@@ -1563,10 +1580,18 @@ const settingsFile = pluginSources.get("includes/class-kd-settings.php") ?? "";
 expect(settingsFile.includes("const CAPABILITY = 'manage_woocommerce'"), "the screen is for store managers");
 expect(settingsFile.includes("check_admin_referer( self::NONCE_ACTION, self::NONCE_FIELD )"), "the nonce is checked");
 expect(settingsFile.includes("wp_nonce_field( self::NONCE_ACTION, self::NONCE_FIELD )"), "and printed in every form");
+const formCount = (settingsFile.match(/<form /gu) ?? []).length;
+const nonceFieldCount = (settingsFile.match(/wp_nonce_field\(/gu) ?? []).length;
+
+expect(
+  formCount >= 4,
+  "the screen has at least the four forms this STEP wrote: key, connect, refresh, disconnect",
+);
 expectEqual(
-  (settingsFile.match(/wp_nonce_field\(/gu) ?? []).length,
-  4,
-  "once per form, and there are four",
+  nonceFieldCount,
+  formCount,
+  "and every form that posts a state change prints its own nonce - an equality, so a later STEP adding a form cannot " +
+    "add one without its nonce",
 );
 expectEqual(
   (settingsFile.match(/check_admin_referer\(/gu) ?? []).length,
@@ -1577,9 +1602,14 @@ for (const handler of ["handle_save_key", "handle_connect", "handle_refresh", "h
   expect(settingsFile.includes(`function ${handler}()`), `${handler} is a handler`);
 }
 
-expect(
-  (settingsFile.match(/\$this->authorise\(\);/gu) ?? []).length === 4,
-  "and every handler authorises before it acts",
+const handlerCount = (settingsFile.match(/public function handle_[a-z_]+\(\): void \{/gu) ?? []).length;
+const authoriseCount = (settingsFile.match(/\$this->authorise\(\);/gu) ?? []).length;
+
+expect(handlerCount >= 4, "the screen has at least the four handlers this STEP wrote");
+expectEqual(
+  authoriseCount,
+  handlerCount,
+  "and every handler authorises before it acts - an equality, so a handler added later must authorise too",
 );
 expect(
   settingsFile.indexOf("if ( ! current_user_can( self::CAPABILITY ) )") <
@@ -1613,6 +1643,28 @@ expect(settingsFile.includes("get_current_user_id()"), "and per user");
 expect(settingsFile.includes("delete_transient("), "and cleared once shown");
 
 // ---------------------------------------------------------------------------------------------
+
+/**
+ * Every `.php` file under a plugin directory, relative to it and sorted.
+ *
+ * Written as a walk rather than a list because a plugin's files are its surface: the moment a file is added and the walk
+ * does not find it, the safety checks below stop applying to it silently.
+ */
+async function listPluginFiles(root: URL): Promise<readonly string[]> {
+  const files: string[] = [];
+
+  for (const entry of await readdir(root, { withFileTypes: true })) {
+    if (entry.isDirectory()) {
+      for (const nested of await listPluginFiles(new URL(`${entry.name}/`, root))) {
+        files.push(`${entry.name}/${nested}`);
+      }
+    } else if (entry.name.endsWith(".php")) {
+      files.push(entry.name);
+    }
+  }
+
+  return files.sort();
+}
 
 /**
  * The depth of every bracket, brace and parenthesis in a PHP file, ignoring strings and comments.

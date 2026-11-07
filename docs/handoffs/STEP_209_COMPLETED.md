@@ -238,3 +238,31 @@ transport, because a real database and a real shop are not available in this env
    and also installed the plugin receives both, about the same payment, with different proofs and different bodies. A
    later STEP may want to suppress one when the other is configured; today the plugin's dedupe makes the second
    harmless, and the plan says nothing either way.
+
+---
+
+## Audit addendum (2026-11-07) — the sweep over STEPs 181 to 209
+
+The instruction after this STEP was to check every STEP in the 181 to 209 range for a defect or a gap.
+Full record: **`docs/AUDIT_181_209.md`**. What changed for *this* STEP:
+
+1. **A test a merchant can press** — the gap above said a merchant could not see the path work before a real customer
+   paid. The screen now has **Send a test callback** (`handle_test_callback()`, its own nonce and capability check),
+   which asks `KD_Connection::test_callback()` to find the newest payment this shop created through the gateway's own
+   meta and asks `KD_Api_Client::request_callback()` to have the platform call this shop about it. It reports the
+   platform's `delivered` and `rule`, and it **never marks an order paid**: only the endpoint may, and only after asking
+   the platform. Nine gate checks and four mutations cover it.
+2. **Gap 4 is now refused instead of mis-connected** — `install_path()` reads the path from `home_url()`, and
+   `connect()` refuses a shop installed in a subdirectory before it sends the handshake, because the derived address
+   `https://{domain}/?wc-api=…` cannot reach `/blog/?wc-api=…`. A path column is still the real fix and still a
+   migration; until then the failure is stated, not silent.
+3. **The plugin's order lookup could pay the wrong customer** — `order_of()` used `meta_query` alone, which WooCommerce's
+   legacy post store silently ignores, so the endpoint would have moved the newest order on a callback naming a different
+   payment. It now asks both ways and verifies every candidate with `get_meta()`. This was the worst defect in the range
+   and it failed silently.
+4. **Ambiguity was permanent** — `connectionOf()` counted every row, and `0035` never deletes a revoked one, so a merchant
+   who moved shops was refused `409 connection_ambiguous` for good. It counts active rows now, and answers
+   `connection_missing`, `connection_revoked` or `connection_not_active` in the order a merchant can act on.
+5. **Carried gap 2 is unchanged and now guarded** — nothing in this tree moves a store payment's state, so nothing can
+   schedule a callback (or a STEP 205 webhook). The seam a later STEP calls is pinned by `verify-store-webhooks`, so the
+   job cannot quietly become unreachable and no route can register it for itself.

@@ -103,8 +103,8 @@ export function storeCallbackTypeOf(status: (typeof API_STORE_PAYMENT_STATUSES)[
 /**
  * The reasons a callback is not delivered.
  *
- * Three of them are the **connection's** - there is none, it is not active, or it was revoked - and they are the only
- * ones a merchant can fix. `store_endpoint_invalid` is a domain that cannot be called (a private host, a host with a
+ * Four of them are the **connection's** - there is none, none is active, the only one was revoked, or two active ones
+ * make the shop unknowable - and they are the only ones a merchant can fix. `store_endpoint_invalid` is a domain that cannot be called (a private host, a host with a
  * port, anything the URL validator refuses). `connection_token_unavailable` is a box that will not open: a platform
  * fault, never a report about the shop. The store-side rules are STEP 205's own, imported rather than repeated.
  */
@@ -112,6 +112,7 @@ export const STORE_CALLBACK_RULES = Object.freeze({
   connectionMissing: "connection_missing",
   connectionNotActive: "connection_not_active",
   connectionRevoked: "connection_revoked",
+  connectionAmbiguous: "connection_ambiguous",
   connectionTokenUnavailable: "connection_token_unavailable",
   storeEndpointInvalid: "store_endpoint_invalid",
   bodyTooLarge: "body_too_large",

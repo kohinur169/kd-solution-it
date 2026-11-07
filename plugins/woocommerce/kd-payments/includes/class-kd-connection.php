@@ -35,6 +35,21 @@ class KD_Connection {
 		return $host;
 	}
 
+	/**
+	 * The path this WordPress is installed under, with the slashes trimmed - empty at a domain root.
+	 *
+	 * The platform derives a shop's callback address from the domain alone (`https://{domain}/?wc-api=kd_payments_callback`),
+	 * because a connection row stores a bare host and this STEP does not add a path column. A shop installed at
+	 * `https://example.com/shop/` answers only at `https://example.com/shop/?wc-api=...`, so the derived address would
+	 * 404 on every payment. The handshake refuses such a site rather than connecting it to a callback it cannot receive.
+	 */
+	public static function install_path(): string {
+		$path = wp_parse_url( home_url(), PHP_URL_PATH );
+		$path = is_string( $path ) ? trim( $path, '/' ) : '';
+
+		return $path;
+	}
+
 	/** The API key the merchant saved, or an empty string. */
 	public static function api_key(): string {
 		$key = get_option( self::API_KEY_OPTION, '' );
@@ -123,6 +138,13 @@ class KD_Connection {
 			);
 		}
 
+		if ( '' !== self::install_path() ) {
+			return array(
+				'ok'      => false,
+				'message' => __( 'This WordPress is installed in a subdirectory. The platform calls a shop at its domain root, so a callback to this site would not arrive. Move the shop to the root of its domain before connecting.', 'kd-payments' ),
+			);
+		}
+
 		$answer = $client->connect( $domain, self::store_token() );
 
 		return $this->remember( $answer, __( 'Connected.', 'kd-payments' ) );
@@ -155,6 +177,102 @@ class KD_Connection {
 		}
 
 		return $this->remember( $answer, __( 'Status refreshed.', 'kd-payments' ) );
+	}
+
+	/**
+	 * The newest payment this shop created, so the screen can offer to test a callback against a real one.
+	 *
+	 * The shop is the only party that knows which payments it made - the platform would need a store reference on the
+	 * payment row to answer this, and STEP 203's row has none - so the search starts here, over this shop's own orders.
+	 *
+	 * @return array{payment_id: string, order_id: int}|null
+	 */
+	public static function newest_payment(): ?array {
+		$orders = wc_get_orders(
+			array(
+				'limit'   => 10,
+				'return'  => 'objects',
+				'orderby' => 'date',
+				'order'   => 'DESC',
+				'status'  => array( 'on-hold', 'pending', 'processing', 'completed' ),
+			)
+		);
+
+		foreach ( $orders as $order ) {
+			if ( ! $order instanceof WC_Order ) {
+				continue;
+			}
+
+			$payment_id = (string) $order->get_meta( KD_Payment_Gateway::PAYMENT_ID_META );
+
+			if ( '' !== $payment_id ) {
+				return array(
+					'payment_id' => $payment_id,
+					'order_id'   => $order->get_id(),
+				);
+			}
+		}
+
+		return null;
+	}
+
+	/**
+	 * Ask the platform to call this shop about the newest payment, and say what happened.
+	 *
+	 * A merchant's own test of the callback: the platform makes the real request, to the real address, with the real
+	 * store token. The answer's `delivered` and `rule` are what the screen repeats - and nothing here marks an order
+	 * paid, because only the callback endpoint may do that, and only after asking the platform.
+	 *
+	 * @return array{ok: bool, message: string}
+	 */
+	public function test_callback(): array {
+		$client = $this->client();
+
+		if ( null === $client ) {
+			return array(
+				'ok'      => false,
+				'message' => __( 'Add your API key before testing the callback.', 'kd-payments' ),
+			);
+		}
+
+		$newest = self::newest_payment();
+
+		if ( null === $newest ) {
+			return array(
+				'ok'      => false,
+				'message' => __( 'No order has a platform payment yet, so there is nothing to call this shop about.', 'kd-payments' ),
+			);
+		}
+
+		$answer = $client->request_callback( $newest['payment_id'] );
+
+		if ( ! $answer['ok'] ) {
+			return array(
+				'ok'      => false,
+				'message' => $this->sentence_for( $answer['status'], $answer['error'] ),
+			);
+		}
+
+		$delivered = isset( $answer['body']['delivered'] ) && true === $answer['body']['delivered'];
+		$rule      = isset( $answer['body']['rule'] ) && is_string( $answer['body']['rule'] ) ? $answer['body']['rule'] : '';
+
+		if ( $delivered ) {
+			return array(
+				'ok'      => true,
+				'message' => __( 'The platform called this shop and it answered. The callback path works.', 'kd-payments' ),
+			);
+		}
+
+		return array(
+			'ok'      => false,
+			'message' => '' === $rule
+				? __( 'The platform could not deliver the callback to this shop.', 'kd-payments' )
+				: sprintf(
+					/* translators: %s: the platform's machine word for what went wrong. */
+					__( 'The platform could not deliver the callback to this shop (%s).', 'kd-payments' ),
+					$rule
+				),
+		);
 	}
 
 	/**

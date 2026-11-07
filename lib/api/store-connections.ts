@@ -7,7 +7,6 @@ import type { SecretBox } from "../auth/secrets.ts";
 import { AppError, type ErrorDetail } from "../errors/app-error.ts";
 import type { ApiPrincipal } from "./public-fields.ts";
 import {
-  API_WOOCOMMERCE_CONNECTION_PATH,
   STORE_CONNECTION_AUDIT,
   STORE_CONNECTION_BODY_FIELD,
   STORE_CONNECTION_BODY_MAXIMUM_BYTES,
@@ -722,9 +721,4 @@ export async function disconnectWooCommerceStore(
   });
 
   return viewOf(written);
-}
-
-/** The path a plugin calls, so a test and a document build the same string. */
-export function wooCommerceConnectionPath(): string {
-  return API_WOOCOMMERCE_CONNECTION_PATH;
 }

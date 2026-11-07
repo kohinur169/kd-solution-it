@@ -44,6 +44,7 @@ class KD_Settings {
 		add_action( 'admin_post_kd_payments_save_key', array( $this, 'handle_save_key' ) );
 		add_action( 'admin_post_kd_payments_connect', array( $this, 'handle_connect' ) );
 		add_action( 'admin_post_kd_payments_refresh', array( $this, 'handle_refresh' ) );
+		add_action( 'admin_post_kd_payments_test_callback', array( $this, 'handle_test_callback' ) );
 		add_action( 'admin_post_kd_payments_disconnect', array( $this, 'handle_disconnect' ) );
 	}
 
@@ -155,6 +156,12 @@ class KD_Settings {
 							</form>
 
 							<?php if ( $is_active ) : ?>
+								<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" style="display:inline-block;margin-right:8px;">
+									<input type="hidden" name="action" value="kd_payments_test_callback" />
+									<?php wp_nonce_field( self::NONCE_ACTION, self::NONCE_FIELD ); ?>
+									<?php submit_button( __( 'Send a test callback', 'kd-payments' ), 'secondary', 'submit', false ); ?>
+								</form>
+
 								<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" style="display:inline-block;">
 									<input type="hidden" name="action" value="kd_payments_disconnect" />
 									<?php wp_nonce_field( self::NONCE_ACTION, self::NONCE_FIELD ); ?>
@@ -201,6 +208,22 @@ class KD_Settings {
 		$this->authorise();
 
 		$result = $this->connection->refresh();
+
+		$this->finish( $result['ok'], $result['message'] );
+	}
+
+	/**
+	 * Test the callback path.
+	 *
+	 * The platform is asked to call this shop about the newest payment the shop created, so a merchant can see the whole
+	 * round trip - the platform's request, the store token this shop compares, the platform's own status read, and the
+	 * answer - without waiting for a real payment to change state. Nothing here marks an order paid: only the callback
+	 * endpoint may do that, and only after asking the platform.
+	 */
+	public function handle_test_callback(): void {
+		$this->authorise();
+
+		$result = $this->connection->test_callback();
 
 		$this->finish( $result['ok'], $result['message'] );
 	}

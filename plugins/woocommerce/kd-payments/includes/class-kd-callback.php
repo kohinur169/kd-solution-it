@@ -199,16 +199,40 @@ class KD_Callback {
 	}
 
 	/**
-	 * The order this shop created the payment for.
+	 * The order this shop created the payment for, or null.
 	 *
-	 * Found through the meta the gateway wrote, never through anything the body names.
+	 * ## Why the result is verified rather than trusted
+	 *
+	 * WooCommerce has two order stores and they do not answer the same arguments: the high performance tables document
+	 * `meta_query`, and a legacy post store answers `meta_key`/`meta_value`. A query the active store does not
+	 * understand is not an error - it is **silently ignored**, and an ignored filter returns the newest orders instead
+	 * of the one this callback is about. Paying the wrong customer's order is the worst thing this endpoint could do,
+	 * so every candidate is checked against the payment id the gateway actually wrote and anything else is discarded.
 	 *
 	 * @param string $payment_id The platform's payment id.
 	 */
 	private function order_of( string $payment_id ): ?WC_Order {
-		$orders = wc_get_orders(
+		foreach ( $this->candidate_orders( $payment_id ) as $order ) {
+			if ( $payment_id === (string) $order->get_meta( KD_Payment_Gateway::PAYMENT_ID_META ) ) {
+				return $order;
+			}
+		}
+
+		return null;
+	}
+
+	/**
+	 * What the two documented queries offer as candidates, newest first, without duplicates.
+	 *
+	 * Both are asked only until one answers, and neither answer is used without being verified by the caller.
+	 *
+	 * @param string $payment_id The platform's payment id.
+	 * @return array<int, WC_Order>
+	 */
+	private function candidate_orders( string $payment_id ): array {
+		$queries = array(
 			array(
-				'limit'      => 1,
+				'limit'      => 5,
 				'return'     => 'objects',
 				'orderby'    => 'date',
 				'order'      => 'DESC',
@@ -219,16 +243,32 @@ class KD_Callback {
 						'compare' => '=',
 					),
 				),
-			)
+			),
+			array(
+				'limit'        => 5,
+				'return'       => 'objects',
+				'orderby'      => 'date',
+				'order'        => 'DESC',
+				'meta_key'     => KD_Payment_Gateway::PAYMENT_ID_META,
+				'meta_value'   => $payment_id,
+				'meta_compare' => '=',
+			),
 		);
+		$candidates = array();
 
-		foreach ( $orders as $order ) {
-			if ( $order instanceof WC_Order ) {
-				return $order;
+		foreach ( $queries as $args ) {
+			foreach ( wc_get_orders( $args ) as $order ) {
+				if ( $order instanceof WC_Order ) {
+					$candidates[ $order->get_id() ] = $order;
+				}
+			}
+
+			if ( array() !== $candidates ) {
+				break;
 			}
 		}
 
-		return null;
+		return array_values( $candidates );
 	}
 
 	/**

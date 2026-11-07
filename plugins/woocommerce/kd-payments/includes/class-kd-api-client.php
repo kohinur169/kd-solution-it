@@ -48,6 +48,11 @@ class KD_Api_Client {
 		return $this->payments_url() . '/' . rawurlencode( $payment_id );
 	}
 
+	/** The URL that asks the platform to call this shop about one payment. */
+	public function callback_url( string $payment_id ): string {
+		return $this->payment_url( $payment_id ) . '/callback';
+	}
+
 	/**
 	 * Activate the connection.
 	 *
@@ -133,6 +138,20 @@ class KD_Api_Client {
 	 */
 	public function payment_status( string $payment_id ): array {
 		return $this->request( 'GET', $this->payment_url( $payment_id ) );
+	}
+
+	/**
+	 * Ask the platform to call this shop about one payment, now.
+	 *
+	 * This is the merchant's own test of the whole path - the platform's `POST` to the shop's endpoint, the store token
+	 * the shop will compare, and the shop's answer - without waiting for a real payment to change state. The platform
+	 * reports what the shop did, so the screen can say whether the integration works.
+	 *
+	 * @param string $payment_id The payment the callback is about.
+	 * @return array{ok: bool, status: int, body: array<string, mixed>, error: string, replayed: bool}
+	 */
+	public function request_callback( string $payment_id ): array {
+		return $this->request( 'POST', $this->callback_url( $payment_id ) );
 	}
 
 	/**

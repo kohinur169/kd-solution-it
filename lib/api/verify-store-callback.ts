@@ -681,7 +681,7 @@ for (const [connections, rule, description] of [
   [
     [connectionRow(storeDomain, { id: uuidOf(1) }), connectionRow(secondDomain, { id: uuidOf(6) })],
     "connection_ambiguous",
-    "two shops on one tenant",
+    "two active shops on one tenant",
   ],
 ] as readonly [readonly Row[], string, string][]) {
   const fixture = createFixture();
@@ -699,6 +699,70 @@ for (const [connections, rule, description] of [
     `${description}: and the refusal is in the chain`,
   );
 }
+
+const revokedBesideActiveFixture = createFixture();
+
+revokedBesideActiveFixture.state.connections = [
+  connectionRow(storeDomain),
+  connectionRow(revokedDomain, { id: uuidOf(2), status: "revoked", revoked_at: instantIso }),
+];
+
+const revokedBesideActive = await deliverStoreCallback(
+  inputOf(),
+  dependenciesOf(revokedBesideActiveFixture),
+);
+
+expectEqual(
+  revokedBesideActive.delivered,
+  true,
+  "a revoked shop beside a live one is one usable shop, because a revoked row is never deleted and must not block the live one",
+);
+expectEqual(
+  revokedBesideActive.endpoint_host,
+  storeDomain,
+  "and the callback goes to the shop that is still connected",
+);
+expectEqual(
+  revokedBesideActiveFixture.sent.length,
+  1,
+  "so every merchant who ever moved shops can still be called",
+);
+
+const pendingBesideActiveFixture = createFixture();
+
+pendingBesideActiveFixture.state.connections = [
+  connectionRow(storeDomain),
+  connectionRow(pendingDomain, { id: uuidOf(3), status: "pending", connected_at: null }),
+];
+
+const pendingBesideActive = await deliverStoreCallback(
+  inputOf(),
+  dependenciesOf(pendingBesideActiveFixture),
+);
+
+expectEqual(
+  pendingBesideActive.delivered,
+  true,
+  "a half-finished install beside a live one does not make the tenant ambiguous either",
+);
+
+const twoActiveFixture = createFixture();
+
+twoActiveFixture.state.connections = [
+  connectionRow(storeDomain, { id: uuidOf(1) }),
+  connectionRow(secondDomain, { id: uuidOf(6) }),
+];
+
+const twoActiveRefusal = await refusalOf(async () =>
+  deliverStoreCallback(inputOf(), dependenciesOf(twoActiveFixture)),
+);
+
+expectEqual(
+  twoActiveRefusal.rule,
+  STORE_CALLBACK_RULES.connectionAmbiguous,
+  "only two active shops are ambiguous",
+);
+expectEqual(STORE_CALLBACK_RULES.connectionAmbiguous, "connection_ambiguous", "and the rule is a word, pinned");
 
 const shopifyFixture = createFixture();
 
@@ -1262,6 +1326,7 @@ for (const [file, source] of pluginSources) {
 }
 
 const mainFile = pluginSources.get("kd-payments.php") ?? "";
+const connectionFile = pluginSources.get("includes/class-kd-connection.php") ?? "";
 const clientFile = pluginSources.get("includes/class-kd-api-client.php") ?? "";
 const gatewayFile = pluginSources.get("includes/class-kd-payment-gateway.php") ?? "";
 const callbackFile = pluginSources.get("includes/class-kd-callback.php") ?? "";
@@ -1402,6 +1467,24 @@ expect(
   "the order is found through the meta the gateway wrote, never through anything the body names",
 );
 expect(
+  callbackFile.includes("'meta_key'     => KD_Payment_Gateway::PAYMENT_ID_META,"),
+  "and asked twice, because WooCommerce's two order stores do not answer the same argument",
+);
+expect(
+  callbackFile.includes(
+    "if ( $payment_id === (string) $order->get_meta( KD_Payment_Gateway::PAYMENT_ID_META ) ) {",
+  ),
+  "while every candidate is verified against the payment id before it is used",
+);
+expect(
+  callbackFile.includes("if ( array() !== $candidates ) {"),
+  "and the second query is only asked when the first offers nothing",
+);
+expect(
+  !callbackFile.includes("return $orders[0]") && !callbackFile.includes("$orders[0]"),
+  "nothing takes the first row a query returned without checking it",
+);
+expect(
   callbackFile.includes("if ( $callback_id === $order->get_meta( KD_Payment_Gateway::CALLBACK_ID_META ) ) {"),
   "a callback already applied is not applied again",
 );
@@ -1455,6 +1538,76 @@ expect(
     !callbackFile.includes("error_log") &&
     !callbackFile.includes("file_put_contents"),
   "and it writes no secret anywhere",
+);
+
+// --- the merchant's own test of the whole path -------------------------------------------------
+
+const settingsFile = pluginSources.get("includes/class-kd-settings.php") ?? "";
+
+expect(
+  clientFile.includes("public function request_callback( string $payment_id ): array"),
+  "the client can ask the platform to call this shop",
+);
+expect(
+  clientFile.includes("return $this->payment_url( $payment_id ) . '/callback';"),
+  "on the resource this STEP added, pinned",
+);
+expect(
+  settingsFile.includes("add_action( 'admin_post_kd_payments_test_callback', array( $this, 'handle_test_callback' ) );"),
+  "the screen has a handler for it",
+);
+expect(
+  settingsFile.includes("public function handle_test_callback(): void {") &&
+    settingsFile.includes("$result = $this->connection->test_callback();"),
+  "which asks the connection to run the test",
+);
+expect(
+  settingsFile.includes("<?php submit_button( __( 'Send a test callback', 'kd-payments' ), 'secondary', 'submit', false ); ?>"),
+  "and a button a merchant can press",
+);
+expect(
+  (settingsFile.match(/<form /gu) ?? []).length === (settingsFile.match(/wp_nonce_field\(/gu) ?? []).length,
+  "every form on the screen, including this one, carries its own nonce",
+);
+expect(
+  connectionFile.includes("public function test_callback(): array {"),
+  "the connection owns the test",
+);
+expect(
+  connectionFile.includes("$answer = $client->request_callback( $newest['payment_id'] );"),
+  "against the newest payment the shop created",
+);
+expect(
+  connectionFile.includes("'meta_key'   => KD_Payment_Gateway::PAYMENT_ID_META,") === false &&
+    connectionFile.includes("$payment_id = (string) $order->get_meta( KD_Payment_Gateway::PAYMENT_ID_META );"),
+  "found through the meta the gateway wrote, never guessed",
+);
+expect(
+  connectionFile.includes("$delivered = isset( $answer['body']['delivered'] ) && true === $answer['body']['delivered'];"),
+  "and the outcome the platform reports is what the screen shows",
+);
+expect(
+  !connectionFile.includes("payment_complete") && !connectionFile.includes("set_status("),
+  "nothing in the test path marks an order paid, because only the callback endpoint may, and only after asking the platform",
+);
+
+expect(
+  connectionFile.includes("$path = wp_parse_url( home_url(), PHP_URL_PATH );") &&
+    connectionFile.includes("$path = is_string( $path ) ? trim( $path, '/' ) : '';"),
+  "the shop knows the path it is installed under, from its own address",
+);
+expect(
+  connectionFile.includes("if ( '' !== self::install_path() ) {"),
+  "and refuses to connect from a subdirectory",
+);
+expect(
+  connectionFile.indexOf("if ( '' !== self::install_path() ) {") <
+    connectionFile.indexOf("$answer = $client->connect( $domain, self::store_token() );"),
+  "before it sends the handshake, not after",
+);
+expect(
+  readme.includes("The shop must live at the root of its domain"),
+  "which the readme says in the merchant's own words",
 );
 
 expect(readme.includes("wc-api=kd_payments_callback"), "the readme documents the callback address");

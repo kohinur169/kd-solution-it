@@ -169,7 +169,14 @@ async function refuse(
   throw error;
 }
 
-/** Every living connection of one merchant on this platform, newest first, at most two read. */
+/**
+ * Every living connection of one merchant on this platform: active, revoked, pending and errored, newest first.
+ *
+ * All of them, not "the newest one": a revoked row is never deleted (`0035`'s guard makes revocation final, and a soft
+ * delete would hide the history), so a merchant who has ever disconnected a shop carries a dead row beside their live
+ * one for ever. Counting rows to decide whether a tenant has one shop would therefore answer "two" for every merchant
+ * who once moved shops - which is exactly the bug this read is shaped to avoid.
+ */
 async function readConnections(
   dependencies: StoreCallbackDependencies,
   companyId: string,
@@ -179,7 +186,7 @@ async function readConnections(
     `select=${STORE_CONNECTION_COLUMNS},company_id,access_token_ciphertext,access_token_iv,access_token_tag` +
       `&company_id=eq.${encodeURIComponent(companyId)}` +
       `&platform=eq.${STORE_CONNECTION_PLATFORM}&deleted_at=is.null` +
-      "&order=connected_at.desc&limit=2",
+      "&order=connected_at.desc&limit=50",
     connectionSchema,
   );
 }
@@ -187,18 +194,39 @@ async function readConnections(
 /**
  * The one connection a callback may use, or the refusal that says why it cannot.
  *
- * Read here rather than by a shared helper because the *uniqueness* is this surface's requirement: a settings screen
- * that lists connections (STEP 208's status read) is happy with any of them, while a callback that guesses is a
- * callback that lies to one shop about another shop's money.
+ * The question is not "how many connections does this merchant have" but **"how many are active"**: a revoked row
+ * beside a live one is one usable shop, and a pending row beside it is still one. Only two *active* rows make the shop
+ * unknowable, because only an active row can be called.
+ *
+ * The refusals then explain the absence in the order a merchant can act on: none at all, one that was revoked (the
+ * permanent state `0035` describes), or one that never finished activating.
  */
 async function connectionOf(
   dependencies: StoreCallbackDependencies,
   input: StoreCallbackInput,
 ): Promise<ConnectionRow> {
   const connections = await readConnections(dependencies, input.principal.companyId);
+  const active = connections.filter((row) => row.status === "active");
+
+  if (active.length > 1) {
+    throw await refuse(
+      dependencies,
+      input,
+      STORE_CALLBACK_RULES.connectionAmbiguous,
+      new AppError("CONFLICT", {
+        details: [{ field: "connection", rule: STORE_CALLBACK_RULES.connectionAmbiguous }],
+      }),
+    );
+  }
+
+  const connection = active[0];
+
+  if (connection !== undefined) {
+    return connection;
+  }
 
   if (connections.length === 0) {
-    await refuse(
+    throw await refuse(
       dependencies,
       input,
       STORE_CALLBACK_RULES.connectionMissing,
@@ -208,24 +236,9 @@ async function connectionOf(
     );
   }
 
-  if (connections.length > 1) {
-    await refuse(
-      dependencies,
-      input,
-      "connection_ambiguous",
-      new AppError("CONFLICT", { details: [{ field: "connection", rule: "connection_ambiguous" }] }),
-    );
-  }
-
-  const connection = connections[0];
-
-  if (connection === undefined) {
-    // Unreachable: a non-empty array's first element exists. Kept so the type is a row rather than a maybe.
-    throw new AppError("DEPENDENCY_FAILED", { cause: { rule: "connection_unreadable" } });
-  }
-
-  if (connection.status === "revoked") {
-    await refuse(
+  if (connections.some((row) => row.status === "revoked")) {
+    // A revoked connection is final: reinstalling is a support action, and saying so is more useful than "not active".
+    throw await refuse(
       dependencies,
       input,
       STORE_CALLBACK_RULES.connectionRevoked,
@@ -235,18 +248,14 @@ async function connectionOf(
     );
   }
 
-  if (connection.status !== "active") {
-    await refuse(
-      dependencies,
-      input,
-      STORE_CALLBACK_RULES.connectionNotActive,
-      new AppError("CONFLICT", {
-        details: [{ field: "connection", rule: STORE_CALLBACK_RULES.connectionNotActive }],
-      }),
-    );
-  }
-
-  return connection;
+  throw await refuse(
+    dependencies,
+    input,
+    STORE_CALLBACK_RULES.connectionNotActive,
+    new AppError("CONFLICT", {
+      details: [{ field: "connection", rule: STORE_CALLBACK_RULES.connectionNotActive }],
+    }),
+  );
 }
 
 /** The address a callback lands on, validated before anything is sent. */
