@@ -13,7 +13,12 @@ import { openSecret as openSecretForFixture, sealSecret, type SecretBox } from "
 import { AppError, isAppError } from "../errors/app-error.ts";
 import { PUBLIC_API_VERSION, PUBLIC_API_VERSION_HEADER } from "./public-fields.ts";
 import { handlePublicApiCall } from "./public-api.ts";
-import { API_PAYMENTS_PATH } from "./payment-fields.ts";
+import {
+  API_PAYMENT_CURRENCY,
+  API_PAYMENT_MAXIMUM_AMOUNT_MINOR,
+  API_PAYMENT_MINIMUM_AMOUNT_MINOR,
+  API_PAYMENTS_PATH,
+} from "./payment-fields.ts";
 import {
   API_PAYMENT_ID_PATTERN,
   API_STORE_PAYMENT_STATUSES,
@@ -1390,8 +1395,29 @@ expect(
   gatewayFile.includes("return get_woocommerce_currency() === self::CURRENCY;"),
   "and a shop in another currency does not see it at all",
 );
-expect(gatewayFile.includes("const MINIMUM_AMOUNT_MINOR = 50;"), "the platform's floor, pinned");
-expect(gatewayFile.includes("const MAXIMUM_AMOUNT_MINOR = 10000000;"), "and its ceiling");
+// The plugin mirrors three of the platform's numbers, and a literal pin only proves the copy has not been edited. These
+// read the plugin's constants and compare them with the platform's own, which is what makes a later change to the floor,
+// the ceiling or the currency fail here instead of in a shop that refuses every order at checkout.
+function gatewayNumber(name: string): number | null {
+  const raw = new RegExp(`const ${name} = ([0-9_]+);`, "u").exec(gatewayFile)?.[1];
+
+  return raw === undefined ? null : Number(raw.replaceAll("_", ""));
+}
+
+expectEqual(
+  gatewayNumber("MINIMUM_AMOUNT_MINOR"),
+  API_PAYMENT_MINIMUM_AMOUNT_MINOR,
+  "the plugin's floor is the platform's own, not a copy that can rot",
+);
+expectEqual(
+  gatewayNumber("MAXIMUM_AMOUNT_MINOR"),
+  API_PAYMENT_MAXIMUM_AMOUNT_MINOR,
+  "and so is its ceiling",
+);
+expect(
+  gatewayFile.includes(`const CURRENCY = '${API_PAYMENT_CURRENCY}';`),
+  "and the currency it charges in is the one the API accepts",
+);
 expect(
   gatewayFile.includes("$decimal = wc_format_decimal( $order->get_total(), 2 );"),
   "the total is read as a two-place string rather than multiplied as a float",
@@ -1413,8 +1439,29 @@ expect(
   "no card field is read, because the platform collects the card",
 );
 expect(
-  gatewayFile.includes("if ( is_string( $existing ) && '' !== $existing )"),
-  "a second submit of the same order does not create a second payment",
+  gatewayFile.includes("$same_amount = ! is_string( $recorded ) || '' === $recorded || (string) $amount === $recorded;") &&
+    gatewayFile.includes("if ( is_string( $existing ) && '' !== $existing && $same_amount ) {"),
+  "a second submit of the same order, for the same amount, does not create a second payment",
+);
+expect(
+  gatewayFile.includes("const PAYMENT_AMOUNT_META = '_kd_payment_amount';") &&
+    gatewayFile.includes("$order->update_meta_data( self::PAYMENT_AMOUNT_META, (string) $amount );"),
+  "the amount the payment was made for is recorded on the order, so a changed total is visible",
+);
+expect(
+  gatewayFile.indexOf("$same_amount = ") < gatewayFile.indexOf("$client->create_payment("),
+  "and it is decided before a payment is made, not after",
+);
+expect(
+  gatewayFile.includes("if ( $order->is_paid() ) {") &&
+    gatewayFile.indexOf("if ( $order->is_paid() ) {") < gatewayFile.indexOf("$existing = $order->get_meta( self::PAYMENT_ID_META );"),
+  "an order that is already paid starts no payment of its own",
+);
+expect(
+  gatewayFile.includes(
+    "The order total changed after a payment was created, so a new payment was made for the new total.",
+  ),
+  "and a payment that replaced another says so on the order",
 );
 // `is_available()` asks the same two questions, so the pin names the order-pay branch itself: a duplicate of the
 // availability check would satisfy a looser string without ever guarding the path that never consults it.
@@ -1503,6 +1550,110 @@ expect(
 expect(
   callbackFile.includes("$payment_id  = (string) $envelope['payment']['id'];"),
   "the payment id comes from the body's payment block",
+);
+
+// The plugin's own patterns, run against the platform's own values. A literal pin compares two strings; this compares a
+// regex to the vocabulary it must accept, so a status added later - or an id shape that changes - fails here rather than
+// in a shop, where a refused body is a callback that never lands.
+function pluginPatternOf(name: string): RegExp | null {
+  const declared = new RegExp(`const ${name}\\s*= '([^']+)';`, "u").exec(callbackFile)?.[1];
+
+  if (declared === undefined) {
+    return null;
+  }
+
+  // The plugin's value is a PHP pattern with its delimiters: `/^payment\.[a-z_]{3,32}$/`. The body between them is the
+  // same regex JavaScript reads, which is why the vocabulary can be tested against it here rather than restated.
+  const body = /^\/(.*)\/[a-z]*$/u.exec(declared)?.[1];
+
+  return body === undefined ? null : new RegExp(body, "u");
+}
+
+const pluginTypePattern = pluginPatternOf("TYPE_PATTERN");
+
+expect(pluginTypePattern !== null, "the plugin's type pattern is read from the file, not restated here");
+
+for (const status of API_STORE_PAYMENT_STATUSES) {
+  expect(
+    pluginTypePattern?.test(`payment.${status}`) === true,
+    `the plugin accepts the type of a ${status} payment`,
+  );
+}
+
+expect(
+  pluginTypePattern?.test("payment.requires_3ds_2") === false,
+  "and the pattern still refuses a word the platform's vocabulary cannot make",
+);
+
+expect(
+  pluginPatternOf("PAYMENT_ID_PATTERN")?.test("41000000-0000-4000-8000-000000000001") === true,
+  "the plugin's payment id pattern accepts a uuid",
+);
+expect(
+  pluginPatternOf("CALLBACK_ID_PATTERN")?.test(`${STORE_CALLBACK_ID_PREFIX}${"0".repeat(32)}`) === true,
+  "and its callback id pattern accepts the id this platform derives",
+);
+expect(
+  pluginPatternOf("CALLBACK_ID_PATTERN")?.test(STORE_CALLBACK_ID_PREFIX + "f".repeat(31)) === false,
+  "while refusing one that is a character short",
+);
+
+// --- the recovery a merchant has when a callback was missed ---------------------------------
+
+expect(
+  callbackFile.includes("add_filter( 'woocommerce_order_actions', array( $this, 'add_order_action' ) );") &&
+    callbackFile.includes(
+      "add_action( 'woocommerce_order_action_kd_payments_check_status', array( $this, 'check_order_status' ) );",
+    ),
+  "a missed callback can be made up by hand, from WooCommerce's own order actions",
+);
+expect(
+  callbackFile.includes(
+    "$actions['kd_payments_check_status'] = __( 'Check the payment with KD Payments', 'kd-payments' );",
+  ),
+  "named in words a merchant understands",
+);
+expect(
+  callbackFile.includes("if ( ! current_user_can( 'edit_shop_order', $order->get_id() ) ) {"),
+  "and the handler checks the capability itself rather than trusting the screen that reached it",
+);
+expect(
+  callbackFile.includes("$status = $this->confirmed_status_of( $payment_id );"),
+  "it asks the platform, exactly as the callback does",
+);
+expect(
+  (callbackFile.match(/\$this->confirmed_status_of\( \$payment_id \);/gu) ?? []).length === 2,
+  "one read for the callback and one for the merchant, never a third that could drift",
+);
+// Scoped to the handler's own body, because `apply()` delegates with the same line: a whole-file `includes` would be
+// satisfied by the callback's own path and would say nothing about this one.
+const checkStart = callbackFile.indexOf("public function check_order_status( WC_Order $order ): void {");
+const checkBody = callbackFile.slice(checkStart, callbackFile.indexOf("\n\t}", checkStart));
+
+expect(checkStart > 0, "the merchant's check is a handler on its own");
+expect(
+  checkBody.includes("$payment_id = (string) $order->get_meta( KD_Payment_Gateway::PAYMENT_ID_META );"),
+  "the payment it asks about is the one the order itself recorded",
+);
+expect(
+  checkBody.includes("$status = $this->confirmed_status_of( $payment_id );"),
+  "and it asks the platform rather than deciding",
+);
+expect(
+  checkBody.includes("$this->apply_status( $order, $payment_id, $status );"),
+  "and applies the answer through the same decision the callback uses",
+);
+expect(
+  !checkBody.includes("$this->apply(") && !checkBody.includes("CALLBACK_ID_META"),
+  "without inventing a callback id: the dedupe meta records callbacks, and a manual check is not one",
+);
+expect(
+  !callbackFile.includes("$order->set_status( 'processing'") && !callbackFile.includes("$order->set_status( 'completed'"),
+  "and it never decides a paid state for itself",
+);
+expect(
+  readme.includes("from the order actions and apply it:"),
+  "the readme's recovery instruction is the one that exists",
 );
 expect(
   callbackFile.includes("'meta_query' => array(") &&

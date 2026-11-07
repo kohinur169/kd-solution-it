@@ -48,6 +48,15 @@ class KD_Payment_Gateway extends WC_Payment_Gateway {
 	/** The order meta that records the platform's own status. */
 	const PAYMENT_STATUS_META = '_kd_payment_status';
 
+	/**
+	 * The order meta that records the amount the payment was created for, in minor units.
+	 *
+	 * Without it the gateway cannot tell "the customer pressed the button twice" from "the order changed after the
+	 * payment was made": the total is recomputed on every submit, and a second submit that finds the first payment
+	 * already recorded would send the customer on to confirm an amount the order no longer has.
+	 */
+	const PAYMENT_AMOUNT_META = '_kd_payment_amount';
+
 	/** Build the gateway: its id, its name and the three settings a merchant needs. */
 	public function __construct() {
 		$this->id                 = 'kd_payments';
@@ -142,17 +151,29 @@ class KD_Payment_Gateway extends WC_Payment_Gateway {
 			return array( 'result' => 'failure' );
 		}
 
-		$existing = $order->get_meta( self::PAYMENT_ID_META );
-
-		if ( is_string( $existing ) && '' !== $existing ) {
-			// The customer is submitting the same order twice. The payment exists; do not make a second one.
+		if ( $order->is_paid() ) {
+			// Nothing to start: the order is paid, and a second payment would be a second charge for it.
 			return array(
 				'result'   => 'success',
 				'redirect' => $order->get_checkout_order_received_url(),
 			);
 		}
 
-		$amount = $this->amount_minor_of( $order );
+		$amount   = $this->amount_minor_of( $order );
+		$existing = $order->get_meta( self::PAYMENT_ID_META );
+		$recorded = $order->get_meta( self::PAYMENT_AMOUNT_META );
+
+		$same_amount = ! is_string( $recorded ) || '' === $recorded || (string) $amount === $recorded;
+
+		if ( is_string( $existing ) && '' !== $existing && $same_amount ) {
+			// The customer is submitting the same order twice, for the same amount. The payment exists; do not make a
+			// second one. An order whose total moved after the payment was made is *not* this case: the payment on the
+			// platform is for the old amount, and confirming it would take the wrong money from the customer.
+			return array(
+				'result'   => 'success',
+				'redirect' => $order->get_checkout_order_received_url(),
+			);
+		}
 
 		if ( $amount < self::MINIMUM_AMOUNT_MINOR || $amount > self::MAXIMUM_AMOUNT_MINOR ) {
 			wc_add_notice( __( 'This order total cannot be paid with this method.', 'kd-payments' ), 'error' );
@@ -183,7 +204,15 @@ class KD_Payment_Gateway extends WC_Payment_Gateway {
 			return array( 'result' => 'failure' );
 		}
 
+		if ( is_string( $existing ) && '' !== $existing && $existing !== $payment_id ) {
+			// The total moved, so this is a second payment for the same order. The first one was never paid - it is
+			// `pending` on the platform - and the id below replaces it, so a callback about it finds no order and the
+			// platform stops retrying rather than moving an order it is not about.
+			$order->add_order_note( __( 'The order total changed after a payment was created, so a new payment was made for the new total.', 'kd-payments' ) );
+		}
+
 		$order->update_meta_data( self::PAYMENT_ID_META, $payment_id );
+		$order->update_meta_data( self::PAYMENT_AMOUNT_META, (string) $amount );
 		$order->update_meta_data( self::PAYMENT_STATUS_META, 'pending' );
 		$order->update_meta_data( '_kd_payment_mode', $mode );
 		$order->save();

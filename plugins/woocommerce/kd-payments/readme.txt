@@ -57,6 +57,9 @@ small JSON body naming the payment. This plugin:
   what the body claims;
 * records the callback id on the order, so the same callback twice changes nothing.
 
+A callback the shop missed can be made up by hand: **Check the payment with KD Payments**, in WooCommerce's own order
+actions, reads that order's payment from the platform and applies it through the same code path.
+
 If the platform cannot be reached the endpoint answers `503`, which asks the platform to try again. If no order matches
 the payment it answers `200` with `handled: false`, so the platform does not retry a callback this shop can never use.
 
@@ -78,8 +81,11 @@ without moving money. Payments carry their own mode, which is the key's mode.
 
 = What happens if a callback is missed? =
 
-The order stays on hold. Press **Refresh status** on the plugin's screen, or resend the callback from the platform; the
-payment id on the order is what the platform calls about, and the callback is idempotent.
+The order stays on hold, and nothing moves it until the platform is asked again. Open the order in WooCommerce, choose
+**Check the payment with KD Payments** from the order actions and apply it: the plugin asks the platform about that
+order's payment - the id it stored at checkout, never one typed by hand - and applies the answer exactly as a callback
+would. The result is a note on the order either way, doing it twice changes nothing, and if the platform cannot be
+reached the order is left as it is rather than guessed at.
 
 = Where is the API key stored? =
 

@@ -50,9 +50,65 @@ class KD_Callback {
 	/** The states that mean it did not and will not. */
 	const FAILED_STATUSES = array( 'failed', 'voided' );
 
-	/** Hook the route WooCommerce already knows how to dispatch. */
+	/** Hook the route WooCommerce already knows how to dispatch, and the order action a merchant needs. */
 	public function register(): void {
 		add_action( 'woocommerce_api_' . self::ROUTE, array( $this, 'handle' ) );
+		add_filter( 'woocommerce_order_actions', array( $this, 'add_order_action' ) );
+		add_action( 'woocommerce_order_action_kd_payments_check_status', array( $this, 'check_order_status' ) );
+	}
+
+	/**
+	 * Add "Check the payment with the platform" to WooCommerce's own order actions.
+	 *
+	 * A callback can be missed - the shop was down, the token was rotated, the platform's request timed out and gave up
+	 * - and the readme tells a merchant they can recover. This is that recovery, on the order it concerns: WooCommerce
+	 * renders the control, verifies the post's nonce and the edit capability before it fires the action, and the note
+	 * the handler leaves is what the merchant reads afterwards.
+	 *
+	 * @param array<string, string> $actions The order actions WooCommerce offers.
+	 * @return array<string, string>
+	 */
+	public function add_order_action( array $actions ): array {
+		$actions['kd_payments_check_status'] = __( 'Check the payment with KD Payments', 'kd-payments' );
+
+		return $actions;
+	}
+
+	/**
+	 * Ask the platform about one order's payment and apply the answer, outside any callback.
+	 *
+	 * The same two facts decide as in the callback: the payment id comes from the order's own meta, and the status
+	 * applied is the one the platform returns for that id. Nothing here can mark an order paid that the platform does
+	 * not say is paid, and an unreachable platform leaves the order exactly as it was, with a note saying so.
+	 *
+	 * @param WC_Order $order The order being checked.
+	 */
+	public function check_order_status( WC_Order $order ): void {
+		// WooCommerce has already checked the nonce and the edit capability; this repeats the capability because a
+		// handler reachable by any other path must not be a way for a subscriber to move an order.
+		if ( ! current_user_can( 'edit_shop_order', $order->get_id() ) ) {
+			wp_die( esc_html__( 'You are not allowed to check this order.', 'kd-payments' ), 403 );
+		}
+
+		$payment_id = (string) $order->get_meta( KD_Payment_Gateway::PAYMENT_ID_META );
+
+		if ( '' === $payment_id ) {
+			$order->add_order_note( __( 'This order has no payment on the platform to check.', 'kd-payments' ) );
+
+			return;
+		}
+
+		$status = $this->confirmed_status_of( $payment_id );
+
+		if ( null === $status ) {
+			// The platform could not be asked, so the order is left as it is. This is the one answer that must not
+			// guess: guessing here would be a status nobody verified, applied by hand.
+			$order->add_order_note( __( 'The payment status could not be read from the platform, so this order was left as it is. Try again in a moment.', 'kd-payments' ) );
+
+			return;
+		}
+
+		$this->apply_status( $order, $payment_id, $status );
 	}
 
 	/**
@@ -351,6 +407,23 @@ class KD_Callback {
 	 * @param string   $status      The platform's authoritative status.
 	 */
 	private function apply( WC_Order $order, string $callback_id, string $payment_id, string $status ): void {
+		$this->apply_status( $order, $payment_id, $status );
+
+		$order->update_meta_data( KD_Payment_Gateway::CALLBACK_ID_META, $callback_id );
+		$order->save();
+	}
+
+	/**
+	 * Move the order to what the platform says, once.
+	 *
+	 * Split from the callback id above so a merchant's own check applies exactly the same decision without inventing a
+	 * callback id for it - the dedupe meta records callbacks, and a manual check is not one.
+	 *
+	 * @param WC_Order $order      The order the payment belongs to.
+	 * @param string   $payment_id The platform's payment id.
+	 * @param string   $status     The platform's authoritative status.
+	 */
+	private function apply_status( WC_Order $order, string $payment_id, string $status ): void {
 		if ( in_array( $status, self::PAID_STATUSES, true ) ) {
 			if ( ! $order->is_paid() ) {
 				// WooCommerce's own path: it records the transaction, reduces stock, fires the emails and moves the
@@ -374,7 +447,6 @@ class KD_Callback {
 			$order->add_order_note( sprintf( __( 'The platform reported the payment as %s. No order status change.', 'kd-payments' ), $status ) );
 		}
 
-		$order->update_meta_data( KD_Payment_Gateway::CALLBACK_ID_META, $callback_id );
 		$order->update_meta_data( KD_Payment_Gateway::PAYMENT_STATUS_META, $status );
 		$order->save();
 	}
