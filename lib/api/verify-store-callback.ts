@@ -159,23 +159,28 @@ function hashOf(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex");
 }
 
-function boxOf(domain: string, tenant: string = companyId): SecretBox {
+function boxOf(
+  domain: string,
+  tenant: string = companyId,
+  platform: "shopify" | "woocommerce" = "woocommerce",
+): SecretBox {
   return sealSecret(
     masterKey,
     storeToken,
-    storeConnectionSecretContext({ companyId: tenant, platform: "woocommerce", storeDomain: domain }),
+    storeConnectionSecretContext({ companyId: tenant, platform, storeDomain: domain }),
   );
 }
 
 function connectionRow(domain: string, overrides: Row = {}): Row {
-  const box = boxOf(domain, String(overrides["company_id"] ?? companyId));
+  const platform = overrides["platform"] === "shopify" ? "shopify" : "woocommerce";
+  const box = boxOf(domain, String(overrides["company_id"] ?? companyId), platform);
 
   return {
     id: uuidOf(1),
     company_id: companyId,
-    platform: "woocommerce",
+    platform,
     store_domain: domain,
-    external_store_id: `sc_${hashOf(`${companyId}|woocommerce|${domain}`).slice(0, 32)}`,
+    external_store_id: `sc_${hashOf(`${companyId}|${platform}|${domain}`).slice(0, 32)}`,
     access_token_last_four: storeToken.slice(-4),
     access_token_ciphertext: box.ciphertext,
     access_token_iv: box.iv,
@@ -609,11 +614,16 @@ expectEqual(STORE_CALLBACK_CONTENT_TYPE, "application/json", "the body is JSON")
 expectEqual(STORE_CALLBACK_TIMEOUT_MS, 10_000, "a callback waits ten seconds, as a webhook does");
 expectEqual(STORE_CALLBACK_MAXIMUM_BODY_BYTES, 16_384, "and its body has the same ceiling as an event");
 expectEqual(
-  storeCallbackUrlOf(storeDomain),
+  storeCallbackUrlOf("woocommerce", storeDomain),
   "https://shop.example.com/?wc-api=kd_payments_callback",
   "the address is derived from the stored domain, pinned",
 );
-expect(!storeCallbackUrlOf(storeDomain).includes("http:"), "and is always https");
+expect(!storeCallbackUrlOf("woocommerce", storeDomain).includes("http:"), "and is always https");
+expectEqual(
+  storeCallbackUrlOf("shopify", "shop.example.myshopify.com"),
+  "https://shop.example.myshopify.com/apps/kd-payments/callbacks/payment",
+  "and a Shopify connection is called at its own platform's route on the same host",
+);
 
 expectEqual(STORE_CALLBACK_RULES.connectionMissing, "connection_missing", "the missing-connection rule, pinned");
 expectEqual(STORE_CALLBACK_RULES.connectionNotActive, "connection_not_active", "the not-active rule");
@@ -771,16 +781,17 @@ expectEqual(STORE_CALLBACK_RULES.connectionAmbiguous, "connection_ambiguous", "a
 
 const shopifyFixture = createFixture();
 
-shopifyFixture.state.connections = [connectionRow(shopifyDomain, { platform: "shopify" })];
+shopifyFixture.state.connections = [
+  connectionRow(shopifyDomain, { platform: "shopify" }),
+];
 
-const shopifyRefusal = await refusalOf(async () =>
-  deliverStoreCallback(inputOf(), dependenciesOf(shopifyFixture)),
-);
+const shopifyDelivered = await deliverStoreCallback(inputOf(), dependenciesOf(shopifyFixture));
 
+expectEqual(shopifyDelivered.delivered, true, "a Shopify connection is one this callback can use");
 expectEqual(
-  shopifyRefusal.rule,
-  STORE_CALLBACK_RULES.connectionMissing,
-  "a Shopify connection is not one this callback can use",
+  shopifyFixture.sent[0]?.url,
+  `https://${shopifyDomain}/apps/kd-payments/callbacks/payment`,
+  "and it is called at the App Proxy path its own platform gives it",
 );
 
 const deletedFixture = createFixture();
@@ -1900,9 +1911,10 @@ if (failures.length > 0) {
   process.exitCode = 1;
 } else {
   process.stdout.write(
-    `store callback gate passed: ${String(checkCount)} checks, one derived address per connected shop, the shop's ` +
-      "own sealed token as the only credential, an envelope that never carries a secret, an outcome reported rather " +
-      "than raised, and a plugin whose gateway creates the payment and whose endpoint verifies the token and asks the " +
+    `store callback gate passed: ${String(checkCount)} checks, one derived address per connected shop - ` +
+      "WooCommerce's own query route, and the App Proxy path STEP 211 gave a Shopify shop - the shop's own sealed token " +
+      "opened under the row's own platform, an envelope that never carries a secret, an outcome reported rather than " +
+      "raised, and a plugin whose gateway creates the payment and whose endpoint verifies the token and asks the " +
       "platform before it touches an order\n",
   );
 }

@@ -28,7 +28,7 @@ import {
 } from "./store-callback-fields.ts";
 import {
   STORE_CONNECTION_COLUMNS,
-  STORE_CONNECTION_PLATFORM,
+  STORE_CONNECTION_PLATFORMS,
   STORE_CONNECTION_TABLE,
   storeConnectionSecretContext,
 } from "./store-connection-fields.ts";
@@ -52,7 +52,9 @@ import {
  *
  * The first is STEP 204's own read - the same columns, the same tenant and mode fences, the same `404` for every cause -
  * reused rather than re-implemented, so a callback can never be built from a payment the caller could not have read.
- * The second is one query over `store_connections`, narrowed by tenant and platform. The third is the **URL validator**
+ * The second is one query over `store_connections`, narrowed by tenant and to the two platforms `0035` accepts - both of
+ * them, because a Shopify shop is a connection too and its address is the one its own platform gives it. The third is
+ * the **URL validator**
  * over the address derived from the stored domain, which is where a connection to a private host is refused before
  * anything leaves the platform. The fourth opens the box STEP 208 sealed, under the same associated data - company,
  * platform **and domain** - so a token copied into another row does not open. Only then does a byte travel.
@@ -60,9 +62,16 @@ import {
  * ## What a caller cannot choose
  *
  * The URL, the token, the body, the id and the status. A caller names a payment and nothing else: the address comes
- * from `0035`'s row, the credential from the box, the state from the row STEP 204 read, and the id from a hash of the
- * three. That is what makes this safe to expose as a merchant-facing call: a merchant who asks the platform to call
- * their shop cannot make it call somebody else's.
+ * from `0035`'s row (its domain **and** its platform), the credential from the box, the state from the row STEP 204
+ * read, and the id from a hash of the three. That is what makes this safe to expose as a merchant-facing call: a
+ * merchant who asks the platform to call their shop cannot make it call somebody else's.
+ *
+ * ## Two platforms, one rule
+ *
+ * A connection is addressed by the platform it was made on: WooCommerce's query route, or Shopify's App Proxy path that
+ * the shop forwards to the platform's own app. The token is opened under **the row's own platform**, because STEP 208
+ * sealed a WooCommerce shop's token under `woocommerce` and STEP 210 sealed a Shopify shop's under `shopify` - the
+ * associated data is a binding, and a row read with the wrong one is a box that does not open.
  *
  * ## One connection, or none
  *
@@ -185,7 +194,7 @@ async function readConnections(
     STORE_CONNECTION_TABLE,
     `select=${STORE_CONNECTION_COLUMNS},company_id,access_token_ciphertext,access_token_iv,access_token_tag` +
       `&company_id=eq.${encodeURIComponent(companyId)}` +
-      `&platform=eq.${STORE_CONNECTION_PLATFORM}&deleted_at=is.null` +
+      `&platform=in.(${STORE_CONNECTION_PLATFORMS.join(",")})&deleted_at=is.null` +
       "&order=connected_at.desc&limit=50",
     connectionSchema,
   );
@@ -262,7 +271,7 @@ async function connectionOf(
 function callbackUrlOf(
   connection: ConnectionRow,
 ): { readonly url: string } | { readonly refusal: ErrorDetail } {
-  const derived = storeCallbackUrlOf(connection.store_domain);
+  const derived = storeCallbackUrlOf(connection.platform, connection.store_domain);
 
   try {
     return { url: requireHttpUrl(derived, "connection.store_domain", { allowedProtocols: ["https:"] }) };
@@ -293,7 +302,7 @@ function tokenOf(
   try {
     const context = storeConnectionSecretContext({
       companyId: connection.company_id,
-      platform: STORE_CONNECTION_PLATFORM,
+      platform: connection.platform,
       storeDomain: connection.store_domain,
     });
     const token = dependencies.openSecret(box, context);

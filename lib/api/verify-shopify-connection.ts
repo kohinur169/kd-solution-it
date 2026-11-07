@@ -1393,6 +1393,8 @@ const appFiles = [
   "shopify.mjs",
   "session.mjs",
   "platform.mjs",
+  "payments.mjs",
+  "callback.mjs",
   "screen.mjs",
   "server.mjs",
 ];
@@ -1412,7 +1414,7 @@ const readmeSource = await sourceOf("readme.txt");
 const exampleConfiguration = JSON.parse(await sourceOf("config.example.json")) as Record<string, unknown>;
 const appPackage = JSON.parse(await sourceOf("package.json")) as Record<string, unknown>;
 
-expect(appFiles.length === 7, "the app is seven modules and no more");
+expect(appFiles.length === 9, "the app is nine modules and no more: STEP 211 added the payment and callback pair");
 expectEqual(appPackage["private"], true, "it is a private package");
 expectEqual(appPackage["type"], "module", "written as ES modules");
 expectEqual(
@@ -1684,8 +1686,8 @@ const appTree = await readdir(new URL("src/", appRoot));
 
 expectEqual(
   appTree.sort().join(","),
-  "config.mjs,copy.mjs,platform.mjs,screen.mjs,server.mjs,session.mjs,shopify.mjs",
-  "the source tree holds exactly the seven modules this gate reviewed",
+  "callback.mjs,config.mjs,copy.mjs,payments.mjs,platform.mjs,screen.mjs,server.mjs,session.mjs,shopify.mjs",
+  "the source tree holds exactly the nine modules the gates between them review",
 );
 
 // ---------------------------------------------------------------------------------------------
@@ -1784,8 +1786,9 @@ expectEqual(
   "every visible field the page draws has a label bound to it, and the count is an equality so a new field must too",
 );
 expect(
-  (screenSource.match(/type="password"/gu) ?? []).length === 2,
-  "and the two forms that take a key take it as a password",
+  (screenSource.match(/name="api_key[^"]*" type="password"/gu) ?? []).length ===
+    (screenSource.match(/name="api_key[^"]*"/gu) ?? []).length,
+  "and every field that takes a key is a password field, counted as an equality",
 );
 
 // ---------------------------------------------------------------------------------------------

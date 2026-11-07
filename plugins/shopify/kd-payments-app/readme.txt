@@ -30,6 +30,31 @@ What it does
 Later visits can check the connection (POST /status) or revoke it (POST /disconnect), each
 time with the key typed again, because nothing is stored between requests.
 
+Payments, and the callback
+--------------------------
+
+7. POST /payments creates the platform payment for one Shopify order: the merchant types the
+   order id and the amount in USD, and the app sends { amount_minor, currency, payment_method }
+   to POST /api/public/v1/payments with an idempotency key derived from the shop, the order and
+   the amount. The same order and amount therefore replay the same payment instead of charging
+   twice, and the amount is read from the decimal string a merchant types, never from a float.
+8. The platform calls the shop's own host at
+   https://{shop}/apps/kd-payments/callbacks/payment. Shopify's App Proxy forwards that to
+   POST /callbacks/payment on this app, adding a signature over the query. The app verifies the
+   signature with its client secret in constant time, bounds the timestamp, bounds the body at
+   16 KB, compares the envelope's six keys whole, requires the body's store to be the shop
+   Shopify forwarded it for, and dedupes by the platform's callback id.
+9. A verified callback is recorded and shown to the merchant. The app does not mark the Shopify
+   order paid: that needs an offline Admin API token and this app deliberately holds no Shopify
+   token after the platform has one. So the outcome is readable here, and the order is moved in
+   the Shopify admin.
+
+The App Proxy prefix (/apps/kd-payments) is registered in the Shopify Partner dashboard under
+App proxy, and it must point at this app's origin with the path forwarded unchanged. The
+callback's proof is Shopify's proxy signature rather than a store token, which is what makes
+this reachable at the shop's own permanent host without a second hostname column on the
+platform.
+
 Configuration
 -------------
 
@@ -62,6 +87,9 @@ Endpoints
     POST /login           connect the shop to the merchant's account
     POST /status          ask the platform what the connection is
     POST /disconnect      revoke the connection
+    POST /payments        create the platform payment for one Shopify order
+    POST /payments/refresh  ask the platform about every payment this session created
+    POST /callbacks/payment the platform's callback, through Shopify's App Proxy
     GET  /healthz         liveness, JSON, no session
 
 Security
@@ -77,6 +105,12 @@ Security
 - Every form carries a CSRF token compared in constant time against the session's.
 - No merchant key is stored. The Shopify token lives in memory, and is removed as soon as the
   platform accepts it.
+- A payment's amount is parsed from its own decimal string, and its idempotency key is derived
+  from the shop, the order and the amount, so a retry is the same payment and a clock cannot
+  make a second one.
+- The callback is authenticated by Shopify's app-proxy signature over the query, bounded at
+  16 KB, compared as six exact keys, tied to the shop Shopify forwarded it for, and deduped by
+  the platform's callback id. Nothing in this app trusts a callback's body beyond recording it.
 - The page is built with an escaping function applied to every interpolated value, and served
   with a content security policy, DENY framing, no referrer and no caching.
 - Logs are one JSON object per event and carry a shop domain, a rule and a status: never a
@@ -92,4 +126,9 @@ What this package does not do yet
 - It does not handle app/uninstalled. The platform's own DELETE remains the revocation path,
   and an uninstall that is not followed by a disconnect leaves a token Shopify will refuse.
 - It is not published. Registering the app, listing it and getting it approved are release
-  actions, not code.
+  actions, not code. The App Proxy prefix has to be configured there before a callback can land.
+- It does not call Shopify's Admin API. Marking an order paid needs an offline token stored
+  somewhere, and this app stores no Shopify token at all; a payment therefore appears on the
+  platform and in this app's record, and the order is moved in Shopify's admin.
+- The app-proxy signature is implemented from Shopify's documented algorithm and has never
+  been exercised against a live proxy in this environment.

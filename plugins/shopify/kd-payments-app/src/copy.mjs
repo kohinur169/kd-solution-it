@@ -55,6 +55,34 @@ export const COPY = Object.freeze({
     submit: "Revoke this connection",
   }),
 
+  /** The payment half: one order, one amount, and the record of what the platform answered. */
+  payments: Object.freeze({
+    title: "Create a payment for a Shopify order",
+    body:
+      "The platform charges in USD only, so an order in another currency cannot be paid through this app. The same " +
+      "order and the same amount always produce the same payment, so pressing this twice does not charge twice.",
+    orderLabel: "Shopify order id",
+    orderPlaceholder: "1001",
+    amountLabel: "Amount in USD",
+    amountPlaceholder: "19.99",
+    submit: "Create the payment",
+    refresh: "Refresh the statuses",
+    listTitle: "Payments this session created",
+    empty: "No payment has been created in this session yet.",
+    outcomeTitle: "Callbacks the platform has sent",
+    outcomeEmpty: "No callback has reached this app since it started.",
+    order: "Order",
+    amount: "Amount",
+    status: "Status",
+    paymentId: "Payment id",
+    callbackId: "Callback",
+    receivedAt: "Received",
+    notApplied:
+      "A status here is the platform's record, checked against Shopify's own signature on the way in. This app holds " +
+      "no Shopify access token after the platform has one, so marking the order paid is done in the Shopify admin.",
+    minorUnits: "minor units",
+  }),
+
   /** The six terms of the connection view, and the three stand-ins for a value the platform did not send. */
   fields: Object.freeze({
     shop: "Shop",
@@ -121,6 +149,23 @@ export const COPY = Object.freeze({
     platformRefusedWithRule: Object.freeze({
       title: "The platform did not accept that",
       detail: "The platform answered {status} ({rule}). Nothing was changed.",
+    }),
+    paymentCreated: Object.freeze({
+      title: "The platform created the payment",
+      detail: "It is listed below with the order it was created for. Its status changes as the payer pays.",
+    }),
+    statusesRefreshed: Object.freeze({
+      title: "The statuses are fresh",
+      detail: "The platform was asked about every payment this session created, and answered with these.",
+    }),
+    paymentRefused: Object.freeze({
+      title: "That payment was not created",
+      detail: "The {rule} check failed, so nothing was sent to the platform. Correct it and press the button again.",
+    }),
+    paymentNeedsShop: Object.freeze({
+      title: "This session has no shop",
+      detail:
+        "A payment is created for a connected shop. Connect the shop, or check its connection with your key, first.",
     }),
     unexpected: Object.freeze({
       title: "The app could not finish that",

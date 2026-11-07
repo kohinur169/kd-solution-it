@@ -1,4 +1,5 @@
 // path: plugins/shopify/kd-payments-app/src/platform.mjs
+import { PAYMENT_PATH } from "./payments.mjs";
 
 /**
  * The three calls this app makes to the platform, and nothing else.
@@ -20,6 +21,16 @@
 
 /** The platform's resource, spelled once. */
 export const CONNECTION_PATH = "/api/public/v1/stores/shopify/connection";
+
+/**
+ * The platform's two payment calls.
+ *
+ * A payment is created with an idempotency key in a header and three body fields; its status is read back by id. Both
+ * are section 20's public API and neither needs anything this app does not already hold: the merchant's key, and a
+ * value to name.
+ */
+/** The header the platform reads a key from, and the one it answers a replay in. */
+export const IDEMPOTENCY_HEADER = "idempotency-key";
 
 /** The platform's published key shape: `kd_<mode>_<prefix>_<64 hex>`. Checked before a byte leaves. */
 export const API_KEY_PATTERN = /^kd_(?:test|live)_[a-z][a-z0-9_]{1,15}_[0-9a-f]{64}$/u;
@@ -74,10 +85,11 @@ function refusalOf(status, body) {
 
 /** The client one app instance holds: the base URL, a fetch, and a timeout that is the platform's contract too. */
 export function createPlatformClient({ baseUrl, fetchImpl = fetch, timeoutMs = 10_000 }) {
-  async function call({ method, path, apiKey, body }) {
+  async function call({ method, path, apiKey, body, extraHeaders = {} }) {
     const headers = {
       authorization: `Bearer ${apiKey}`,
       accept: "application/json",
+      ...extraHeaders,
     };
 
     if (body !== undefined) {
@@ -146,6 +158,31 @@ export function createPlatformClient({ baseUrl, fetchImpl = fetch, timeoutMs = 1
       return call({
         method: "GET",
         path: `${CONNECTION_PATH}?shop_domain=${encodeURIComponent(shopDomain)}`,
+        apiKey,
+      });
+    },
+
+    /**
+     * Create the platform payment for one store order.
+     *
+     * The body is the three fields the platform documents - an amount in minor units, the currency, and how the payer
+     * will pay - and the key travels in its own header, because it describes the call rather than the payment.
+     */
+    async createPayment({ apiKey, amountMinor, idempotencyKey }) {
+      return call({
+        method: "POST",
+        path: PAYMENT_PATH,
+        apiKey,
+        body: { amount_minor: amountMinor, currency: "USD", payment_method: "card" },
+        extraHeaders: { [IDEMPOTENCY_HEADER]: idempotencyKey },
+      });
+    },
+
+    /** Ask the platform what one payment is now. Served fresh on every call; the answer is never cached. */
+    async readPayment({ apiKey, paymentId }) {
+      return call({
+        method: "GET",
+        path: `${PAYMENT_PATH}/${encodeURIComponent(paymentId)}`,
         apiKey,
       });
     },

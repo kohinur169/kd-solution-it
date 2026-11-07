@@ -23,6 +23,16 @@ import {
 } from "./session.mjs";
 import { COPY, fill } from "./copy.mjs";
 import { renderPage, SECURITY_HEADERS, STAGES } from "./screen.mjs";
+import { CALLBACK_PATH, createOutcomeStore, handleCallback } from "./callback.mjs";
+import {
+  parseAmountMinor,
+  parseOrderReference,
+  paymentIdempotencyKeyOf,
+  paymentViewOf,
+  PaymentError,
+  sessionPaymentOf,
+  withPayment,
+} from "./payments.mjs";
 
 /**
  * The Shopify side of section 20: the install Shopify redirects into, the token exchange, and the credential login that
@@ -61,6 +71,9 @@ const PATHS = Object.freeze({
   login: "/login",
   status: "/status",
   disconnect: "/disconnect",
+  payments: "/payments",
+  paymentsRefresh: "/payments/refresh",
+  paymentCallback: CALLBACK_PATH,
   health: "/healthz",
 });
 
@@ -133,6 +146,7 @@ export function createApp({ config, fetchImpl = fetch, now = () => Date.now(), w
   const log = createLogger(write);
   const sessions = createSessionStore({ ttlMs: config.sessionTtlMs, now });
   const platform = createPlatformClient({ baseUrl: config.platformBaseUrl, fetchImpl });
+  const outcomes = createOutcomeStore({ now });
 
   /** The session a request names, or undefined. A cookie that does not verify names no session. */
   function sessionOf(request) {
@@ -159,12 +173,17 @@ export function createApp({ config, fetchImpl = fetch, now = () => Date.now(), w
 
   /** The page, with the session's CSRF token and whatever the caller learned. */
   function page(context, values) {
+    const shop = values.shop ?? context.record?.shop;
+
     return renderPage({
       stage: values.stage,
-      shop: values.shop ?? context.record?.shop,
+      shop,
       csrf: context.record?.csrf ?? "",
       notice: values.notice,
       connection: values.connection,
+      payments: values.payments ?? context.record?.payments,
+      // Only the outcomes of the shop this page is about: a callback for another shop is another merchant's business.
+      outcomes: typeof shop === "string" && shop.length > 0 ? outcomes.forStore(shop) : undefined,
     });
   }
 
@@ -218,6 +237,25 @@ export function createApp({ config, fetchImpl = fetch, now = () => Date.now(), w
 
     if (url.pathname === PATHS.health) {
       send(responseObject, 200, JSON.stringify({ status: "ok" }), { "content-type": "application/json" });
+
+      return;
+    }
+
+    if (url.pathname === PATHS.paymentCallback) {
+      // The platform's callback, arriving through Shopify's App Proxy. No session, no CSRF and no cookie: the caller is
+      // a server, and the proof it carries is Shopify's signature over the proxy query.
+      const answer = await handleCallback({
+        request,
+        secret: config.shopifyApiSecret,
+        outcomes,
+        now,
+      });
+
+      log("payment_callback", { status: answer.status, rule: answer.body.rule ?? undefined });
+
+      send(responseObject, answer.status, JSON.stringify(answer.body), {
+        "content-type": "application/json",
+      });
 
       return;
     }
@@ -349,7 +387,9 @@ export function createApp({ config, fetchImpl = fetch, now = () => Date.now(), w
     const isFormPath =
       url.pathname === PATHS.login ||
       url.pathname === PATHS.status ||
-      url.pathname === PATHS.disconnect;
+      url.pathname === PATHS.disconnect ||
+      url.pathname === PATHS.payments ||
+      url.pathname === PATHS.paymentsRefresh;
 
     if (!isFormPath) {
       send(responseObject, 404, "");
@@ -432,6 +472,77 @@ export function createApp({ config, fetchImpl = fetch, now = () => Date.now(), w
       return;
     }
 
+    if (url.pathname === PATHS.payments || url.pathname === PATHS.paymentsRefresh) {
+      const stated = (form.get("shop") ?? "").trim();
+      const remembered = typeof context.record.shop === "string" ? context.record.shop : "";
+
+      if (stated.length === 0 && remembered.length === 0) {
+        // A payment is for a shop, and a session that never held one cannot name it. The page it lands on can.
+        log("payment_without_shop", {});
+
+        sendPage(responseObject, context, 409, {
+          stage: STAGES.installRequired,
+          notice: noticeOf(COPY.notices.paymentNeedsShop),
+        });
+
+        return;
+      }
+
+      const shop = parseShopDomain(stated.length > 0 ? stated : remembered);
+
+      if (url.pathname === PATHS.payments) {
+        // Both values are parsed before anything is sent, so a typo costs no call to the platform.
+        const order = parseOrderReference(form.get("order") ?? "");
+        const amountMinor = parseAmountMinor(form.get("amount") ?? "");
+        const idempotencyKey = paymentIdempotencyKeyOf({ shop, orderId: order.orderId, amountMinor });
+        const answer = await platform.createPayment({ apiKey, amountMinor, idempotencyKey });
+        const payment = sessionPaymentOf({
+          orderId: order.orderId,
+          orderGid: order.orderGid,
+          amountMinor,
+          view: paymentViewOf(answer),
+        });
+
+        const payments = withPayment(context.record.payments, payment);
+
+        sessions.update(context.id, { shop, payments });
+        log("payment_created", { shop, payment: payment.view.id, status: payment.view.status });
+
+        sendPage(responseObject, context, 200, {
+          stage: STAGES.connected,
+          shop,
+          connection: context.record.connection,
+          payments,
+          notice: noticeOf(COPY.notices.paymentCreated, "ok"),
+        });
+
+        return;
+      }
+
+      // Refresh: ask the platform about every payment this session created, and keep the answers the platform gave.
+      const payments = Array.isArray(context.record.payments) ? context.record.payments : [];
+      const refreshed = [];
+
+      for (const payment of payments) {
+        const answer = await platform.readPayment({ apiKey, paymentId: payment.view.id });
+
+        refreshed.push({ ...payment, view: paymentViewOf(answer) });
+      }
+
+      sessions.update(context.id, { shop, payments: refreshed });
+      log("payments_refreshed", { shop, count: refreshed.length });
+
+      sendPage(responseObject, context, 200, {
+        stage: STAGES.connected,
+        shop,
+        connection: context.record.connection,
+        payments: refreshed,
+        notice: noticeOf(COPY.notices.statusesRefreshed, "ok"),
+      });
+
+      return;
+    }
+
     if (url.pathname === PATHS.status || url.pathname === PATHS.disconnect) {
       const stated = (form.get("shop") ?? "").trim();
       const shop = parseShopDomain(stated.length > 0 ? stated : String(context.record.shop ?? ""));
@@ -471,6 +582,19 @@ export function createApp({ config, fetchImpl = fetch, now = () => Date.now(), w
           responseObject,
           400,
           noticeOf(COPY.notices.installRefused, "error", { rule: error.rule }),
+        );
+
+        return;
+      }
+
+      if (error instanceof PaymentError) {
+        log("payment_refused", { rule: error.rule });
+
+        sendFailure(
+          request,
+          responseObject,
+          400,
+          noticeOf(COPY.notices.paymentRefused, "error", { rule: error.rule }),
         );
 
         return;

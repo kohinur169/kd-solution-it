@@ -101,6 +101,66 @@ function credentialForm({ csrf, shop, label, hint, action, submit }) {
   ].join("");
 }
 
+/** The payment form: an order and an amount, both typed, neither of them a secret. */
+function paymentForm({ csrf, shop }) {
+  return [
+    '<form method="post" action="/payments" autocomplete="off">',
+    `<input type="hidden" name="csrf" value="${escapeHtml(csrf)}">`,
+    `<input type="hidden" name="shop" value="${escapeHtml(shop)}">`,
+    `<label for="order">${escapeHtml(COPY.payments.orderLabel)}</label>`,
+    '<input id="order" name="order" type="text" inputmode="numeric" ' +
+      `placeholder="${escapeHtml(COPY.payments.orderPlaceholder)}" autocomplete="off" spellcheck="false" required>`,
+    `<label for="amount">${escapeHtml(COPY.payments.amountLabel)}</label>`,
+    '<input id="amount" name="amount" type="text" inputmode="decimal" ' +
+      `placeholder="${escapeHtml(COPY.payments.amountPlaceholder)}" autocomplete="off" spellcheck="false" required>`,
+    `<button type="submit">${escapeHtml(COPY.payments.submit)}</button>`,
+    "</form>",
+  ].join("");
+}
+
+/** One payment this session created: the order it was for and the platform's last answer about it. */
+function paymentList(payments) {
+  if (payments === undefined || payments.length === 0) {
+    return `<p class="muted">${escapeHtml(COPY.payments.empty)}</p>`;
+  }
+
+  const rows = [];
+
+  for (const payment of payments) {
+    rows.push(
+      "<dl>" +
+        `<dt>${escapeHtml(COPY.payments.order)}</dt><dd><code>${escapeHtml(payment.orderId)}</code></dd>` +
+        `<dt>${escapeHtml(COPY.payments.amount)}</dt>` +
+        `<dd>${escapeHtml(String(payment.view.amountMinor))} ${escapeHtml(COPY.payments.minorUnits)} ` +
+        `${escapeHtml(payment.view.currency)}</dd>` +
+        `<dt>${escapeHtml(COPY.payments.status)}</dt><dd>${escapeHtml(payment.view.status)}</dd>` +
+        `<dt>${escapeHtml(COPY.payments.paymentId)}</dt><dd><code>${escapeHtml(payment.view.id)}</code></dd>` +
+        "</dl>",
+    );
+  }
+
+  return rows.join("");
+}
+
+/** The callbacks the platform has sent, newest first: the proof they arrived is that they are listed at all. */
+function outcomeList(outcomes) {
+  if (outcomes === undefined || outcomes.length === 0) {
+    return `<p class="muted">${escapeHtml(COPY.payments.outcomeEmpty)}</p>`;
+  }
+
+  const rows = outcomes.map(
+    (outcome) =>
+      "<dl>" +
+      `<dt>${escapeHtml(COPY.payments.status)}</dt><dd>${escapeHtml(outcome.status)}</dd>` +
+      `<dt>${escapeHtml(COPY.payments.paymentId)}</dt><dd><code>${escapeHtml(outcome.paymentId)}</code></dd>` +
+      `<dt>${escapeHtml(COPY.payments.callbackId)}</dt><dd><code>${escapeHtml(outcome.id)}</code></dd>` +
+      `<dt>${escapeHtml(COPY.payments.receivedAt)}</dt><dd>${escapeHtml(outcome.receivedAt)}</dd>` +
+      "</dl>",
+  );
+
+  return rows.join("");
+}
+
 /** The connection the platform answered, as a definition list. No field of it is a secret. */
 function connectionList(connection) {
   const rows = [
@@ -125,7 +185,7 @@ function connectionList(connection) {
  * `notice` is the one thing this app says about the last form: a success message, or the platform's `{field, rule}`
  * pair rendered as the two machine words it is. `connection` is present only when the platform answered with one.
  */
-export function renderPage({ stage, shop, csrf, notice, connection }) {
+export function renderPage({ stage, shop, csrf, notice, connection, payments, outcomes }) {
   const sections = [];
 
   if (notice !== undefined) {
@@ -184,6 +244,33 @@ export function renderPage({ stage, shop, csrf, notice, connection }) {
       panel({
         title: COPY.connected.title,
         body: connection === undefined ? `<p>${escapeHtml(COPY.connected.answer)}</p>` : connectionList(connection),
+      }),
+    );
+    sections.push(
+      panel({
+        title: COPY.payments.title,
+        body:
+          `<p>${escapeHtml(COPY.payments.body)}</p>` +
+          paymentForm({ csrf, shop: shop ?? "" }) +
+          `<h2>${escapeHtml(COPY.payments.listTitle)}</h2>` +
+          paymentList(payments) +
+          (payments === undefined || payments.length === 0
+            ? ""
+            : [
+                '<form method="post" action="/payments/refresh" autocomplete="off">',
+                `<input type="hidden" name="csrf" value="${escapeHtml(csrf)}">`,
+                `<input type="hidden" name="shop" value="${escapeHtml(shop ?? "")}">`,
+                `<label for="api_key_refresh">${escapeHtml(COPY.connected.keyLabel)}</label>`,
+                '<input id="api_key_refresh" name="api_key" type="password" autocomplete="off" spellcheck="false" required>',
+                `<button type="submit" class="secondary">${escapeHtml(COPY.payments.refresh)}</button>`,
+                "</form>",
+              ].join("")),
+      }),
+    );
+    sections.push(
+      panel({
+        title: COPY.payments.outcomeTitle,
+        body: `<p class="muted">${escapeHtml(COPY.payments.notApplied)}</p>` + outcomeList(outcomes),
       }),
     );
     sections.push(

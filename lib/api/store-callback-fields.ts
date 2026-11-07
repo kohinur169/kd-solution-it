@@ -1,5 +1,6 @@
 // path: lib/api/store-callback-fields.ts
 import { API_PAYMENTS_PATH } from "./payment-fields.ts";
+import type { StoreConnectionPlatform } from "./store-connection-fields.ts";
 import { API_PAYMENT_STATUS_ROUTE } from "./store-payment-status.ts";
 import type { ApiStorePaymentStatusView, API_STORE_PAYMENT_STATUSES } from "./store-payment-status.ts";
 
@@ -23,10 +24,18 @@ import type { ApiStorePaymentStatusView, API_STORE_PAYMENT_STATUSES } from "./st
  *
  * ## Where the platform calls, without storing an endpoint
  *
- * STEP 208 stored a bare domain, not a URL - `0035`'s choice, and the right one for a connection. The address of a
- * WooCommerce callback is the shop's own host plus WooCommerce's own route: `https://{domain}/?wc-api=kd_payments_callback`.
- * The URL is therefore **derived** from a stored value that the platform validated on write, and never from anything a
- * caller sent in this request - which is why a caller cannot aim this POST at a host of their choosing.
+ * STEP 208 stored a bare domain, not a URL - `0035`'s choice, and the right one for a connection. Each platform's
+ * callback lives at its own route **on the shop's own host**, so the address is derived from the stored domain and the
+ * stored platform, never from anything a caller sent:
+ *
+ *   - WooCommerce owns a query route: `https://{domain}/?wc-api=kd_payments_callback`.
+ *   - Shopify owns a **path prefix** that a merchant's shop proxies to the app: `https://{domain}/apps/kd-payments/...`
+ *     (Shopify's App Proxy). STEP 211's app answers `/callbacks/payment` behind that prefix, so the platform calls the
+ *     shop's own permanent host and Shopify forwards it, which also means a Shopify shop needs no second hostname
+ *     column for the platform's app.
+ *
+ * The URL is therefore **derived** from values the platform validated on write, and never from anything a caller sent
+ * in this request - which is why a caller cannot aim this POST at a host of their choosing.
  *
  * ## Why the body is not the truth
  *
@@ -60,13 +69,26 @@ export const STORE_CALLBACK_WC_API_QUERY = "wc-api";
 export const STORE_CALLBACK_WC_API_VALUE = "kd_payments_callback";
 
 /**
- * The address the platform calls, derived from the domain `0035` holds.
+ * Where a Shopify callback lives: the App Proxy prefix a merchant's shop forwards to the platform's app.
  *
- * `https` only, no path, no port beyond the default: the domain is a bare host by the time it reaches this function,
- * and STEP 205's own validator runs over the result before anything is sent.
+ * The prefix is the app's own, so it is the same for every shop - which is exactly what makes it derivable from a
+ * domain. The path behind it is the app's callback endpoint, pinned in one place here so the platform, the app and the
+ * gate cannot disagree about where a callback lands.
  */
-export function storeCallbackUrlOf(storeDomain: string): string {
-  return `https://${storeDomain}/?${STORE_CALLBACK_WC_API_QUERY}=${STORE_CALLBACK_WC_API_VALUE}`;
+export const STORE_CALLBACK_SHOPIFY_PROXY_PREFIX = "/apps/kd-payments";
+export const STORE_CALLBACK_SHOPIFY_PATH = `${STORE_CALLBACK_SHOPIFY_PROXY_PREFIX}/callbacks/payment`;
+
+/**
+ * The address the platform calls for one connection, derived from the platform and the domain `0035` holds.
+ *
+ * `https` only, no port beyond the default: the domain is a bare host by the time it reaches this function, and
+ * STEP 205's own validator runs over the result before anything is sent. The platform decides the shape, because only
+ * the platform knows which route its own store side answers - and a caller never supplies either value.
+ */
+export function storeCallbackUrlOf(platform: StoreConnectionPlatform, storeDomain: string): string {
+  return platform === "shopify"
+    ? `https://${storeDomain}${STORE_CALLBACK_SHOPIFY_PATH}`
+    : `https://${storeDomain}/?${STORE_CALLBACK_WC_API_QUERY}=${STORE_CALLBACK_WC_API_VALUE}`;
 }
 
 /**
