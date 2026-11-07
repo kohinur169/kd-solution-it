@@ -5,8 +5,8 @@ import { deepFreeze } from "../../lib/utils/freeze.ts";
 /**
  * The vocabulary of section 19's dispute: the six states `0039_disputes.sql` allows, the order they move
  * in, the roles that may read them, the numbers the schema enforces, the words a refusal names, the events a
- * provider may use to move a row, and - STEP 195 - the response the merchant writes and the window it has to
- * write it in.
+ * provider may use to move a row, - STEP 195 - the response the merchant writes and the window it has to write
+ * it in, and - STEP 196 - the two warnings section 19 sends them along the way.
  *
  * ## Why this is a separate module from the service
  *
@@ -143,6 +143,46 @@ export const DISPUTE_RESPONSE_MAXIMUM_BODY_BYTES = 32_768;
 export const DISPUTE_EXTENDED_WINDOW_HOURS = 48;
 export const DISPUTE_DEADLINE_ROLES: readonly PlatformRole[] = deepFreeze(["super_admin"] as const);
 
+/**
+ * Section 19's two warnings, in the order a window meets them.
+ *
+ * `start` is the opening itself: the merchant is told the window has begun and when it closes. `midpoint` is
+ * half way to the deadline - twelve hours into a twenty-four hour window, twenty-four into a forty-eight hour
+ * one - which is the last moment a warning can still change the answer. Both are emails queued through
+ * `0061`, and `0125` records which of the two each send row was.
+ */
+export const DISPUTE_WARNING_STAGES = deepFreeze(["start", "midpoint"] as const);
+
+export type DisputeWarningStage = (typeof DISPUTE_WARNING_STAGES)[number];
+
+/** The section 23 template key a deadline warning uses. `0061` accepts it; the stage lives in `0125`. */
+export const DISPUTE_WARNING_TEMPLATE_KEY = "dispute_update";
+
+/** What the email is about, in the vocabulary of `email_send_logs.reference_kind`. */
+export const DISPUTE_WARNING_REFERENCE_KIND = "dispute";
+
+/** How many times the email system may try a warning: the same ceiling the other platform alerts use. */
+export const DISPUTE_WARNING_MAX_ATTEMPTS = 3;
+
+/**
+ * How many of a merchant's open disputes one sweep considers.
+ *
+ * A tick that found more than this is not a busy platform, it is a broken one, and a bounded read that says
+ * how much it left for the next tick is better than a sweep that grows until it times out.
+ */
+export const DISPUTE_WARNING_BATCH_LIMIT = 200;
+
+/**
+ * The reason recorded on a send row whose warning another sweep won.
+ *
+ * A duplicate is dropped rather than deleted: `0061` refuses a delete, and a dropped row with a reason tells
+ * the whole story of a race that produced one email instead of two.
+ */
+export const DISPUTE_WARNING_DUPLICATE_REASON = "A deadline warning for this stage was already queued.";
+
+/** The roles that may send a merchant's due warnings by hand, when the deployment's clock has not. */
+export const DISPUTE_WARNING_ROLES: readonly PlatformRole[] = deepFreeze(["ceo", "compliance_kyc", "super_admin"] as const);
+
 /** The largest provider body a dispute webhook reads. Stripe's own ceiling for an event is far smaller. */
 export const DISPUTE_WEBHOOK_MAXIMUM_BODY_BYTES = 1_048_576;
 
@@ -230,6 +270,7 @@ export const DISPUTE_AUDIT = deepFreeze({
   listed: "dispute.listed",
   responseSaved: "dispute.response_saved",
   deadlineExtended: "dispute.deadline_extended",
+  warningSent: "dispute.warning_sent",
 } as const);
 
 /** True when a value is one of `0039`'s six statuses. */

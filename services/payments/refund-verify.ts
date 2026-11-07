@@ -1358,11 +1358,11 @@ async function main(): Promise<void> {
     .map((name) => Number.parseInt(name.slice(0, 4), 10))
     .sort((left, right) => left - right);
 
-  // 124 is STEP 195's `0124_dispute_response`, the merchant's answer and the instant it was saved; 123 was this
-  // STEP's own `0123_refund_fee_rule`. This STEP still owns no migration: `0038` carries the whole lifecycle.
+  // The head is now STEP 196's `0125_dispute_deadline_warnings`; 124 was STEP 195's and 123 was this STEP's own
+  // `0123_refund_fee_rule`. This STEP still owns no migration: `0038` carries the whole lifecycle.
   expectEqual(
     migrations[migrations.length - 1] ?? 0,
-    124,
+    125,
     "this STEP adds no migration, because `0038` already carries the whole lifecycle",
   );
 

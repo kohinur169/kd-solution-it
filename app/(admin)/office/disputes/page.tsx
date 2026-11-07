@@ -2,11 +2,15 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import type { ReactNode } from "react";
+import { listDisputeWarnings, type DisputeWarningRecord } from "@/services/disputes/dispute-warnings";
 import { DisputeDeadlineExtensionForm } from "./deadline-extension-form";
+import { DisputeWarningRunPanel } from "./warning-run-panel";
 import { AppError } from "@/lib/errors/app-error";
-import { getMessage } from "@/lib/i18n/messages";
+import { formatMessage, getMessage } from "@/lib/i18n/messages";
 import { listDisputeQueue, type DisputeView } from "@/services/disputes/dispute";
-import { DISPUTE_DEFAULT_WINDOW_HOURS } from "@/services/disputes/dispute-fields";
+import { DISPUTE_DEFAULT_WINDOW_HOURS, DISPUTE_WARNING_ROLES } from "@/services/disputes/dispute-fields";
+import { hasSatisfiedTwoFactor } from "@/lib/auth/session";
+import type { RequestActor } from "@/lib/auth/types";
 import { getDisputeRuntime } from "@/services/disputes/dispute-runtime";
 import { readOfficeActor } from "../../office-actor";
 
@@ -35,6 +39,13 @@ export const dynamic = "force-dynamic";
  * factor and the device proof are the route's, so an account that presses it reads a refusal rather than
  * discovering the rule after the window moved.
  *
+ * ## What the rows say about the warnings
+ *
+ * Each row prints the two warnings section 19 owes its merchant - when the window started, when it reached its
+ * middle - because "did we tell them" is the first question an officer asks when a dispute is lost on silence.
+ * A row that carries no warning prints so, and one that carries a start but no middle is a row whose middle
+ * has not arrived yet: the queue is a queue of live windows, and the sweep is what fills the lines in.
+ *
  * ## Why the page refuses before it renders
  *
  * `listDisputeQueue` requires one of the four roles that answer for a dispute and throws `PERMISSION_DENIED`
@@ -52,7 +63,13 @@ type QueueState =
   | { readonly kind: "signed-out" }
   | { readonly kind: "forbidden" }
   | { readonly kind: "unavailable" }
-  | { readonly kind: "ready"; readonly disputes: readonly DisputeView[] };
+  | {
+      readonly kind: "ready";
+      readonly disputes: readonly DisputeView[];
+      readonly warnings: ReadonlyMap<string, readonly DisputeWarningRecord[]>;
+      /** Whether this officer may send the two warnings by hand, which the panel needs to know. */
+      readonly mayWarn: boolean;
+    };
 
 async function readQueueState(): Promise<QueueState> {
   const actorState = await readOfficeActor();
@@ -66,9 +83,16 @@ async function readQueueState(): Promise<QueueState> {
   }
 
   try {
-    const disputes = await listDisputeQueue({ actor: actorState.actor }, getDisputeRuntime());
+    const dependencies = getDisputeRuntime();
+    const disputes = await listDisputeQueue({ actor: actorState.actor }, dependencies);
+    // One read for the whole page: the queue prints who has been warned, and a query per row would turn a
+    // screen into a hundred round trips.
+    const warnings = await listDisputeWarnings(
+      { disputeIds: disputes.map((dispute) => dispute.id) },
+      dependencies,
+    ).catch(() => new Map<string, readonly DisputeWarningRecord[]>());
 
-    return { kind: "ready", disputes };
+    return { kind: "ready", disputes, warnings, mayWarn: maySendWarnings(actorState.actor) };
   } catch (error) {
     if (error instanceof AppError) {
       if (error.code === "AUTHENTICATION_REQUIRED") {
@@ -82,6 +106,21 @@ async function readQueueState(): Promise<QueueState> {
 
     return { kind: "unavailable" };
   }
+}
+
+/**
+ * Whether this officer may press the button that sends section 19's warnings.
+ *
+ * The page only decides what to *offer*: `runDisputeWarningsNow` asks the same two questions of the same
+ * actor before it sweeps, so a browser that shows the button to the wrong account earns a refusal rather than
+ * a sweep. The second factor is asked here for the same reason it is asked there - a session that has not
+ * proved itself must not be able to mail the platform's merchants.
+ */
+function maySendWarnings(actor: RequestActor): boolean {
+  return (
+    hasSatisfiedTwoFactor(actor) &&
+    actor.roles.some((role) => (DISPUTE_WARNING_ROLES as readonly string[]).includes(role))
+  );
 }
 
 const pageClasses = "flex flex-col gap-8";
@@ -129,6 +168,26 @@ function formatInstant(iso: string | null): string {
   const parsed = Date.parse(iso);
 
   return Number.isFinite(parsed) ? `${new Date(parsed).toISOString().slice(0, 16).replace("T", " ")} UTC` : iso;
+}
+
+/**
+ * The warnings a dispute has already had, as one line: the start, the middle, or neither.
+ *
+ * The instant printed is when the warning was *due*, which is the instant the merchant was told about, and not
+ * when the sweep happened to run: a warning that went out a minute late is still a warning about a deadline.
+ */
+function warningTextOf(records: readonly DisputeWarningRecord[] | undefined): string {
+  if (records === undefined || records.length === 0) {
+    return getMessage("disputes.warningNone");
+  }
+
+  return records
+    .map((record) =>
+      formatMessage(record.stage === "start" ? "disputes.warningStartSent" : "disputes.warningMidpointSent", {
+        instant: formatInstant(record.warnedAt),
+      }),
+    )
+    .join(" - ");
 }
 
 /** The status as one phrase, for the badge on a row. */
@@ -190,6 +249,12 @@ export default async function DisputeQueuePage(): Promise<ReactNode> {
           </h2>
           <p className={bodyClasses}>{getMessage("disputes.deadlineHelp")}</p>
 
+          {state.mayWarn ? (
+            <DisputeWarningRunPanel />
+          ) : (
+            <p className={bodyClasses}>{getMessage("disputes.warningRunRoleNote")}</p>
+          )}
+
           {state.disputes.length === 0 ? (
             <p className={bodyClasses}>{getMessage("disputes.queueEmpty")}</p>
           ) : (
@@ -222,6 +287,8 @@ export default async function DisputeQueuePage(): Promise<ReactNode> {
                     <dd className="break-words text-xs tabular-nums sm:text-sm">
                       {dispute.processorDisputeId ?? "-"}
                     </dd>
+                    <dt className={bodyClasses}>{getMessage("disputes.warningRowLabel")}</dt>
+                    <dd className="text-xs sm:text-sm">{warningTextOf(state.warnings.get(dispute.id))}</dd>
                   </dl>
 
                   {dispute.dueState === "overdue" ? (

@@ -2,8 +2,10 @@
 import {
   DISPUTE_DEFAULT_WINDOW_HOURS,
   DISPUTE_DUE_SOON_HOURS,
+  DISPUTE_WARNING_STAGES,
   DISPUTE_WINDOW_HOURS,
   disputeDueAt,
+  type DisputeWarningStage,
 } from "./dispute-fields.ts";
 
 /**
@@ -107,6 +109,77 @@ export function disputeDeadlineOf(
     dueAtEpochMs: disputeDueAt(openedAtEpochMs, hours),
     zone: readDisputeTimeZone(zone),
   };
+}
+
+/**
+ * The middle of a window: half its hours after the opening.
+ *
+ * Twelve hours into a twenty-four hour window, twenty-four into a forty-eight hour one, and it matters that
+ * this is *absolute* for the same reason the deadline is: `0125`'s check compares the midpoint against
+ * `opened_at + make_interval(hours => window_hours / 2)`, so a zone can never move it either. Half of the only
+ * two windows the schema allows are whole hours, so there is no rounding question to answer.
+ */
+export function disputeMidpointOf(openedAtEpochMs: number, windowHours: number): number {
+  const hours = (DISPUTE_WINDOW_HOURS as readonly number[]).includes(windowHours)
+    ? windowHours
+    : DISPUTE_DEFAULT_WINDOW_HOURS;
+
+  return openedAtEpochMs + Math.trunc(hours / 2) * 3_600_000;
+}
+
+/** What a screen and a sweep both need to know about one dispute before they can name a stage. */
+export interface DisputeWarningFacts {
+  readonly openedAtEpochMs: number;
+  readonly dueAtEpochMs: number;
+  readonly windowHours: number;
+  readonly resolved: boolean;
+  readonly submitted: boolean;
+  /** The merchant has already written their side, so a nudge would be a nudge about nothing. */
+  readonly answered: boolean;
+}
+
+/**
+ * Which of section 19's warnings are due at one instant, and why the others are not.
+ *
+ * ## The rule, in one sentence
+ *
+ * A stage is due when its instant has arrived and the deadline has not passed - `warnAt <= now < dueAt` - and
+ * it is not due at all once the merchant has answered, the pack has been sent, or the dispute has been
+ * decided, because a warning exists to produce an answer that is not there yet.
+ *
+ * ## Why the empty array is the interesting answer
+ *
+ * The sweep runs on a clock, so most disputes most of the time are between two stages and owe nothing. The
+ * function therefore returns the stages that are due and never throws, and the caller counts the ones it did
+ * not send instead of inventing a reason for each.
+ *
+ * ## Why a missed stage is not sent late
+ *
+ * A tick that runs after the deadline closes a window with nothing to say: "you had until yesterday" is not a
+ * warning, it is a reproach, and the merchant can no longer act on it. So the deadline is an upper bound on
+ * both stages, and a sweep that was down for a day resumes at the next dispute rather than apologising to
+ * every merchant it missed.
+ */
+export function disputeWarningStagesOf(facts: DisputeWarningFacts, nowMs: number): readonly DisputeWarningStage[] {
+  if (facts.resolved || facts.submitted || facts.answered) {
+    return [];
+  }
+
+  if (!(nowMs >= facts.openedAtEpochMs && nowMs < facts.dueAtEpochMs)) {
+    return [];
+  }
+
+  const due: DisputeWarningStage[] = [];
+
+  for (const stage of DISPUTE_WARNING_STAGES) {
+    const warnAt = stage === "start" ? facts.openedAtEpochMs : disputeMidpointOf(facts.openedAtEpochMs, facts.windowHours);
+
+    if (nowMs >= warnAt) {
+      due.push(stage);
+    }
+  }
+
+  return due;
 }
 
 /**

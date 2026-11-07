@@ -519,8 +519,8 @@ expect(rollback.trim().startsWith("-- path: migrations/0124_dispute_response.dow
 const files = await migrationFiles();
 const numbers = files.map((name) => Number.parseInt(name.slice(0, 4), 10));
 
-expectEqual(numbers[numbers.length - 1] ?? 0, 124, "this STEP adds migration 0124 and it is the newest");
-expectEqual(files.length, 124, "the chain is 124 files");
+expectEqual(numbers[numbers.length - 1] ?? 0, 125, "0124 is still in the chain; STEP 196's 0125 is the newest");
+expectEqual(files.length, 125, "the chain is 125 files");
 expectEqual(
   numbers.every((value, index) => value === index + 1),
   true,

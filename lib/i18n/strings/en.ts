@@ -3541,6 +3541,26 @@ const catalog = {
     windowInvalidRefusal: "The window is set to 24 or 48 hours, and it only ever widens.",
     deadlineNotExtendableRefusal: "A decided dispute has no deadline left to move.",
     deviceRequiredRefusal: "This browser is not enrolled as a trusted device for this account.",
+
+    /**
+     * STEP 196: section 19's two warnings. The office presses the button when no clock has run, and each row
+     * says whether the merchant was told at the start of the window and at its middle.
+     */
+    warningRowLabel: "Warnings",
+    warningNone: "No warning has been sent yet.",
+    warningStartSent: "start {instant}",
+    warningMidpointSent: "midpoint {instant}",
+    warningRunTitle: "Section 19's two warnings",
+    warningRunHelp:
+      "The merchant is told when the window opens and again when half of it has passed. A deployment with a scheduler sends these on its own; this button sends the ones that are due now, and it never sends one twice.",
+    warningRunButton: "Send the warnings that are due now",
+    warningRunBusy: "Sending",
+    warningRunDeviceNote: "This browser signs the request with the account's enrolled device key.",
+    warningRunDone: "{sent} warnings were handed to the email system; {blocked} were due and could not be queued.",
+    warningRunBlocked:
+      "{count} warnings were due and could not be queued: no sending method is active or the merchant has no owner address.",
+    warningRunNothing: "Nothing was due: every open window is between its two warnings.",
+    warningRunRoleNote: "Only the compliance desk and leadership with a verified device send these warnings.",
   },
   email: {
     lockAlert: {
@@ -3554,6 +3574,14 @@ const catalog = {
     newDevice: {
       /** Subject of the section 23 alert of section 22: an account was used from a new device. */
       subject: "A new device signed in to your account. Confirm it with your authenticator",
+    },
+    disputeWarning: {
+      /**
+       * STEP 196: section 19's two warnings, and the only place their words live. A subject is capped at 160
+       * characters by `0061`, so each one says the deadline and nothing else.
+       */
+      startSubject: "A dispute was opened against your payment: you have until the deadline to answer",
+      midpointSubject: "Half of the dispute response window has passed. Answer before the deadline",
     },
   },
   policies: {
