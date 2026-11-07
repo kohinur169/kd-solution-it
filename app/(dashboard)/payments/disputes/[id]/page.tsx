@@ -5,10 +5,12 @@ import type { ReactNode } from "react";
 import { AppError } from "@/lib/errors/app-error";
 import { getMessage } from "@/lib/i18n/messages";
 import type { DisputeView } from "@/services/disputes/dispute";
-import { readCompanyDispute } from "@/services/disputes/dispute-response";
-import { getDisputeRuntime } from "@/services/disputes/dispute-runtime";
+import type { DisputeEvidenceView } from "@/services/disputes/dispute-evidence";
+import { readDisputeEvidence } from "@/services/disputes/dispute-evidence";
+import { getDisputeEvidenceRuntime } from "@/services/disputes/dispute-runtime";
 import { readOwnerActor } from "../../../onboarding/owner-actor";
 import { DisputeDeadlineClock } from "./dispute-deadline-clock";
+import { DisputeEvidencePanel } from "./dispute-evidence-panel";
 import { DisputeResponseForm } from "./dispute-response-form";
 
 export const metadata: Metadata = {
@@ -40,15 +42,22 @@ export const dynamic = "force-dynamic";
  *
  * It prints the deadline twice - UTC from the server, the merchant's own zone from the browser - because
  * section 19's window is a fact about the person reading it. It does not print the processor's payload, the
- * evidence the desk assembles or the outcome before it exists: the response is the merchant's, and everything
- * else on this row belongs to the office.
+ * compliance desk's review or the outcome before it exists: the response and the pack are the merchant's, and
+ * everything else on this row belongs to the office.
+ *
+ * ## The pack of STEP 197
+ *
+ * `readDisputeEvidence` is one call and answers the whole page: the dispute, the pack it may already have - its
+ * four parts, its documents and the digest it was frozen with - and the records the platform holds that the
+ * pack does not. The panel renders that answer and refreshes it after every act, so no number on this screen is
+ * computed twice.
  */
 type AnswerState =
   | { readonly kind: "signed-out" }
   | { readonly kind: "forbidden" }
   | { readonly kind: "not-found" }
   | { readonly kind: "unavailable" }
-  | { readonly kind: "ready"; readonly dispute: DisputeView };
+  | { readonly kind: "ready"; readonly view: DisputeEvidenceView };
 
 async function readAnswerState(disputeId: string): Promise<AnswerState> {
   const actorState = await readOwnerActor();
@@ -62,9 +71,9 @@ async function readAnswerState(disputeId: string): Promise<AnswerState> {
   }
 
   try {
-    const dispute = await readCompanyDispute({ actor: actorState.actor, disputeId }, getDisputeRuntime());
+    const view = await readDisputeEvidence({ actor: actorState.actor, disputeId }, getDisputeEvidenceRuntime());
 
-    return { kind: "ready", dispute };
+    return { kind: "ready", view };
   } catch (error) {
     if (error instanceof AppError) {
       if (error.code === "AUTHENTICATION_REQUIRED") {
@@ -167,14 +176,15 @@ export default async function DisputeAnswerPage({
       ) : state.kind === "unavailable" ? (
         <p className={alertClasses}>{getMessage("disputes.failed")}</p>
       ) : (
-        <DisputeAnswer dispute={state.dispute} />
+        <DisputeAnswer view={state.view} />
       )}
     </main>
   );
 }
 
-/** The ready page: the row, the deadline on both clocks, and the form in whichever state it is in. */
-function DisputeAnswer({ dispute }: { readonly dispute: DisputeView }): ReactNode {
+/** The ready page: the row, the deadline on both clocks, the form, and the evidence pack beside it. */
+function DisputeAnswer({ view }: { readonly view: DisputeEvidenceView }): ReactNode {
+  const dispute: DisputeView = view.dispute;
   const decided = dispute.resolvedAt !== null;
   const sent = dispute.responseSubmittedAt !== null;
   const closed = dispute.dueState === "overdue";
@@ -242,6 +252,13 @@ function DisputeAnswer({ dispute }: { readonly dispute: DisputeView }): ReactNod
 
         <p className={bodyClasses}>{getMessage("disputes.documentsNote")}</p>
       </section>
+
+      <DisputeEvidencePanel
+        candidates={view.candidates}
+        disputeId={dispute.id}
+        mayBuild={view.mayBuild}
+        pack={view.pack}
+      />
 
       {decided ? (
         <section aria-labelledby="dispute-outcome-heading" className={sectionClasses}>

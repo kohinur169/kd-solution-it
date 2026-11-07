@@ -519,8 +519,9 @@ expect(rollback.trim().startsWith("-- path: migrations/0124_dispute_response.dow
 const files = await migrationFiles();
 const numbers = files.map((name) => Number.parseInt(name.slice(0, 4), 10));
 
-expectEqual(numbers[numbers.length - 1] ?? 0, 125, "0124 is still in the chain; STEP 196's 0125 is the newest");
-expectEqual(files.length, 125, "the chain is 125 files");
+// 0124 is this STEP's own; 0125 was STEP 196's and 0126 is STEP 197's, which now heads the chain.
+expectEqual(numbers[numbers.length - 1] ?? 0, 126, "0124 is still in the chain; STEP 197's 0126 is the newest");
+expectEqual(files.length, 126, "the chain is 126 files");
 expectEqual(
   numbers.every((value, index) => value === index + 1),
   true,
@@ -1131,7 +1132,14 @@ expectSourceContains(formSource, "role=\"status\"", "the outcome of a save is an
 expectSourceLacks(formSource, "verifySensitiveRequest", "the form carries no proof it cannot produce");
 expectSourceLacks(formSource, "response_text: text,", "the body is built once, from the field the service reads");
 
-expectSourceContains(answerSource, "readCompanyDispute(", "the answer page reads through the service and not through the table");
+// STEP 197 moved the page's one read to `readDisputeEvidence`, which asks this STEP's `readCompanyDispute` for
+// the row itself and then reads the pack beside it. The rule this assertion exists for - the page reads through
+// a service and never through the table - is what both calls serve.
+expectSourceContains(
+  answerSource,
+  "readDisputeEvidence(",
+  "the answer page reads through the service and not through the table",
+);
 expectSourceContains(answerSource, "readOwnerActor(", "using the session the dashboard already has");
 expectSourceContains(answerSource, "RESOURCE_NOT_FOUND", "and maps another merchant's dispute to a sentence rather than an empty form");
 expectSourceContains(answerSource, "DisputeDeadlineClock", "the page carries the clock");

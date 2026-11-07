@@ -3523,7 +3523,7 @@ const catalog = {
     responseMovedError: "Somebody saved this dispute while your page was open. Reload and check.",
     responseNotFoundError: "This dispute is not on your account.",
     documentsNote:
-      "Documents are collected by the compliance desk when the evidence pack is assembled. This form takes your words only.",
+      "Your words and your documents both belong in the pack below. The form above takes the words only.",
     deadlineExtensionTitle: "The merchant's window",
     deadlineExtensionHelp:
       "A super administrator may set the window to 48 hours when the merchant needs it. The deadline moves with the window, and both stop mattering once the pack is sent.",
@@ -3561,6 +3561,83 @@ const catalog = {
       "{count} warnings were due and could not be queued: no sending method is active or the merchant has no owner address.",
     warningRunNothing: "Nothing was due: every open window is between its two warnings.",
     warningRunRoleNote: "Only the compliance desk and leadership with a verified device send these warnings.",
+
+    /**
+     * STEP 197: section 19's four part evidence pack. The merchant assembles it from the records the platform
+     * already holds, supplies the documents, and freezes it once it is complete; the compliance desk reviews
+     * and sends it in STEP 198. The four parts are named as section 19 names them.
+     */
+    evidenceTitle: "The evidence pack",
+    evidenceDescription:
+      "Section 19's pack has four parts: the invoice, the delivery proof, the client communication record and the terms acceptance record. Assemble them, add your own documents, and freeze the pack when every part is filled.",
+    evidenceRoleNote: "Only the account owner assembles a dispute's evidence pack.",
+    evidenceEmpty: "No pack has been started for this dispute.",
+    evidenceAssemble: "Assemble the pack",
+    evidenceAssembling: "Assembling",
+    evidenceRefresh: "Refresh from my records",
+    evidenceRefreshing: "Refreshing",
+    evidenceAssembled: "The pack holds {items} records and {documents} documents.",
+    evidenceAssembledDone: "The pack is assembled from the records the platform holds.",
+    evidenceStatusDraft: "Draft",
+    evidenceStatusFrozen: "Frozen",
+    evidenceFrozenAt: "Frozen {instant}",
+    evidenceDigestLabel: "Fingerprint",
+    evidenceSectionInvoice: "Invoice",
+    evidenceSectionDelivery: "Delivery proof",
+    evidenceSectionCommunication: "Client communication",
+    evidenceSectionTerms: "Terms acceptance",
+    evidenceSectionCounts: "{items} records and {documents} documents",
+    evidenceSectionMissing: "still empty",
+    evidenceNoneInSection: "Nothing in this part yet.",
+    evidenceRemove: "Remove",
+    evidenceRemoving: "Removing",
+    evidenceAddNoteTitle: "Add a note",
+    evidenceAddNoteHelp: "One sentence of your own, filed under one part of the pack.",
+    evidenceAddNotePlaceholder: "What this record shows.",
+    evidenceAddNoteButton: "Add the note",
+    evidenceUploadTitle: "Add a document",
+    evidenceUploadHelp: "PDF, JPEG or PNG, up to 50 MB, filed under one part of the pack.",
+    evidenceUploadSectionLabel: "Part",
+    evidenceUploadCaption: "What it shows (optional)",
+    evidenceUploadButton: "Attach the document",
+    evidenceUploading: "Attaching",
+    evidenceFreeze: "Freeze the pack",
+    evidenceFreezing: "Freezing",
+    evidenceFreezeHelp:
+      "Freezing goes one way. Once it is frozen the pack is the evidence the compliance desk sends, and nothing in it can change.",
+    evidenceFrozenNote:
+      "This pack is frozen and cannot change. The compliance desk reviews it and sends it to the processor.",
+    evidenceIncomplete:
+      "Every part needs at least one record or document, and the pack needs at least one document, before it can be frozen.",
+    evidenceMissingList: "Still empty: {sections}.",
+    evidenceMoved: "Somebody changed this pack while your page was open. Reload and read it again.",
+    evidenceNoPack: "This dispute has no pack yet. Assemble one first.",
+    evidenceDecided: "This dispute is decided, so its pack stays exactly as it was frozen.",
+    evidenceSubmittedNote: "The pack has been sent to the processor, so it is fixed.",
+    evidenceFrozenRefusal: "A frozen pack cannot be changed. That is the point of freezing it.",
+    evidenceDocumentRejected: "That file was not accepted: PDF, JPEG or PNG, up to 50 MB.",
+    evidenceDocumentQuarantined:
+      "The bytes in that file do not match a type the platform stores, so it was refused rather than attached.",
+    evidenceStorageMissing:
+      "This deployment has no document storage bound, so no file was attached. The rest of the pack is unaffected.",
+    evidenceNoteRequired: "Write the note before adding it.",
+    evidenceNoteTooLong: "A note is at most 600 characters.",
+    evidenceCaptionTooLong: "The caption is at most 160 characters.",
+    evidenceFileNameRequired: "The file needs a name of at least three characters.",
+    evidenceItemAdded: "Added to the pack.",
+    evidenceItemRemoved: "Removed from the pack.",
+    evidenceDocumentAttached: "The document was attached to the pack.",
+    evidenceDuplicateNote: "That file is already attached to this pack.",
+    evidenceFrozenDone: "The pack is frozen. The compliance desk reviews it and sends it next.",
+    evidenceDocumentRemoved: "The document was removed from the pack.",
+    evidencePackNotFound: "This pack is not on your account.",
+    evidenceFailed: "That did not go through. Try again.",
+    evidenceInvoiceLabel: "Invoice {number}",
+    evidenceFulfilmentLabel: "Delivery recorded {instant}",
+    evidenceAcceptanceLabel: "Buyer confirmation {instant}",
+    evidencePolicyLabel: "{policy} accepted {instant}",
+    evidenceEmailLabel: "Email to the client sent {instant}",
+    evidenceEventLabel: "{event} {instant}",
   },
   email: {
     lockAlert: {

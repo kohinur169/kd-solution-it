@@ -271,6 +271,12 @@ export const DISPUTE_AUDIT = deepFreeze({
   responseSaved: "dispute.response_saved",
   deadlineExtended: "dispute.deadline_extended",
   warningSent: "dispute.warning_sent",
+  evidenceAssembled: "dispute.evidence_assembled",
+  evidenceItemAdded: "dispute.evidence_item_added",
+  evidenceItemRemoved: "dispute.evidence_item_removed",
+  evidenceDocumentAdded: "dispute.evidence_document_added",
+  evidenceDocumentRemoved: "dispute.evidence_document_removed",
+  evidenceFrozen: "dispute.evidence_frozen",
 } as const);
 
 /** True when a value is one of `0039`'s six statuses. */

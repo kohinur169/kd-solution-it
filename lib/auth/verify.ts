@@ -12823,11 +12823,17 @@ async function checkCsrfProtection(): Promise<void> {
   //
   // STEP 196 adds one file and one call: the queue's "send the warnings that are due now" panel, which is the
   // button a deployment without a scheduler uses to pay section 19's two warning emails.
-  expectEqual(browserMutations.length, 55, "fifty five browser files send a mutation");
+  //
+  // STEP 197 adds one file and seven calls: the evidence pack panel, whose six acts are seven requests because
+  // a record is both added and removed from one card and a document is attached and removed from another. One
+  // `send` owns the fetch, the refusal and the refresh, and each call site still asks for the token itself,
+  // which is what keeps one spread per mutation. So the files arrive at fifty six and the call sites at
+  // eighty two.
+  expectEqual(browserMutations.length, 56, "fifty six browser files send a mutation");
   expectEqual(
     browserMutations.reduce((total, path) => total + mutationCalls(appSourceOf(appSources, path)), 0),
-    75,
-    "across seventy five call sites",
+    82,
+    "across eighty two call sites",
   );
   const postCalls = mutationCalls;
   const tokenSpreads = (source: string): number =>

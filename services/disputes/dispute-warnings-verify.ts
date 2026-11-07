@@ -655,12 +655,13 @@ expect(!rollback.includes("drop table if exists public.disputes"), "and the disp
 
 const numbers = await migrationNumbers();
 
-expectEqual(numbers[numbers.length - 1] ?? 0, 125, "0125 is the newest migration in the chain");
-expectEqual(numbers.length, 125, "and the chain is 125 files");
+// `0125` is this STEP's own; STEP 197's `0126_dispute_evidence_packs` heads the chain above it.
+expectEqual(numbers[numbers.length - 1] ?? 0, 126, "0126 heads the chain above this STEP's 0125");
+expectEqual(numbers.length, 126, "and the chain is 126 files");
 expectEqual(
   numbers.every((value, index) => value === index + 1),
   true,
-  "the chain is contiguous from 0001 to 0125",
+  "the chain is contiguous from 0001 to 0126",
 );
 expectEqual(new Set(numbers).size, numbers.length, "no migration number is used twice");
 

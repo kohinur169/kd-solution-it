@@ -1,7 +1,12 @@
 // path: services/disputes/dispute-runtime.ts
 import { getAuthRuntime } from "../../lib/auth/runtime.ts";
+import { registerDefaultStorageAdapters } from "../../lib/storage/adapters.ts";
+import { createDefaultFileEncryption } from "../../lib/storage/encryption.ts";
+import { StorageAdapterRegistry, activeAdapter } from "../../lib/storage/registry.ts";
 import type { DisputeDependencies } from "./dispute.ts";
 import type { DisputeWebhookDependencies } from "./dispute-webhook.ts";
+import type { DisputeEvidenceDependencies } from "./dispute-evidence.ts";
+import { createDisputeEvidenceStorage } from "./dispute-evidence-storage.ts";
 
 /**
  * The production wiring of section 19's disputes: the PostgREST client, the signed audit trail, the settings
@@ -54,6 +59,40 @@ export function getDisputeWebhookRuntime(): DisputeWebhookRuntime {
     rest: runtime.rest,
     audit: runtime.audit,
     settings: runtime.settings,
+    now: (): number => Date.now(),
+  };
+}
+
+/** The dependencies the evidence pack's four acts use: the dispute's own, plus the bound document port. */
+export type DisputeEvidenceRuntime = DisputeEvidenceDependencies & { readonly now: () => number };
+
+/**
+ * The evidence pack's wiring (STEP 197).
+ *
+ * The storage port is built here rather than in the service. `lib/storage` already decides which adapter the
+ * environment selects (`STORAGE_PROVIDER`), refuses to boot with half an S3 configuration and refuses a
+ * signature that does not match the bytes; this module only asks it for the active one and for the platform's
+ * own seal. So a deployment with a bucket gets working uploads and a deployment without one gets the honest
+ * refusal `dispute_evidence_storage_missing`, and neither of them gets a file written to disk.
+ *
+ * The registry is built per call: adapters hold no connection until a request is made, and a module-level
+ * registry would be a second place a provider could be registered twice.
+ */
+export function getDisputeEvidenceRuntime(): DisputeEvidenceRuntime {
+  const runtime = getAuthRuntime();
+  const registry = new StorageAdapterRegistry();
+  registerDefaultStorageAdapters(registry);
+
+  return {
+    rest: runtime.rest,
+    audit: runtime.audit,
+    storage: createDisputeEvidenceStorage({
+      adapter: activeAdapter(registry),
+      encryption: createDefaultFileEncryption(),
+      rest: runtime.rest,
+      audit: runtime.audit,
+      now: (): number => Date.now(),
+    }),
     now: (): number => Date.now(),
   };
 }
