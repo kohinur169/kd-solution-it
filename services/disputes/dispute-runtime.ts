@@ -8,6 +8,7 @@ import type { DisputeDependencies } from "./dispute.ts";
 import type { DisputeWebhookDependencies } from "./dispute-webhook.ts";
 import type { DisputeEvidenceDependencies } from "./dispute-evidence.ts";
 import { createDisputeEvidenceStorage } from "./dispute-evidence-storage.ts";
+import type { ChargebackRateDependencies } from "./chargeback-rate.ts";
 import type { DisputeSubmissionDependencies } from "./dispute-submission.ts";
 import { SUBMITTING_PROVIDER_KEYS, type DisputeSubmissionPorts } from "./dispute-submission-provider.ts";
 
@@ -129,6 +130,26 @@ export function getDisputeSubmissionRuntime(): DisputeSubmissionRuntime {
     rest: runtime.rest,
     audit: runtime.audit,
     ports,
+    now: (): number => Date.now(),
+  };
+}
+
+/**
+ * The chargeback programme's wiring: the platform client, the signed chain and a clock.
+ *
+ * Section 18's seven thresholds are read from `platform_settings` by the service, so this module adds no reader
+ * of its own - `getAuthRuntime().rest` is already the client that reaches the table the super administrator
+ * writes. No provider client and no storage port either: a measurement counts rows, a warning queues mail and an
+ * extra reserve is a `0044` agreement, and none of those leaves the platform.
+ */
+export type ChargebackRuntime = ChargebackRateDependencies;
+
+export function getChargebackRuntime(): ChargebackRuntime {
+  const runtime = getAuthRuntime();
+
+  return {
+    rest: runtime.rest,
+    audit: runtime.audit,
     now: (): number => Date.now(),
   };
 }

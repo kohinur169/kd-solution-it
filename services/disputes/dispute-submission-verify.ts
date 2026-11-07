@@ -931,8 +931,8 @@ const numbers = [
   ),
 ].sort((left, right) => left - right);
 
-expectEqual(numbers[numbers.length - 1] ?? 0, 127, "0127 is the newest migration in the chain");
-expectEqual(numbers.length, 127, "and the chain is 127 files");
+expectEqual(numbers[numbers.length - 1] ?? 0, 128, "0128 is the newest migration in the chain");
+expectEqual(numbers.length, 128, "and the chain is 128 files");
 
 // `0059`-`0061` are the email STEPs' and gain nothing here.
 for (const file of ["0059_email_settings.sql", "0060_email_templates.sql", "0061_email_send_logs.sql"]) {

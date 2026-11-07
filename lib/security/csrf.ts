@@ -156,6 +156,9 @@ export const CSRF_PROTECTED_PATHS: readonly string[] = Object.freeze([
   "/api/office/disputes/[id]/deadline",
   "/api/office/disputes/[id]/review",
   "/api/office/disputes/[id]/submit",
+  "/api/office/disputes/chargeback/apply",
+  "/api/office/disputes/chargeback/clear",
+  "/api/office/disputes/chargeback/policy",
   "/api/office/disputes/warnings",
 ]);
 

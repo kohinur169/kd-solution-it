@@ -520,8 +520,8 @@ const files = await migrationFiles();
 const numbers = files.map((name) => Number.parseInt(name.slice(0, 4), 10));
 
 // 0124 is this STEP's own; 0125 was STEP 196's and 0126 is STEP 197's, which now heads the chain.
-expectEqual(numbers[numbers.length - 1] ?? 0, 127, "0124 is still in the chain; STEP 198's 0127 is the newest");
-expectEqual(files.length, 127, "the chain is 127 files");
+expectEqual(numbers[numbers.length - 1] ?? 0, 128, "0124 is still in the chain; STEP 199's 0128 is the newest");
+expectEqual(files.length, 128, "the chain is 128 files");
 expectEqual(
   numbers.every((value, index) => value === index + 1),
   true,

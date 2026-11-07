@@ -656,8 +656,8 @@ expect(!rollback.includes("drop table if exists public.disputes"), "and the disp
 const numbers = await migrationNumbers();
 
 // `0125` is this STEP's own; STEP 197's `0126_dispute_evidence_packs` heads the chain above it.
-expectEqual(numbers[numbers.length - 1] ?? 0, 127, "0127 heads the chain above this STEP's 0125");
-expectEqual(numbers.length, 127, "and the chain is 127 files");
+expectEqual(numbers[numbers.length - 1] ?? 0, 128, "0128 heads the chain above this STEP's 0125");
+expectEqual(numbers.length, 128, "and the chain is 128 files");
 expectEqual(
   numbers.every((value, index) => value === index + 1),
   true,

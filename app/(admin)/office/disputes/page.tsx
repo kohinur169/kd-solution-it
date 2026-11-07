@@ -3,6 +3,10 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import type { ReactNode } from "react";
 import { listDisputeWarnings, type DisputeWarningRecord } from "@/services/disputes/dispute-warnings";
+import { ChargebackPanel } from "./chargeback-panel";
+import { CHARGEBACK_READ_ROLES } from "@/services/disputes/chargeback-fields";
+import { readChargebackScreen, type ChargebackScreenView } from "@/services/disputes/chargeback-rate";
+import { getChargebackRuntime } from "@/services/disputes/dispute-runtime";
 import { DisputeDeadlineExtensionForm } from "./deadline-extension-form";
 import { DisputeWarningRunPanel } from "./warning-run-panel";
 import { AppError } from "@/lib/errors/app-error";
@@ -74,6 +78,8 @@ type QueueState =
       readonly mayWarn: boolean;
       /** The frozen packs of this desk, empty for a role that may read the queue but not review one. */
       readonly reviews: readonly DisputeReviewQueueRow[];
+      /** Section 18's programme, or null for a role that may answer a dispute but not watch a rate. */
+      readonly chargeback: ChargebackScreenView | null;
     };
 
 async function readQueueState(): Promise<QueueState> {
@@ -103,12 +109,19 @@ async function readQueueState(): Promise<QueueState> {
       ? await listReviewQueue({ actor: actorState.actor }, getDisputeSubmissionRuntime()).catch(() => [])
       : [];
 
+    // One more read, and only for a role section 18 gives the programme to: the watchlist measures every
+    // merchant, so asking it on behalf of the finance desk would be an outage line rather than a permission.
+    const chargeback = mayWatch(actorState.actor)
+      ? await readChargebackScreen(actorState.actor, getChargebackRuntime()).catch(() => null)
+      : null;
+
     return {
       kind: "ready",
       disputes,
       warnings,
       mayWarn: maySendWarnings(actorState.actor),
       reviews,
+      chargeback,
     };
   } catch (error) {
     if (error instanceof AppError) {
@@ -137,6 +150,19 @@ function mayReview(actor: RequestActor): boolean {
   return (
     hasSatisfiedTwoFactor(actor) &&
     actor.roles.some((role) => (DISPUTE_REVIEW_ROLES as readonly string[]).includes(role))
+  );
+}
+
+/**
+ * Whether this officer may read section 18's programme.
+ *
+ * The page decides what to *offer*, and `readChargebackScreen` decides again: it asks the same roles and the same
+ * second factor, so a browser that reaches the panel without them reads a refusal rather than numbers.
+ */
+function mayWatch(actor: RequestActor): boolean {
+  return (
+    hasSatisfiedTwoFactor(actor) &&
+    actor.roles.some((role) => CHARGEBACK_READ_ROLES.includes(role))
   );
 }
 
@@ -268,6 +294,16 @@ export default async function DisputeQueuePage(): Promise<ReactNode> {
         <p className={alertClasses}>{getMessage("disputes.failed")}</p>
       ) : (
         <>
+        {state.chargeback === null ? null : (
+          <section aria-labelledby="chargeback-heading" className={sectionClasses}>
+            <h2 id="chargeback-heading" className={headingClasses}>
+              {getMessage("disputes.chargebackTitle")}
+            </h2>
+            <p className={bodyClasses}>{getMessage("disputes.chargebackDescription")}</p>
+            <ChargebackPanel view={state.chargeback} />
+          </section>
+        )}
+
         <section aria-labelledby="dispute-review-queue-heading" className={sectionClasses}>
           <h2 id="dispute-review-queue-heading" className={headingClasses}>
             {getMessage("disputes.reviewQueueTitle")}

@@ -3720,6 +3720,74 @@ const catalog = {
     reviewQueueDecision: "Decision",
     reviewQueueNoDecision: "Not reviewed",
     reviewQueueOpen: "Open the pack",
+
+    chargebackTitle: "Chargeback rate",
+    chargebackDescription:
+      "The rate and the transaction count together, over the window the super administrator set. A percentage below the minimum count means nothing, which is why both are printed on every row.",
+    chargebackPolicyTitle: "The thresholds",
+    chargebackPolicyHelp:
+      "Every number here is a `chargeback.*` platform setting. A warning and an extra reserve are taken by the platform; a suspension is a super administrator's own decision.",
+    chargebackPolicyWindowLabel: "Window, days",
+    chargebackPolicyMinimumLabel: "Minimum transactions",
+    chargebackPolicyWarningLabel: "Warning bar, basis points",
+    chargebackPolicyReserveLabel: "Extra reserve bar, basis points",
+    chargebackPolicySuspensionLabel: "Suspension bar, basis points",
+    chargebackPolicyReservePercentLabel: "Extra reserve, percent withheld (basis points)",
+    chargebackPolicyReserveDaysLabel: "Extra reserve, days held",
+    chargebackPolicyDigest: "Policy {digest}",
+    chargebackPolicyUnset: "Never configured; the defaults are in force.",
+    chargebackPolicySave: "Save the thresholds",
+    chargebackPolicySaved: "The thresholds are saved. The measurement now reads the policy it names below.",
+    chargebackWatchActionNote: "Only a super administrator or the compliance desk may take a step, and only when the numbers earn one.",
+    chargebackPolicyFailure: "The thresholds were not saved. Every bar must sit between 1 and 10000 basis points, in the order warning, reserve, suspension, and the minimum must be a count the platform can hold.",
+    chargebackPolicyRoleNote:
+      "Only a super administrator with a proved second factor changes the thresholds. The panel shows them so the desk can read the bar it is measuring against.",
+    chargebackWatchTitle: "The merchants",
+    chargebackWatchDescription:
+      "Every merchant, its transactions and chargebacks over the window, the rate they give, and the step that rate earns.",
+    chargebackWatchEmpty: "No merchant is registered on this platform yet.",
+    chargebackWatchRate: "Rate",
+    chargebackWatchCounts: "{chargebacks} chargebacks of {payments} transactions",
+    chargebackWatchDue: "Earns",
+    chargebackWatchStanding: "Standing",
+    chargebackWatchNoStep: "No step",
+    chargebackWatchCleared: "cleared",
+    chargebackWatchTruncated:
+      "This window is larger than one measurement reads, so the rate is not acted on until it is measured again.",
+    chargebackStepWarning: "Warning and monitoring",
+    chargebackStepReserve: "Extra reserve",
+    chargebackStepSuspension: "Suspension",
+    chargebackRunLabel: "Take the step these numbers earn",
+    chargebackSuspendLabel: "Suspend",
+    chargebackSuspendReasonLabel: "Why this merchant is being suspended",
+    chargebackSuspendReasonHelp:
+      "Recorded as the reason on the account event, at most 280 characters. A suspension always carries the name of the officer who took it.",
+    chargebackSuspendRoleNote:
+      "Only a super administrator may suspend. The platform takes the warning and the reserve on its own; stopping a merchant's business is a person's decision.",
+    chargebackClearLabel: "Clear",
+    chargebackClearNoteLabel: "Why the step is lifted",
+    chargebackHistoryTitle: "Steps taken",
+    chargebackHistoryDescription: "The last twenty steps, newest first, with the numbers each was taken on.",
+    chargebackHistoryEmpty: "No chargeback step has been taken yet.",
+    chargebackApplied: "The {kind} step is recorded.",
+    chargebackCleared: "The {kind} step is cleared.",
+    chargebackModeAutomatic: "Automatic",
+    chargebackModeManual: "Manual",
+    chargebackAppliedAt: "Applied",
+    chargebackActor: "Officer",
+    chargebackReserveGiven: "Reserve at {percent} percent",
+    chargebackRuleBelowThreshold: "The rate is under the warning bar, so no step is owed.",
+    chargebackRuleMinimum: "Too few transactions in the window for a percentage to mean anything.",
+    chargebackRuleTaken: "This step is already standing for this merchant.",
+    chargebackRuleSuspended: "This merchant is suspended; the account lifecycle owns the way back.",
+    chargebackRuleMissing: "This merchant is not on the platform.",
+    chargebackRuleTruncated: "The window is too large to measure, so no step is taken on it.",
+    chargebackRuleInvalidPolicy: "A stored threshold is outside its bounds, so nothing is measured until it is fixed.",
+    chargebackRuleNotClearable: "A suspension is not cleared here: the account lifecycle returns the merchant.",
+    chargebackRuleAlreadyCleared: "This step was already cleared.",
+    chargebackRuleReasonRequired: "A suspension needs the officer's own sentence.",
+    chargebackRuleInvalidFormat: "The form could not be read. Check the numbers and try again.",
+    chargebackFailed: "The step was not taken. Try again.",
   },
   email: {
     lockAlert: {
@@ -3740,6 +3808,13 @@ const catalog = {
        * characters by `0061`, so it names the event and nothing else.
        */
       subject: "Your evidence pack was sent to the processor for your disputed payment",
+    },
+    chargebackWarning: {
+      /**
+       * STEP 199: the merchant is warned that the chargeback rate crossed the bar. A subject is capped at 160
+       * characters by `0061`, so it names the event and the window rather than the numbers.
+       */
+      subject: "Your chargeback rate crossed the warning bar and your account is being monitored",
     },
     disputeWarning: {
       /**

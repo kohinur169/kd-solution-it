@@ -999,8 +999,8 @@ expectSourceContains(filesSchema, "content_sha256 text not null", "`0057` alread
 
 const numbers = await migrationNumbers();
 
-expectEqual(numbers[numbers.length - 1] ?? 0, 127, "0127 is the newest migration in the chain");
-expectEqual(numbers.length, 127, "and the chain is 127 files");
+expectEqual(numbers[numbers.length - 1] ?? 0, 128, "0128 is the newest migration in the chain");
+expectEqual(numbers.length, 128, "and the chain is 128 files");
 expect(
   numbers.every((value, index) => index === 0 || value === (numbers[index - 1] ?? 0) + 1),
   "the chain is contiguous from 0001 to 0126",
