@@ -81,8 +81,8 @@ import {
  *     requires, and the fee column untouched: section 18's chargeback fee is a later STEP's number.
  *   - **No migration is needed.** `0039` already carries the table, the deadline arithmetic, the evidence
  *     rule, the resolution pair, the unique processor key and the triggers. The gate reads that file and
- *     asserts each of them, and asserts the highest migration is 126 - STEP 197's
- *     `0126_dispute_evidence_packs`, which this STEP did not write.
+ *     asserts each of them, and asserts the highest migration is 127 - STEP 198's
+ *     `0127_dispute_reviews_and_submissions`, which this STEP did not write.
  *   - **Nothing here writes money.** No `payments` write, no ledger call, no chargeback fee.
  */
 
@@ -1223,11 +1223,11 @@ async function main(): Promise<void> {
     .map((name) => Number.parseInt(name.slice(0, 4), 10))
     .sort((left, right) => left - right);
 
-  // 126 is STEP 197's `0126_dispute_evidence_packs`; 125 was STEP 196's, 124 STEP 195's. This STEP (194)
+  // 127 is STEP 198's `0127_dispute_reviews_and_submissions`; 126 was STEP 197's, 125 STEP 196's. This STEP (194)
   // itself owns no migration: `0039` carries the dispute and `0032` the delivery.
   expectEqual(
     migrations[migrations.length - 1] ?? 0,
-    126,
+    127,
     "this STEP adds no migration: `0039` already carries the dispute and `0032` the delivery",
   );
   expectEqual(harness.fixture.disputes.length, 1, "and the fixture closed with one row, as the deliveries said");

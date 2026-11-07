@@ -8,6 +8,9 @@ import { DisputeWarningRunPanel } from "./warning-run-panel";
 import { AppError } from "@/lib/errors/app-error";
 import { formatMessage, getMessage } from "@/lib/i18n/messages";
 import { listDisputeQueue, type DisputeView } from "@/services/disputes/dispute";
+import { listReviewQueue, type DisputeReviewQueueRow } from "@/services/disputes/dispute-submission";
+import { DISPUTE_REVIEW_ROLES } from "@/services/disputes/dispute-submission-fields";
+import { getDisputeSubmissionRuntime } from "@/services/disputes/dispute-runtime";
 import { DISPUTE_DEFAULT_WINDOW_HOURS, DISPUTE_WARNING_ROLES } from "@/services/disputes/dispute-fields";
 import { hasSatisfiedTwoFactor } from "@/lib/auth/session";
 import type { RequestActor } from "@/lib/auth/types";
@@ -69,6 +72,8 @@ type QueueState =
       readonly warnings: ReadonlyMap<string, readonly DisputeWarningRecord[]>;
       /** Whether this officer may send the two warnings by hand, which the panel needs to know. */
       readonly mayWarn: boolean;
+      /** The frozen packs of this desk, empty for a role that may read the queue but not review one. */
+      readonly reviews: readonly DisputeReviewQueueRow[];
     };
 
 async function readQueueState(): Promise<QueueState> {
@@ -92,7 +97,19 @@ async function readQueueState(): Promise<QueueState> {
       dependencies,
     ).catch(() => new Map<string, readonly DisputeWarningRecord[]>());
 
-    return { kind: "ready", disputes, warnings, mayWarn: maySendWarnings(actorState.actor) };
+    // One more read, and only for the desk that answers for a pack: `listReviewQueue` refuses every other role,
+    // so asking it on behalf of the finance desk would turn a permission into an outage line.
+    const reviews = mayReview(actorState.actor)
+      ? await listReviewQueue({ actor: actorState.actor }, getDisputeSubmissionRuntime()).catch(() => [])
+      : [];
+
+    return {
+      kind: "ready",
+      disputes,
+      warnings,
+      mayWarn: maySendWarnings(actorState.actor),
+      reviews,
+    };
   } catch (error) {
     if (error instanceof AppError) {
       if (error.code === "AUTHENTICATION_REQUIRED") {
@@ -116,6 +133,13 @@ async function readQueueState(): Promise<QueueState> {
  * a sweep. The second factor is asked here for the same reason it is asked there - a session that has not
  * proved itself must not be able to mail the platform's merchants.
  */
+function mayReview(actor: RequestActor): boolean {
+  return (
+    hasSatisfiedTwoFactor(actor) &&
+    actor.roles.some((role) => (DISPUTE_REVIEW_ROLES as readonly string[]).includes(role))
+  );
+}
+
 function maySendWarnings(actor: RequestActor): boolean {
   return (
     hasSatisfiedTwoFactor(actor) &&
@@ -243,6 +267,53 @@ export default async function DisputeQueuePage(): Promise<ReactNode> {
       ) : state.kind === "unavailable" ? (
         <p className={alertClasses}>{getMessage("disputes.failed")}</p>
       ) : (
+        <>
+        <section aria-labelledby="dispute-review-queue-heading" className={sectionClasses}>
+          <h2 id="dispute-review-queue-heading" className={headingClasses}>
+            {getMessage("disputes.reviewQueueTitle")}
+          </h2>
+          <p className={bodyClasses}>{getMessage("disputes.reviewQueueDescription")}</p>
+
+          {state.reviews.length === 0 ? (
+            <p className={bodyClasses}>{getMessage("disputes.reviewQueueEmpty")}</p>
+          ) : (
+            <ul className={listClasses}>
+              {state.reviews.map((row) => (
+                <li key={row.packId} className={cardClasses}>
+                  <div className={rowHeaderClasses}>
+                    <span className="text-sm font-semibold tabular-nums text-foreground">
+                      {row.dispute.amountText}
+                    </span>
+                    <span className={noteClasses}>{row.dispute.reasonCode}</span>
+                    <span className={dueBadgeClasses}>
+                      {row.decision === null
+                        ? getMessage("disputes.reviewQueueNoDecision")
+                        : row.decision === "approved"
+                          ? getMessage("disputes.reviewDecisionApproved")
+                          : getMessage("disputes.reviewDecisionDeclined")}
+                    </span>
+                  </div>
+
+                  <dl className="grid grid-cols-1 gap-1 text-sm sm:grid-cols-[12rem_1fr]">
+                    <dt className={bodyClasses}>{getMessage("disputes.companyRowLabel")}</dt>
+                    <dd className="break-words text-xs sm:text-sm">{row.companyName}</dd>
+                    <dt className={bodyClasses}>{getMessage("disputes.amountRowLabel")}</dt>
+                    <dd className="text-xs tabular-nums sm:text-sm">{row.dispute.amountText}</dd>
+                    <dt className={bodyClasses}>{getMessage("disputes.dueRowLabel")}</dt>
+                    <dd className="text-xs sm:text-sm">{formatInstant(row.dispute.responseDueAt)}</dd>
+                    <dt className={bodyClasses}>{getMessage("disputes.reviewPackTitle")}</dt>
+                    <dd className="break-all text-xs tabular-nums sm:text-sm">{row.digest.slice(0, 16)}</dd>
+                  </dl>
+
+                  <Link className={linkClasses} href={`/office/disputes/${encodeURIComponent(row.dispute.id)}`}>
+                    {getMessage("disputes.reviewQueueOpen")}
+                  </Link>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+
         <section aria-labelledby="dispute-queue-heading" className={sectionClasses}>
           <h2 id="dispute-queue-heading" className={headingClasses}>
             {getMessage("disputes.queueTitle")}
@@ -306,6 +377,7 @@ export default async function DisputeQueuePage(): Promise<ReactNode> {
             </ul>
           )}
         </section>
+        </>
       )}
     </main>
   );

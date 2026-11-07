@@ -3638,6 +3638,88 @@ const catalog = {
     evidencePolicyLabel: "{policy} accepted {instant}",
     evidenceEmailLabel: "Email to the client sent {instant}",
     evidenceEventLabel: "{event} {instant}",
+
+    /**
+     * STEP 198: the compliance desk's review of that pack, and the two ways the pack reaches the processor.
+     * Section 19's sentence is "compliance_kyc reviews the evidence pack and sends it to the processor", so the
+     * words here are the desk's: a decision, a reason, and the processor's own case number typed off its portal.
+     */
+    reviewTitle: "Review the evidence pack",
+    reviewDescription:
+      "Section 19 gives this desk the pack. Read the four parts and the merchant's documents, then approve the pack or decline it with a reason. The pack is frozen: nothing on this screen edits the evidence.",
+    reviewRoleNote: "Only the compliance desk and a super administrator review a pack.",
+    reviewNoPack: "The merchant has not frozen an evidence pack yet, so there is nothing to review.",
+    reviewNoPackHelp:
+      "The pack is assembled and frozen by the merchant on their own dispute screen. This desk reads it once it exists.",
+    reviewPackTitle: "The frozen pack",
+    reviewPackEmpty: "This part holds nothing.",
+    reviewCounts: "{items} records and {documents} documents",
+    reviewDigest: "Fingerprint {digest}",
+    reviewFrozenAt: "Frozen {instant}",
+    reviewDecideTitle: "Your decision",
+    reviewApprove: "Approve the pack",
+    reviewDecline: "Decline the pack",
+    reviewNoteLabel: "Reason",
+    reviewNoteHelp: "One sentence: what you checked, or what is wrong with the pack.",
+    reviewNotePlaceholder: "What this decision rests on.",
+    reviewSaving: "Recording",
+    reviewApproved: "The pack is approved. It may be sent to the processor.",
+    reviewDeclined: "The pack is declined. The merchant keeps their dispute and the pack stays frozen.",
+    reviewHistoryTitle: "Decisions on this pack",
+    reviewHistoryEmpty: "No decision has been recorded on this pack.",
+    reviewDecisionApproved: "Approved",
+    reviewDecisionDeclined: "Declined",
+    reviewLatestApproved: "The latest decision on this pack is an approval.",
+    reviewLatestDeclined: "The latest decision on this pack is a decline, so it cannot be sent.",
+    reviewAwaitingDecision: "No decision yet, so this pack cannot be sent.",
+    reviewMoved: "Somebody else changed this dispute while your page was open. Reload and check.",
+    reviewFailed: "The decision was not recorded. Try again.",
+
+    submissionTitle: "Send the pack to the processor",
+    submissionHelp:
+      "The processor answers chargebacks on its own case file. Send the pack through the processor's API when this build has one for that provider, or send it from the processor's portal and record the case number here.",
+    submissionChannelLabel: "How it is sent",
+    submissionChannelProvider: "Through the processor's API",
+    submissionChannelRecorded: "Recorded: I sent it from the processor's portal",
+    submissionReferenceLabel: "Processor case number",
+    submissionReferenceHelp: "The identifier or case number the processor gave the submission.",
+    submissionReferencePlaceholder: "The number on the processor's page.",
+    submissionNoteLabel: "What you did (optional)",
+    submissionNotePlaceholder: "Where it was sent, or who you spoke to.",
+    submissionButton: "Send the pack",
+    submissionRecordingButton: "Record the submission",
+    submissionSending: "Sending",
+    submissionSentGeneric: "The pack is sent to the processor.",
+    submissionDone: "The pack is sent. The processor's reference is {reference}.",
+    submissionAlreadyDone: "This pack was already sent. The processor's reference is {reference}.",
+    submissionProviderUnsupported:
+      "This build has no documented dispute API for this provider's processor, so the pack is sent from the portal and recorded here.",
+    submissionNeedsApproval: "The pack must be approved before it is sent.",
+    submissionSentTitle: "Sent to the processor",
+    submissionSentBy: "Recorded by an officer of this desk.",
+    submissionReferenceText: "Reference {reference}",
+    submissionSentAt: "Sent {instant}",
+    submissionChannelProviderText: "Sent through the processor's API",
+    submissionChannelRecordedText: "Sent from the processor's portal and recorded here",
+    submissionRulePackMissing: "The merchant has not frozen an evidence pack, so there is nothing to send.",
+    submissionRuleReviewRequired: "The pack must be approved by this desk before it is sent.",
+    submissionRuleExists: "This pack is already with the processor, or an attempt is in flight.",
+    submissionRuleUnsupported: "This build cannot call this provider's dispute API. Record the submission instead.",
+    submissionRuleDeclined: "The processor refused the evidence.",
+    submissionRuleUnanswered: "The processor did not answer, so the evidence was not confirmed. Try again.",
+    submissionRuleProviderMissing: "The disputed payment names no provider, so no channel is available.",
+    submissionRuleAlready: "The evidence was already sent for this dispute.",
+    submissionRuleDecided: "This dispute is decided and cannot be reviewed or sent.",
+    submissionRuleNotFound: "This dispute is not on this platform.",
+    submissionFailed: "The pack was not sent. Try again.",
+
+    reviewQueueTitle: "Packs waiting for the desk",
+    reviewQueueDescription:
+      "Every frozen evidence pack no officer has sent yet, nearest deadline first. A pack with no decision is the first thing to look at.",
+    reviewQueueEmpty: "No frozen pack is waiting for a decision.",
+    reviewQueueDecision: "Decision",
+    reviewQueueNoDecision: "Not reviewed",
+    reviewQueueOpen: "Open the pack",
   },
   email: {
     lockAlert: {
@@ -3651,6 +3733,13 @@ const catalog = {
     newDevice: {
       /** Subject of the section 23 alert of section 22: an account was used from a new device. */
       subject: "A new device signed in to your account. Confirm it with your authenticator",
+    },
+    disputeSubmission: {
+      /**
+       * STEP 198: the merchant is told their evidence reached the processor. A subject is capped at 160
+       * characters by `0061`, so it names the event and nothing else.
+       */
+      subject: "Your evidence pack was sent to the processor for your disputed payment",
     },
     disputeWarning: {
       /**

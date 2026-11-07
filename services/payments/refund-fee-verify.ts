@@ -1215,8 +1215,8 @@ async function main(): Promise<void> {
 
   // 0123 is this STEP's own, 0124 was STEP 195's, 0125 STEP 196's and 0126 is STEP 197's; the chain is
   // contiguous.
-  expectEqual(Math.max(...numbers), 126, "0126 is the newest migration in the chain");
-  expectEqual(numbers.length, 126, "and the chain is one longer than STEP 192 left it");
+  expectEqual(Math.max(...numbers), 127, "0127 is the newest migration in the chain");
+  expectEqual(numbers.length, 127, "and the chain is one longer than STEP 192 left it");
 
   // The service writes no payment, and reuses the refund module's guarded write.
   expect(

@@ -1,5 +1,6 @@
 // path: services/disputes/dispute-runtime.ts
 import { getAuthRuntime } from "../../lib/auth/runtime.ts";
+import { AppError } from "../../lib/errors/app-error.ts";
 import { registerDefaultStorageAdapters } from "../../lib/storage/adapters.ts";
 import { createDefaultFileEncryption } from "../../lib/storage/encryption.ts";
 import { StorageAdapterRegistry, activeAdapter } from "../../lib/storage/registry.ts";
@@ -7,6 +8,8 @@ import type { DisputeDependencies } from "./dispute.ts";
 import type { DisputeWebhookDependencies } from "./dispute-webhook.ts";
 import type { DisputeEvidenceDependencies } from "./dispute-evidence.ts";
 import { createDisputeEvidenceStorage } from "./dispute-evidence-storage.ts";
+import type { DisputeSubmissionDependencies } from "./dispute-submission.ts";
+import { SUBMITTING_PROVIDER_KEYS, type DisputeSubmissionPorts } from "./dispute-submission-provider.ts";
 
 /**
  * The production wiring of section 19's disputes: the PostgREST client, the signed audit trail, the settings
@@ -93,6 +96,39 @@ export function getDisputeEvidenceRuntime(): DisputeEvidenceRuntime {
       audit: runtime.audit,
       now: (): number => Date.now(),
     }),
+    now: (): number => Date.now(),
+  };
+}
+
+/** The dependencies the review and the submission use: the dispute's own, plus the processor ports. */
+export type DisputeSubmissionRuntime = DisputeSubmissionDependencies & { readonly now: () => number };
+
+/**
+ * The review and submission wiring (STEP 198).
+ *
+ * The ports are built from `SUBMITTING_PROVIDER_KEYS`, which is empty in this build: no provider's dispute API
+ * has been read from the provider's own documentation in a session yet, and the master prompt's provider rule
+ * is that an adapter is written from that documentation and never from memory. So the provider channel refuses
+ * with `dispute_submission_unsupported` and the recorded channel - the compliance desk sending the pack from the
+ * processor's portal and typing its case number here - is the one that works today.
+ *
+ * That is a wiring decision, not a hole: adding a provider is one adapter file and one entry in that list, and
+ * this function needs no change at all, because it registers whatever the list names.
+ */
+export function getDisputeSubmissionRuntime(): DisputeSubmissionRuntime {
+  const runtime = getAuthRuntime();
+  const ports: DisputeSubmissionPorts = {};
+
+  if (SUBMITTING_PROVIDER_KEYS.length !== 0) {
+    // A key in the list with no adapter beside it would be a provider this build claims to support and cannot
+    // call. The list and this object grow together, in one commit, or neither of them moves.
+    throw new AppError("DEPENDENCY_FAILED", { cause: { rule: "submission_port_missing" } });
+  }
+
+  return {
+    rest: runtime.rest,
+    audit: runtime.audit,
+    ports,
     now: (): number => Date.now(),
   };
 }
