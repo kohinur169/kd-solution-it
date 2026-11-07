@@ -1,0 +1,563 @@
+-- path: migrations/0127_dispute_reviews_and_submissions.sql
+-- STEP 198 - the compliance desk reviews the pack, and the pack goes to the processor.
+--
+-- Section 19's sentence is one line: "compliance_kyc reviews the evidence pack and sends it to the processor."
+-- Three things follow from it, and all three are in this file:
+--
+--   1. `dispute_reviews` - the decision of a named compliance officer on one frozen pack: approved, or declined
+--      with a reason. Append only. The pack itself never moves, which is `0126`'s rule and the reason a declined
+--      review is a note on the record rather than an edit to the evidence.
+--   2. `dispute_submissions` - the attempt to hand that pack to the processor: the claim (`sending`), then the
+--      answer (`sent`, with the processor's reference, or `failed`, with the rule that failed). One pack is with
+--      the processor once: the unique index refuses a second live attempt, and a failed attempt frees the pack
+--      for the next one.
+--   3. `disputes_guard_submission` - `0039`'s `evidence_submitted` status stops being a status a caller may
+--      simply set. It is true only while a *sent* submission exists for a frozen pack of that dispute, which is
+--      what makes the status mean "the desk sent the evidence" rather than "somebody said so".
+--
+-- ## Why two tables and not one
+--
+-- A review is a judgement with a name and a reason attached; a submission is a fact about the outside world
+-- with a reference attached. They are written at different moments, by the same role on different days, and one
+-- can exist without the other in both directions: a declined review is never submitted, and a submission whose
+-- processor call failed has a review but no reference. Folding them into one row would make "approved but not
+-- yet sent" a state with no home.
+--
+-- ## Why the review is required by the database and not only by the service
+--
+-- The sentence that gives the desk this act is the same sentence that gives it the review. A service that could
+-- skip the review would make the compliance desk's approval decorative, so the submission's guard asks the
+-- reviews table itself: the latest decision for the pack must be `approved`. A later `declined` therefore blocks
+-- the next attempt without touching the earlier approval, which is what an append-only log is for.
+--
+-- ## What is deliberately absent
+--
+-- No evidence bytes, no item and no document: the submission points at the pack, and the pack points at its
+-- rows. No amount and no currency: the money is in `0037`/`0039`. No request body and no response body: a
+-- processor's envelope is not the platform's to keep, and a payload column would become a copy of a client's
+-- correspondence with a stranger's authentication tokens in it. What is kept is the digest of exactly what was
+-- sent - the same 64 hex characters the pack was frozen with - so a reviewer can prove later which evidence the
+-- processor received.
+--
+-- Both tables carry `company_id` and default-deny under row level security, with the platform's service role as
+-- the only writer, like every other table in the chain.
+
+begin;
+
+create table public.dispute_reviews (
+  id uuid not null default public.uuid_generate_v7(),
+  company_id uuid not null,
+  dispute_id uuid not null,
+  pack_id uuid not null,
+  decision text not null,
+  note text not null,
+  pack_digest text not null,
+  reviewer_user_id uuid not null,
+  decided_at timestamptz not null default now(),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  deleted_at timestamptz,
+  version integer not null default 1,
+  constraint dispute_reviews_pkey primary key (id),
+  constraint dispute_reviews_company_fkey foreign key (company_id)
+    references public.companies (id),
+  constraint dispute_reviews_dispute_fkey foreign key (dispute_id)
+    references public.disputes (id),
+  constraint dispute_reviews_pack_fkey foreign key (pack_id)
+    references public.dispute_evidence_packs (id),
+  constraint dispute_reviews_reviewer_fkey foreign key (reviewer_user_id)
+    references public.users (id),
+  constraint dispute_reviews_decision_check check (decision in ('approved', 'declined')),
+  constraint dispute_reviews_note_check check (
+    char_length(note) between 1 and 500
+    and note = btrim(note)
+  ),
+  constraint dispute_reviews_digest_check check (pack_digest ~ '^[0-9a-f]{64}$'),
+  constraint dispute_reviews_decided_check check (decided_at >= created_at),
+  constraint dispute_reviews_row_version_check check (version > 0),
+  constraint dispute_reviews_updated_check check (updated_at >= created_at),
+  constraint dispute_reviews_deleted_check check (deleted_at is null or deleted_at >= created_at)
+);
+
+comment on table public.dispute_reviews is
+  'Append only: one compliance officer''s decision on one frozen evidence pack, approved or declined with a reason.';
+
+comment on column public.dispute_reviews.id is
+  'UUID v7 primary key. Time ordered, generated by public.uuid_generate_v7().';
+
+comment on column public.dispute_reviews.company_id is
+  'The merchant whose pack was reviewed. Equal to the dispute''s tenant, which the guard re-checks.';
+
+comment on column public.dispute_reviews.dispute_id is
+  'The dispute the reviewed pack answers.';
+
+comment on column public.dispute_reviews.pack_id is
+  'The frozen pack this decision is about. A pack may be reviewed more than once; the latest decision is the one that counts.';
+
+comment on column public.dispute_reviews.decision is
+  'approved means the desk may send this pack; declined means it may not, and the note says why.';
+
+comment on column public.dispute_reviews.note is
+  'The officer''s reason, trimmed and bounded. Never empty: a decision without a reason is not a review.';
+
+comment on column public.dispute_reviews.pack_digest is
+  'The pack''s own SHA-256 at the moment of the review, so a decision can never be read against different evidence.';
+
+comment on column public.dispute_reviews.reviewer_user_id is
+  'The compliance account that decided. Never a system identity and never a merchant.';
+
+comment on column public.dispute_reviews.decided_at is
+  'When the decision was made. Never before the row was created.';
+
+comment on column public.dispute_reviews.created_at is
+  'When the decision row was written.';
+
+comment on column public.dispute_reviews.updated_at is
+  'Set by the dispute_reviews_set_row_metadata trigger, which the append only guard makes unreachable.';
+
+comment on column public.dispute_reviews.deleted_at is
+  'Never written: a review is append only, because a decision that can be removed is not a decision.';
+
+comment on column public.dispute_reviews.version is
+  'Optimistic locking counter, kept for the chain''s shape; a review never moves past version 1.';
+
+create index dispute_reviews_pack_idx
+  on public.dispute_reviews (pack_id, decided_at desc);
+
+create index dispute_reviews_company_idx
+  on public.dispute_reviews (company_id, decided_at desc);
+
+create table public.dispute_submissions (
+  id uuid not null default public.uuid_generate_v7(),
+  company_id uuid not null,
+  dispute_id uuid not null,
+  pack_id uuid not null,
+  channel text not null,
+  status text not null default 'sending',
+  provider_key text not null,
+  mode text not null,
+  processor_reference text,
+  failure_rule text,
+  note text,
+  pack_digest text not null,
+  item_count integer not null,
+  document_count integer not null,
+  submitted_by_user_id uuid not null,
+  claimed_at timestamptz not null default now(),
+  sent_at timestamptz,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  deleted_at timestamptz,
+  version integer not null default 1,
+  constraint dispute_submissions_pkey primary key (id),
+  constraint dispute_submissions_company_fkey foreign key (company_id)
+    references public.companies (id),
+  constraint dispute_submissions_dispute_fkey foreign key (dispute_id)
+    references public.disputes (id),
+  constraint dispute_submissions_pack_fkey foreign key (pack_id)
+    references public.dispute_evidence_packs (id),
+  constraint dispute_submissions_sender_fkey foreign key (submitted_by_user_id)
+    references public.users (id),
+  constraint dispute_submissions_channel_check check (channel in ('provider', 'recorded')),
+  constraint dispute_submissions_status_check check (status in ('sending', 'sent', 'failed')),
+  constraint dispute_submissions_mode_check check (mode in ('test', 'live')),
+  constraint dispute_submissions_provider_check check (
+    provider_key ~ '^[a-z][a-z0-9-]{1,31}$'
+  ),
+  constraint dispute_submissions_reference_check check (
+    processor_reference is null
+    or (char_length(processor_reference) between 1 and 120 and processor_reference = btrim(processor_reference))
+  ),
+  constraint dispute_submissions_failure_check check (
+    failure_rule is null or failure_rule ~ '^[a-z][a-z0-9_]{1,63}$'
+  ),
+  constraint dispute_submissions_note_check check (
+    note is null or (char_length(note) between 1 and 500 and note = btrim(note))
+  ),
+  constraint dispute_submissions_digest_check check (pack_digest ~ '^[0-9a-f]{64}$'),
+  constraint dispute_submissions_counts_check check (item_count >= 0 and document_count >= 0),
+  constraint dispute_submissions_sent_check check (
+    (status = 'sent') = (sent_at is not null and processor_reference is not null)
+  ),
+  constraint dispute_submissions_failed_check check (
+    (status = 'failed') = (failure_rule is not null)
+  ),
+  constraint dispute_submissions_claimed_check check (sent_at is null or sent_at >= claimed_at),
+  constraint dispute_submissions_row_version_check check (version > 0),
+  constraint dispute_submissions_updated_check check (updated_at >= created_at),
+  constraint dispute_submissions_deleted_check check (deleted_at is null or deleted_at >= created_at)
+);
+
+comment on table public.dispute_submissions is
+  'The attempt to hand one frozen evidence pack to the processor: claimed, then sent with a reference, or failed with a rule.';
+
+comment on column public.dispute_submissions.id is
+  'UUID v7 primary key. Time ordered, generated by public.uuid_generate_v7().';
+
+comment on column public.dispute_submissions.company_id is
+  'The merchant whose evidence was sent. Equal to the pack''s tenant, which the guard re-checks.';
+
+comment on column public.dispute_submissions.dispute_id is
+  'The dispute being answered. The status moves to evidence_submitted when this row is sent.';
+
+comment on column public.dispute_submissions.pack_id is
+  'The frozen pack that was sent. One live attempt per pack: the unique index is the claim.';
+
+comment on column public.dispute_submissions.channel is
+  'provider when the processor''s own API was called, recorded when the desk sent it through the processor''s portal and recorded the reference here.';
+
+comment on column public.dispute_submissions.status is
+  'sending while the call is in flight, sent with the processor''s reference, failed with the rule that stopped it.';
+
+comment on column public.dispute_submissions.provider_key is
+  'The payment provider the pack went to, as lib/payments/registry.ts names it.';
+
+comment on column public.dispute_submissions.mode is
+  'test or live: the mode the disputed payment was taken in, never a mode chosen here.';
+
+comment on column public.dispute_submissions.processor_reference is
+  'The processor''s own identifier or case number for the submitted evidence. Required exactly when the row is sent.';
+
+comment on column public.dispute_submissions.failure_rule is
+  'Why the attempt failed, in the same vocabulary the service refuses with. Required exactly when the row has failed.';
+
+comment on column public.dispute_submissions.note is
+  'The desk''s sentence for a recorded submission: who they spoke to, or where they sent it.';
+
+comment on column public.dispute_submissions.pack_digest is
+  'The digest of exactly what was sent - the pack''s own SHA-256 at its freeze.';
+
+comment on column public.dispute_submissions.item_count is
+  'Records in the pack when it was sent, copied from the frozen pack rather than counted here.';
+
+comment on column public.dispute_submissions.document_count is
+  'Documents in the pack when it was sent, copied from the frozen pack rather than counted here.';
+
+comment on column public.dispute_submissions.submitted_by_user_id is
+  'The compliance account that sent the evidence. Never a system identity and never a merchant.';
+
+comment on column public.dispute_submissions.claimed_at is
+  'When the attempt was claimed. The claim is written before the processor is called, so two officers cannot both send.';
+
+comment on column public.dispute_submissions.sent_at is
+  'When the processor answered, or when the desk recorded a submission it had already made. Null while sending.';
+
+comment on column public.dispute_submissions.created_at is
+  'When the claim was written.';
+
+comment on column public.dispute_submissions.updated_at is
+  'Set by the dispute_submissions_set_row_metadata trigger on the one transition a row has.';
+
+comment on column public.dispute_submissions.deleted_at is
+  'Never written: an attempt is append only, and a failed one frees the pack by its status rather than by a delete.';
+
+comment on column public.dispute_submissions.version is
+  'Optimistic locking counter, incremented by the metadata trigger on the sending to sent or failed transition.';
+
+-- One live attempt per pack, and one per dispute: the row is the claim, so two officers cannot both send the
+-- same evidence. A failed attempt is not live, which is what makes a retry after a processor outage possible.
+create unique index dispute_submissions_pack_key
+  on public.dispute_submissions (pack_id)
+  where deleted_at is null and status in ('sending', 'sent');
+
+create unique index dispute_submissions_dispute_key
+  on public.dispute_submissions (dispute_id)
+  where deleted_at is null and status in ('sending', 'sent');
+
+create index dispute_submissions_company_idx
+  on public.dispute_submissions (company_id, claimed_at desc)
+  where deleted_at is null;
+
+create index dispute_submissions_status_idx
+  on public.dispute_submissions (status, claimed_at)
+  where deleted_at is null;
+
+-- A review is a judgement: frozen evidence, one decision, a reason, a named officer, and no way to change it.
+create function public.dispute_reviews_guard()
+returns trigger
+language plpgsql
+set search_path = ''
+as $$
+declare
+  pack_status text;
+  pack_company uuid;
+  pack_dispute uuid;
+  pack_digest text;
+  dispute_resolved timestamptz;
+  submitted boolean;
+begin
+  if tg_op <> 'INSERT' then
+    raise exception 'a compliance decision is append only'
+      using errcode = 'check_violation';
+  end if;
+
+  select packs.status, packs.company_id, packs.dispute_id, packs.digest
+    into pack_status, pack_company, pack_dispute, pack_digest
+    from public.dispute_evidence_packs as packs
+   where packs.id = new.pack_id
+     and packs.deleted_at is null;
+
+  if not found then
+    raise exception 'a review is about a pack that exists'
+      using errcode = 'check_violation';
+  end if;
+
+  if pack_status <> 'frozen' then
+    raise exception 'only a frozen evidence pack can be reviewed'
+      using errcode = 'check_violation';
+  end if;
+
+  if pack_dispute <> new.dispute_id or pack_company <> new.company_id then
+    raise exception 'a review belongs to the pack''s own dispute and merchant'
+      using errcode = 'check_violation';
+  end if;
+
+  if pack_digest is null or pack_digest <> new.pack_digest then
+    raise exception 'a review names the digest of the evidence it reviewed'
+      using errcode = 'check_violation';
+  end if;
+
+  select disputes.resolved_at
+    into dispute_resolved
+    from public.disputes as disputes
+   where disputes.id = new.dispute_id
+     and disputes.company_id = new.company_id;
+
+  if not found then
+    raise exception 'a review is about a dispute of the same merchant'
+      using errcode = 'check_violation';
+  end if;
+
+  if dispute_resolved is not null then
+    raise exception 'a decided dispute needs no review'
+      using errcode = 'check_violation';
+  end if;
+
+  select exists (
+           select 1
+             from public.dispute_submissions as submissions
+            where submissions.pack_id = new.pack_id
+              and submissions.status in ('sending', 'sent')
+              and submissions.deleted_at is null
+         )
+    into submitted;
+
+  if submitted then
+    raise exception 'a pack that has been sent to the processor cannot be reviewed again'
+      using errcode = 'check_violation';
+  end if;
+
+  return new;
+end;
+$$;
+
+comment on function public.dispute_reviews_guard() is
+  'Append only, frozen evidence only, the pack''s own digest only, and never once the pack has been sent.';
+
+create trigger dispute_reviews_guard
+  before insert or update or delete on public.dispute_reviews
+  for each row
+  execute function public.dispute_reviews_guard();
+
+create trigger dispute_reviews_set_row_metadata
+  before update on public.dispute_reviews
+  for each row
+  execute function public.set_row_metadata();
+
+-- The submission: claimed against a reviewed, frozen pack, and moved once - sending to sent or to failed.
+create function public.dispute_submissions_guard()
+returns trigger
+language plpgsql
+set search_path = ''
+as $$
+declare
+  pack_status text;
+  pack_company uuid;
+  pack_dispute uuid;
+  pack_digest text;
+  pack_items integer;
+  pack_documents integer;
+  dispute_status text;
+  dispute_resolved timestamptz;
+  latest_decision text;
+begin
+  if tg_op = 'DELETE' then
+    raise exception 'a submission attempt is never deleted'
+      using errcode = 'check_violation';
+  end if;
+
+  if tg_op = 'UPDATE' then
+    if old.status <> 'sending' then
+      raise exception 'a submission attempt that has an answer cannot be rewritten'
+        using errcode = 'check_violation';
+    end if;
+
+    if new.status = 'sending' then
+      raise exception 'a claim moves to sent or to failed, never to itself again'
+        using errcode = 'check_violation';
+    end if;
+
+    if new.pack_id <> old.pack_id
+       or new.dispute_id <> old.dispute_id
+       or new.company_id <> old.company_id
+       or new.channel <> old.channel
+       or new.provider_key <> old.provider_key
+       or new.mode <> old.mode
+       or new.pack_digest <> old.pack_digest
+       or new.item_count <> old.item_count
+       or new.document_count <> old.document_count
+       or new.submitted_by_user_id <> old.submitted_by_user_id then
+      raise exception 'a submission attempt keeps the facts it was claimed with'
+        using errcode = 'check_violation';
+    end if;
+
+    return new;
+  end if;
+
+  select packs.status, packs.company_id, packs.dispute_id, packs.digest, packs.item_count, packs.document_count
+    into pack_status, pack_company, pack_dispute, pack_digest, pack_items, pack_documents
+    from public.dispute_evidence_packs as packs
+   where packs.id = new.pack_id
+     and packs.deleted_at is null;
+
+  if not found then
+    raise exception 'a submission is about a pack that exists'
+      using errcode = 'check_violation';
+  end if;
+
+  if pack_status <> 'frozen' then
+    raise exception 'only a frozen evidence pack can be submitted'
+      using errcode = 'check_violation';
+  end if;
+
+  if pack_dispute <> new.dispute_id or pack_company <> new.company_id then
+    raise exception 'a submission belongs to the pack''s own dispute and merchant'
+      using errcode = 'check_violation';
+  end if;
+
+  if pack_digest is null or pack_digest <> new.pack_digest then
+    raise exception 'a submission names the digest of the evidence it sends'
+      using errcode = 'check_violation';
+  end if;
+
+  if pack_items <> new.item_count or pack_documents <> new.document_count then
+    raise exception 'a submission carries the counts of the pack it sends'
+      using errcode = 'check_violation';
+  end if;
+
+  select disputes.status, disputes.resolved_at
+    into dispute_status, dispute_resolved
+    from public.disputes as disputes
+   where disputes.id = new.dispute_id
+     and disputes.company_id = new.company_id;
+
+  if not found then
+    raise exception 'a submission is about a dispute of the same merchant'
+      using errcode = 'check_violation';
+  end if;
+
+  if dispute_resolved is not null then
+    raise exception 'a decided dispute is not submitted'
+      using errcode = 'check_violation';
+  end if;
+
+  if dispute_status not in ('open', 'under_review') then
+    raise exception 'a dispute at this status is not submitted'
+      using errcode = 'check_violation';
+  end if;
+
+  select reviews.decision
+    into latest_decision
+    from public.dispute_reviews as reviews
+   where reviews.pack_id = new.pack_id
+   order by reviews.decided_at desc, reviews.id desc
+   limit 1;
+
+  if latest_decision is distinct from 'approved' then
+    raise exception 'the compliance desk approves the evidence pack before it is sent'
+      using errcode = 'check_violation';
+  end if;
+
+  return new;
+end;
+$$;
+
+comment on function public.dispute_submissions_guard() is
+  'One claim per frozen pack, an approved review behind it, and exactly one transition from sending.';
+
+create trigger dispute_submissions_guard
+  before insert or update or delete on public.dispute_submissions
+  for each row
+  execute function public.dispute_submissions_guard();
+
+create trigger dispute_submissions_set_row_metadata
+  before update on public.dispute_submissions
+  for each row
+  execute function public.set_row_metadata();
+
+-- `evidence_submitted` stops being a status a caller may set: it is true while a sent submission exists.
+create function public.disputes_guard_submission()
+returns trigger
+language plpgsql
+set search_path = ''
+as $$
+begin
+  if old.status = 'evidence_submitted' and new.status in ('open', 'under_review') then
+    raise exception 'a dispute whose evidence has been sent does not go back to waiting'
+      using errcode = 'check_violation';
+  end if;
+
+  if new.status <> 'evidence_submitted' and new.submitted_at is null then
+    return new;
+  end if;
+
+  if new.submitted_at is null then
+    raise exception 'a dispute is evidence submitted at an instant'
+      using errcode = 'check_violation';
+  end if;
+
+  if not exists (
+    select 1
+      from public.dispute_submissions as submissions
+     where submissions.dispute_id = new.id
+       and submissions.company_id = new.company_id
+       and submissions.status = 'sent'
+       and submissions.deleted_at is null
+  ) then
+    raise exception 'a dispute is evidence submitted only when a sent submission carries its pack'
+      using errcode = 'check_violation';
+  end if;
+
+  return new;
+end;
+$$;
+
+comment on function public.disputes_guard_submission() is
+  'Makes evidence_submitted mean what section 19 says: the compliance desk sent the pack to the processor.';
+
+create trigger disputes_guard_submission
+  before update on public.disputes
+  for each row
+  execute function public.disputes_guard_submission();
+
+alter table public.dispute_reviews enable row level security;
+
+create policy dispute_reviews_default_deny
+  on public.dispute_reviews
+  as permissive
+  for all
+  to public
+  using (false)
+  with check (false);
+
+alter table public.dispute_submissions enable row level security;
+
+create policy dispute_submissions_default_deny
+  on public.dispute_submissions
+  as permissive
+  for all
+  to public
+  using (false)
+  with check (false);
+
+commit;

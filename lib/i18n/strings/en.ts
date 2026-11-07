@@ -56,6 +56,31 @@ const catalog = {
     themeLight: "Light",
     themeDark: "Dark",
   },
+  /**
+   * The public website's shell (STEP 231-238). Every label here is read by
+   * `components/public/`, and the three footer headings name columns that appear only once a
+   * public page belongs to them.
+   */
+  publicSite: {
+    /** Accessible name of the primary navigation in the site header. */
+    navLabel: "Primary",
+    /** The home page's navigation label. */
+    navHome: "Home",
+    signIn: "Sign in",
+    createAccount: "Create account",
+    /**
+     * FEATURE_LIST section 25 fixes how partners are named on public and merchant surfaces.
+     * The wording is reviewable copy, so it lives here rather than in a component.
+     */
+    partnerNaming: "Global Payout Partners and Local Payment Methods via Licensed Partners.",
+    copyright: "Copyright {year} KD Solution IT. All rights reserved.",
+    legalNote: "All amounts are shown in US dollars.",
+    footer: {
+      product: "Product",
+      company: "Company",
+      resources: "Resources",
+    },
+  },
   errors: {
     /** Every message states what the client can do next. None describes what the server saw. */
     validationFailed:
@@ -2845,6 +2870,1013 @@ const catalog = {
     signatureImageStored: "A drawn signature is stored with this record.",
     signatureImmutable: "This record is append-only: it cannot be edited or removed.",
   },
+  portal: {
+    /** Section 2 and 16: the tokenized invoice page opened under i/[token] without a login. */
+    eyebrow: "Invoice",
+    metaDescription:
+      "Open this invoice, its paid state and its receipt. No account is needed: this link is the access.",
+    privacyNote: "Keep this link to yourself. Anyone who has it can open this invoice.",
+    linkInvalidTitle: "This link cannot be opened",
+    linkInvalidBody:
+      "The link is not valid, has expired, or belongs to an invoice that is no longer available. Ask the business that sent it for a new one.",
+    notIssuedTitle: "This invoice is not ready yet",
+    notIssuedBody:
+      "It has not been issued, so there is nothing to pay and nothing to confirm. The business that sent it will let you know.",
+    voidTitle: "This invoice was cancelled",
+    voidBody:
+      "The business cancelled this invoice, so this link does not take payment and nothing further is owed on it.",
+    sellerSection: "From",
+    buyerSection: "Billed to",
+    invoiceSection: "Invoice",
+    receiptSection: "Receipt",
+    deliverySection: "Delivery",
+    confirmationSection: "Confirm this invoice",
+    numberLabel: "Number",
+    issuedOn: "Issued {date}",
+    dueOn: "Due {date}",
+    overdue: "Overdue",
+    descriptionLabel: "Description",
+    quantityLabel: "Quantity",
+    unitPriceLabel: "Price",
+    amountLabel: "Amount",
+    subtotalLabel: "Subtotal",
+    discountLabel: "Discount",
+    taxLabel: "Tax",
+    totalLabel: "Total",
+    paidLabel: "Amount paid",
+    remainingLabel: "Still due",
+    amountDueTitle: "Still due",
+    amountDueBody: "This link accepts {amount} and no more: the exact amount this invoice still owes.",
+    minimumBody:
+      "A partial payment is at least {minimum}. The payment that settles the invoice may be the remainder.",
+    settledSentence: "This invoice is paid in full, so the link no longer accepts payment.",
+    partiallyPaidSentence:
+      "This invoice has taken {paid} of {total}, so the link accepts only the rest.",
+    paidTitle: "Paid in full",
+    paidBody:
+      "Paid on {date}. This link no longer accepts payment, and the receipt below is your record of it.",
+    paidBodyUndated:
+      "This invoice is paid in full. This link no longer accepts payment, and the receipt below is your record of it.",
+    receiptEmpty: "No payment has been received yet.",
+    receiptPaidOnLabel: "Paid on",
+    receiptMethodLabel: "Method",
+    receiptReceivedLabel: "Received",
+    receiptRefundedLabel: "Refunded",
+    receiptNetLabel: "Net received",
+    receiptCardLine: "{brand} ending {lastFour}",
+    receiptMethodCard: "Card",
+    receiptMethodBankTransfer: "Bank transfer",
+    receiptMethodEWallet: "Electronic wallet",
+    receiptModeTest: "Test payment",
+    receiptTestNote: "Paid in test mode. No money moved.",
+    receiptTruncated:
+      "The newest {shown} payments are shown. {omitted} older payments are not listed here, so the totals below cover only the payments shown.",
+    deliveryRecordedDelivery: "The goods were delivered on {date}.",
+    deliveryRecordedService: "The service was completed on {date}.",
+    deliveryRecordedDeliveryUndated: "The goods were delivered.",
+    deliveryRecordedServiceUndated: "The service was completed.",
+    deliveryReference: "Reference {reference}",
+    deliveryMissing:
+      "The business has not recorded the delivery of this invoice yet. The confirmation opens once it has.",
+    confirmationBody:
+      "Confirm that you received what this invoice charges for. Your name, your email address and the time are stored with the confirmation as its evidence.",
+    confirmationNameLabel: "Your name",
+    confirmationNameHint: "The person confirming, as the name should appear on the record.",
+    confirmationEmailLabel: "Your email address",
+    confirmationEmailHint: "Used only to record who confirmed and how to reach them.",
+    acceptanceConsent:
+      "I confirm that I received the goods or accepted the service this invoice charges for, and that this confirmation may be kept as evidence.",
+    confirmationSubmit: "Confirm",
+    confirmationSubmitting: "Confirming...",
+    confirmationFailed: "The confirmation was not recorded. Check the marked fields and try again.",
+    confirmationConflict:
+      "This invoice has changed, or it has already been confirmed. Reload the page to see it as it is now.",
+    confirmationRateLimited: "Too many attempts from this connection. Try again in a moment.",
+    confirmedTitle: "Confirmed",
+    confirmedBody:
+      "Confirmed by {name} on {date}. This confirmation is stored with the invoice and cannot be changed.",
+    confirmedBodyUndated:
+      "This invoice has been confirmed. The confirmation is stored with the invoice and cannot be changed.",
+    merchantSection: "Delivery record",
+    merchantBody:
+      "Record when the goods were delivered or the service was performed. Your client can confirm it once this is saved.",
+    merchantKindLabel: "What happened",
+    merchantKindDelivery: "Goods were delivered",
+    merchantKindService: "A service was performed",
+    merchantMethodLabel: "How",
+    merchantMethodCarrier: "By carrier",
+    merchantMethodHandDelivery: "Hand delivered",
+    merchantMethodPickup: "Collected in person",
+    merchantMethodDigital: "Sent digitally",
+    merchantMethodInPerson: "Performed on site",
+    merchantMethodRemote: "Performed remotely",
+    merchantOccurredLabel: "When it happened",
+    merchantReferenceLabel: "Reference",
+    merchantReferenceHint: "A tracking number or job reference you can quote later.",
+    merchantDescriptionLabel: "Note",
+    merchantDescriptionHint: "Optional. Not printed on the invoice.",
+    merchantSubmit: "Save delivery record",
+    merchantSubmitting: "Saving...",
+    merchantReplaceNotice:
+      "A delivery record is already saved. Saving again replaces it, until your client has confirmed it.",
+    merchantFailed: "The delivery record was not saved. Check the marked fields and try again.",
+    merchantSaved: "Delivery record saved.",
+    merchantForbidden:
+      "This link does not belong to an account that may record a delivery for it.",
+    merchantConflict:
+      "This invoice changed, or your client has confirmed it, so the record cannot be saved now. Reload the page to see it as it is now.",
+    ruleRequired: "This is required.",
+    ruleTooShort: "This is too short.",
+    ruleTooLong: "This is too long.",
+    ruleTooLarge: "This is later than today.",
+    ruleTooSmall: "This is too far in the past.",
+    ruleInvalidFormat: "This is not in the right format.",
+    ruleUnknownField: "This field is not part of this record.",
+    ruleNotFound: "That does not exist on this invoice.",
+    ruleAlreadyUsed: "This has already been done once, and once is enough.",
+    ruleAlreadyChanged: "This changed while the page was open. Reload the page to see it as it is now.",
+    ruleNotIssued: "This invoice has not been issued yet.",
+    ruleInvoiceVoid: "This invoice was cancelled.",
+    ruleNotPaidYet: "Nothing has been paid on this invoice yet.",
+    ruleEvidenceMissing: "The delivery record is missing.",
+    ruleEvidenceChanged: "The delivery record changed while this page was open. Reload it.",
+    ruleStatementMismatch: "The confirmation does not match what was recorded.",
+    ruleEvidenceConfirmed: "Your client has confirmed the delivery, so the record cannot change now.",
+    ruleSelfConfirmation:
+      "A confirmation has to come from your client. This browser is signed in to the account that sent the invoice.",
+    fieldInvalid: "This value was refused.",
+
+    /** Section 16: the tokenized estimate page opened under e/[token] without a login. */
+    estimateEyebrow: "Estimate",
+    estimateMetaDescription:
+      "Open this estimate, accept or decline it, and read the signature record. No account is needed: this link is the access.",
+    estimatePrivacyNote: "Keep this link to yourself. Anyone who has it can decide this estimate.",
+    estimateSection: "Estimate",
+    estimateOfferSection: "The offer",
+    estimateClientSection: "Prepared for",
+    estimateDecisionSection: "Your decision",
+    estimateIssuedOn: "Issued {date}",
+    estimateExpiresOn: "Valid until {date}",
+    estimateExpiresOpen: "This offer stays open until {date}.",
+    estimateStateOpen: "Open for your decision",
+    estimateStateAccepted: "Accepted",
+    estimateStateDeclined: "Declined",
+    estimateStateExpired: "Expired",
+    estimateStateWithdrawn: "Withdrawn",
+    estimateStateNotIssued: "Draft",
+    estimateNotIssuedTitle: "This estimate is not ready yet",
+    estimateNotIssuedBody:
+      "It is still a draft, so there is nothing to accept or decline. The business that sent it will let you know.",
+    estimateExpiredTitle: "This estimate has expired",
+    estimateExpiredBody:
+      "The offer ended on {date}, so it can no longer be accepted. Ask the business that sent it for a new one.",
+    estimateExpiredBodyUndated:
+      "The offer period has ended, so it can no longer be accepted. Ask the business that sent it for a new one.",
+    estimateWithdrawnTitle: "This estimate was withdrawn",
+    estimateWithdrawnBody:
+      "The business withdrew this offer, so it can no longer be accepted. Nothing is owed on it.",
+    estimateAcceptedTitle: "Accepted",
+    estimateAcceptedBody:
+      "Accepted by {name} on {date}. The signature below is kept with the offer and cannot be changed.",
+    estimateAcceptedBodyUndated:
+      "This offer has been accepted. The signature below is kept with the offer and cannot be changed.",
+    estimateDeclinedTitle: "Declined",
+    estimateDeclinedBody:
+      "Declined by {name} on {date}. The record below is kept with the offer and cannot be changed.",
+    estimateDeclinedBodyUndated:
+      "This offer was declined. The record below is kept with the offer and cannot be changed.",
+    estimateDecisionBody:
+      "Deciding records your name, your email address, the consent below, the time, the address of this connection and a digest of the offer as it stands. Accepting means you agree to the offer; declining ends it.",
+    estimateAcceptSubmit: "Accept this estimate",
+    estimateAcceptSubmitting: "Accepting...",
+    estimateDeclineSubmit: "Decline this estimate",
+    estimateDeclineSubmitting: "Declining...",
+    estimateDecisionFailed: "The decision was not recorded. Check the marked fields and try again.",
+    estimateDecisionConflict:
+      "This estimate changed, or it has already been decided. Reload the page to see it as it is now.",
+    estimateDecisionRateLimited: "Too many attempts from this connection. Try again in a moment.",
+    estimateSignerNameLabel: "Your name",
+    estimateSignerNameHint: "The person deciding, as the name should appear on the record.",
+    estimateSignerEmailLabel: "Your email address",
+    estimateSignerEmailHint: "Used only to record who decided and how to reach them.",
+    estimateSignatureSection: "Signature record",
+    estimateSignatureBody:
+      "What this decision recorded, kept as evidence. The record is append-only and cannot be edited.",
+    estimateSignatureSignedBy: "Signed by",
+    estimateSignatureSignedAt: "Signed at (UTC)",
+    estimateSignatureEmail: "Signer's email address",
+    estimateSignatureDecisionLabel: "Decision",
+    estimateSignatureIp: "IP address",
+    estimateSignatureGeo: "Location",
+    estimateSignatureFingerprint: "Device fingerprint",
+    estimateSignatureConsentShown: "Consent shown",
+    estimateSignatureDocumentHash: "Document digest",
+    estimateSignatureDocumentHashHint:
+      "A digest of the offer as it stood when the decision was made. It changes if any line, price, discount, tax or client detail changes.",
+    estimateSignatureTyped: "The typed name is the signature: no drawn signature is stored.",
+    signatureConsent:
+      "I agree to this decision being recorded as my signature on this estimate, together with my name, my email address, the time and the evidence described above, and I accept that the record is kept as evidence.",
+    ruleEstimateExpired: "This estimate expired before the decision could be recorded.",
+    ruleEstimateAlreadyAccepted: "This estimate has already been accepted.",
+    ruleEstimateAlreadyDeclined: "This estimate has already been declined.",
+    ruleEstimateWithdrawn: "The business withdrew this estimate.",
+    ruleEstimateSelfDecision:
+      "A decision has to come from your client. This browser is signed in to the account that sent the estimate.",
+    ruleEstimateEvidenceMissing: "The offer this decision would point at is not there any more.",
+
+    /** Section 18: the card payment page opened under i/[token]/pay with the provider's hosted fields. */
+    paymentEyebrow: "Payment",
+    paymentMetaDescription:
+      "Pay this invoice by card. The card number, the expiry and the security code are entered in fields hosted by the payment provider; this site never sees them.",
+    paymentSection: "Pay by card",
+    paymentAmountTitle: "Amount to pay",
+    paymentAmountBody: "This link takes {amount} and no more: the exact amount this invoice still owes.",
+    paymentCardNumberLabel: "Card number",
+    paymentExpiryLabel: "Expiry",
+    paymentSecurityCodeLabel: "Security code",
+    paymentSecureFieldsNote:
+      "These three fields are drawn by the payment provider inside this page. The card details go straight to the provider and never reach this site.",
+    paymentSubmit: "Pay {amount}",
+    paymentSubmitting: "Paying...",
+    paymentFailed: "The payment was not taken. Check the card and try again.",
+    paymentFieldsUnavailable:
+      "The secure card fields could not be loaded. Check your connection and reload the page.",
+    paymentFieldsInvalid: "The card details are not complete yet.",
+    paymentCapturedTitle: "Payment received",
+    paymentCapturedBody:
+      "Paid {amount} on {date} (UTC). This invoice shows the payment as soon as its receipt is posted.",
+    paymentPrivacyNote: "Keep this link to yourself. Anyone who has it can open this invoice.",
+    paymentBackToInvoice: "Back to the invoice",
+    paymentStart: "Pay by card",
+    paymentNotPayableTitle: "This invoice cannot be paid here",
+    paymentUnavailableTitle: "Card payment is not available yet",
+    paymentUnavailableProviderBody:
+      "This business has not finished connecting its card gateway, so this page cannot take a card. The invoice stays open, and the business has been told.",
+    paymentUnavailableRecorderBody:
+      "Card payment is switched off while the platform finishes its payment records, so this page cannot take a card. The invoice stays open, and nothing has been charged.",
+    paymentRuleNotPayable: "This invoice has nothing left to pay, so the link takes no card.",
+    paymentRuleInvoiceVoid: "This invoice was cancelled, so it cannot be paid.",
+    paymentRuleNotIssued: "This invoice has not been issued yet.",
+    paymentRuleSelfPayment:
+      "A payment has to come from your client. This browser is signed in to the account that sent the invoice.",
+    paymentRuleCardDataRefused:
+      "Card details are only ever entered in the payment provider's own fields. Nothing was charged: reload the page and enter the card there.",
+    paymentRuleInvalidToken: "The card details could not be read. Reload the page and enter the card again.",
+    paymentRuleCardDeclined: "The card was declined by the bank. Try another card, or contact the business.",
+    paymentRuleProviderUnavailable:
+      "The payment provider is not reachable right now, so nothing was charged. Try again in a moment.",
+    paymentRuleRecorderUnavailable:
+      "Card payment is switched off while the platform finishes its payment records. Nothing was charged.",
+    paymentRuleOutcomeUnknown:
+      "The provider has not confirmed this payment yet. Do not try again: the payment is being checked, and the invoice will show the result.",
+    paymentRuleAmountUnrepresentable:
+      "This invoice's total cannot be charged as dollars and cents, so this link takes no card. Ask the business to correct the invoice.",
+    paymentRuleStaleDocument:
+      "This invoice changed while the page was open, so nothing was charged. Reload the page to see it as it is now.",
+
+    /** STEP 184: the 3D Secure step in front of a card payment, and what a payer reads afterwards. */
+    paymentThreeDsEyebrow: "Card verification",
+    paymentThreeDsResultMetaDescription:
+      "What happened to this card payment, and what it means for the invoice.",
+    paymentThreeDsChallengeTitle: "Confirm this payment with your bank",
+    paymentThreeDsChallengeBody:
+      "Banks in most countries ask for one more step before a card payment completes. You will be taken to your bank's own page now, and brought back here when it is done.",
+    paymentThreeDsContinue: "Continue to your bank",
+    paymentThreeDsChallengeNote:
+      "This step happens on your bank's page. This site does not see your card details, and it does not see what you type there either.",
+    paymentThreeDsCapturedBody:
+      "Your bank confirmed the payment and it has been taken. This invoice shows the payment as soon as its receipt is posted.",
+    paymentThreeDsCapturedAmountNote:
+      "The figure below is what this invoice still shows as due. It falls when the payment's receipt is posted.",
+    paymentThreeDsRemainingAmountNote: "What this invoice still shows as due.",
+    paymentThreeDsReviewTitle: "This payment is being checked",
+    paymentThreeDsReviewBody:
+      "Your bank did not finish the extra verification step, so nothing has been taken. The payment has gone to our compliance team for review, and you will be contacted if anything else is needed.",
+    paymentThreeDsDeclinedTitle: "Your bank did not approve this payment",
+    paymentThreeDsDeclinedBody:
+      "Nothing has been taken. You can start again from the invoice with the same card or a different one.",
+    paymentThreeDsUnknownTitle: "This payment could not be confirmed",
+    paymentThreeDsUnknownBody:
+      "We could not confirm whether your bank approved the payment. Do not try again yet: the payment is being checked, and you will not be charged twice.",
+    paymentThreeDsExpiredTitle: "The verification step was not completed",
+    paymentThreeDsExpiredBody:
+      "Your bank's verification page expired, or the step was not finished in time. Nothing has been taken. Start again from the invoice.",
+    /** STEP 185: the billing postal code section 18 compares, and what a payer reads about it. */
+    paymentBillingPostalLabel: "Billing postal code",
+    paymentBillingPostalHint:
+      "The postal code on the card's billing address. Your bank uses it, with the country of this connection, to check the payment.",
+    /** STEP 189: the amount a payer chose, and the two limits a part payment is held to. */
+    partPaymentLabel: "Amount to pay now",
+    partPaymentHint:
+      "This link accepts up to {remaining}. The smallest part payment is {minimum}.",
+    partPaymentNoChoice:
+      "The amount due is below the smallest part payment, so the whole amount is paid in one payment.",
+    paymentSubmitGeneric: "Pay now",
+    partPaymentInvalidAmount:
+      "That is not an amount this page can take. Type a number like 25.00, with a dot before the decimals.",
+    partPaymentBelowMinimum:
+      "A part payment must be at least the smallest amount this link accepts, which is shown beside the amount. Enter that or more, or pay the whole remaining amount.",
+    partPaymentExceedsRemaining:
+      "That is more than the invoice still owes. Enter the remaining amount or less, and nothing has been charged.",
+    /** STEP 188: this card or this address reached a velocity limit, or the counters could not be read. */
+    ruleVelocityCardLimited:
+      "This card has been used for too many payment attempts in a short time. Nothing was charged. Please wait a little and try again, or use another card.",
+    ruleVelocityAddressLimited:
+      "There have been too many payment attempts from this network in a short time. Nothing was charged. Please wait a little and try again.",
+    ruleVelocityUnavailable:
+      "Payment attempts cannot be counted right now, so the payment was not attempted and nothing was charged. Please try again in a few minutes.",
+    /** STEP 187: the card is on the platform's own list, or the list could not be read. */
+    ruleCardBlacklisted:
+      "This card cannot be used for payments on this platform. Nothing was charged. If you believe this is wrong, contact the business you are paying.",
+    ruleCardBlacklistUnavailable:
+      "This card could not be checked against our list of blocked cards, so the payment was not attempted and nothing was charged. Please try again in a few minutes.",
+    /** STEP 186: a payment the gateway flagged, refused at once or held for review. */
+    ruleRiskRejected:
+      "This payment was refused by the card's bank or by the payment provider before any money moved. Nothing was charged. Do not try this card again: contact the business if you believe this is wrong.",
+    ruleRiskSuspicious:
+      "The payment provider asked us to check this payment before it goes through. Nothing has been charged yet: the payment is under review and you will be contacted if anything else is needed.",
+    ruleBillingPostalInvalid:
+      "That postal code could not be read. Check it and try again: letters, digits, spaces and hyphens only.",
+    paymentThreeDsAmountTitle: "Amount",
+    paymentThreeDsAmountNote: "{amount}",
+    paymentThreeDsUnavailableTitle: "Card payment is not available yet",
+    paymentThreeDsUnavailableBody:
+      "This platform asks every card's bank to confirm the payment before it is taken, and that step is not switched on yet. Nothing has been charged. The invoice stays open, and the business has been told.",
+    ruleThreeDsUnavailable:
+      "Card payments need a bank confirmation step that is not switched on yet, so nothing was charged.",
+    ruleThreeDsRecorderUnavailable:
+      "Card payment is switched off while the platform finishes its payment records. Nothing was charged.",
+    ruleThreeDsAuthenticationFailed:
+      "Your bank did not confirm this payment, so nothing was charged. You can try again with the same card or another one.",
+    ruleThreeDsChallengeExpired:
+      "The bank's verification page expired before the payment was confirmed. Nothing was charged. Start again from the invoice.",
+    ruleThreeDsChallengeReplayed:
+      "This verification has already been used. Nothing was charged twice. Start again from the invoice if the payment is still due.",
+    ruleThreeDsChallengeInvalid:
+      "This verification could not be matched to the payment it came from, so nothing was charged. Start again from the invoice.",
+    ruleThreeDsChallengeUnknown:
+      "This verification was not found, so nothing was charged. Start again from the invoice.",
+    ruleThreeDsUnderReview:
+      "Nothing has been taken. The payment is being reviewed by our compliance team, who will contact you if anything else is needed.",
+    ruleThreeDsResultInvalid:
+      "Your bank's answer could not be read, so nothing was charged. Start again from the invoice.",
+    /** STEP 190: the hosted checkout a general payment link opens. */
+    linkPageEyebrow: "Payment link",
+    linkPageMetaDescription:
+      "Pay this business through its payment link. The amount is the one the business set, not one this page can change.",
+    linkDescriptionLabel: "For",
+    linkReferenceLabel: "Reference",
+    linkAmountTitle: "Amount",
+    linkAmountBody: "This link takes {amount}, the amount the business set for it.",
+    linkExpiresOn: "The link stops working on {date}.",
+    linkCardSection: "Pay by card",
+    linkPrivacyNote:
+      "Only the amount and the business's note are stored here. Your card details go straight to the payment provider.",
+    linkPaidTitle: "This link is paid",
+    linkPaidBody:
+      "The business has already been paid through this link, so it takes no further payment. Keep the confirmation you were given as your record.",
+    linkRevokedTitle: "This link was cancelled",
+    linkRevokedBody:
+      "The business cancelled this link, so it does not take payment. Ask them for a new one if you still need to pay.",
+    linkExpiredTitle: "This link has expired",
+    linkExpiredBody:
+      "The link was made for a limited time and that time has passed. Nothing has been charged. Ask the business for a new link.",
+    linkUnavailableTitle: "Card payment is not available",
+    linkUnavailableProviderBody:
+      "This business has not connected its card gateway yet, so this link cannot take a card. Nothing has been charged.",
+    linkUnavailableRecorderBody:
+      "This platform cannot record this payment durably yet, so the link does not take a card. Nothing has been charged.",
+    ruleLinkNotFound:
+      "This link cannot be opened. It is not valid, has expired, or has been cancelled. Ask the business that sent it for a new one.",
+    ruleLinkExpired:
+      "This link has expired, so it does not take payment. Nothing has been charged. Ask the business for a new link.",
+    ruleLinkRevoked:
+      "The business cancelled this link, so it does not take payment. Nothing has been charged.",
+    ruleLinkPaid:
+      "This link has already been paid, so it takes no further payment. Nothing more was charged.",
+    ruleLinkNotActive:
+      "This link has moved on: it was cancelled, reissued or already paid. Nothing has been charged.",
+    ruleLinkStoreUnavailable:
+      "Payment links cannot be kept reliably in this deployment, so none was created and nothing was charged.",
+    rulePaymentLinksNotInPlan:
+      "Payment links are not part of this account's plan, so a link could not be made.",
+    /** STEP 190: the merchant console's own refusals, worded for the person typing the link. */
+    ruleAmountTooSmall: "That amount is below the smallest a payment link can take.",
+    ruleAmountTooLarge: "That amount is above the largest a payment link can take.",
+    ruleDescriptionInvalid: "Add a short note of up to 200 characters saying what the payment is for.",
+    ruleReferenceInvalid: "That reference is too long. Keep it to 64 characters or fewer.",
+    ruleLifetimeInvalid: "A link works for at least one hour and at most thirty days.",
+  },
+  paymentLinks: {
+    /** STEP 190: the merchant console at /payments/links. */
+    title: "Payment links",
+    description:
+      "Ask for a fixed amount without an invoice: make a link, share it anywhere, and cancel it when you are done.",
+    createTitle: "New payment link",
+    amountLabel: "Amount",
+    amountPlaceholder: "25.00",
+    descriptionLabel: "What it is for",
+    descriptionPlaceholder: "Design retainer, March",
+    referenceLabel: "Reference (optional)",
+    referenceHelp: "Up to 64 characters, printed on the payer's page and kept with your records.",
+    lifetimeLabel: "Works for (days)",
+    lifetimeHelp: "At least one hour and at most thirty days. A link closes on its own when the time is up.",
+    submit: "Create link",
+    submitting: "Creating...",
+    createdTitle: "Link ready",
+    createdBody:
+      "Copy this URL and share it. It is shown once: if you lose it, reissue the link for a new one.",
+    copy: "Copy",
+    copied: "Copied",
+    listTitle: "Your links",
+    listEmpty: "No payment link yet.",
+    stateActive: "Live",
+    statePaid: "Paid",
+    stateRevoked: "Cancelled",
+    stateExpired: "Expired",
+    revoke: "Cancel link",
+    revokeConfirm: "Cancel this link? Its URL stops working immediately.",
+    dismiss: "Keep it",
+    reissue: "Reissue",
+    reissueHelp: "Reissuing keeps the same payment request and gives it a fresh URL. The old one stops working.",
+    reissuedTitle: "New URL ready",
+    reissuedBody: "The old URL no longer works. Share this one instead.",
+    expiresLabel: "Closes",
+    paidLabel: "Paid",
+    loading: "Loading your links...",
+    errorGeneric: "That did not work. Try again.",
+    notEntitledTitle: "Your plan does not include payment links",
+    notEntitledBody: "Ask the account owner to upgrade the plan, or send an invoice link instead.",
+    unavailableTitle: "Payment links are not available yet",
+    unavailableBody:
+      "This deployment cannot keep payment links durably, so it does not create them. Nothing was charged.",
+    roleRefusedBody: "Only the account owner can create and manage payment links.",
+  },
+  api: {
+    /** STEP 200: section 20's merchant API credentials at /developers/api-credentials. */
+    eyebrow: "Developers",
+    title: "API credentials",
+    description:
+      "Make the credentials your store calls the platform with. A test credential moves no money; a live one does.",
+    createTitle: "Make a credential",
+    createHelp:
+      "Give it a name you will recognise in six months - a shop, a checkout, a subscription service.",
+    labelLabel: "Name",
+    labelPlaceholder: "Main store checkout",
+    modeLabel: "Mode",
+    modeTest: "Test",
+    modeLive: "Live",
+    limitLabel: "%used% of %limit% credentials used in this mode.",
+    createButton: "Make credential",
+    creating: "Making...",
+    created: "Credential made.",
+    createdTitle: "This credential exists now",
+    createdHelp:
+      "The key is shown masked here and everywhere else, by design: the platform never displays a full key or signing secret, and neither of them is ever written to a log or an error message.",
+    createFailed: "The credential was not made. Try again.",
+    maskedKeyLabel: "Key",
+    signingSecretLabel: "Webhook signing secret",
+    statusActive: "Active",
+    statusRevoked: "Revoked",
+    createdLabel: "Made on",
+    lastUsedLabel: "Last used",
+    lastUsedNever: "never",
+    revoke: "Revoke",
+    revoking: "Revoking...",
+    revokeConfirm: "Revoke this credential",
+    revokeReasonPrompt: "Why it goes away",
+    revokeReasonPlaceholder: "Replaced by a new checkout",
+    revokeReasonLabel: "Revoked because:",
+    revoked: "Credential revoked. The key it carried no longer works.",
+    revokedLabel: "Revoked on",
+    revokeFailed: "The credential was not revoked. Try again.",
+    regenerate: "Regenerate",
+    regenerated: "New credential made under the same name. The old key no longer works.",
+    regenerateFailed: "The credential was not regenerated. Try again.",
+    cancel: "Cancel",
+    ruleReasonInvalid: "Write a sentence between 1 and 280 characters saying why it goes away.",
+    ruleAlreadyRevoked: "This credential is already revoked.",
+    ruleNotActive: "A revoked credential cannot be regenerated. Make a new one instead.",
+    ruleAlreadyRotated: "This credential has already been replaced once.",
+    ruleRotationIncomplete: "The new credential was made, but the old one could not be retired. Revoke it by hand.",
+    ruleNotFound: "That credential is not on this account.",
+    listTitle: "Your credentials",
+    listEmpty: "No credential yet. The form above makes the first one.",
+    listTruncated: "Showing the most recent credentials only.",
+    ruleLabelInvalid: "Give the credential a name between 1 and 80 characters.",
+    ruleModeInvalid: "Choose test or live.",
+    ruleLabelTaken: "You already have a credential with that name. Pick another name.",
+    ruleLimitReached: "This mode already has as many credentials as the platform allows. Revoke one first.",
+    ruleCsrf: "The form expired. Reload the page and try again.",
+    rateLimited: "Too many attempts. Wait a moment and try again.",
+    signedOut: "Sign in to manage your API credentials.",
+    forbidden: "Only the owner of this business can manage its API credentials.",
+    unavailable: "Your credentials could not be read just now. Try again in a moment.",
+    signInLink: "Sign in",
+    homeLink: "Back to the dashboard",
+  },
+  refunds: {
+    /** STEP 191: the merchant refund desk at /payments/refunds and the office queue at /office/refunds. */
+    title: "Refunds",
+    description:
+      "Ask for money back on a payment you received, and follow each request until it is decided.",
+    requestTitle: "Ask for a refund",
+    paymentLabel: "Payment",
+    paymentPlaceholder: "Choose a payment",
+    paymentOption: "%amount% - %date%",
+    paymentEmpty: "Nothing can be refunded right now. Payments appear here once they are captured.",
+    amountLabel: "Amount",
+    amountHelp: "At most what is left of the payment, less anything already asked for or approved.",
+    reasonLabel: "Why the money goes back",
+    reasonPlaceholder: "Damaged goods, returned on 12 November",
+    reasonHelp: "Between 1 and 500 characters. It stays on the refund and is never copied into the audit trail.",
+    submit: "Send request",
+    submitting: "Sending...",
+    requestedTitle: "Request sent",
+    requestedBody: "The finance desk decides it. You can withdraw the request until somebody does.",
+    listTitle: "Your refunds",
+    listEmpty: "No refund yet.",
+    stateRequested: "Waiting for a decision",
+    stateApproved: "Approved",
+    stateProcessing: "On its way back",
+    stateSucceeded: "Refunded",
+    stateFailed: "Failed",
+    stateCancelled: "Closed",
+    statusHelp:
+      "A refund is money the platform promises to send back. It is paid out by the finance desk, not by this screen.",
+    cancel: "Withdraw request",
+    cancelConfirm: "Withdraw this request? The finance desk will not decide it.",
+    cancelKeep: "Keep it",
+    dismiss: "Dismiss",
+    amountRowLabel: "Amount",
+    reasonRowLabel: "Reason",
+    requestedAtRowLabel: "Asked",
+    decidedAtRowLabel: "Decided",
+    queueTitle: "Refund queue",
+    queueDescription:
+      "Every refund waiting for a person, oldest first. Approving one authorises the money; paying it out is the next step.",
+    queueEmpty: "No refund is waiting for a decision.",
+    approve: "Approve",
+    reject: "Reject",
+    approving: "Saving...",
+    decisionNoteLabel: "Note (optional)",
+    decisionNoteHelp: "Kept with the decision. The merchant sees that a decision was taken, not this note.",
+    approvedDone: "Approved. The money is authorised and waiting to be paid out.",
+    rejectedDone: "Rejected. The merchant can ask again with different details.",
+    cancelledDone: "Request withdrawn.",
+    requesterLabel: "Asked by",
+    loading: "Loading refunds...",
+    errorGeneric: "That did not work. Try again.",
+    amountInvalid: "Type an amount like 25.00, more than zero.",
+    reasonInvalid: "Write between 1 and 500 characters.",
+    exceedsRefundable: "That is more than the payment has left to refund.",
+    nothingToRefund: "Nothing is left to refund on that payment.",
+    paymentNotRefundable: "That payment was never captured, so there is nothing to send back.",
+    paymentNotFound: "That payment is not one of yours.",
+    refundNotFound: "That refund is not one of yours.",
+    refundNotPending: "Somebody already decided this refund.",
+    selfDecision: "You raised this request, so somebody else has to decide it.",
+    refundMoved: "Another decision landed first. Reload to see where the refund stands.",
+    refundGuard: "The payment cannot take a refund of that amount any more.",
+    roleRefusedBody: "Only the account owner can ask for a refund.",
+    officeRoleRefusedBody: "Only the finance desk and the super administrator decide refunds.",
+    signedOut: "Your session ended. Sign in again.",
+    deviceRequired: "This device is not verified for a decision. Enrol it and try again.",
+    failed: "That did not work. Try again.",
+    /** STEP 192: sending an approved refund back through the provider that took the payment. */
+    execute: "Send to provider",
+    executing: "Sending...",
+    executeHelp:
+      "The money leaves through the provider that took the payment. Nothing else about this refund changes.",
+    executedDone: "Sent. The payment now records the refunded amount.",
+    executionPending: "The provider has it and will answer again. The refund stays in progress.",
+    executionUnanswered:
+      "The provider did not answer. The money may or may not have moved, so nothing is retried here: check the provider's own report.",
+    executionDeclined: "The provider refused the refund. Its reason is on the refund.",
+    executionNotSent: "The provider was not asked, so nothing moved. The refund is approved again.",
+    notExecutable: "Only an approved refund can be sent, and only once.",
+    providerUnsupported: "This payment was taken through a provider that cannot be refunded from here yet.",
+    referenceMissing: "The payment carries no provider transaction to refund against.",
+    amountUnrepresentable: "The provider cannot express this amount, so it was not sent.",
+    providerKeyMissing: "This deployment holds no usable key for that provider in the mode the payment was taken.",
+    providerRefused: "The provider refused the refund request before it was sent.",
+    processedRowLabel: "Sent to provider",
+    providerReferenceLabel: "Provider reference",
+    failureRowLabel: "Provider answer",
+    /** STEP 193: the section 18 answer printed on a succeeded row, and the way to change it. */
+    feesLink: "Platform fee on refunds",
+    feeReturnedRowLabel: "Platform fee returned",
+    feeRetainedRowLabel: "The platform kept its fee on this refund.",
+  },
+  refundFees: {
+    /**
+     * STEP 193: the section 18 switch at /office/refunds/fees. One person answers whether the platform fee
+     * comes back with a refund, and this screen states the answer, what it does, and what is still unpaid.
+     */
+    screenTitle: "Platform fee on refunds",
+    screenDescription:
+      "When a refund sends the payer's money back, the platform's own fee on that money is a separate question. The super administrator answers it here, once, for every refund the platform processes.",
+    backToQueue: "Back to the refund queue",
+    ruleHeading: "The answer in force",
+    stateReturned: "The fee comes back",
+    stateRetained: "The platform keeps the fee",
+    stateHelp:
+      "When the fee comes back, each refund returns its share of the fee the payment carried, in the same proportion as the refund is of the payment. The refund that completes a payment returns the rest of the fee, so a payment refunded in full gives the whole fee back.",
+    updatedLabel: "Last answered",
+    updatedNever: "Never. This deployment is using the default.",
+    defaultNote:
+      "Nobody has answered this yet, so the platform is applying the default: it keeps its fee on a refund.",
+    readOnlyNote:
+      "Only the super administrator answers this. You can read the answer in force and run a pass below.",
+    prorationHelp:
+      "A part refund never returns more than its share of the fee, and no refund returns more than the fee the payment carried. A fee that was already returned in full by earlier refunds is not returned twice.",
+    passHeading: "Refunds waiting for an answer",
+    backlogLabel: "Succeeded refunds with no answer yet:",
+    backlogNone: "No succeeded refund is waiting for an answer.",
+    backlogCapped: "This counts the first hundred. Running a pass works through the rest over more than one press.",
+    passHelp:
+      "A pass applies the answer in force to the refunds that have not been answered yet, fifty at a time, oldest first. A refund the execution settled already has its answer.",
+    ledgerAbsentNote:
+      "The answer is recorded on the refund and in the audit chain. This deployment holds no ledger store yet, so the balanced ledger pair for a returned fee is not posted; the group is derived from the refund, so it can be posted later without posting twice.",
+    switchLabel: "On a refund, the platform fee is",
+    switchReturned: "returned with the refund",
+    switchRetained: "kept by the platform",
+    save: "Save this answer",
+    saving: "Saving...",
+    saved: "Saved. Refunds executed from now on are answered with this.",
+    saveHelp: "The change is recorded in the audit chain with the account that made it.",
+    runPass: "Run a pass now",
+    runningPass: "Running...",
+    runPassHelp: "Fifty refunds a press, and the counts come back to this page.",
+    passDone: "The pass finished. The counts are on the refunds it answered.",
+    passNothing: "There was nothing waiting. Every succeeded refund has an answer.",
+    reauthRequired: "This act needs a fresh second factor. Sign in again with your authenticator first.",
+    staleSave: "Somebody else answered this while the page was open. Reload to read their answer.",
+    failed: "That did not go through. Try again, and quote the reference if it keeps happening.",
+  },
+  disputes: {
+    /**
+     * STEP 194: section 19's dispute list. The merchant reads what a processor reported against their money
+     * and how far the status has moved; the office reads the same rows as a queue, nearest deadline first.
+     * The response form and the evidence pack are later STEPs, so neither screen offers one.
+     */
+    title: "Disputes",
+    description:
+      "A dispute is money a payer asked their bank to take back. Follow each one here, from the report to the outcome.",
+    listTitle: "Your disputes",
+    listEmpty: "No dispute has been reported against your payments.",
+    queueTitle: "Dispute queue",
+    queueDescription:
+      "Every dispute still waiting for an answer, nearest deadline first. The deadline is the processor's window, not this screen's.",
+    queueEmpty: "No dispute is waiting for an answer.",
+    statusHelp:
+      "The status is the processor's, not this platform's. A dispute moves forward only, and a decided one stays decided.",
+    stateOpen: "Open",
+    stateUnderReview: "Under review",
+    stateEvidenceSubmitted: "Evidence sent",
+    stateWon: "Won",
+    stateLost: "Lost",
+    stateClosed: "Closed",
+    dueOpen: "In time",
+    dueSoon: "Due soon",
+    dueOverdue: "Past the deadline",
+    dueResolved: "Decided",
+    deadlineHelp:
+      "The response window is 24 hours from the moment the processor reported the dispute. The compliance desk sends the evidence pack before it closes.",
+    overdueNote:
+      "The window on this dispute has closed. Nothing is retried from here: the processor decides on what it already has.",
+    nextStepNote:
+      "Writing your side of the dispute and uploading the documents is the next step. This screen tracks the status until then.",
+    referenceRowLabel: "Processor reference",
+    reasonRowLabel: "Reason",
+    amountRowLabel: "Disputed amount",
+    openedRowLabel: "Reported",
+    dueRowLabel: "Deadline",
+    resolvedRowLabel: "Decided",
+    outcomeRowLabel: "Outcome",
+    companyRowLabel: "Merchant",
+    statusRowLabel: "Status",
+    refundQueueLink: "Refund queue",
+    refundDeskLink: "Refund desk",
+    signedOut: "Your session ended. Sign in again.",
+    roleRefusedBody: "Only the account owner can read the disputes of a merchant.",
+    officeRoleRefusedBody: "Only the compliance desk, the finance desk and the leadership read the dispute queue.",
+    failed: "That did not work. Try again.",
+
+    /**
+     * STEP 195: the merchant's answer, and the deadline it is written against. Every sentence here is read by
+     * a merchant whose money is held, so the deadline is printed twice - in their own zone and in UTC - and the
+     * words say which one decides.
+     */
+    answerLink: "Answer",
+    answerTitle: "Answer this dispute",
+    answerDescription:
+      "Your processor has asked for your side of this payment. Write what happened, and the compliance desk sends it with the evidence pack before the window closes.",
+    answerEyebrow: "Dispute response",
+    backToList: "Back to disputes",
+    responseSavedBadge: "Response saved",
+    summaryTitle: "This dispute",
+    deadlineCardTitle: "The window",
+    deadlineLocalLabel: "Deadline in your time zone",
+    deadlineUtcLabel: "Deadline (UTC)",
+    deadlineZoneLabel: "Your time zone",
+    deadlineHelpBoth:
+      "Both lines are the same instant. The one in your time zone is the one to work to; the UTC one is what the processor records.",
+    deadlineShiftedNote:
+      "Your time zone changed its clock inside this window, so the dial reads {localHours} hours across it while the window itself is {absoluteHours} hours. The deadline has not moved.",
+    deadlineNoZoneNote:
+      "This screen could not read your browser's time zone, so the deadline is shown in UTC.",
+    deadlineRemainingOpen: "{hours} h {minutes} min left",
+    deadlineRemainingDueSoon: "Due soon: {hours} h {minutes} min left",
+    deadlineRemainingDue: "{minutes} min left",
+    deadlineRemainingOverdue: "The window has closed",
+    deadlineClosedNote:
+      "The window on this dispute has closed, so a response can no longer be saved. Nothing is retried from here: the processor decides on what it already has.",
+    responseLabel: "What happened",
+    responseHelp:
+      "Describe the order, what you delivered and any conversation with the payer. Plain text, up to 20,000 characters. You can edit it until the deadline.",
+    responsePlaceholder: "The order, the delivery, and what the payer told you.",
+    responseCharacterCount: "{used} of {limit} characters",
+    responseSave: "Save response",
+    responseSaving: "Saving",
+    responseSavedDone: "Response saved.",
+    responseSavedAt: "Saved {instant}. You can edit it until the deadline.",
+    responseSubmittedNote:
+      "The compliance desk has sent this dispute to the processor, so the response is fixed.",
+    responseResolvedNote: "This dispute is decided, so the response is history.",
+    responseEmptyError: "Write your side of the dispute before saving.",
+    responseTooLongError: "Your response is longer than 20,000 characters.",
+    responseInvalidError: "Use plain text: no control characters, and something other than spaces.",
+    responseDeadlineError: "The window closed before this response arrived, so nothing was saved.",
+    responseMovedError: "Somebody saved this dispute while your page was open. Reload and check.",
+    responseNotFoundError: "This dispute is not on your account.",
+    documentsNote:
+      "Your words and your documents both belong in the pack below. The form above takes the words only.",
+    deadlineExtensionTitle: "The merchant's window",
+    deadlineExtensionHelp:
+      "A super administrator may set the window to 48 hours when the merchant needs it. The deadline moves with the window, and both stop mattering once the pack is sent.",
+    deadlineExtensionButton: "Extend to 48 hours",
+    deadlineExtensionBusy: "Extending",
+    deadlineExtensionDone: "The window is now 48 hours.",
+    deadlineExtensionClosedNote: "The window has already closed, so it cannot be extended.",
+    deadlineExtensionRoleNote: "Only a super administrator with a verified device can extend a deadline.",
+    deadlineExtensionDeviceNote: "This browser signs the request with the account's enrolled device key.",
+    windowLabel: "Window",
+    windowHoursText: "{hours} hours",
+    deadlinePassedRefusal: "The window closed before this request, so nothing changed.",
+    submittedRefusal: "The pack has been sent, so the response can no longer change.",
+    resolvedRefusal: "This dispute is decided and cannot be reopened from here.",
+    windowInvalidRefusal: "The window is set to 24 or 48 hours, and it only ever widens.",
+    deadlineNotExtendableRefusal: "A decided dispute has no deadline left to move.",
+    deviceRequiredRefusal: "This browser is not enrolled as a trusted device for this account.",
+
+    /**
+     * STEP 196: section 19's two warnings. The office presses the button when no clock has run, and each row
+     * says whether the merchant was told at the start of the window and at its middle.
+     */
+    warningRowLabel: "Warnings",
+    warningNone: "No warning has been sent yet.",
+    warningStartSent: "start {instant}",
+    warningMidpointSent: "midpoint {instant}",
+    warningRunTitle: "Section 19's two warnings",
+    warningRunHelp:
+      "The merchant is told when the window opens and again when half of it has passed. A deployment with a scheduler sends these on its own; this button sends the ones that are due now, and it never sends one twice.",
+    warningRunButton: "Send the warnings that are due now",
+    warningRunBusy: "Sending",
+    warningRunDeviceNote: "This browser signs the request with the account's enrolled device key.",
+    warningRunDone: "{sent} warnings were handed to the email system; {blocked} were due and could not be queued.",
+    warningRunBlocked:
+      "{count} warnings were due and could not be queued: no sending method is active or the merchant has no owner address.",
+    warningRunNothing: "Nothing was due: every open window is between its two warnings.",
+    warningRunRoleNote: "Only the compliance desk and leadership with a verified device send these warnings.",
+
+    /**
+     * STEP 197: section 19's four part evidence pack. The merchant assembles it from the records the platform
+     * already holds, supplies the documents, and freezes it once it is complete; the compliance desk reviews
+     * and sends it in STEP 198. The four parts are named as section 19 names them.
+     */
+    evidenceTitle: "The evidence pack",
+    evidenceDescription:
+      "Section 19's pack has four parts: the invoice, the delivery proof, the client communication record and the terms acceptance record. Assemble them, add your own documents, and freeze the pack when every part is filled.",
+    evidenceRoleNote: "Only the account owner assembles a dispute's evidence pack.",
+    evidenceEmpty: "No pack has been started for this dispute.",
+    evidenceAssemble: "Assemble the pack",
+    evidenceAssembling: "Assembling",
+    evidenceRefresh: "Refresh from my records",
+    evidenceRefreshing: "Refreshing",
+    evidenceAssembled: "The pack holds {items} records and {documents} documents.",
+    evidenceAssembledDone: "The pack is assembled from the records the platform holds.",
+    evidenceStatusDraft: "Draft",
+    evidenceStatusFrozen: "Frozen",
+    evidenceFrozenAt: "Frozen {instant}",
+    evidenceDigestLabel: "Fingerprint",
+    evidenceSectionInvoice: "Invoice",
+    evidenceSectionDelivery: "Delivery proof",
+    evidenceSectionCommunication: "Client communication",
+    evidenceSectionTerms: "Terms acceptance",
+    evidenceSectionCounts: "{items} records and {documents} documents",
+    evidenceSectionMissing: "still empty",
+    evidenceNoneInSection: "Nothing in this part yet.",
+    evidenceRemove: "Remove",
+    evidenceRemoving: "Removing",
+    evidenceAddNoteTitle: "Add a note",
+    evidenceAddNoteHelp: "One sentence of your own, filed under one part of the pack.",
+    evidenceAddNotePlaceholder: "What this record shows.",
+    evidenceAddNoteButton: "Add the note",
+    evidenceUploadTitle: "Add a document",
+    evidenceUploadHelp: "PDF, JPEG or PNG, up to 50 MB, filed under one part of the pack.",
+    evidenceUploadSectionLabel: "Part",
+    evidenceUploadCaption: "What it shows (optional)",
+    evidenceUploadButton: "Attach the document",
+    evidenceUploading: "Attaching",
+    evidenceFreeze: "Freeze the pack",
+    evidenceFreezing: "Freezing",
+    evidenceFreezeHelp:
+      "Freezing goes one way. Once it is frozen the pack is the evidence the compliance desk sends, and nothing in it can change.",
+    evidenceFrozenNote:
+      "This pack is frozen and cannot change. The compliance desk reviews it and sends it to the processor.",
+    evidenceIncomplete:
+      "Every part needs at least one record or document, and the pack needs at least one document, before it can be frozen.",
+    evidenceMissingList: "Still empty: {sections}.",
+    evidenceMoved: "Somebody changed this pack while your page was open. Reload and read it again.",
+    evidenceNoPack: "This dispute has no pack yet. Assemble one first.",
+    evidenceDecided: "This dispute is decided, so its pack stays exactly as it was frozen.",
+    evidenceSubmittedNote: "The pack has been sent to the processor, so it is fixed.",
+    evidenceFrozenRefusal: "A frozen pack cannot be changed. That is the point of freezing it.",
+    evidenceDocumentRejected: "That file was not accepted: PDF, JPEG or PNG, up to 50 MB.",
+    evidenceDocumentQuarantined:
+      "The bytes in that file do not match a type the platform stores, so it was refused rather than attached.",
+    evidenceStorageMissing:
+      "This deployment has no document storage bound, so no file was attached. The rest of the pack is unaffected.",
+    evidenceNoteRequired: "Write the note before adding it.",
+    evidenceNoteTooLong: "A note is at most 600 characters.",
+    evidenceCaptionTooLong: "The caption is at most 160 characters.",
+    evidenceFileNameRequired: "The file needs a name of at least three characters.",
+    evidenceItemAdded: "Added to the pack.",
+    evidenceItemRemoved: "Removed from the pack.",
+    evidenceDocumentAttached: "The document was attached to the pack.",
+    evidenceDuplicateNote: "That file is already attached to this pack.",
+    evidenceFrozenDone: "The pack is frozen. The compliance desk reviews it and sends it next.",
+    evidenceDocumentRemoved: "The document was removed from the pack.",
+    evidencePackNotFound: "This pack is not on your account.",
+    evidenceFailed: "That did not go through. Try again.",
+    evidenceInvoiceLabel: "Invoice {number}",
+    evidenceFulfilmentLabel: "Delivery recorded {instant}",
+    evidenceAcceptanceLabel: "Buyer confirmation {instant}",
+    evidencePolicyLabel: "{policy} accepted {instant}",
+    evidenceEmailLabel: "Email to the client sent {instant}",
+    evidenceEventLabel: "{event} {instant}",
+
+    /**
+     * STEP 198: the compliance desk's review of that pack, and the two ways the pack reaches the processor.
+     * Section 19's sentence is "compliance_kyc reviews the evidence pack and sends it to the processor", so the
+     * words here are the desk's: a decision, a reason, and the processor's own case number typed off its portal.
+     */
+    reviewTitle: "Review the evidence pack",
+    reviewDescription:
+      "Section 19 gives this desk the pack. Read the four parts and the merchant's documents, then approve the pack or decline it with a reason. The pack is frozen: nothing on this screen edits the evidence.",
+    reviewRoleNote: "Only the compliance desk and a super administrator review a pack.",
+    reviewNoPack: "The merchant has not frozen an evidence pack yet, so there is nothing to review.",
+    reviewNoPackHelp:
+      "The pack is assembled and frozen by the merchant on their own dispute screen. This desk reads it once it exists.",
+    reviewPackTitle: "The frozen pack",
+    reviewPackEmpty: "This part holds nothing.",
+    reviewCounts: "{items} records and {documents} documents",
+    reviewDigest: "Fingerprint {digest}",
+    reviewFrozenAt: "Frozen {instant}",
+    reviewDecideTitle: "Your decision",
+    reviewApprove: "Approve the pack",
+    reviewDecline: "Decline the pack",
+    reviewNoteLabel: "Reason",
+    reviewNoteHelp: "One sentence: what you checked, or what is wrong with the pack.",
+    reviewNotePlaceholder: "What this decision rests on.",
+    reviewSaving: "Recording",
+    reviewApproved: "The pack is approved. It may be sent to the processor.",
+    reviewDeclined: "The pack is declined. The merchant keeps their dispute and the pack stays frozen.",
+    reviewHistoryTitle: "Decisions on this pack",
+    reviewHistoryEmpty: "No decision has been recorded on this pack.",
+    reviewDecisionApproved: "Approved",
+    reviewDecisionDeclined: "Declined",
+    reviewLatestApproved: "The latest decision on this pack is an approval.",
+    reviewLatestDeclined: "The latest decision on this pack is a decline, so it cannot be sent.",
+    reviewAwaitingDecision: "No decision yet, so this pack cannot be sent.",
+    reviewMoved: "Somebody else changed this dispute while your page was open. Reload and check.",
+    reviewFailed: "The decision was not recorded. Try again.",
+
+    submissionTitle: "Send the pack to the processor",
+    submissionHelp:
+      "The processor answers chargebacks on its own case file. Send the pack through the processor's API when this build has one for that provider, or send it from the processor's portal and record the case number here.",
+    submissionChannelLabel: "How it is sent",
+    submissionChannelProvider: "Through the processor's API",
+    submissionChannelRecorded: "Recorded: I sent it from the processor's portal",
+    submissionReferenceLabel: "Processor case number",
+    submissionReferenceHelp: "The identifier or case number the processor gave the submission.",
+    submissionReferencePlaceholder: "The number on the processor's page.",
+    submissionNoteLabel: "What you did (optional)",
+    submissionNotePlaceholder: "Where it was sent, or who you spoke to.",
+    submissionButton: "Send the pack",
+    submissionRecordingButton: "Record the submission",
+    submissionSending: "Sending",
+    submissionSentGeneric: "The pack is sent to the processor.",
+    submissionDone: "The pack is sent. The processor's reference is {reference}.",
+    submissionAlreadyDone: "This pack was already sent. The processor's reference is {reference}.",
+    submissionProviderUnsupported:
+      "This build has no documented dispute API for this provider's processor, so the pack is sent from the portal and recorded here.",
+    submissionNeedsApproval: "The pack must be approved before it is sent.",
+    submissionSentTitle: "Sent to the processor",
+    submissionSentBy: "Recorded by an officer of this desk.",
+    submissionReferenceText: "Reference {reference}",
+    submissionSentAt: "Sent {instant}",
+    submissionChannelProviderText: "Sent through the processor's API",
+    submissionChannelRecordedText: "Sent from the processor's portal and recorded here",
+    submissionRulePackMissing: "The merchant has not frozen an evidence pack, so there is nothing to send.",
+    submissionRuleReviewRequired: "The pack must be approved by this desk before it is sent.",
+    submissionRuleExists: "This pack is already with the processor, or an attempt is in flight.",
+    submissionRuleUnsupported: "This build cannot call this provider's dispute API. Record the submission instead.",
+    submissionRuleDeclined: "The processor refused the evidence.",
+    submissionRuleUnanswered: "The processor did not answer, so the evidence was not confirmed. Try again.",
+    submissionRuleProviderMissing: "The disputed payment names no provider, so no channel is available.",
+    submissionRuleAlready: "The evidence was already sent for this dispute.",
+    submissionRuleDecided: "This dispute is decided and cannot be reviewed or sent.",
+    submissionRuleNotFound: "This dispute is not on this platform.",
+    submissionFailed: "The pack was not sent. Try again.",
+
+    reviewQueueTitle: "Packs waiting for the desk",
+    reviewQueueDescription:
+      "Every frozen evidence pack no officer has sent yet, nearest deadline first. A pack with no decision is the first thing to look at.",
+    reviewQueueEmpty: "No frozen pack is waiting for a decision.",
+    reviewQueueDecision: "Decision",
+    reviewQueueNoDecision: "Not reviewed",
+    reviewQueueOpen: "Open the pack",
+
+    chargebackTitle: "Chargeback rate",
+    chargebackDescription:
+      "The rate and the transaction count together, over the window the super administrator set. A percentage below the minimum count means nothing, which is why both are printed on every row.",
+    chargebackPolicyTitle: "The thresholds",
+    chargebackPolicyHelp:
+      "Every number here is a `chargeback.*` platform setting. A warning and an extra reserve are taken by the platform; a suspension is a super administrator's own decision.",
+    chargebackPolicyWindowLabel: "Window, days",
+    chargebackPolicyMinimumLabel: "Minimum transactions",
+    chargebackPolicyWarningLabel: "Warning bar, basis points",
+    chargebackPolicyReserveLabel: "Extra reserve bar, basis points",
+    chargebackPolicySuspensionLabel: "Suspension bar, basis points",
+    chargebackPolicyReservePercentLabel: "Extra reserve, percent withheld (basis points)",
+    chargebackPolicyReserveDaysLabel: "Extra reserve, days held",
+    chargebackPolicyDigest: "Policy {digest}",
+    chargebackPolicyUnset: "Never configured; the defaults are in force.",
+    chargebackPolicySave: "Save the thresholds",
+    chargebackPolicySaved: "The thresholds are saved. The measurement now reads the policy it names below.",
+    chargebackWatchActionNote: "Only a super administrator or the compliance desk may take a step, and only when the numbers earn one.",
+    chargebackPolicyFailure: "The thresholds were not saved. Every bar must sit between 1 and 10000 basis points, in the order warning, reserve, suspension, and the minimum must be a count the platform can hold.",
+    chargebackPolicyRoleNote:
+      "Only a super administrator with a proved second factor changes the thresholds. The panel shows them so the desk can read the bar it is measuring against.",
+    chargebackWatchTitle: "The merchants",
+    chargebackWatchDescription:
+      "Every merchant, its transactions and chargebacks over the window, the rate they give, and the step that rate earns.",
+    chargebackWatchEmpty: "No merchant is registered on this platform yet.",
+    chargebackWatchRate: "Rate",
+    chargebackWatchCounts: "{chargebacks} chargebacks of {payments} transactions",
+    chargebackWatchDue: "Earns",
+    chargebackWatchStanding: "Standing",
+    chargebackWatchNoStep: "No step",
+    chargebackWatchCleared: "cleared",
+    chargebackWatchTruncated:
+      "This window is larger than one measurement reads, so the rate is not acted on until it is measured again.",
+    chargebackStepWarning: "Warning and monitoring",
+    chargebackStepReserve: "Extra reserve",
+    chargebackStepSuspension: "Suspension",
+    chargebackRunLabel: "Take the step these numbers earn",
+    chargebackSuspendLabel: "Suspend",
+    chargebackSuspendReasonLabel: "Why this merchant is being suspended",
+    chargebackSuspendReasonHelp:
+      "Recorded as the reason on the account event, at most 280 characters. A suspension always carries the name of the officer who took it.",
+    chargebackSuspendRoleNote:
+      "Only a super administrator may suspend. The platform takes the warning and the reserve on its own; stopping a merchant's business is a person's decision.",
+    chargebackClearLabel: "Clear",
+    chargebackClearNoteLabel: "Why the step is lifted",
+    chargebackHistoryTitle: "Steps taken",
+    chargebackHistoryDescription: "The last twenty steps, newest first, with the numbers each was taken on.",
+    chargebackHistoryEmpty: "No chargeback step has been taken yet.",
+    chargebackApplied: "The {kind} step is recorded.",
+    chargebackCleared: "The {kind} step is cleared.",
+    chargebackModeAutomatic: "Automatic",
+    chargebackModeManual: "Manual",
+    chargebackAppliedAt: "Applied",
+    chargebackActor: "Officer",
+    chargebackReserveGiven: "Reserve at {percent} percent",
+    chargebackRuleBelowThreshold: "The rate is under the warning bar, so no step is owed.",
+    chargebackRuleMinimum: "Too few transactions in the window for a percentage to mean anything.",
+    chargebackRuleTaken: "This step is already standing for this merchant.",
+    chargebackRuleSuspended: "This merchant is suspended; the account lifecycle owns the way back.",
+    chargebackRuleMissing: "This merchant is not on the platform.",
+    chargebackRuleTruncated: "The window is too large to measure, so no step is taken on it.",
+    chargebackRuleInvalidPolicy: "A stored threshold is outside its bounds, so nothing is measured until it is fixed.",
+    chargebackRuleNotClearable: "A suspension is not cleared here: the account lifecycle returns the merchant.",
+    chargebackRuleAlreadyCleared: "This step was already cleared.",
+    chargebackRuleReasonRequired: "A suspension needs the officer's own sentence.",
+    chargebackRuleInvalidFormat: "The form could not be read. Check the numbers and try again.",
+    chargebackFailed: "The step was not taken. Try again.",
+  },
   email: {
     lockAlert: {
       /** Subject of the section 23 alert of section 22: the owner is told their account locked. */
@@ -2857,6 +3889,28 @@ const catalog = {
     newDevice: {
       /** Subject of the section 23 alert of section 22: an account was used from a new device. */
       subject: "A new device signed in to your account. Confirm it with your authenticator",
+    },
+    disputeSubmission: {
+      /**
+       * STEP 198: the merchant is told their evidence reached the processor. A subject is capped at 160
+       * characters by `0061`, so it names the event and nothing else.
+       */
+      subject: "Your evidence pack was sent to the processor for your disputed payment",
+    },
+    chargebackWarning: {
+      /**
+       * STEP 199: the merchant is warned that the chargeback rate crossed the bar. A subject is capped at 160
+       * characters by `0061`, so it names the event and the window rather than the numbers.
+       */
+      subject: "Your chargeback rate crossed the warning bar and your account is being monitored",
+    },
+    disputeWarning: {
+      /**
+       * STEP 196: section 19's two warnings, and the only place their words live. A subject is capped at 160
+       * characters by `0061`, so each one says the deadline and nothing else.
+       */
+      startSubject: "A dispute was opened against your payment: you have until the deadline to answer",
+      midpointSubject: "Half of the dispute response window has passed. Answer before the deadline",
     },
   },
   policies: {

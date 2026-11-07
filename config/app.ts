@@ -45,6 +45,16 @@ export interface AppConfig {
       readonly consecutiveFailureLimit: number;
       readonly lockDurationMinutes: number;
     };
+    /**
+     * FEATURE_LIST section 18: card and IP velocity limits, with defaults in config. The hit that reaches a
+     * limit is the attempt the payment page refuses, so a card limit of five allows four charged attempts in
+     * an hour; `lib/security/velocity.ts` states the same numbers as the platform's baseline and a gate keeps
+     * the two equal.
+     */
+    readonly velocity: {
+      readonly card: { readonly limit: number; readonly windowSeconds: number };
+      readonly ip: { readonly limit: number; readonly windowSeconds: number };
+    };
   };
   readonly payouts: {
     readonly bankChangeCoolingPeriodHours: number;
@@ -104,6 +114,12 @@ const configuredAppConfig = {
     loginLock: {
       consecutiveFailureLimit: 2,
       lockDurationMinutes: 120,
+    },
+    // FEATURE_LIST section 18: one card, five attempts an hour; one address, twenty. The window is aligned to
+    // the epoch by the counter itself, so these are a length and not an instant.
+    velocity: {
+      card: { limit: 5, windowSeconds: 3_600 },
+      ip: { limit: 20, windowSeconds: 3_600 },
     },
   },
   payouts: {
@@ -203,6 +219,18 @@ function collectInvariantViolations(config: AppConfig): readonly string[] {
     config.security.loginLock.lockDurationMinutes,
     1,
   );
+  // The bounds the counter table enforces: `0056` refuses a limit below one and a window outside one second
+  // to thirty days, so a configuration that would fail there fails here first.
+  for (const subject of ["card", "ip"] as const) {
+    requirePositive(`security.velocity.${subject}.limit`, config.security.velocity[subject].limit, 1);
+    if (
+      !Number.isInteger(config.security.velocity[subject].windowSeconds) ||
+      config.security.velocity[subject].windowSeconds < 1 ||
+      config.security.velocity[subject].windowSeconds > 2_592_000
+    ) {
+      violations.push(`security.velocity.${subject}.windowSeconds must be 1 to 2592000 seconds`);
+    }
+  }
 
   requirePositive(
     "payouts.bankChangeCoolingPeriodHours",

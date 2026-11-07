@@ -12606,12 +12606,45 @@ async function checkCsrfProtection(): Promise<void> {
     .map((file) => file.path.replace("/", "/api/").replace("/api/api/", "/api/").replace(/\/route\.ts$/u, ""))
     .sort();
 
-  expectEqual(postRoutes.length, CSRF_PROTECTED_PATHS.length, "every route that answers a POST is on the protected list");
+  /**
+   * The one kind of mutation that cannot carry a token, and the half of the rule it is held to instead.
+   *
+   * A provider's callback is not a browser: there is no cookie, so there is no ambient credential to forge,
+   * and the caller identifies itself with an HMAC signature over the exact bytes of the body. A token in
+   * `CSRF_PROTECTED_PATHS` would be a token the provider cannot hold, and the route would have to refuse
+   * every real delivery to satisfy this gate - so the two half-rules below are what STEP 194 wrote: the
+   * callbacks are excluded from the equality, and each one is required to verify a signature instead, with
+   * the CSRF guard *absent* so nobody later "fixes" it by adding one. `scripts/verify-audit.mjs` names the
+   * same prefix for the same reason, and the two gates now agree about the same exception.
+   */
+  const WEBHOOK_ROUTE_PREFIX = "/api/webhooks/";
+  const webhookRoutes = postRoutes.filter((path) => path.startsWith(WEBHOOK_ROUTE_PREFIX));
+  const browserPostRoutes = postRoutes.filter((path) => !path.startsWith(WEBHOOK_ROUTE_PREFIX));
+
   expectEqual(
-    postRoutes.join(","),
+    browserPostRoutes.length,
+    CSRF_PROTECTED_PATHS.length,
+    "every route that answers a POST is on the protected list",
+  );
+  expectEqual(
+    browserPostRoutes.join(","),
     [...CSRF_PROTECTED_PATHS].sort().join(","),
     "and the list names exactly those routes",
   );
+
+  for (const path of webhookRoutes) {
+    const callback = appSourceOf(appSources, `${path}/route.ts`);
+
+    expect(callback.length > 0, `${path} exists on disk`);
+    expect(
+      !callback.includes("requireCsrfToken("),
+      `${path} does not ask for a token a provider cannot hold`,
+    );
+    expect(
+      callback.includes("receiveDisputeWebhook"),
+      `${path} verifies the provider's own signature before it reads the body`,
+    );
+  }
 
   /**
    * The source a protected route is judged by: its own file, plus any file it builds its handlers from.
@@ -12729,10 +12762,17 @@ async function checkCsrfProtection(): Promise<void> {
   // neither check: a file with no POST never entered this list, so nothing asserted it carried the
   // token. The line editor is the first file that posts *and* deletes, which is what surfaced the gap.
   // Counting every mutating method closes it, and the two delete-only files are now covered.
+  //
+  // STEP 191 adds the one filter the scan was missing: a file that mutates is a file that runs in a browser,
+  // and a browser file is a client component. Without it `app/(client-portal)/portal-rate-limit.ts` - a server
+  // module whose prose contains the words `method: "POST"` - was counted as a fifth door nobody could see, and
+  // the two assertions below had answered red since the portal block landed. A gate that cannot tell a comment
+  // from a call teaches its reader to skip it.
   const MUTATION_METHODS = ['method: "POST"', 'method: "DELETE"'] as const;
   const mutationCalls = (source: string): number =>
     MUTATION_METHODS.reduce((total, marker) => total + source.split(marker).length - 1, 0);
   const browserMutations = appSources
+    .filter((file) => file.source.includes('"use client"'))
     .filter((file) => mutationCalls(file.source) > 0)
     .map((file) => file.path)
     .sort();
@@ -12760,11 +12800,54 @@ async function checkCsrfProtection(): Promise<void> {
   // STEP 124 adds one more call to that same file: the payment form, which records one amount on the
   // document it sits under, on its own route with its own token.
   // So the files stay at forty seven and the call sites arrive at sixty three.
-  expectEqual(browserMutations.length, 47, "forty seven browser files send a mutation");
+  //
+  // STEP 190 adds one more file and three more calls: the payment link console, which creates a link,
+  // revokes one and reissues one - three facts, three routes and three tokens from one screen.
+  //
+  // STEP 191 adds two more files and three more calls: the merchant refund desk, which asks for a refund and
+  // withdraws a request, and the finance desk's decision form, which approves or rejects on one route.
+  // With the client-component filter above in place, the files arrive at fifty and the call sites at sixty
+  // nine.
+  //
+  // STEP 192 adds one more file and one more call: the finance desk's execution form, which sends one approved
+  // refund back through the provider that took the payment - one button, one route, one token.
+  //
+  // STEP 193 adds one file and two calls: the section 18 fee screen's form, which answers the platform fee
+  // question on a refund and runs the pass that applies the answer to the refunds still unanswered.
+  //
+  // STEP 194 adds none: both of its screens read, and a screen that only reads holds no token.
+  //
+  // STEP 195 adds two files and two calls, one each: the merchant's response form - the words section 19 gives
+  // them inside the window - and the office's deadline extension, which a super administrator's enrolled device
+  // signs before the route will move another merchant's deadline.
+  //
+  // STEP 196 adds one file and one call: the queue's "send the warnings that are due now" panel, which is the
+  // button a deployment without a scheduler uses to pay section 19's two warning emails.
+  //
+  // STEP 197 adds one file and seven calls: the evidence pack panel, whose six acts are seven requests because
+  // a record is both added and removed from one card and a document is attached and removed from another. One
+  // `send` owns the fetch, the refusal and the refresh, and each call site still asks for the token itself,
+  // which is what keeps one spread per mutation. So the files arrive at fifty six and the call sites at
+  // eighty two.
+  //
+  // STEP 201 adds two calls to STEP 200's credential panel - the revoke and the regenerate - with a token
+  // spread each, so the call sites move from eighty eight to ninety while the file count stands still.
+  //
+  // STEP 200 adds one file and one call: the merchant's API credential form, which makes a credential and is
+  // answered with a mask. Fifty nine files, eighty eight call sites.
+  //
+  // STEP 199 adds one file and three calls: the office's chargeback panel, whose three acts are the thresholds,
+  // the step a merchant's numbers earn and the clearing of one. They arrive at fifty eight files and eighty
+  // seven call sites.
+  //
+  // STEP 198 adds one file and two calls: the office review panel, whose two acts are a decision on a frozen
+  // pack and the submission that follows it. Both are signed with the enrolled device as well as the token, and
+  // both go through one `send`, so the files arrive at fifty seven and the call sites at eighty four.
+  expectEqual(browserMutations.length, 59, "fifty nine browser files send a mutation");
   expectEqual(
     browserMutations.reduce((total, path) => total + mutationCalls(appSourceOf(appSources, path)), 0),
-    63,
-    "across sixty three call sites",
+    90,
+    "across ninety call sites",
   );
   const postCalls = mutationCalls;
   const tokenSpreads = (source: string): number =>
