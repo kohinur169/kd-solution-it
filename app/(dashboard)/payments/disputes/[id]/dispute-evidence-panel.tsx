@@ -472,7 +472,7 @@ export function DisputeEvidencePanel({
                           <span className={subRowClasses}>
                             {document.caption === null
                               ? `${document.contentType} · ${String(document.byteSize)} B`
-                              : `${document.caption} · ${document.contentType}`}
+                              : `${document.caption} · ${document.contentType} · ${String(document.byteSize)} B`}
                           </span>
                         </div>
 
@@ -695,7 +695,7 @@ export function DisputeEvidencePanel({
         </>
       )}
 
-      {mayBuild ? (
+      {mayBuild && !frozen ? (
         <div className={actionsClasses}>
           <button
             className={secondaryButtonClasses}
@@ -715,7 +715,7 @@ export function DisputeEvidencePanel({
       ) : null}
 
       {message === null ? null : (
-        <p className={isError ? "text-sm text-destructive" : messageClasses} role="status">
+        <p className={isError ? "text-sm text-destructive" : messageClasses} role={isError ? "alert" : "status"}>
           {message}
         </p>
       )}

@@ -1681,6 +1681,9 @@ expectSourceContains(panelSource, "router.refresh()", "and re-reads the page aft
 expectSourceContains(panelSource, "disabled={busy || !complete}", "the freeze button is disabled until the pack is complete");
 expectSourceContains(panelSource, "disputeEvidenceIsComplete(", "using the same completeness question the database asks");
 expectSourceContains(panelSource, "evidenceSectionLabel(", "and the four parts are named in one place");
+expectSourceContains(panelSource, "{mayBuild && !frozen ? (", "a frozen pack offers no action, because the service would refuse every one of them");
+expectSourceContains(panelSource, 'role={isError ? "alert" : "status"}', "and a refusal is announced rather than printed quietly");
+expectEqual(panelSource.split("document.byteSize").length - 1, 2, "a document says how big it is whether or not it has a caption");
 expectSourceContains(panelSource, "grid-cols-1", "the panel is one column on a phone");
 expectSourceContains(panelSource, "sm:grid-cols-2", "and two from the tablet breakpoint");
 expectSourceContains(panelSource, 'accept={DISPUTE_EVIDENCE_CONTENT_TYPES.join(",")}', "the file input offers the three types the server accepts");
